@@ -307,6 +307,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
     context.logger.log_stats(summary).await;
     context.logger.flush_all().await;
+    if !context.config.quiet {
+        let (elapsed_secs, fetched_blocks, avg_speed, avg_window, max_speed, failed_blocks) = {
+            let stats = context.stats.lock().await;
+            let elapsed_secs = run_start.elapsed().as_secs_f64().max(0.001);
+            let fetched_blocks = stats.receipts_ok_total;
+            let avg_speed = fetched_blocks as f64 / elapsed_secs;
+            let avg_window = if stats.window_count > 0 {
+                stats.window_blocks_per_sec_sum / stats.window_count as f64
+            } else {
+                0.0
+            };
+            (
+                elapsed_secs,
+                fetched_blocks,
+                avg_speed,
+                avg_window,
+                stats.window_blocks_per_sec_max,
+                stats.failed_blocks_total,
+            )
+        };
+        if failed_blocks > 0 {
+            println!(
+                "All done! Fetched {} blocks in {:.1}s ({} failed). Avg {:.2} blocks/s, window avg {:.2}, max {:.2}.",
+                fetched_blocks,
+                elapsed_secs,
+                failed_blocks,
+                avg_speed,
+                avg_window,
+                max_speed
+            );
+        } else {
+            println!(
+                "All done! Fetched {} blocks in {:.1}s. Avg {:.2} blocks/s, window avg {:.2}, max {:.2}.",
+                fetched_blocks,
+                elapsed_secs,
+                avg_speed,
+                avg_window,
+                max_speed
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1737,7 +1778,10 @@ fn spawn_window_stats(context: Arc<RunContext>) {
     });
 }
 
-fn spawn_progress_bar(context: Arc<RunContext>, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+fn spawn_progress_bar(
+    context: Arc<RunContext>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     if context.config.quiet {
         return;
     }
@@ -1752,9 +1796,10 @@ fn spawn_progress_bar(context: Arc<RunContext>, mut shutdown_rx: tokio::sync::wa
     .unwrap()
     .progress_chars("=>-");
     pb.set_style(style);
-    pb.set_message("peers 0");
+    pb.set_message("status looking_for_peers | peers 0/0");
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        let mut sent_shutdown = false;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -1763,9 +1808,26 @@ fn spawn_progress_bar(context: Arc<RunContext>, mut shutdown_rx: tokio::sync::wa
                     let processed = completed + failed;
                     let active = context.active_peers.lock().await.len();
                     let sessions = context.sessions.load(Ordering::SeqCst);
-                    let msg = format!("peers {}/{}", active, sessions);
+                    let queue_len = context.queue_len().await;
+                    let in_flight = context.in_flight.load(Ordering::SeqCst);
+                    let status = if sessions == 0 {
+                        "looking_for_peers"
+                    } else if processed >= context.total_targets && queue_len == 0 && in_flight == 0 {
+                        "finalizing"
+                    } else {
+                        "fetching"
+                    };
+                    let msg = format!("status {} | peers {}/{}", status, active, sessions);
                     pb.set_message(msg);
                     pb.set_position(processed.min(context.total_targets) as u64);
+                    if !sent_shutdown
+                        && processed >= context.total_targets
+                        && queue_len == 0
+                        && in_flight == 0
+                    {
+                        let _ = context.shutdown_tx.send(true);
+                        sent_shutdown = true;
+                    }
                 }
                 _ = shutdown_rx.changed() => {
                     break;
