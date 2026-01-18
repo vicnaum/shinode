@@ -1,4 +1,4 @@
-reth/
+./reth/
 target/
 .DS_Store
 harness/output/
