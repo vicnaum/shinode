@@ -45,27 +45,79 @@ To serve `eth_getLogs` correctly, we must retain enough to produce:
   - calldata retention (`input`)
 
 ### RPC surface (v0.1)
-Required:
+Required (v0.1 target: rindexer event indexing):
 - `eth_chainId`
-- `net_version`
-- `web3_clientVersion`
 - `eth_blockNumber`
-- `eth_getBlockByNumber` (at least header + tx hashes)
-- `eth_getBlockByHash` (at least header + tx hashes)
-- `eth_getLogs`
+- `eth_getBlockByNumber` (must support `"latest"`; must include `number`, `timestamp`, `hash`, `logsBloom`)
+- `eth_getLogs` (must include standard log fields: `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`, `logIndex`; `blockTimestamp` is optional)
 
-Optional (only if we retain enough data):
-- `eth_getTransactionReceipt`
-- `eth_getTransactionByHash`
+#### v0.1 RPC contract (rindexer-minimum)
+This section is the concrete “contract” we implement for v0.1. It is intentionally minimal and chosen to satisfy rindexer’s default event indexing mode (polling).
 
-Explicitly unsupported (return standard JSON-RPC “method not found” or a clear “not supported” error):
-- stateful and trace methods (`eth_call`, balances, storage, `debug_trace*`, etc.)
+**1) `eth_chainId`**
+- **Params**: `[]`
+- **Result**: hex quantity chain id (e.g. `"0x1"`)
+
+**2) `eth_blockNumber`**
+- **Params**: `[]`
+- **Result**: hex quantity block number.
+- **Semantics**: returns the **highest canonical block number fully indexed and queryable** by this node. May temporarily decrease within the configured reorg rollback window.
+
+**3) `eth_getBlockByNumber`**
+- **Params**: `[block: "latest" | hex_quantity, full_transactions: boolean]`
+- **Supported in v0.1**:
+  - `block`: `"latest"` and explicit hex block numbers
+  - `full_transactions`: **false only** (if `true`, return a clear “not supported” error)
+- **Result (minimum fields guaranteed)**:
+  - `number`, `hash`, `parentHash`, `timestamp`, `logsBloom`
+  - `transactions`: array of **tx hashes** (since `full_transactions=false`)
+
+**4) `eth_getLogs`**
+- **Params**: `[filter: { fromBlock?, toBlock?, blockHash?, address?, topics? }]`
+- **Supported in v0.1**:
+  - range queries via `fromBlock` + `toBlock` (hex quantities or `"latest"`)
+  - `address`: single value or array
+  - `topics`: standard topic filter shape (topic0-3), including `null` wildcards
+- **Result (minimum fields guaranteed for each log)**:
+  - `address`, `topics`, `data`
+  - `blockNumber`, `blockHash`
+  - `transactionHash`, `transactionIndex`
+  - `logIndex`
+  - `removed`: always `false` in v0.1 (`eth_getLogs` returns canonical logs only)
+- **Ordering**:
+  - logs are sorted ascending by `(blockNumber, transactionIndex, logIndex)` (rindexer assumes `logs.last()` corresponds to the highest block)
+- **Limits**:
+  - enforce a configurable `max_blocks_per_filter` and `max_logs_per_response` (reth-style defaults)
+  - **On limit violation**: return JSON-RPC **invalid params** (`-32602`) with a deterministic message (reth-style)
+    - block range too wide: `query exceeds max block range {max_blocks_per_filter}`
+    - too many logs: `query exceeds max results {max_logs_per_response}, retry with the range {from_block}-{to_block}`
+      - `to_block` should be the **last successfully processed block** (so the client can retry the suggested smaller range)
+    - reference: reth’s `eth_getLogs` implementation (`reth/crates/rpc/rpc/src/eth/filter.rs`) uses these messages and maps them to `-32602`
+  - **rindexer retry behavior**: rindexer will shrink the requested range on *any* `eth_getLogs` error, but it shrinks faster if the error `message` or `data` contains provider-style hints. rindexer currently recognizes (case-insensitive):
+    - `this block range should work: [0xFROM, 0xTO]`
+    - `try with this block range [0xFROM, 0xTO]`
+    - `block range is too wide`
+    - `block range too large`
+    - `limited to a N`
+    - `response is too big` / `error decoding response body`
+
+Optional / deferred (v0.2+):
+- **Ponder baseline compatibility adds**:
+  - `eth_getBlockByHash` (reorg traversal)
+  - `eth_call` (multicall3 / readContract; requires state and is not supported by a fully stateless node unless proxied or supported via a stateless execution approach like RESS)
+  - optional WS: `eth_subscribe` (`newHeads`) with polling fallback
+  - optional receipts: `eth_getBlockReceipts` / `eth_getTransactionReceipt`
+  - optional call traces: `debug_traceBlockByNumber` / `debug_traceBlockByHash`
+- Other deferred items:
+  - `net_version`, `web3_clientVersion`
+  - `eth_getTransactionByHash` (if we decide to support it)
+  - non-standard chain detection methods (e.g., `zks_L1ChainId`)
 
 ### Reorg semantics (v0.1)
 - Maintain a configurable **rollback window** (e.g., 64 blocks default).
 - When a reorg is detected:
   - roll back canonical blocks/logs above the common ancestor
-  - make “removed logs” visible to RPC clients (how depends on our chosen internal log model; see storage section)
+  - v0.1 default: delete-on-rollback (no tombstones); `eth_getLogs` continues to return canonical logs only (`removed=false`)
 
 ### Head tracking / trust model (v0.1)
 Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we start pragmatic:
@@ -206,7 +258,7 @@ Deliverables:
 - explicit “unsupported RPC list”
 
 Verification:
-- service starts/stops, creates DB, exposes health/version endpoints (or `web3_clientVersion`)
+- service starts/stops, creates DB, exposes a minimal “identity” RPC (e.g., `eth_chainId`)
 
 ### v0.1.1 Sync + ingest loop
 Deliverables:
@@ -246,6 +298,5 @@ Verification:
 
 ## Open questions (for you)
 These don’t block writing code, but they affect the “default” product contract:
-1. Which indexer is the “must pass” target first: Ponder, rindexer, or a specific custom pipeline?
-2. Confirm the exact RPC method surface those indexers call (we can repo-scan Ponder + rindexer and update the v0.1 RPC list accordingly).
+1. If/when Ponder support becomes a goal: decide the `eth_call` strategy (proxy to upstream vs. stateless execution via RESS vs. running execution/state).
 

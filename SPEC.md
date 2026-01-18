@@ -23,12 +23,19 @@ This repo currently contains a working **receipt availability harness** (see App
 - **Backfill** from a configured `start_block` to a moving “head”.
 - **Follow** new blocks continuously.
 - **Persist** data restart-safely and idempotently (no duplicates, no corruption).
-- **Serve RPC** sufficient for an indexer workload (Uniswap-style):
-  - Required: `eth_chainId`, `net_version`, `web3_clientVersion`, `eth_blockNumber`
-  - Required: `eth_getBlockByNumber`, `eth_getBlockByHash` (at least header + tx hashes)
+- **Serve RPC** sufficient for the v0.1 target indexer (**rindexer**) to run end-to-end:
+  - Required: `eth_chainId`
+  - Required: `eth_blockNumber`
+  - Required: `eth_getBlockByNumber` (including `"latest"`)
   - Required: `eth_getLogs`
-  - Optional: `eth_getTransactionReceipt`, `eth_getTransactionByHash` (only for retained txs)
-- **Handle reorgs** within a configured rollback window and correctly mark removed logs.
+  - Optional (v0.2+): additional endpoints for other indexers (see note below)
+- **Handle reorgs** within a configured rollback window (v0.1 default: delete-on-rollback).
+
+### Note: Ponder baseline requires stateful RPC
+Ponder’s baseline “normal app” mode includes **`eth_call`** (multicall3 / read-contract / some factory flows) and uses **`eth_getBlockByHash`** for realtime reorg traversal. Since `eth_call` requires EVM state, a fully stateless history node cannot serve it without either:
+- running execution/state (out of scope), or
+- proxying `eth_call` to an upstream RPC (optional future integration), or
+- a stateless execution approach (e.g., Reth’s RESS subsystem) if feasible for the required calls.
 
 ### Data we must ingest (minimum set)
 To serve `eth_getLogs` correctly (including `transactionHash`/`transactionIndex`/`logIndex`), we need:

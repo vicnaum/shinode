@@ -18,7 +18,7 @@
 
 ## 🎯 v0.1 MVP (Functional): “Synced History RPC for Indexing”
 
-Goal: ship a long-running service that **backfills**, **stays in sync with the head**, **persists history**, and exposes an **indexer-compatible JSON-RPC subset** (Ponder, rindexer, etc.) so you can index Uniswap without paid RPC.
+Goal: ship a long-running service that **backfills**, **stays in sync with the head**, **persists history**, and exposes an **indexer-compatible JSON-RPC subset** (v0.1 target: **rindexer**) so you can index Uniswap without paid RPC.
 
 This MVP is intentionally **stateless**: no EVM execution, no state trie, no archive-state growth. It ingests EL history artifacts (headers + bodies/tx hashes + receipts/logs) and serves them back.
 
@@ -29,7 +29,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] **Canonicality & head source contract** (explicit trust model):
   - MVP default: follow a best-effort head from the P2P view and handle reorgs within a rollback window
   - Later option: integrate a local CL or beacon API for finalized/safe head
-- [ ] **Reorg semantics**: rollback window, “removed logs”, and define what `eth_blockNumber` means (e.g., last fully indexed block)
+- [ ] **Reorg semantics**: rollback window, rollback strategy (v0.1 default: delete-on-rollback), and define what `eth_blockNumber` means (e.g., last fully indexed block)
 - [ ] **Storage choice (early)**: pick a backend that won’t block future work
   - Recommended baseline: **MDBX** (reth-style), with a schema designed for later “static files” / cold storage
 - [ ] **Crate/module boundaries** (match reth’s separation of concerns): `p2p`, `sync/ingest`, `chain`, `storage`, `rpc`, `cli/config`
@@ -49,16 +49,24 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - txs: per-block tx hashes
   - receipts/logs: enough to answer `eth_getLogs` (and optionally `eth_getTransactionReceipt` later)
 - [ ] Indexes for fast `eth_getLogs` (at least by block range + address/topic0)
-- [ ] Reorg rollback: delete/mark data past common ancestor and emit “removed logs” correctly
+- [ ] Reorg rollback: delete data past common ancestor (tombstones/“removed logs” support deferred)
 
 ### v0.1.3 JSON-RPC server (indexer-compatible subset)
-- [ ] Basics: `eth_chainId`, `net_version`, `web3_clientVersion`
-- [ ] Sync: `eth_blockNumber`
-- [ ] Blocks: `eth_getBlockByNumber`, `eth_getBlockByHash` (header + tx hashes)
-- [ ] Logs: `eth_getLogs` (fast path via log indexes; adopt reth-style query limits)
-- [ ] Keep the RPC surface minimal for v0.1; validate exact indexer needs against Ponder/rindexer and add only what’s required
+- [ ] Target v0.1 indexer: **rindexer** (polling-based; no `eth_subscribe` required)
+- [ ] **Minimum RPC for rindexer event indexing**:
+  - `eth_chainId`
+  - `eth_blockNumber`
+  - `eth_getBlockByNumber` (must support `"latest"`; must include `timestamp`, `number`, `hash`, `logsBloom`)
+  - `eth_getLogs` (must include `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`, `logIndex`)
+- [ ] **Ponder compatibility (later; NOT in v0.1) requires more than rindexer**:
+  - `eth_getBlockByHash` (reorg traversal via `parentHash`)
+  - `eth_call` (multicall3 + factory/read-contract flows; requires state, so not supported by a fully-stateless node unless proxied or executed via a stateless execution approach like RESS)
+  - optional WS: `eth_subscribe` (`newHeads`) with polling fallback
+  - optional receipts: `eth_getBlockReceipts` / `eth_getTransactionReceipt`
+  - optional call traces: `debug_traceBlockByNumber` / `debug_traceBlockByHash`
+- [ ] Adopt reth-style query limits (`max_blocks_per_filter`, `max_logs_per_response`) and return a clear error when exceeded
 - [ ] Security defaults: bind **localhost by default**, configurable host/port, request/response limits, basic rate limiting
-- [ ] (Optional) WS subscriptions if your chosen indexer benefits
+- [ ] Deferred beyond v0.1: `net_version`, `web3_clientVersion`, tx/receipt endpoints, WS subscriptions
 
 ### v0.1.4 Operator experience (minimum to run unattended)
 - [ ] CLI/config: chain, start block, retention, DB path, RPC bind, resource limits
