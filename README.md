@@ -34,6 +34,7 @@ All output is written under `harness/output/`:
 - `requests.jsonl`: request/response timing + peer events.
 - `probes.jsonl`: per-block probe outcome (header/receipts, latencies).
 - `known_blocks.jsonl`: blocks confirmed as available.
+- `missing_blocks.jsonl`: blocks not fetched (written at end if any remain).
 - `stats.jsonl`: windowed stats + final summary.
 
 ## CLI flags
@@ -68,6 +69,6 @@ Logging and stats:
   again on as many distinct peers as possible (one attempt per peer).
 
 ## Notes
-- This harness targets Ethereum mainnet only (for now).
+- This harness targets **Ethereum mainnet only**.
 - Receipt root validation is intentionally skipped in v1.
 - Re-running reuses `known_blocks.jsonl` to avoid duplicate work.
