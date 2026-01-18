@@ -232,9 +232,15 @@ Recommendation:
 
 ## Testing plan (v0.1)
 
+### Approach (parallel + contract-first)
+- Write tests **in parallel** with implementation. Treat the PRD “v0.1 RPC contract” as **executable acceptance criteria**.
+- Use **TDD where the spec is crisp** (RPC response shape/errors, log ordering, storage idempotency, rollback semantics).
+- For evolving areas (P2P heuristics, peer selection/orchestration), prefer **invariants + regression tests**: codify “must never happen” and add a test whenever we fix a bug/edge case.
+- Keep fixtures **small and deterministic** so `cargo test` is fast and reliable.
+
 ### Unit tests
 - receipt decoding + eth version variants (`eth/68`, `eth/69`, `eth/70`)
-- receipt→log derivation correctness (tx index/log index, removed flag rules)
+- receipt→log derivation correctness (tx index/log index; `removed` is always `false` in v0.1)
 - reorg common ancestor + rollback math
 - storage idempotency: “write same block twice” yields same DB state
 
@@ -242,11 +248,19 @@ Recommendation:
 - spin up the service, ingest a short range, then query via RPC and compare against known fixtures
 - simulate a reorg by injecting an alternate header chain and assert rollback behavior
 
-### RPC conformance checks
-- Use a minimal “indexer probe” script/test that:
-  - calls `eth_blockNumber`
-  - fetches blocks and logs
-  - validates response shape matches expectations for the chosen indexer
+### RPC conformance checks (contract tests)
+- Implement a small “indexer probe” integration test that validates:
+  - `eth_chainId` returns the configured chain id
+  - `eth_blockNumber` returns “last fully indexed block”
+  - `eth_getBlockByNumber("latest", false)` returns minimum fields: `number`, `hash`, `parentHash`, `timestamp`, `logsBloom`, `transactions` (hashes)
+  - `eth_getBlockByNumber(_, true)` returns a clear “not supported” error
+  - `eth_getLogs` returns:
+    - required fields and **ascending** ordering by `(blockNumber, transactionIndex, logIndex)`
+    - topic/address filter semantics used by indexers (address as single or array; topic wildcards)
+    - limit errors as `-32602` with deterministic reth-style messages (see RPC contract section)
+- Where possible, reuse/refer to reth’s `eth_getLogs` compatibility vectors as test inputs:
+  - `reth/crates/rpc/rpc-e2e-tests/testdata/rpc-compat/eth_getLogs/`
+- Acceptance test (manual or automated later): run `rindexer` against the node for a small range and confirm end-to-end indexing works.
 
 ## Milestone plan (mapped to ROADMAP.md)
 
@@ -260,6 +274,10 @@ Deliverables:
 Verification:
 - service starts/stops, creates DB, exposes a minimal “identity” RPC (e.g., `eth_chainId`)
 
+Test gate (must pass):
+- `cargo test` passes
+- RPC smoke: `eth_chainId` responds with configured chain id
+
 ### v0.1.1 Sync + ingest loop
 Deliverables:
 - range sync backfill `start_block..head`
@@ -268,6 +286,10 @@ Deliverables:
 
 Verification:
 - ingest a small range and confirm `eth_getBlockByNumber` and `eth_getLogs` return expected results
+
+Test gate (must pass):
+- Unit tests for receipt→log derivation and rollback math
+- Integration: ingest a small fixture range and validate `eth_getLogs` ordering + required fields
 
 ### v0.1.2 Persistence hardening
 Deliverables:
@@ -279,6 +301,11 @@ Verification:
 - restart mid-sync and ensure progress resumes correctly
 - induce reorg and ensure DB returns to consistent canonical chain
 
+Test gate (must pass):
+- Idempotency: “write same block twice” yields same DB state
+- Restart: resume from checkpoint without duplicates
+- Reorg: rollback deletes data above common ancestor (v0.1 delete-on-rollback)
+
 ### v0.1.3 RPC server
 Deliverables:
 - required RPC endpoints implemented
@@ -288,6 +315,11 @@ Deliverables:
 Verification:
 - run an indexer against it for a small range
 
+Test gate (must pass):
+- RPC contract tests (“indexer probe”) for v0.1 RPC surface:
+  - response shapes, log ordering, and `-32602` limit errors/messages
+- Compatibility vectors: reth `eth_getLogs` topic/address wildcard fixtures (where applicable)
+
 ### v0.1.4 Operator experience
 Deliverables:
 - structured logs/metrics (lag to head, throughput, reorg count)
@@ -295,6 +327,9 @@ Deliverables:
 
 Verification:
 - unattended run for N hours with stable memory and bounded queues
+
+Test gate (must pass):
+- (Manual) N-hour soak run: bounded memory/queues and continued forward progress
 
 ## Open questions (for you)
 These don’t block writing code, but they affect the “default” product contract:
