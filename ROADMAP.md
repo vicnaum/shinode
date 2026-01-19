@@ -62,12 +62,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Write path: persist headers + tx hashes + receipts/logs during ingest
 - [x] Compute/persist **logsBloom** from receipts (eth/69/70)
 - [x] Read path: fetch stored blocks/receipts/logs by number/range (for upcoming RPC)
-- [ ] Indexes for fast `eth_getLogs` (at least by block range + address/topic0)
+- [x] Indexes for fast `eth_getLogs` (at least by block range + address/topic0)
 - [ ] Reorg rollback: delete data past common ancestor (tombstones/“removed logs” support deferred)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (tables + codecs compile)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (ingest writes + storage reads)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (logsBloom persisted from receipts)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (range reads for headers/receipts/logs)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (log index tables + queries)
 
 ### v0.1.3 JSON-RPC server (indexer-compatible subset)
 - [ ] Target v0.1 indexer: **rindexer** (polling-based; no `eth_subscribe` required)

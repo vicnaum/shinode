@@ -9,13 +9,13 @@ use reth_db::{
 };
 use reth_codecs::Compact;
 use reth_db_api::{
-    cursor::DbCursorRO,
+    cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW},
     table::{Compress, Decompress},
     transaction::{DbTx, DbTxMut},
     DatabaseError,
 };
 use reth_ethereum_primitives::Receipt;
-use reth_primitives_traits::Header;
+use reth_primitives_traits::{Header, ValueWithSubKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -25,8 +25,9 @@ use std::{
 use tracing::info;
 
 mod tables {
-    use super::{StoredLogs, StoredReceipts, StoredTxHashes};
-    use reth_db_api::{table::TableInfo, tables, TableSet, TableType, TableViewer};
+    use super::{LogIndexEntry, StoredLogs, StoredReceipts, StoredTxHashes};
+    use alloy_primitives::{Address, B256};
+    use reth_db_api::{table::{DupSort, TableInfo}, tables, TableSet, TableType, TableViewer};
     use reth_primitives_traits::Header;
     use std::fmt;
 
@@ -60,6 +61,20 @@ mod tables {
             type Key = u64;
             type Value = StoredLogs;
         }
+
+                /// Log index entries grouped by address.
+                table LogIndexByAddress {
+                    type Key = Address;
+                    type Value = LogIndexEntry;
+                    type SubKey = u64;
+                }
+
+                /// Log index entries grouped by topic0.
+                table LogIndexByTopic0 {
+                    type Key = B256;
+                    type Value = LogIndexEntry;
+                    type SubKey = u64;
+                }
     }
 }
 
@@ -102,6 +117,45 @@ pub struct StoredLogs {
     pub logs: Vec<StoredLog>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogIndexEntry {
+    pub block_number: u64,
+    pub log_index: u64,
+}
+
+impl ValueWithSubKey for LogIndexEntry {
+    type SubKey = u64;
+
+    fn get_subkey(&self) -> Self::SubKey {
+        self.block_number
+    }
+}
+
+impl Compact for LogIndexEntry {
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: bytes::BufMut + AsMut<[u8]>,
+    {
+        buf.put_slice(&self.block_number.to_be_bytes());
+        buf.put_slice(&self.log_index.to_be_bytes());
+        16
+    }
+
+    fn from_compact(mut buf: &[u8], _len: usize) -> (Self, &[u8]) {
+        use bytes::Buf;
+        let mut block_bytes = [0u8; 8];
+        block_bytes.copy_from_slice(&buf[..8]);
+        buf.advance(8);
+        let mut log_bytes = [0u8; 8];
+        log_bytes.copy_from_slice(&buf[..8]);
+        buf.advance(8);
+        let block_number = u64::from_be_bytes(block_bytes);
+        let log_index = u64::from_be_bytes(log_bytes);
+        (Self { block_number, log_index }, buf)
+    }
+}
+
 macro_rules! impl_compact_value {
     ($($name:ty),+ $(,)?) => {
         $(
@@ -123,7 +177,7 @@ macro_rules! impl_compact_value {
     };
 }
 
-impl_compact_value!(StoredTxHashes);
+impl_compact_value!(StoredTxHashes, LogIndexEntry);
 
 impl Compress for StoredReceipts {
     type Compressed = Vec<u8>;
@@ -379,6 +433,32 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist log index entries for address/topic queries.
+    #[allow(dead_code)]
+    pub fn write_log_indexes(&self, logs: &[StoredLog]) -> Result<()> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.db.tx_mut()?;
+        let mut address_cursor = tx.cursor_dup_write::<tables::LogIndexByAddress>()?;
+        let mut topic_cursor = tx.cursor_dup_write::<tables::LogIndexByTopic0>()?;
+
+        for log in logs {
+            let entry = LogIndexEntry {
+                block_number: log.block_number,
+                log_index: log.log_index,
+            };
+            address_cursor.append_dup(log.address, entry)?;
+            if let Some(topic0) = log.topics.first() {
+                topic_cursor.append_dup(*topic0, entry)?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Fetch a canonical header by block number.
     #[allow(dead_code)]
     pub fn block_header(&self, number: u64) -> Result<Option<Header>> {
@@ -483,6 +563,58 @@ impl Storage {
         Ok(out)
     }
 
+    /// Fetch log index entries for an address over an inclusive block range.
+    #[allow(dead_code)]
+    pub fn log_index_by_address_range(
+        &self,
+        address: Address,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<LogIndexEntry>> {
+        let start_subkey = log_index_subkey(*range.start());
+        let end_subkey = log_index_subkey(*range.end());
+        let tx = self.db.tx()?;
+        let mut cursor = tx.cursor_dup_read::<tables::LogIndexByAddress>()?;
+        let mut out = Vec::new();
+        for entry in cursor.walk_dup(Some(address), Some(start_subkey))? {
+            let (key, value) = entry?;
+            if key != address {
+                break;
+            }
+            if value.get_subkey() > end_subkey {
+                break;
+            }
+            out.push(value);
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Fetch log index entries for a topic0 over an inclusive block range.
+    #[allow(dead_code)]
+    pub fn log_index_by_topic0_range(
+        &self,
+        topic0: B256,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<LogIndexEntry>> {
+        let start_subkey = log_index_subkey(*range.start());
+        let end_subkey = log_index_subkey(*range.end());
+        let tx = self.db.tx()?;
+        let mut cursor = tx.cursor_dup_read::<tables::LogIndexByTopic0>()?;
+        let mut out = Vec::new();
+        for entry in cursor.walk_dup(Some(topic0), Some(start_subkey))? {
+            let (key, value) = entry?;
+            if key != topic0 {
+                break;
+            }
+            if value.get_subkey() > end_subkey {
+                break;
+            }
+            out.push(value);
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     fn read_optional_u64(&self, key: &str) -> Result<Option<u64>> {
         let tx = self.db.tx()?;
         let bytes = tx.get::<tables::Meta>(key.to_string())?;
@@ -500,6 +632,10 @@ impl Storage {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn log_index_subkey(block_number: u64) -> u64 {
+    block_number
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -653,6 +789,59 @@ mod tests {
 
         let logs = storage.block_logs_range(0..=1).expect("logs range");
         assert_eq!(logs.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_log_index_queries() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let topic0 = B256::from([0x11u8; 32]);
+        let log = StoredLog {
+            address: Address::ZERO,
+            topics: vec![topic0],
+            block_number: 5,
+            block_hash: B256::ZERO,
+            transaction_hash: B256::ZERO,
+            transaction_index: 0,
+            log_index: 2,
+            removed: false,
+            data: Bytes::from(vec![0x01]),
+        };
+
+        storage
+            .write_log_indexes(&[log.clone()])
+            .expect("write log indexes");
+
+        let by_address = storage
+            .log_index_by_address_range(Address::ZERO, 0..=10)
+            .expect("address index query");
+        assert_eq!(
+            by_address,
+            vec![LogIndexEntry {
+                block_number: 5,
+                log_index: 2
+            }]
+        );
+
+        let by_topic = storage
+            .log_index_by_topic0_range(topic0, 0..=10)
+            .expect("topic index query");
+        assert_eq!(
+            by_topic,
+            vec![LogIndexEntry {
+                block_number: 5,
+                log_index: 2
+            }]
+        );
+
+        let empty = storage
+            .log_index_by_address_range(Address::ZERO, 6..=10)
+            .expect("address range query");
+        assert!(empty.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

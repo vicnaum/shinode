@@ -337,7 +337,8 @@ where
                     receipts: receipts,
                 },
             )?;
-            storage.write_block_logs(header.number, StoredLogs { logs: block_logs })?;
+            storage.write_block_logs(header.number, StoredLogs { logs: block_logs.clone() })?;
+            storage.write_log_indexes(&block_logs)?;
             storage.set_last_indexed_block(header.number)?;
         }
 
