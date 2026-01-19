@@ -14,7 +14,7 @@ use reth_db::{
 };
 use reth_codecs::Compact;
 use reth_db_api::{
-    cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW},
+    cursor::{DbCursorRO, DbDupCursorRO},
     table::{Compress, Decompress},
     transaction::{DbTx, DbTxMut},
     DatabaseError,
@@ -257,6 +257,13 @@ struct StoredConfig {
     rpc_max_logs_per_response: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageConfigKey {
+    retention_mode: RetentionMode,
+    head_source: HeadSource,
+    reorg_strategy: ReorgStrategy,
+}
+
 impl From<&NodeConfig> for StoredConfig {
     fn from(config: &NodeConfig) -> Self {
         Self {
@@ -297,6 +304,16 @@ impl Default for StoredConfig {
             rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
             rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
             rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+        }
+    }
+}
+
+impl StoredConfig {
+    fn storage_key(&self) -> StorageConfigKey {
+        StorageConfigKey {
+            retention_mode: self.retention_mode,
+            head_source: self.head_source,
+            reorg_strategy: self.reorg_strategy,
         }
     }
 }
@@ -370,13 +387,25 @@ impl Storage {
                     .ok_or_else(|| eyre!("missing config metadata"))?;
                 let stored_config: StoredConfig = decode_json(config_bytes)?;
                 let expected = StoredConfig::from(config);
-                if stored_config != expected {
-                    return Err(eyre!("config mismatch: db={stored_config:?} config={expected:?}"));
+                let stored_key = stored_config.storage_key();
+                let expected_key = expected.storage_key();
+                if stored_key != expected_key {
+                    return Err(eyre!(
+                        "storage config mismatch: db={stored_key:?} config={expected_key:?}"
+                    ));
                 }
 
                 let last_indexed = tx.get::<tables::Meta>(META_LAST_INDEXED_BLOCK_KEY.to_string())?;
                 let head_seen = tx.get::<tables::Meta>(META_HEAD_SEEN_KEY.to_string())?;
                 tx.commit()?;
+                if stored_config != expected {
+                    let tx = self.db.tx_mut()?;
+                    tx.put::<tables::Meta>(
+                        META_CONFIG_KEY.to_string(),
+                        encode_json(&expected)?,
+                    )?;
+                    tx.commit()?;
+                }
                 (last_indexed.is_none(), head_seen.is_none())
             }
         };
@@ -467,20 +496,16 @@ impl Storage {
         }
 
         let tx = self.db.tx_mut()?;
-        let mut address_cursor = tx.cursor_dup_write::<tables::LogIndexByAddress>()?;
-        let mut topic_cursor = tx.cursor_dup_write::<tables::LogIndexByTopic0>()?;
-
         for log in logs {
             let entry = LogIndexEntry {
                 block_number: log.block_number,
                 log_index: log.log_index,
             };
-            address_cursor.append_dup(log.address, entry)?;
+            tx.put::<tables::LogIndexByAddress>(log.address, entry)?;
             if let Some(topic0) = log.topics.first() {
-                topic_cursor.append_dup(*topic0, entry)?;
+                tx.put::<tables::LogIndexByTopic0>(*topic0, entry)?;
             }
         }
-
         tx.commit()?;
         Ok(())
     }
@@ -819,6 +844,20 @@ mod tests {
             "unexpected error: {err_string}"
         );
 
+        let mut changed = config.clone();
+        changed.rpc_bind = "127.0.0.1:9999".parse().expect("valid bind");
+        changed.verbosity = 2;
+        changed.rpc_max_connections = 42;
+        let storage_updated = Storage::open(&changed).expect("open with runtime config");
+        let tx = storage_updated.db.tx().expect("open tx");
+        let config_bytes = tx
+            .get::<tables::Meta>(META_CONFIG_KEY.to_string())
+            .expect("read config bytes")
+            .expect("config present");
+        let stored: StoredConfig = decode_json(config_bytes).expect("decode config");
+        assert_eq!(stored, StoredConfig::from(&changed));
+        tx.commit().expect("commit tx");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -942,6 +981,88 @@ mod tests {
             .log_index_by_address_range(Address::ZERO, 6..=10)
             .expect("address range query");
         assert!(empty.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_log_index_accepts_unsorted_logs() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let topic0 = B256::from([0x11u8; 32]);
+        let topic1 = B256::from([0x22u8; 32]);
+        let log_a = StoredLog {
+            address: Address::from([0x22u8; 20]),
+            topics: vec![topic1],
+            block_number: 6,
+            block_hash: B256::ZERO,
+            transaction_hash: B256::ZERO,
+            transaction_index: 0,
+            log_index: 1,
+            removed: false,
+            data: Bytes::from(vec![0x02]),
+        };
+        let log_b = StoredLog {
+            address: Address::from([0x11u8; 20]),
+            topics: vec![topic0],
+            block_number: 5,
+            block_hash: B256::ZERO,
+            transaction_hash: B256::ZERO,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+            data: Bytes::from(vec![0x01]),
+        };
+
+        storage
+            .write_log_indexes(&[log_a.clone(), log_b.clone()])
+            .expect("write log indexes");
+
+        let addr_a = storage
+            .log_index_by_address_range(log_a.address, 0..=10)
+            .expect("address index query");
+        assert_eq!(
+            addr_a,
+            vec![LogIndexEntry {
+                block_number: log_a.block_number,
+                log_index: log_a.log_index
+            }]
+        );
+
+        let addr_b = storage
+            .log_index_by_address_range(log_b.address, 0..=10)
+            .expect("address index query");
+        assert_eq!(
+            addr_b,
+            vec![LogIndexEntry {
+                block_number: log_b.block_number,
+                log_index: log_b.log_index
+            }]
+        );
+
+        let by_topic0 = storage
+            .log_index_by_topic0_range(topic0, 0..=10)
+            .expect("topic index query");
+        assert_eq!(
+            by_topic0,
+            vec![LogIndexEntry {
+                block_number: log_b.block_number,
+                log_index: log_b.log_index
+            }]
+        );
+
+        let by_topic1 = storage
+            .log_index_by_topic0_range(topic1, 0..=10)
+            .expect("topic index query");
+        assert_eq!(
+            by_topic1,
+            vec![LogIndexEntry {
+                block_number: log_a.block_number,
+                log_index: log_a.log_index
+            }]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
