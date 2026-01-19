@@ -1,6 +1,7 @@
 //! P2P subsystem.
 
 use crate::sync::{BlockPayload, BlockPayloadSource};
+use crate::sync::ReceiptPayload;
 use alloy_primitives::B256;
 use async_trait::async_trait;
 use eyre::{eyre, Result, WrapErr};
@@ -12,12 +13,14 @@ use reth_eth_wire_types::{
     HeadersDirection,
 };
 use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
+use reth_network::PeersConfig;
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network::NetworkHandle;
 use reth_network_api::{
     events::PeerEvent, NetworkEvent, NetworkEventListenerProvider, PeerId, PeerRequest,
     PeerRequestSender,
 };
+use tracing::warn;
 use reth_primitives_traits::{Header, SealedHeader};
 use reth_ethereum_primitives::Receipt;
 use std::sync::{
@@ -63,11 +66,16 @@ impl PeerSelector for RoundRobinPeerSelector {
     }
 }
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-const PEER_TARGET: usize = 3;
-const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const PEER_TARGET: usize = 15;
+const MIN_PEER_START: usize = 1;
+const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PEER_ATTEMPTS: usize = 3;
 const RETRY_BACKOFF_MS: u64 = 250;
+const MAX_OUTBOUND: usize = 400;
+const MAX_CONCURRENT_DIALS: usize = 100;
+const PEER_REFILL_INTERVAL_MS: u64 = 500;
+const MAX_HEADERS_PER_REQUEST: usize = 1024;
 
 /// Active peer session information used for requests.
 #[derive(Clone, Debug)]
@@ -88,9 +96,14 @@ pub struct NetworkSession {
 /// Start the devp2p network and wait for compatible peers.
 pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
     let secret_key = rng_secret_key();
+    let peers_config = PeersConfig::default()
+        .with_max_outbound(MAX_OUTBOUND)
+        .with_max_concurrent_dials(MAX_CONCURRENT_DIALS)
+        .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS));
     let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
         .mainnet_boot_nodes()
         .with_unused_ports()
+        .peer_config(peers_config)
         .disable_tx_gossip(true)
         .block_import(Box::new(ProofOfStakeBlockImport::default()))
         .build_with_noop_provider(MAINNET.clone());
@@ -101,7 +114,19 @@ pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
         .wrap_err("failed to start p2p network")?;
     let pool = Arc::new(PeerPool::new(MAX_PEER_ATTEMPTS));
     spawn_peer_watcher(handle.clone(), Arc::clone(&pool));
-    wait_for_peer_pool(Arc::clone(&pool), PEER_TARGET, PEER_DISCOVERY_TIMEOUT).await;
+    let connected = wait_for_peer_pool(
+        Arc::clone(&pool),
+        MIN_PEER_START,
+        PEER_DISCOVERY_TIMEOUT,
+    )
+    .await?;
+    if connected < PEER_TARGET {
+        warn!(
+            peers = connected,
+            target = PEER_TARGET,
+            "p2p peer target not reached"
+        );
+    }
 
     Ok(NetworkSession {
         _handle: handle,
@@ -125,7 +150,7 @@ impl PeerPool {
         }
     }
 
-    fn next_peer(&self) -> Option<NetworkPeer> {
+    pub fn next_peer(&self) -> Option<NetworkPeer> {
         let peers = self.peers.read().expect("peer pool lock");
         let len = peers.len();
         if len == 0 {
@@ -150,6 +175,11 @@ impl PeerPool {
         peers.len()
     }
 
+    pub fn snapshot(&self) -> Vec<NetworkPeer> {
+        let peers = self.peers.read().expect("peer pool lock");
+        peers.clone()
+    }
+
     fn add_peer(&self, peer: NetworkPeer) {
         let mut peers = self.peers.write().expect("peer pool lock");
         if peers.iter().any(|existing| existing.peer_id == peer.peer_id) {
@@ -162,6 +192,15 @@ impl PeerPool {
         let mut peers = self.peers.write().expect("peer pool lock");
         peers.retain(|peer| peer.peer_id != peer_id);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn peer_pool_for_tests(peers: Vec<NetworkPeer>) -> PeerPool {
+    let pool = PeerPool::new(1);
+    for peer in peers {
+        pool.add_peer(peer);
+    }
+    pool
 }
 
 /// P2P-backed block payload source.
@@ -187,10 +226,17 @@ impl BlockPayloadSource for NetworkBlockPayloadSource {
     async fn blocks_by_number(&self, range: std::ops::RangeInclusive<u64>) -> Result<Vec<BlockPayload>> {
         fetch_payloads_for_peer(&self.peer, range).await
     }
+
+    async fn receipts_only_by_number(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<ReceiptPayload>> {
+        fetch_receipts_only_for_peer(&self.peer, range).await
+    }
 }
 
 /// P2P-backed block payload source with multi-peer retries.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MultiPeerBlockPayloadSource {
     pool: Arc<PeerPool>,
 }
@@ -220,6 +266,31 @@ impl BlockPayloadSource for MultiPeerBlockPayloadSource {
                 return Err(eyre!("no peers available for request"));
             };
             match fetch_payloads_for_peer(&peer, range.clone()).await {
+                Ok(payloads) => return Ok(payloads),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt + 1 < attempts {
+                        sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| eyre!("all peer attempts failed")))
+    }
+
+    async fn receipts_only_by_number(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<ReceiptPayload>> {
+        let mut last_err = None;
+        let attempts = self.pool.attempts();
+
+        for attempt in 0..attempts {
+            let Some(peer) = self.pool.next_peer() else {
+                return Err(eyre!("no peers available for request"));
+            };
+            match fetch_receipts_only_for_peer(&peer, range.clone()).await {
                 Ok(payloads) => return Ok(payloads),
                 Err(err) => {
                     last_err = Some(err);
@@ -274,17 +345,24 @@ async fn wait_for_peer_pool(
     pool: Arc<PeerPool>,
     target: usize,
     timeout_after: Duration,
-) {
+) -> Result<usize> {
     let deadline = Instant::now() + timeout_after;
 
     loop {
-        if pool.len() >= target {
-            break;
+        let peers = pool.len();
+        if peers >= target {
+            return Ok(peers);
         }
 
         let now = Instant::now();
         if now >= deadline {
-            break;
+            if peers == 0 {
+                return Err(eyre!(
+                    "no peers connected within {:?}; check network access",
+                    timeout_after
+                ));
+            }
+            return Ok(peers);
         }
 
         sleep(Duration::from_millis(200)).await;
@@ -303,7 +381,7 @@ async fn request_head_number(
     Ok(header.number)
 }
 
-async fn request_headers(
+pub(crate) async fn request_headers_batch(
     peer: &NetworkPeer,
     start_block: u64,
     limit: usize,
@@ -312,7 +390,35 @@ async fn request_headers(
         .await
 }
 
-async fn fetch_payloads_for_peer(
+pub(crate) async fn request_headers_chunked(
+    peer: &NetworkPeer,
+    start_block: u64,
+    count: usize,
+) -> Result<Vec<Header>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut headers = Vec::with_capacity(count);
+    let mut current = start_block;
+    let mut remaining = count;
+    while remaining > 0 {
+        let batch = remaining.min(MAX_HEADERS_PER_REQUEST);
+        let mut batch_headers = request_headers_batch(peer, current, batch).await?;
+        if batch_headers.len() != batch {
+            return Err(eyre!(
+                "header count mismatch: expected {}, got {}",
+                batch,
+                batch_headers.len()
+            ));
+        }
+        headers.append(&mut batch_headers);
+        current = current.saturating_add(batch as u64);
+        remaining = remaining.saturating_sub(batch);
+    }
+    Ok(headers)
+}
+
+pub(crate) async fn fetch_payloads_for_peer(
     peer: &NetworkPeer,
     range: std::ops::RangeInclusive<u64>,
 ) -> Result<Vec<BlockPayload>> {
@@ -320,14 +426,7 @@ async fn fetch_payloads_for_peer(
     let end = *range.end();
     let count = (end - start + 1) as usize;
 
-    let headers = request_headers(peer, start, count).await?;
-    if headers.len() != count {
-        return Err(eyre!(
-            "header count mismatch: expected {}, got {}",
-            count,
-            headers.len()
-        ));
-    }
+    let headers = request_headers_chunked(peer, start, count).await?;
 
     let mut hashes = Vec::with_capacity(count);
     for header in &headers {
@@ -335,8 +434,10 @@ async fn fetch_payloads_for_peer(
         hashes.push(hash);
     }
 
-    let bodies = request_bodies_chunked(peer, &hashes).await?;
-    let receipts = request_receipts_chunked(peer, &hashes).await?;
+    let (bodies, receipts) = tokio::try_join!(
+        request_bodies_chunked(peer, &hashes),
+        request_receipts_chunked(peer, &hashes)
+    )?;
 
     let mut payloads = Vec::with_capacity(count);
     for ((header, body), receipts) in headers
@@ -359,6 +460,30 @@ async fn fetch_payloads_for_peer(
         });
     }
 
+    Ok(payloads)
+}
+
+async fn fetch_receipts_only_for_peer(
+    peer: &NetworkPeer,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<Vec<ReceiptPayload>> {
+    let start = *range.start();
+    let end = *range.end();
+    let count = (end - start + 1) as usize;
+
+    let headers = request_headers_chunked(peer, start, count).await?;
+
+    let mut hashes = Vec::with_capacity(count);
+    for header in &headers {
+        let hash = SealedHeader::seal_slow(header.clone()).hash();
+        hashes.push(hash);
+    }
+
+    let receipts = request_receipts_chunked(peer, &hashes).await?;
+    let mut payloads = Vec::with_capacity(count);
+    for (header, receipts) in headers.into_iter().zip(receipts.into_iter()) {
+        payloads.push(ReceiptPayload { header, receipts });
+    }
     Ok(payloads)
 }
 
@@ -473,7 +598,7 @@ async fn request_bodies_chunked(
         .collect()
 }
 
-async fn request_receipts(
+pub(crate) async fn request_receipts(
     peer: &NetworkPeer,
     hashes: &[B256],
 ) -> Result<Vec<Vec<Receipt>>> {
@@ -482,6 +607,58 @@ async fn request_receipts(
         EthVersion::Eth69 => request_receipts69(peer, hashes).await,
         _ => request_receipts_legacy(peer, hashes).await,
     }
+}
+
+pub(crate) async fn request_receipt_counts(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
+    match peer.eth_version {
+        EthVersion::Eth70 => request_receipt_counts70(peer, hashes).await,
+        EthVersion::Eth69 => request_receipt_counts69(peer, hashes).await,
+        _ => request_receipt_counts_legacy(peer, hashes).await,
+    }
+}
+
+async fn request_receipt_counts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
+    let request = GetReceipts(hashes.to_vec());
+    let (tx, rx) = oneshot::channel();
+    peer.messages
+        .try_send(PeerRequest::GetReceipts { request, response: tx })
+        .map_err(|err| eyre!("failed to send receipts request: {err:?}"))?;
+    let response = timeout(REQUEST_TIMEOUT, rx)
+        .await
+        .map_err(|_| eyre!("receipts request to {:?} timed out", peer.peer_id))??;
+    let receipts = response.map_err(|err| eyre!("receipts response error from {:?}: {err:?}", peer.peer_id))?;
+    Ok(receipts.0.iter().map(|block| block.len()).collect())
+}
+
+async fn request_receipt_counts69(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
+    let request = GetReceipts(hashes.to_vec());
+    let (tx, rx) = oneshot::channel();
+    peer.messages
+        .try_send(PeerRequest::GetReceipts69 { request, response: tx })
+        .map_err(|err| eyre!("failed to send receipts69 request: {err:?}"))?;
+    let response = timeout(REQUEST_TIMEOUT, rx)
+        .await
+        .map_err(|_| eyre!("receipts69 request to {:?} timed out", peer.peer_id))??;
+    let receipts = response.map_err(|err| eyre!("receipts69 response error from {:?}: {err:?}", peer.peer_id))?;
+    Ok(receipts.0.iter().map(|block| block.len()).collect())
+}
+
+async fn request_receipt_counts70(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
+    let request = GetReceipts70 {
+        first_block_receipt_index: 0,
+        block_hashes: hashes.to_vec(),
+    };
+    let (tx, rx) = oneshot::channel();
+    peer.messages
+        .try_send(PeerRequest::GetReceipts70 { request, response: tx })
+        .map_err(|err| eyre!("failed to send receipts70 request: {err:?}"))?;
+    let response = timeout(REQUEST_TIMEOUT, rx)
+        .await
+        .map_err(|_| eyre!("receipts70 request to {:?} timed out", peer.peer_id))??;
+    let receipts = response.map_err(|err| eyre!("receipts70 response error from {:?}: {err:?}", peer.peer_id))?;
+    // Note: eth/70 can flag `last_block_incomplete` (partial). Harness treats this as a partial
+    // response and requeues the missing block(s), rather than failing the whole batch.
+    Ok(receipts.receipts.iter().map(|block| block.len()).collect())
 }
 
 async fn request_receipts_chunked(
@@ -586,7 +763,7 @@ async fn request_receipts70(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_eth_wire_types::BlockBodies;
+    use reth_eth_wire_types::{BlockBodies, BlockHeaders};
     use reth_network_api::PeerRequestSender;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -663,5 +840,41 @@ mod tests {
             .expect("bodies");
         assert_eq!(bodies.len(), hashes.len());
         assert!(request_count.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn request_headers_chunked_splits_large_requests() {
+        let peer_id = PeerId::random();
+        let (tx, mut rx) = mpsc::channel(8);
+        let messages = PeerRequestSender::new(peer_id, tx);
+        let peer = NetworkPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages,
+            head_number: 0,
+        };
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_task = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                match request {
+                    PeerRequest::GetBlockHeaders { request, response } => {
+                        request_count_task.fetch_add(1, Ordering::SeqCst);
+                        let count = request.limit as usize;
+                        let headers = vec![Header::default(); count];
+                        let _ = response.send(Ok(BlockHeaders::from(headers)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let count = MAX_HEADERS_PER_REQUEST + 1;
+        let headers = request_headers_chunked(&peer, 0, count)
+            .await
+            .expect("headers");
+        assert_eq!(headers.len(), count);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
     }
 }

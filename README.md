@@ -54,6 +54,7 @@ Core:
 - `--data-dir <path>`: base data directory (default: `data`).
 - `--rpc-bind <ip:port>`: RPC bind (default: `127.0.0.1:8545`).
 - `--start-block <u64>`: first block to backfill (default: 0).
+- `--end-block <u64>`: optional final block to stop at.
 - `--rollback-window <u64>`: max rollback depth (default: 64).
 - `--retention-mode <full>`: retention policy (default: `full`).
 - `--head-source <p2p>`: head source (default: `p2p`).
@@ -63,6 +64,15 @@ Core:
 - `-vvv`: trace for node internals.
 - Default without `-v` is errors only. `RUST_LOG` overrides all defaults.
 
+Benchmark/probe:
+- `--benchmark probe`: harness-like probe mode (headers + receipts only).
+  - No DB writes, no chain tracking, no RPC server.
+  - Exits after finishing the configured range.
+  - Range selection uses the same flags as normal sync:
+    - `--start-block` sets the start (default 0).
+    - `--end-block` limits the end.
+    - If `--end-block` is not set, the end is the head at startup (with rollback window applied).
+
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).
 - `--rpc-max-response-body-bytes <u32>` (default: 104_857_600).
@@ -70,6 +80,10 @@ RPC safety limits:
 - `--rpc-max-batch-requests <u32>` (default: 100; `0` = unlimited).
 - `--rpc-max-blocks-per-filter <u64>` (default: 10000; `0` = unlimited).
 - `--rpc-max-logs-per-response <u64>` (default: 100000; `0` = unlimited).
+
+Ingest tuning:
+- `--db-write-batch-blocks <u64>`: DB batch size (default: 32).
+- `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
 
 ## Configuration and storage
 

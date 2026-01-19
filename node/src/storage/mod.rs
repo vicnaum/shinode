@@ -1,10 +1,12 @@
 //! Storage bootstrap and metadata.
 
 use crate::cli::{
-    HeadSource, NodeConfig, ReorgStrategy, RetentionMode, DEFAULT_RPC_MAX_BATCH_REQUESTS,
-    DEFAULT_RPC_MAX_BLOCKS_PER_FILTER, DEFAULT_RPC_MAX_CONNECTIONS,
-    DEFAULT_RPC_MAX_LOGS_PER_RESPONSE, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
-    DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+    BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode,
+    DEFAULT_RPC_MAX_BATCH_REQUESTS, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+    DEFAULT_RPC_MAX_CONNECTIONS, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+    DEFAULT_RPC_MAX_REQUEST_BODY_BYTES, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+    DEFAULT_FAST_SYNC_CHUNK_SIZE, DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+    DEFAULT_FAST_SYNC_MAX_INFLIGHT, DEFAULT_DB_WRITE_BATCH_BLOCKS,
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
 use eyre::{eyre, Result, WrapErr};
@@ -152,6 +154,27 @@ pub struct StoredWithdrawals {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Compact)]
 pub struct StoredBlockSize {
     pub size: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockBundle {
+    pub number: u64,
+    pub header: Header,
+    pub tx_hashes: StoredTxHashes,
+    pub transactions: StoredTransactions,
+    pub withdrawals: StoredWithdrawals,
+    pub size: StoredBlockSize,
+    pub receipts: StoredReceipts,
+    pub logs: StoredLogs,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptBundle {
+    pub number: u64,
+    pub header: Header,
+    pub receipts: StoredReceipts,
 }
 
 #[allow(dead_code)]
@@ -339,12 +362,18 @@ struct StoredConfig {
     head_source: HeadSource,
     reorg_strategy: ReorgStrategy,
     verbosity: u8,
+    benchmark: BenchmarkMode,
     rpc_max_request_body_bytes: u32,
     rpc_max_response_body_bytes: u32,
     rpc_max_connections: u32,
     rpc_max_batch_requests: u32,
     rpc_max_blocks_per_filter: u64,
     rpc_max_logs_per_response: u64,
+    fast_sync_chunk_size: u64,
+    fast_sync_max_inflight: u32,
+    fast_sync_max_buffered_blocks: u64,
+    db_write_batch_blocks: u64,
+    db_write_flush_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,12 +395,18 @@ impl From<&NodeConfig> for StoredConfig {
             head_source: config.head_source,
             reorg_strategy: config.reorg_strategy,
             verbosity: config.verbosity,
+            benchmark: config.benchmark,
             rpc_max_request_body_bytes: config.rpc_max_request_body_bytes,
             rpc_max_response_body_bytes: config.rpc_max_response_body_bytes,
             rpc_max_connections: config.rpc_max_connections,
             rpc_max_batch_requests: config.rpc_max_batch_requests,
             rpc_max_blocks_per_filter: config.rpc_max_blocks_per_filter,
             rpc_max_logs_per_response: config.rpc_max_logs_per_response,
+            fast_sync_chunk_size: config.fast_sync_chunk_size,
+            fast_sync_max_inflight: config.fast_sync_max_inflight,
+            fast_sync_max_buffered_blocks: config.fast_sync_max_buffered_blocks,
+            db_write_batch_blocks: config.db_write_batch_blocks,
+            db_write_flush_interval_ms: config.db_write_flush_interval_ms,
         }
     }
 }
@@ -388,12 +423,18 @@ impl Default for StoredConfig {
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
+            benchmark: BenchmarkMode::Disabled,
             rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
             rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
             rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
             rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+            fast_sync_chunk_size: DEFAULT_FAST_SYNC_CHUNK_SIZE,
+            fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
+            fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+            db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
+            db_write_flush_interval_ms: None,
         }
     }
 }
@@ -591,6 +632,69 @@ impl Storage {
     pub fn write_block_size(&self, number: u64, size: StoredBlockSize) -> Result<()> {
         let tx = self.db.tx_mut()?;
         tx.put::<tables::BlockSizes>(number, size)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist all block artifacts in a single transaction.
+    #[allow(dead_code)]
+    pub fn write_block_bundle_batch(&self, bundles: &[BlockBundle]) -> Result<()> {
+        if bundles.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.tx_mut()?;
+        for bundle in bundles {
+            tx.put::<tables::BlockHeaders>(bundle.number, bundle.header.clone())?;
+            tx.put::<tables::BlockTxHashes>(bundle.number, bundle.tx_hashes.clone())?;
+            tx.put::<tables::BlockTransactions>(bundle.number, bundle.transactions.clone())?;
+            tx.put::<tables::BlockWithdrawals>(bundle.number, bundle.withdrawals.clone())?;
+            tx.put::<tables::BlockSizes>(bundle.number, bundle.size)?;
+            tx.put::<tables::BlockReceipts>(bundle.number, bundle.receipts.clone())?;
+            tx.put::<tables::BlockLogs>(bundle.number, bundle.logs.clone())?;
+
+            for log in &bundle.logs.logs {
+                let entry = LogIndexEntry {
+                    block_number: log.block_number,
+                    log_index: log.log_index,
+                };
+                tx.put::<tables::LogIndexByAddress>(log.address, entry)?;
+                if let Some(topic0) = log.topics.first().copied() {
+                    tx.put::<tables::LogIndexByTopic0>(topic0, entry)?;
+                }
+            }
+        }
+
+        let last_number = bundles
+            .last()
+            .expect("bundles is not empty")
+            .number;
+        tx.put::<tables::Meta>(
+            META_LAST_INDEXED_BLOCK_KEY.to_string(),
+            encode_json(&Some(last_number))?,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist headers + receipts only (debug receipts-only mode).
+    #[allow(dead_code)]
+    pub fn write_header_receipts_batch(&self, bundles: &[ReceiptBundle]) -> Result<()> {
+        if bundles.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.tx_mut()?;
+        for bundle in bundles {
+            tx.put::<tables::BlockHeaders>(bundle.number, bundle.header.clone())?;
+            tx.put::<tables::BlockReceipts>(bundle.number, bundle.receipts.clone())?;
+        }
+        let last_number = bundles
+            .last()
+            .expect("bundles is not empty")
+            .number;
+        tx.put::<tables::Meta>(
+            META_LAST_INDEXED_BLOCK_KEY.to_string(),
+            encode_json(&Some(last_number))?,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -935,6 +1039,7 @@ fn decode_json<T: DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
 mod tests {
     use super::*;
     use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, U256};
+    use reth_primitives_traits::SealedHeader;
     use reth_ethereum_primitives::TxType;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -960,17 +1065,24 @@ mod tests {
             data_dir,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
+            end_block: None,
             rollback_window: 64,
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
+            benchmark: BenchmarkMode::Disabled,
             rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
             rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
             rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
             rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+            fast_sync_chunk_size: DEFAULT_FAST_SYNC_CHUNK_SIZE,
+            fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
+            fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+            db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
+            db_write_flush_interval_ms: None,
         }
     }
 
@@ -1178,6 +1290,136 @@ mod tests {
                 .expect("size exists"),
             StoredBlockSize { size: 1234 }
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_block_bundle_batch_roundtrip() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let header0 = header_with_number(0);
+        let header0_hash = SealedHeader::seal_slow(header0.clone()).hash();
+        let header1 = header_with_number(1);
+        let header1_hash = SealedHeader::seal_slow(header1.clone()).hash();
+        let tx_hash0 = B256::from([0x11u8; 32]);
+        let tx_hash1 = B256::from([0x22u8; 32]);
+
+        let log0 = Log::new_unchecked(
+            Address::from([0x01u8; 20]),
+            vec![B256::from([0x10u8; 32])],
+            Bytes::from(vec![0x01]),
+        );
+        let Log { address: address0, data: data0 } = log0.clone();
+        let (topics0, data0) = data0.split();
+        let stored_log0 = StoredLog {
+            address: address0,
+            topics: topics0,
+            data: data0,
+            block_number: 0,
+            block_hash: header0_hash,
+            transaction_hash: tx_hash0,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+
+        let log1 = Log::new_unchecked(
+            Address::from([0x02u8; 20]),
+            vec![B256::from([0x20u8; 32])],
+            Bytes::from(vec![0x02]),
+        );
+        let Log { address: address1, data: data1 } = log1.clone();
+        let (topics1, data1) = data1.split();
+        let stored_log1 = StoredLog {
+            address: address1,
+            topics: topics1,
+            data: data1,
+            block_number: 1,
+            block_hash: header1_hash,
+            transaction_hash: tx_hash1,
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+        };
+
+        let bundle0 = BlockBundle {
+            number: 0,
+            header: header0,
+            tx_hashes: StoredTxHashes { hashes: vec![tx_hash0] },
+            transactions: StoredTransactions {
+                txs: vec![StoredTransaction {
+                    hash: tx_hash0,
+                    from: Address::from([0x0au8; 20]),
+                    to: Some(Address::from([0x0bu8; 20])),
+                    value: U256::from(1),
+                    nonce: 0,
+                }],
+            },
+            withdrawals: StoredWithdrawals { withdrawals: None },
+            size: StoredBlockSize { size: 111 },
+            receipts: StoredReceipts {
+                receipts: vec![receipt_with_logs(vec![log0])],
+            },
+            logs: StoredLogs {
+                logs: vec![stored_log0.clone()],
+            },
+        };
+
+        let bundle1 = BlockBundle {
+            number: 1,
+            header: header1,
+            tx_hashes: StoredTxHashes { hashes: vec![tx_hash1] },
+            transactions: StoredTransactions {
+                txs: vec![StoredTransaction {
+                    hash: tx_hash1,
+                    from: Address::from([0x0cu8; 20]),
+                    to: None,
+                    value: U256::from(2),
+                    nonce: 1,
+                }],
+            },
+            withdrawals: StoredWithdrawals { withdrawals: None },
+            size: StoredBlockSize { size: 222 },
+            receipts: StoredReceipts {
+                receipts: vec![receipt_with_logs(vec![log1])],
+            },
+            logs: StoredLogs {
+                logs: vec![stored_log1.clone()],
+            },
+        };
+
+        storage
+            .write_block_bundle_batch(&[bundle0, bundle1])
+            .expect("write bundle batch");
+
+        assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
+        assert!(storage.block_header(0).expect("header lookup").is_some());
+        assert!(storage.block_header(1).expect("header lookup").is_some());
+        assert_eq!(
+            storage
+                .block_transactions(0)
+                .expect("tx lookup")
+                .expect("txs exist")
+                .txs
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .block_logs(1)
+                .expect("log lookup")
+                .expect("logs exist")
+                .logs
+                .len(),
+            1
+        );
+        let addr_index = storage
+            .log_index_by_address_range(Address::from([0x01u8; 20]), 0..=0)
+            .expect("address index lookup");
+        assert_eq!(addr_index.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

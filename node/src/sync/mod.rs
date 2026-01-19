@@ -4,8 +4,8 @@ use crate::{
     chain::{ChainError, ChainTracker, ChainUpdate, HeadTracker, HeaderStub},
     metrics::range_len,
     storage::{
-        Storage, StoredBlockSize, StoredLog, StoredLogs, StoredReceipts, StoredTransaction,
-        StoredTransactions, StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
+        BlockBundle, ReceiptBundle, Storage, StoredBlockSize, StoredLog, StoredLogs, StoredReceipts,
+        StoredTransaction, StoredTransactions, StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
     },
 };
 use async_trait::async_trait;
@@ -13,11 +13,17 @@ use alloy_consensus::Transaction as _;
 use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, TxKind};
 use alloy_rlp::encode;
 use eyre::Result;
+use futures::stream::{FuturesUnordered, StreamExt};
 use reth_ethereum_primitives::{Block, BlockBody, Receipt};
 use reth_primitives_traits::{Header, SealedHeader, SignerRecoverable};
-use std::ops::RangeInclusive;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::RangeInclusive,
+};
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
+
+pub mod historical;
 
 /// Plans contiguous ranges to fetch from `start_block..=head`.
 #[derive(Debug, Clone)]
@@ -201,6 +207,20 @@ pub struct DerivedLog {
 pub trait BlockPayloadSource: Send + Sync {
     async fn head(&self) -> Result<u64>;
     async fn blocks_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<BlockPayload>>;
+
+    async fn receipts_only_by_number(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<ReceiptPayload>> {
+        let payloads = self.blocks_by_number(range).await?;
+        Ok(payloads
+            .into_iter()
+            .map(|payload| ReceiptPayload {
+                header: payload.header,
+                receipts: payload.receipts,
+            })
+            .collect())
+    }
 }
 
 /// Outcome from a single ingest step.
@@ -211,10 +231,129 @@ pub enum IngestOutcome {
     Reorg { ancestor_number: u64 },
 }
 
-pub trait ProgressReporter {
+pub trait ProgressReporter: Send + Sync {
     fn set_length(&self, len: u64);
     fn inc(&self, delta: u64);
     fn finish(&self);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptPayload {
+    pub header: Header,
+    pub receipts: Vec<Receipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    LookingForPeers,
+    Fetching,
+    Finalizing,
+    UpToDate,
+}
+
+impl SyncStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncStatus::LookingForPeers => "looking_for_peers",
+            SyncStatus::Fetching => "fetching",
+            SyncStatus::Finalizing => "finalizing",
+            SyncStatus::UpToDate => "up_to_date",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SyncProgressStats {
+    processed: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+    queue: std::sync::atomic::AtomicU64,
+    inflight: std::sync::atomic::AtomicU64,
+    peers_active: std::sync::atomic::AtomicU64,
+    peers_total: std::sync::atomic::AtomicU64,
+    status: std::sync::atomic::AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SyncProgressSnapshot {
+    pub processed: u64,
+    pub failed: u64,
+    pub queue: u64,
+    pub inflight: u64,
+    pub peers_active: u64,
+    pub peers_total: u64,
+    pub status: SyncStatus,
+}
+
+impl SyncProgressStats {
+    pub fn snapshot(&self) -> SyncProgressSnapshot {
+        SyncProgressSnapshot {
+            processed: self.processed.load(std::sync::atomic::Ordering::SeqCst),
+            failed: self.failed.load(std::sync::atomic::Ordering::SeqCst),
+            queue: self.queue.load(std::sync::atomic::Ordering::SeqCst),
+            inflight: self.inflight.load(std::sync::atomic::Ordering::SeqCst),
+            peers_active: self.peers_active.load(std::sync::atomic::Ordering::SeqCst),
+            peers_total: self.peers_total.load(std::sync::atomic::Ordering::SeqCst),
+            status: match self.status.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => SyncStatus::Fetching,
+                2 => SyncStatus::Finalizing,
+                3 => SyncStatus::UpToDate,
+                _ => SyncStatus::LookingForPeers,
+            },
+        }
+    }
+
+    pub fn set_status(&self, status: SyncStatus) {
+        let value = match status {
+            SyncStatus::LookingForPeers => 0,
+            SyncStatus::Fetching => 1,
+            SyncStatus::Finalizing => 2,
+            SyncStatus::UpToDate => 3,
+        };
+        self.status
+            .store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn inc_processed(&self, delta: u64) {
+        self.processed
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_queue(&self, queue: u64) {
+        self.queue
+            .store(queue, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_inflight(&self, inflight: u64) {
+        self.inflight
+            .store(inflight, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_peers(&self, active: u64, total: u64) {
+        self.peers_active
+            .store(active, std::sync::atomic::Ordering::SeqCst);
+        self.peers_total
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FastSyncConfig {
+    pub chunk_size: u64,
+    pub max_inflight: usize,
+    pub max_buffered_blocks: u64,
+}
+
+impl FastSyncConfig {
+    pub fn new(chunk_size: u64, max_inflight: u32, max_buffered_blocks: u64) -> Self {
+        let chunk_size = chunk_size.max(1);
+        let max_inflight = max_inflight.max(1) as usize;
+        let max_buffered_blocks = max_buffered_blocks.max(chunk_size);
+        Self {
+            chunk_size,
+            max_inflight,
+            max_buffered_blocks,
+        }
+    }
 }
 
 /// Ingest runner that derives logs and advances checkpoints.
@@ -223,209 +362,577 @@ pub struct IngestRunner<S> {
     source: S,
     chain: ChainTracker,
     batch_size: u64,
+    fast_sync: FastSyncConfig,
+    receipts_only: bool,
 }
 
 #[allow(dead_code)]
 impl<S> IngestRunner<S>
 where
-    S: BlockPayloadSource,
+    S: BlockPayloadSource + Clone + Send + Sync + 'static,
 {
-    pub fn new(source: S, batch_size: u64) -> Self {
+    pub fn new(source: S, batch_size: u64, fast_sync: FastSyncConfig, receipts_only: bool) -> Self {
         Self {
             source,
             chain: ChainTracker::new(),
             batch_size: batch_size.max(1),
+            fast_sync,
+            receipts_only,
         }
     }
 
-    pub async fn run_once(&mut self, storage: &Storage, start_block: u64) -> Result<IngestOutcome> {
-        self.run_once_with_progress(storage, start_block, None).await
+    pub async fn run_once(
+        &mut self,
+        storage: &Storage,
+        start_block: u64,
+        rollback_window: u64,
+    ) -> Result<IngestOutcome> {
+        self.run_once_with_progress(storage, start_block, rollback_window, None, None)
+            .await
     }
 
     pub async fn run_once_with_progress(
         &mut self,
         storage: &Storage,
         start_block: u64,
+        rollback_window: u64,
         progress: Option<&dyn ProgressReporter>,
+        stats: Option<&SyncProgressStats>,
     ) -> Result<IngestOutcome> {
         let head = self.source.head().await?;
         storage.set_head_seen(head)?;
+        let historical_head = head.saturating_sub(rollback_window);
 
-        let controller = SyncController::new(crate::chain::MemoryHeadTracker::new(Some(head)), self.batch_size);
+        let controller =
+            SyncController::new(crate::chain::MemoryHeadTracker::new(Some(head)), self.batch_size);
         let range = match controller.next_range(storage, start_block)? {
             Some(range) => range,
-            None => return Ok(IngestOutcome::UpToDate { head }),
+            None => {
+                if let Some(stats) = stats {
+                    stats.set_status(SyncStatus::UpToDate);
+                    stats.set_queue(0);
+                    stats.set_inflight(0);
+                }
+                return Ok(IngestOutcome::UpToDate { head });
+            }
         };
 
+        let range_start = *range.start();
+        let historical_range = if range_start <= historical_head {
+            Some(range_start..=historical_head)
+        } else {
+            None
+        };
+        let active_range = historical_range.clone().unwrap_or_else(|| range.clone());
         if let Some(progress) = progress {
-            progress.set_length(range_len(&range));
+            progress.set_length(range_len(&active_range));
         }
+        if let Some(stats) = stats {
+            stats.set_status(SyncStatus::Fetching);
+            stats.set_queue(range_len(&active_range));
+            stats.set_inflight(0);
+        }
+        if self.receipts_only {
+            return self
+                .run_receipts_only_range(storage, active_range, progress, stats)
+                .await;
+        }
+        if let Some(fast_range) = historical_range {
+            return self
+                .run_fast_range(storage, fast_range, progress, stats)
+                .await;
+        }
+
+        self.run_sequential_range(storage, range, progress, stats)
+            .await
+    }
+
+    async fn run_sequential_range(
+        &mut self,
+        storage: &Storage,
+        range: RangeInclusive<u64>,
+        progress: Option<&dyn ProgressReporter>,
+        stats: Option<&SyncProgressStats>,
+    ) -> Result<IngestOutcome> {
         let mut payloads = self.source.blocks_by_number(range.clone()).await?;
         if payloads.is_empty() {
-            return Ok(IngestOutcome::UpToDate { head });
+            return Ok(IngestOutcome::UpToDate { head: *range.end() });
         }
         payloads.sort_by_key(|payload| payload.header.number);
 
         let mut derived_logs = Vec::new();
-
+        let total = range_len(&range);
+        let mut processed = 0u64;
         for payload in payloads {
-            let BlockPayload {
-                header,
-                body,
-                receipts,
-            } = payload;
-            let header_hash = SealedHeader::seal_slow(header.clone()).hash();
-            let header_stub = HeaderStub {
-                number: header.number,
-                hash: header_hash,
-                parent_hash: header.parent_hash,
-            };
-            match self.chain.insert_header(header_stub) {
-                Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
-                    storage.rollback_to(ancestor_number)?;
+            match self.process_payload(storage, payload)? {
+                PayloadResult::Reorg { ancestor_number } => {
                     if let Some(progress) = progress {
                         progress.finish();
                     }
                     return Ok(IngestOutcome::Reorg { ancestor_number });
                 }
-                Ok(_) => {}
-                Err(ChainError::UnknownParent(parent)) => {
-                    return Err(eyre::eyre!("unknown parent {parent}"));
+                PayloadResult::Bundle { bundle, logs } => {
+                    storage.write_block_bundle_batch(&[bundle])?;
+                    derived_logs.extend(logs);
+                    if let Some(progress) = progress {
+                        progress.inc(1);
+                    }
+                    processed = processed.saturating_add(1);
+                    if let Some(stats) = stats {
+                        stats.inc_processed(1);
+                        stats.set_queue(total.saturating_sub(processed));
+                        stats.set_inflight(1);
+                    }
                 }
-                Err(ChainError::NonContiguousNumber { expected, got }) => {
-                    return Err(eyre::eyre!(
-                        "non-contiguous header number: expected {expected}, got {got}"
-                    ));
-                }
-            }
-
-            let tx_hashes = body
-                .transactions
-                .iter()
-                .map(|tx| *tx.hash())
-                .collect::<Vec<_>>();
-            if tx_hashes.len() != receipts.len() {
-                return Err(eyre::eyre!(
-                    "tx hash count {} does not match receipts count {} for block {}",
-                    tx_hashes.len(),
-                    receipts.len(),
-                    header.number
-                ));
-            }
-
-            let mut stored_transactions = Vec::with_capacity(body.transactions.len());
-            for tx in &body.transactions {
-                let from = tx
-                    .recover_signer_unchecked()
-                    .map_err(|err| eyre::eyre!("failed to recover signer: {err}"))?;
-                let to = match tx.kind() {
-                    TxKind::Call(address) => Some(address),
-                    TxKind::Create => None,
-                };
-                stored_transactions.push(StoredTransaction {
-                    hash: *tx.hash(),
-                    from,
-                    to,
-                    value: tx.value(),
-                    nonce: tx.nonce(),
-                });
-            }
-
-            let stored_withdrawals = StoredWithdrawals {
-                withdrawals: body.withdrawals.as_ref().map(|withdrawals| {
-                    withdrawals
-                        .as_ref()
-                        .iter()
-                        .map(|withdrawal| StoredWithdrawal {
-                            index: withdrawal.index,
-                            validator_index: withdrawal.validator_index,
-                            address: withdrawal.address,
-                            amount: withdrawal.amount,
-                        })
-                        .collect()
-                }),
-            };
-
-            let block_size = block_rlp_size(&header, &body);
-
-            let computed_bloom = logs_bloom(
-                receipts
-                    .iter()
-                    .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
-            );
-            let mut stored_header = header.clone();
-            stored_header.logs_bloom = computed_bloom;
-            storage.write_block_header(header.number, stored_header)?;
-
-            let mut block_logs = Vec::new();
-            for (tx_index, (tx_hash, receipt)) in tx_hashes
-                .iter()
-                .zip(receipts.iter())
-                .enumerate()
-            {
-                for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
-                    let Log { address, data } = log;
-                    let (topics, data) = data.split();
-                    let stored_log = StoredLog {
-                        address,
-                        topics,
-                        data,
-                        block_number: header.number,
-                        block_hash: header_hash,
-                        transaction_hash: *tx_hash,
-                        transaction_index: tx_index as u64,
-                        log_index: log_index as u64,
-                        removed: false,
-                    };
-                    derived_logs.push(DerivedLog {
-                        address: stored_log.address,
-                        topics: stored_log.topics.clone(),
-                        data: stored_log.data.clone(),
-                        block_number: stored_log.block_number,
-                        block_hash: stored_log.block_hash,
-                        transaction_hash: stored_log.transaction_hash,
-                        transaction_index: stored_log.transaction_index,
-                        log_index: stored_log.log_index,
-                        removed: stored_log.removed,
-                    });
-                    block_logs.push(stored_log);
-                }
-            }
-
-            storage.write_block_tx_hashes(
-                header.number,
-                StoredTxHashes {
-                    hashes: tx_hashes.clone(),
-                },
-            )?;
-            storage.write_block_transactions(
-                header.number,
-                StoredTransactions {
-                    txs: stored_transactions,
-                },
-            )?;
-            storage.write_block_withdrawals(header.number, stored_withdrawals)?;
-            storage.write_block_size(header.number, StoredBlockSize { size: block_size })?;
-            storage.write_block_receipts(
-                header.number,
-                StoredReceipts {
-                    receipts: receipts,
-                },
-            )?;
-            storage.write_block_logs(header.number, StoredLogs { logs: block_logs.clone() })?;
-            storage.write_log_indexes(&block_logs)?;
-            storage.set_last_indexed_block(header.number)?;
-
-            if let Some(progress) = progress {
-                progress.inc(1);
             }
         }
 
         if let Some(progress) = progress {
             progress.finish();
         }
+        if let Some(stats) = stats {
+            stats.set_inflight(0);
+            stats.set_status(SyncStatus::Finalizing);
+        }
         Ok(IngestOutcome::RangeApplied { range, logs: derived_logs })
     }
+
+    async fn run_fast_range(
+        &mut self,
+        storage: &Storage,
+        range: RangeInclusive<u64>,
+        progress: Option<&dyn ProgressReporter>,
+        stats: Option<&SyncProgressStats>,
+    ) -> Result<IngestOutcome> {
+        let mut pending = VecDeque::from(chunk_ranges(&range, self.fast_sync.chunk_size));
+        let mut in_flight: FuturesUnordered<
+            tokio::task::JoinHandle<(RangeInclusive<u64>, Result<Vec<BlockPayload>>)>,
+        > = FuturesUnordered::new();
+        let mut buffered: BTreeMap<u64, Vec<BlockPayload>> = BTreeMap::new();
+        let mut buffered_blocks = 0u64;
+        let mut derived_logs = Vec::new();
+        let mut next_expected = *range.start();
+        let mut attempts: BTreeMap<u64, u32> = BTreeMap::new();
+        const MAX_CHUNK_ATTEMPTS: u32 = 3;
+        if let Some(stats) = stats {
+            stats.set_queue(range_len(&range));
+            stats.set_inflight(0);
+        }
+
+        while !pending.is_empty() || !in_flight.is_empty() || !buffered.is_empty() {
+            let max_workers = self.fast_sync.max_inflight;
+            while in_flight.len() < max_workers && !pending.is_empty() {
+                let can_buffer_more = buffered_blocks < self.fast_sync.max_buffered_blocks
+                    || !buffered.contains_key(&next_expected);
+                if !can_buffer_more {
+                    break;
+                }
+                let chunk = pending.pop_front().expect("pending is not empty");
+                let source = self.source.clone();
+                in_flight.push(tokio::spawn(async move {
+                    let payloads = source.blocks_by_number(chunk.clone()).await;
+                    (chunk, payloads)
+                }));
+            }
+            if let Some(stats) = stats {
+                stats.set_inflight(in_flight.len() as u64);
+                let queue = pending.iter().map(range_len).sum::<u64>();
+                stats.set_queue(queue);
+            }
+
+            let Some(result) = in_flight.next().await else {
+                break;
+            };
+            let (chunk, payloads) = result.map_err(|err| eyre::eyre!("chunk task failed: {err}"))?;
+            match payloads {
+                Ok(mut payloads) => {
+                    if let Some(stats) = stats {
+                        stats.inc_processed(payloads.len() as u64);
+                    }
+                    payloads.sort_by_key(|payload| payload.header.number);
+                    buffered_blocks = buffered_blocks.saturating_add(payloads.len() as u64);
+                    buffered.insert(*chunk.start(), payloads);
+                }
+                Err(err) => {
+                    let key = *chunk.start();
+                    let attempt = attempts.entry(key).or_insert(0);
+                    *attempt += 1;
+                    if *attempt <= MAX_CHUNK_ATTEMPTS {
+                        pending.push_back(chunk);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+
+            while let Some(payloads) = buffered.remove(&next_expected) {
+                let mut bundles = Vec::with_capacity(payloads.len());
+                for payload in payloads {
+                    match self.process_payload(storage, payload)? {
+                        PayloadResult::Reorg { ancestor_number } => {
+                            if let Some(progress) = progress {
+                                progress.finish();
+                            }
+                            return Ok(IngestOutcome::Reorg { ancestor_number });
+                        }
+                        PayloadResult::Bundle { bundle, logs } => {
+                            bundles.push(bundle);
+                            derived_logs.extend(logs);
+                            if let Some(progress) = progress {
+                                progress.inc(1);
+                            }
+                        }
+                    }
+                }
+                buffered_blocks = buffered_blocks.saturating_sub(bundles.len() as u64);
+                if !bundles.is_empty() {
+                    next_expected = bundles
+                        .last()
+                        .expect("bundles is not empty")
+                        .number
+                        .saturating_add(1);
+                    storage.write_block_bundle_batch(&bundles)?;
+                    if let Some(stats) = stats {
+                        let remaining = if next_expected <= *range.end() {
+                            range
+                                .end()
+                                .saturating_sub(next_expected)
+                                .saturating_add(1)
+                        } else {
+                            0
+                        };
+                        stats.set_queue(remaining);
+                    }
+                }
+            }
+        }
+
+        if let Some(progress) = progress {
+            progress.finish();
+        }
+        if let Some(stats) = stats {
+            stats.set_inflight(0);
+            stats.set_status(SyncStatus::Finalizing);
+        }
+        Ok(IngestOutcome::RangeApplied { range, logs: derived_logs })
+    }
+
+    fn process_payload(
+        &mut self,
+        storage: &Storage,
+        payload: BlockPayload,
+    ) -> Result<PayloadResult> {
+        let BlockPayload {
+            header,
+            body,
+            receipts,
+        } = payload;
+        let header_hash = SealedHeader::seal_slow(header.clone()).hash();
+        let header_stub = HeaderStub {
+            number: header.number,
+            hash: header_hash,
+            parent_hash: header.parent_hash,
+        };
+        match self.chain.insert_header(header_stub) {
+            Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
+                storage.rollback_to(ancestor_number)?;
+                return Ok(PayloadResult::Reorg { ancestor_number });
+            }
+            Ok(_) => {}
+            Err(ChainError::UnknownParent(parent)) => {
+                return Err(eyre::eyre!("unknown parent {parent}"));
+            }
+            Err(ChainError::NonContiguousNumber { expected, got }) => {
+                return Err(eyre::eyre!(
+                    "non-contiguous header number: expected {expected}, got {got}"
+                ));
+            }
+        }
+
+        let tx_hashes = body
+            .transactions
+            .iter()
+            .map(|tx| *tx.hash())
+            .collect::<Vec<_>>();
+        if tx_hashes.len() != receipts.len() {
+            return Err(eyre::eyre!(
+                "tx hash count {} does not match receipts count {} for block {}",
+                tx_hashes.len(),
+                receipts.len(),
+                header.number
+            ));
+        }
+
+        let mut stored_transactions = Vec::with_capacity(body.transactions.len());
+        for tx in &body.transactions {
+            let from = tx
+                .recover_signer_unchecked()
+                .map_err(|err| eyre::eyre!("failed to recover signer: {err}"))?;
+            let to = match tx.kind() {
+                TxKind::Call(address) => Some(address),
+                TxKind::Create => None,
+            };
+            stored_transactions.push(StoredTransaction {
+                hash: *tx.hash(),
+                from,
+                to,
+                value: tx.value(),
+                nonce: tx.nonce(),
+            });
+        }
+
+        let stored_withdrawals = StoredWithdrawals {
+            withdrawals: body.withdrawals.as_ref().map(|withdrawals| {
+                withdrawals
+                    .as_ref()
+                    .iter()
+                    .map(|withdrawal| StoredWithdrawal {
+                        index: withdrawal.index,
+                        validator_index: withdrawal.validator_index,
+                        address: withdrawal.address,
+                        amount: withdrawal.amount,
+                    })
+                    .collect()
+            }),
+        };
+
+        let block_size = block_rlp_size(&header, &body);
+
+        let computed_bloom = logs_bloom(
+            receipts
+                .iter()
+                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
+        );
+        let mut stored_header = header.clone();
+        stored_header.logs_bloom = computed_bloom;
+
+        let mut block_logs = Vec::new();
+        let mut derived_logs = Vec::new();
+        for (tx_index, (tx_hash, receipt)) in tx_hashes
+            .iter()
+            .zip(receipts.iter())
+            .enumerate()
+        {
+            for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
+                let Log { address, data } = log;
+                let (topics, data) = data.split();
+                let stored_log = StoredLog {
+                    address,
+                    topics,
+                    data,
+                    block_number: header.number,
+                    block_hash: header_hash,
+                    transaction_hash: *tx_hash,
+                    transaction_index: tx_index as u64,
+                    log_index: log_index as u64,
+                    removed: false,
+                };
+                derived_logs.push(DerivedLog {
+                    address: stored_log.address,
+                    topics: stored_log.topics.clone(),
+                    data: stored_log.data.clone(),
+                    block_number: stored_log.block_number,
+                    block_hash: stored_log.block_hash,
+                    transaction_hash: stored_log.transaction_hash,
+                    transaction_index: stored_log.transaction_index,
+                    log_index: stored_log.log_index,
+                    removed: stored_log.removed,
+                });
+                block_logs.push(stored_log);
+            }
+        }
+
+        let bundle = BlockBundle {
+            number: header.number,
+            header: stored_header,
+            tx_hashes: StoredTxHashes {
+                hashes: tx_hashes,
+            },
+            transactions: StoredTransactions {
+                txs: stored_transactions,
+            },
+            withdrawals: stored_withdrawals,
+            size: StoredBlockSize { size: block_size },
+            receipts: StoredReceipts { receipts },
+            logs: StoredLogs { logs: block_logs },
+        };
+
+        Ok(PayloadResult::Bundle {
+            bundle,
+            logs: derived_logs,
+        })
+    }
+
+    async fn run_receipts_only_range(
+        &mut self,
+        storage: &Storage,
+        range: RangeInclusive<u64>,
+        progress: Option<&dyn ProgressReporter>,
+        stats: Option<&SyncProgressStats>,
+    ) -> Result<IngestOutcome> {
+        let mut pending = VecDeque::from(chunk_ranges(&range, self.fast_sync.chunk_size));
+        let mut in_flight: FuturesUnordered<
+            tokio::task::JoinHandle<(RangeInclusive<u64>, Result<Vec<ReceiptPayload>>)>,
+        > = FuturesUnordered::new();
+        let mut buffered: BTreeMap<u64, Vec<ReceiptPayload>> = BTreeMap::new();
+        let mut buffered_blocks = 0u64;
+        let mut next_expected = *range.start();
+        let mut attempts: BTreeMap<u64, u32> = BTreeMap::new();
+        const MAX_CHUNK_ATTEMPTS: u32 = 3;
+        if let Some(stats) = stats {
+            stats.set_queue(range_len(&range));
+            stats.set_inflight(0);
+        }
+
+        while !pending.is_empty() || !in_flight.is_empty() || !buffered.is_empty() {
+            let max_workers = self.fast_sync.max_inflight;
+            while in_flight.len() < max_workers && !pending.is_empty() {
+                let can_buffer_more = buffered_blocks < self.fast_sync.max_buffered_blocks
+                    || !buffered.contains_key(&next_expected);
+                if !can_buffer_more {
+                    break;
+                }
+                let chunk = pending.pop_front().expect("pending is not empty");
+                let source = self.source.clone();
+                in_flight.push(tokio::spawn(async move {
+                    let payloads = source.receipts_only_by_number(chunk.clone()).await;
+                    (chunk, payloads)
+                }));
+            }
+            if let Some(stats) = stats {
+                stats.set_inflight(in_flight.len() as u64);
+                let queue = pending.iter().map(range_len).sum::<u64>();
+                stats.set_queue(queue);
+            }
+
+            let Some(result) = in_flight.next().await else {
+                break;
+            };
+            let (chunk, payloads) = result.map_err(|err| eyre::eyre!("chunk task failed: {err}"))?;
+            match payloads {
+                Ok(mut payloads) => {
+                    if let Some(stats) = stats {
+                        stats.inc_processed(payloads.len() as u64);
+                    }
+                    payloads.sort_by_key(|payload| payload.header.number);
+                    buffered_blocks = buffered_blocks.saturating_add(payloads.len() as u64);
+                    buffered.insert(*chunk.start(), payloads);
+                }
+                Err(err) => {
+                    let key = *chunk.start();
+                    let attempt = attempts.entry(key).or_insert(0);
+                    *attempt += 1;
+                    if *attempt <= MAX_CHUNK_ATTEMPTS {
+                        pending.push_back(chunk);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+
+            while let Some(payloads) = buffered.remove(&next_expected) {
+                let mut bundles = Vec::with_capacity(payloads.len());
+                for payload in payloads {
+                    let ReceiptPayload { header, receipts } = payload;
+                    let header_hash = SealedHeader::seal_slow(header.clone()).hash();
+                    let header_stub = HeaderStub {
+                        number: header.number,
+                        hash: header_hash,
+                        parent_hash: header.parent_hash,
+                    };
+                    match self.chain.insert_header(header_stub) {
+                        Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
+                            storage.rollback_to(ancestor_number)?;
+                            if let Some(progress) = progress {
+                                progress.finish();
+                            }
+                            return Ok(IngestOutcome::Reorg { ancestor_number });
+                        }
+                        Ok(_) => {}
+                        Err(ChainError::UnknownParent(parent)) => {
+                            return Err(eyre::eyre!("unknown parent {parent}"));
+                        }
+                        Err(ChainError::NonContiguousNumber { expected, got }) => {
+                            return Err(eyre::eyre!(
+                                "non-contiguous header number: expected {expected}, got {got}"
+                            ));
+                        }
+                    }
+
+                    let computed_bloom = logs_bloom(
+                        receipts
+                            .iter()
+                            .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
+                    );
+                    let mut stored_header = header.clone();
+                    stored_header.logs_bloom = computed_bloom;
+                    bundles.push(ReceiptBundle {
+                        number: header.number,
+                        header: stored_header,
+                        receipts: StoredReceipts { receipts },
+                    });
+                    if let Some(progress) = progress {
+                        progress.inc(1);
+                    }
+                }
+
+                buffered_blocks = buffered_blocks.saturating_sub(bundles.len() as u64);
+                if !bundles.is_empty() {
+                    next_expected = bundles
+                        .last()
+                        .expect("bundles is not empty")
+                        .number
+                        .saturating_add(1);
+                    storage.write_header_receipts_batch(&bundles)?;
+                    if let Some(stats) = stats {
+                        let remaining = if next_expected <= *range.end() {
+                            range
+                                .end()
+                                .saturating_sub(next_expected)
+                                .saturating_add(1)
+                        } else {
+                            0
+                        };
+                        stats.set_queue(remaining);
+                    }
+                }
+            }
+        }
+
+        if let Some(progress) = progress {
+            progress.finish();
+        }
+        if let Some(stats) = stats {
+            stats.set_inflight(0);
+            stats.set_status(SyncStatus::Finalizing);
+        }
+        Ok(IngestOutcome::RangeApplied { range, logs: Vec::new() })
+    }
+}
+
+enum PayloadResult {
+    Bundle { bundle: BlockBundle, logs: Vec<DerivedLog> },
+    Reorg { ancestor_number: u64 },
+}
+
+fn chunk_ranges(range: &RangeInclusive<u64>, chunk_size: u64) -> Vec<RangeInclusive<u64>> {
+    let start = *range.start();
+    let end = *range.end();
+    if start > end {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = start;
+    let chunk_size = chunk_size.max(1);
+    while current <= end {
+        let next_end = current.saturating_add(chunk_size - 1).min(end);
+        chunks.push(current..=next_end);
+        if next_end == end {
+            break;
+        }
+        current = next_end.saturating_add(1);
+    }
+    chunks
 }
 
 fn block_rlp_size(header: &Header, body: &BlockBody) -> u64 {
@@ -470,13 +977,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockPayload, BlockPayloadSource, BlockSource, DerivedLog, IngestOutcome, IngestRunner,
-        RangeSyncPlanner, SyncController, SyncOutcome, SyncRunner, process_ranges_concurrently,
+        BlockPayload, BlockPayloadSource, BlockSource, DerivedLog, FastSyncConfig, IngestOutcome,
+        IngestRunner, RangeSyncPlanner, SyncController, SyncOutcome, SyncRunner, chunk_ranges,
+        process_ranges_concurrently,
     };
     use async_trait::async_trait;
     use crate::{
         chain::{HeaderStub, MemoryHeadTracker},
-        cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode},
+        cli::{BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode},
         storage::Storage,
     };
     use alloy_consensus::{Signed, TxLegacy};
@@ -531,17 +1039,24 @@ mod tests {
             data_dir,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
+            end_block: None,
             rollback_window: 64,
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
+            benchmark: BenchmarkMode::Disabled,
             rpc_max_request_body_bytes: crate::cli::DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: crate::cli::DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: crate::cli::DEFAULT_RPC_MAX_CONNECTIONS,
             rpc_max_batch_requests: crate::cli::DEFAULT_RPC_MAX_BATCH_REQUESTS,
             rpc_max_blocks_per_filter: crate::cli::DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
             rpc_max_logs_per_response: crate::cli::DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+            fast_sync_chunk_size: crate::cli::DEFAULT_FAST_SYNC_CHUNK_SIZE,
+            fast_sync_max_inflight: crate::cli::DEFAULT_FAST_SYNC_MAX_INFLIGHT,
+            fast_sync_max_buffered_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+            db_write_batch_blocks: crate::cli::DEFAULT_DB_WRITE_BATCH_BLOCKS,
+            db_write_flush_interval_ms: None,
         }
     }
 
@@ -830,16 +1345,20 @@ mod tests {
             head: 1,
             blocks: vec![block0, block1],
         };
-        let mut runner = IngestRunner::new(source, 10);
-        let outcome = runner
-            .run_once(&storage, config.start_block)
-            .await
-            .expect("ingest");
-
-        let logs = match outcome {
-            IngestOutcome::RangeApplied { logs, .. } => logs,
-            other => panic!("unexpected outcome: {other:?}"),
-        };
+        let fast_sync = FastSyncConfig::new(10, 4, 64);
+        let mut runner = IngestRunner::new(source, 10, fast_sync, false);
+        let mut logs = Vec::new();
+        loop {
+            let outcome = runner
+                .run_once(&storage, config.start_block, config.rollback_window)
+                .await
+                .expect("ingest");
+            match outcome {
+                IngestOutcome::RangeApplied { logs: batch, .. } => logs.extend(batch),
+                IngestOutcome::UpToDate { .. } => break,
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
 
         let expected = vec![
             DerivedLog {
@@ -987,11 +1506,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let source = VecPayloadSource { head: 2, blocks };
-        let mut runner = IngestRunner::new(source, 10);
-        runner
-            .run_once(&storage, config.start_block)
-            .await
-            .expect("initial ingest");
+        let fast_sync = FastSyncConfig::new(10, 4, 64);
+        let mut runner = IngestRunner::new(source, 10, fast_sync, false);
+        loop {
+            let outcome = runner
+                .run_once(&storage, config.start_block, config.rollback_window)
+                .await
+                .expect("initial ingest");
+            if matches!(outcome, IngestOutcome::UpToDate { .. }) {
+                break;
+            }
+        }
         assert_eq!(storage.last_indexed_block().unwrap(), Some(2));
 
         storage.set_last_indexed_block(1).expect("rewind");
@@ -1011,7 +1536,7 @@ mod tests {
             blocks: vec![alt_block],
         };
         let outcome = runner
-            .run_once(&storage, config.start_block)
+            .run_once(&storage, config.start_block, config.rollback_window)
             .await
             .expect("reorg ingest");
         assert_eq!(outcome, IngestOutcome::Reorg { ancestor_number: 1 });
@@ -1061,5 +1586,17 @@ mod tests {
         .expect("process ranges");
 
         assert!(peak.load(Ordering::SeqCst) <= max_concurrency);
+    }
+
+    #[test]
+    fn chunk_ranges_splits_evenly() {
+        let chunks = chunk_ranges(&(0..=9), 4);
+        assert_eq!(chunks, vec![0..=3, 4..=7, 8..=9]);
+    }
+
+    #[test]
+    fn chunk_ranges_handles_small_range() {
+        let chunks = chunk_ranges(&(5..=7), 10);
+        assert_eq!(chunks, vec![5..=7]);
     }
 }

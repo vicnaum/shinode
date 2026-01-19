@@ -618,7 +618,7 @@ struct RpcLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+    use crate::cli::{BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
@@ -648,17 +648,24 @@ mod tests {
             data_dir,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
+            end_block: None,
             rollback_window: 64,
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
+            benchmark: BenchmarkMode::Disabled,
             rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
             rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
             rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
             rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+            fast_sync_chunk_size: crate::cli::DEFAULT_FAST_SYNC_CHUNK_SIZE,
+            fast_sync_max_inflight: crate::cli::DEFAULT_FAST_SYNC_MAX_INFLIGHT,
+            fast_sync_max_buffered_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+            db_write_batch_blocks: crate::cli::DEFAULT_DB_WRITE_BATCH_BLOCKS,
+            db_write_flush_interval_ms: None,
         }
     }
 
