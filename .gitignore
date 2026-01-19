@@ -1,5 +1,6 @@
 ./rindexer/
 ./reth/
 target/
+data/
 .DS_Store
 harness/output/

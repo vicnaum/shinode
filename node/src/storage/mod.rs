@@ -1,6 +1,6 @@
 //! Storage bootstrap and metadata.
 
-use crate::cli::NodeConfig;
+use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
 use eyre::{eyre, Result, WrapErr};
 use reth_db::{
     mdbx::{init_db_for, DatabaseArguments, DatabaseEnv},
@@ -38,10 +38,16 @@ pub struct Storage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 struct StoredConfig {
     chain_id: u64,
     data_dir: PathBuf,
     rpc_bind: SocketAddr,
+    start_block: u64,
+    rollback_window: u64,
+    retention_mode: RetentionMode,
+    head_source: HeadSource,
+    reorg_strategy: ReorgStrategy,
 }
 
 impl From<&NodeConfig> for StoredConfig {
@@ -50,6 +56,26 @@ impl From<&NodeConfig> for StoredConfig {
             chain_id: config.chain_id,
             data_dir: config.data_dir.clone(),
             rpc_bind: config.rpc_bind,
+            start_block: config.start_block,
+            rollback_window: config.rollback_window,
+            retention_mode: config.retention_mode,
+            head_source: config.head_source,
+            reorg_strategy: config.reorg_strategy,
+        }
+    }
+}
+
+impl Default for StoredConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: 1,
+            data_dir: PathBuf::from("data"),
+            rpc_bind: "127.0.0.1:8545".parse().expect("valid default rpc bind"),
+            start_block: 0,
+            rollback_window: 64,
+            retention_mode: RetentionMode::Full,
+            head_source: HeadSource::P2p,
+            reorg_strategy: ReorgStrategy::Delete,
         }
     }
 }
