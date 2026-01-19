@@ -72,12 +72,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - Verified: `cargo test --manifest-path node/Cargo.toml` (rollback deletes block/index data)
 
 ### v0.1.3 JSON-RPC server (indexer-compatible subset)
-- [ ] Target v0.1 indexer: **rindexer** (polling-based; no `eth_subscribe` required)
-- [ ] **Minimum RPC for rindexer event indexing**:
-  - `eth_chainId`
-  - `eth_blockNumber`
-  - `eth_getBlockByNumber` (must support `"latest"`; must include `timestamp`, `number`, `hash`, `logsBloom`)
-  - `eth_getLogs` (must include `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`, `logIndex`)
+- [x] Target v0.1 indexer: **rindexer** (polling-based; no `eth_subscribe` required)
+- [x] **Minimum RPC for rindexer event indexing**:
+  - [x] `eth_chainId`
+  - [x] `eth_blockNumber`
+  - [x] `eth_getBlockByNumber` (must support `"latest"`; must include `timestamp`, `number`, `hash`, `logsBloom`)
+  - [x] `eth_getLogs` (must include `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`, `logIndex`)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (RPC block number + block + logs)
 - [ ] **Ponder compatibility (later; NOT in v0.1) requires more than rindexer**:
   - `eth_getBlockByHash` (reorg traversal via `parentHash`)
   - `eth_call` (multicall3 + factory/read-contract flows; requires state, so not supported by a fully-stateless node unless proxied or executed via a stateless execution approach like RESS)
@@ -119,6 +120,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - receipts root validation (header `receiptsRoot`)
   - multi-peer cross-check for headers/receipts
   - stronger head source (beacon API / CL integration) if P2P-only head proves flaky
+  - tombstone / “removed logs” handling for reorgs (eth_getLogs consistency)
 
 ---
 

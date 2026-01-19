@@ -8,6 +8,7 @@ mod sync;
 use cli::NodeConfig;
 use eyre::Result;
 use sync::IngestOutcome;
+use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -25,7 +26,7 @@ async fn main() -> Result<()> {
         "starting stateless history node"
     );
 
-    let storage = storage::Storage::open(&config)?;
+    let storage = Arc::new(storage::Storage::open(&config)?);
     let head_seen = storage.head_seen()?;
     let last_indexed = storage.last_indexed_block()?;
     info!(
@@ -34,7 +35,7 @@ async fn main() -> Result<()> {
         "sync checkpoints loaded"
     );
 
-    let rpc_handle = rpc::start(config.rpc_bind, config.chain_id).await?;
+    let rpc_handle = rpc::start(config.rpc_bind, config.chain_id, Arc::clone(&storage)).await?;
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
 
     let mut _network_session = None;
@@ -45,7 +46,7 @@ async fn main() -> Result<()> {
 
         let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let mut ingest = sync::IngestRunner::new(source, DEFAULT_SYNC_BATCH_SIZE);
-        match ingest.run_once(&storage, config.start_block).await? {
+            match ingest.run_once(storage.as_ref(), config.start_block).await? {
             IngestOutcome::UpToDate { head } => {
                 info!(head, "ingest up to date");
             }
