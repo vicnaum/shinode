@@ -1,12 +1,19 @@
 //! Storage bootstrap and metadata.
 
 use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+use alloy_primitives::{Address, B256, Bytes};
 use eyre::{eyre, Result, WrapErr};
 use reth_db::{
     mdbx::{init_db_for, DatabaseArguments, DatabaseEnv},
     ClientVersion, Database,
 };
-use reth_db_api::transaction::{DbTx, DbTxMut};
+use reth_codecs::Compact;
+use reth_db_api::{
+    table::{Compress, Decompress},
+    transaction::{DbTx, DbTxMut},
+    DatabaseError,
+};
+use reth_ethereum_primitives::Receipt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -15,7 +22,9 @@ use std::{
 use tracing::info;
 
 mod tables {
+    use super::{StoredLogs, StoredReceipts, StoredTxHashes};
     use reth_db_api::{table::TableInfo, tables, TableSet, TableType, TableViewer};
+    use reth_primitives_traits::Header;
     use std::fmt;
 
     tables! {
@@ -23,6 +32,30 @@ mod tables {
         table Meta {
             type Key = String;
             type Value = Vec<u8>;
+        }
+
+        /// Canonical headers keyed by block number.
+        table BlockHeaders {
+            type Key = u64;
+            type Value = Header;
+        }
+
+        /// Transaction hashes per block.
+        table BlockTxHashes {
+            type Key = u64;
+            type Value = StoredTxHashes;
+        }
+
+        /// Receipts per block.
+        table BlockReceipts {
+            type Key = u64;
+            type Value = StoredReceipts;
+        }
+
+        /// Derived logs per block.
+        table BlockLogs {
+            type Key = u64;
+            type Value = StoredLogs;
         }
     }
 }
@@ -33,6 +66,61 @@ const META_CHAIN_ID_KEY: &str = "chain_id";
 const META_CONFIG_KEY: &str = "config";
 const META_LAST_INDEXED_BLOCK_KEY: &str = "last_indexed_block";
 const META_HEAD_SEEN_KEY: &str = "head_seen";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+pub struct StoredTxHashes {
+    pub hashes: Vec<B256>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+pub struct StoredReceipts {
+    pub receipts: Vec<Receipt>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+pub struct StoredLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub transaction_hash: B256,
+    pub transaction_index: u64,
+    pub log_index: u64,
+    pub removed: bool,
+    pub data: Bytes,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+pub struct StoredLogs {
+    pub logs: Vec<StoredLog>,
+}
+
+macro_rules! impl_compact_value {
+    ($($name:ty),+ $(,)?) => {
+        $(
+            impl Compress for $name {
+                type Compressed = Vec<u8>;
+
+                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+                    let _ = Compact::to_compact(self, buf);
+                }
+            }
+
+            impl Decompress for $name {
+                fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+                    let (obj, _) = Compact::from_compact(value, value.len());
+                    Ok(obj)
+                }
+            }
+        )+
+    };
+}
+
+impl_compact_value!(StoredTxHashes, StoredReceipts, StoredLog, StoredLogs);
 
 #[derive(Debug)]
 pub struct Storage {
