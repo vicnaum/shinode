@@ -24,6 +24,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use tracing::info;
 
 #[derive(Clone)]
 pub struct RpcConfig {
@@ -100,6 +101,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             let params: Option<Value> = params.parse()?;
             ensure_empty_params(params, "eth_chainId expects no params")?;
 
+            info!(method = "eth_chainId", "rpc request");
             Ok(format!("0x{:x}", ctx.config.chain_id))
             },
         )
@@ -112,11 +114,13 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             let params: Option<Value> = params.parse()?;
             ensure_empty_params(params, "eth_blockNumber expects no params")?;
 
+            info!(method = "eth_blockNumber", "rpc request");
             let latest = ctx
                 .storage
                 .last_indexed_block()
                 .map_err(internal_error)?
                 .unwrap_or(0);
+            info!(method = "eth_blockNumber", latest, "rpc response");
             Ok(format!("0x{:x}", latest))
             },
         )
@@ -138,6 +142,12 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             let include_txs = params[1]
                 .as_bool()
                 .ok_or_else(|| invalid_params("includeTransactions must be a boolean"))?;
+            info!(
+                method = "eth_getBlockByNumber",
+                block_tag = ?params[0],
+                include_txs,
+                "rpc request"
+            );
             if include_txs {
                 return Err(invalid_params(
                     "eth_getBlockByNumber only supports includeTransactions=false",
@@ -147,10 +157,12 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             let tag = parse_block_tag(&params[0])?;
             let latest = ctx.storage.last_indexed_block().map_err(internal_error)?;
             let Some(number) = resolve_block_tag_optional(tag, latest)? else {
+                info!(method = "eth_getBlockByNumber", found = false, "rpc response");
                 return Ok(Value::Null);
             };
 
             let Some(header) = ctx.storage.block_header(number).map_err(internal_error)? else {
+                info!(method = "eth_getBlockByNumber", found = false, "rpc response");
                 return Ok(Value::Null);
             };
 
@@ -175,6 +187,12 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 transactions: txs,
             };
 
+            info!(
+                method = "eth_getBlockByNumber",
+                found = true,
+                number = header.number,
+                "rpc response"
+            );
             serde_json::to_value(response).map_err(internal_error)
             },
         )
@@ -212,6 +230,22 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 .map(|tag| resolve_block_tag_required(tag, latest))
                 .transpose()?
                 .unwrap_or(latest);
+            let address_filter = filter.get("address").map(parse_address_filter).transpose()?;
+            let topics_filter = filter.get("topics").map(parse_topics_filter).transpose()?;
+            let topic0_filter = topics_filter
+                .as_ref()
+                .and_then(|topics| topics.first())
+                .and_then(|entry| entry.clone());
+            let address_count = address_filter.as_ref().map(|v| v.len()).unwrap_or(0);
+            let topic0_count = topic0_filter.as_ref().map(|v| v.len()).unwrap_or(0);
+            info!(
+                method = "eth_getLogs",
+                from_block,
+                to_block,
+                address_count,
+                topic0_count,
+                "rpc request"
+            );
             if from_block > to_block {
                 return Ok(Value::Array(Vec::new()));
             }
@@ -219,13 +253,6 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             if block_span > ctx.config.max_blocks_per_filter {
                 return Err(invalid_params("block range exceeds max_blocks_per_filter"));
             }
-
-            let address_filter = filter.get("address").map(parse_address_filter).transpose()?;
-            let topics_filter = filter.get("topics").map(parse_topics_filter).transpose()?;
-            let topic0_filter = topics_filter
-                .as_ref()
-                .and_then(|topics| topics.first())
-                .and_then(|entry| entry.clone());
 
             let mut candidates: Option<BTreeSet<(u64, u64)>> = None;
             if let Some(addresses) = address_filter.as_ref().filter(|a| !a.is_empty()) {
@@ -307,6 +334,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 }
             };
 
+            info!(method = "eth_getLogs", logs = logs.len(), "rpc response");
             serde_json::to_value(logs).map_err(internal_error)
             },
         )

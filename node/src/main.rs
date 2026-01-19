@@ -148,12 +148,17 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(verbosity: u8) {
-    let default_level = match verbosity {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => {
+            let (global, local) = match verbosity {
+                0 => ("error", "error"),
+                1 => ("warn", "info"),
+                2 => ("warn", "debug"),
+                _ => ("warn", "trace"),
+            };
+            EnvFilter::new(format!("{global},stateless_history_node={local}"))
+        }
     };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }

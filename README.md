@@ -57,7 +57,10 @@ Core:
 - `--retention-mode <full>`: retention policy (default: `full`).
 - `--head-source <p2p>`: head source (default: `p2p`).
 - `--reorg-strategy <delete>`: rollback strategy (default: `delete`).
-- `-v/-vv/-vvv`: increase default log verbosity.
+- `-v`: info-level node activity (RPC requests, ingest progress).
+- `-vv`: debug for node internals.
+- `-vvv`: trace for node internals.
+- Default without `-v` is errors only. `RUST_LOG` overrides all defaults.
 
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 5_242_880).
@@ -70,8 +73,9 @@ RPC safety limits:
 ## Configuration and storage
 
 The MDBX database lives under `data_dir/db`. A serialized config is persisted
-on first run and validated on startup. If you change config values, use a new
-`data_dir` to avoid a mismatch.
+on first run and validated on startup. If you change storage-affecting settings
+(retention, head source, reorg strategy), use a new `data_dir`. Runtime-only
+settings (verbosity, RPC limits) can be changed freely.
 
 ## RPC support
 
