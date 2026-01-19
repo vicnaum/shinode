@@ -38,7 +38,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - Verified: `cargo test --manifest-path node/Cargo.toml` (test strategy scaffold + storage metadata + RPC error semantics tests)
 
 ### v0.1.1 Sync + ingest loop (backfill → follow)
-- [ ] Replace anchor-window probing with **range sync** (`start_block..head`)
+- [x] Replace anchor-window probing with **range sync** (`start_block..head`)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (range sync planner)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (checkpoint metadata scaffold)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (head tracker + sync controller)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (runtime planning log wiring)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (canonical chain tracker + reorg detection)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (sync runner with checkpoints + reorg rollback)
 - [ ] Maintain a **canonical header chain** (parent links) and detect reorgs
 - [ ] Fetch **block bodies** (or at least tx hashes) so logs/receipts can be associated with tx hashes correctly
 - [ ] Fetch **receipts**, reconstruct missing blooms (eth/69/70), and derive logs with full metadata

@@ -31,6 +31,8 @@ const SCHEMA_VERSION: u64 = 1;
 const META_SCHEMA_VERSION_KEY: &str = "schema_version";
 const META_CHAIN_ID_KEY: &str = "chain_id";
 const META_CONFIG_KEY: &str = "config";
+const META_LAST_INDEXED_BLOCK_KEY: &str = "last_indexed_block";
+const META_HEAD_SEEN_KEY: &str = "head_seen";
 
 #[derive(Debug)]
 pub struct Storage {
@@ -97,7 +99,7 @@ impl Storage {
         let schema_bytes = tx.get::<tables::Meta>(META_SCHEMA_VERSION_KEY.to_string())?;
         tx.commit()?;
 
-        match schema_bytes {
+        let (needs_last_indexed, needs_head_seen) = match schema_bytes {
             None => {
                 let tx = self.db.tx_mut()?;
                 tx.put::<tables::Meta>(
@@ -112,9 +114,17 @@ impl Storage {
                     META_CONFIG_KEY.to_string(),
                     encode_json(&StoredConfig::from(config))?,
                 )?;
+                tx.put::<tables::Meta>(
+                    META_LAST_INDEXED_BLOCK_KEY.to_string(),
+                    encode_json(&Option::<u64>::None)?,
+                )?;
+                tx.put::<tables::Meta>(
+                    META_HEAD_SEEN_KEY.to_string(),
+                    encode_json(&Option::<u64>::None)?,
+                )?;
                 tx.commit()?;
                 info!(db_path = %db_path.display(), "initialized storage metadata");
-                Ok(())
+                return Ok(());
             }
             Some(bytes) => {
                 let schema_version: u64 = decode_json(bytes)?;
@@ -145,10 +155,71 @@ impl Storage {
                     return Err(eyre!("config mismatch: db={stored_config:?} config={expected:?}"));
                 }
 
+                let last_indexed = tx.get::<tables::Meta>(META_LAST_INDEXED_BLOCK_KEY.to_string())?;
+                let head_seen = tx.get::<tables::Meta>(META_HEAD_SEEN_KEY.to_string())?;
                 tx.commit()?;
-                Ok(())
+                (last_indexed.is_none(), head_seen.is_none())
             }
+        };
+
+        if needs_last_indexed || needs_head_seen {
+            let tx = self.db.tx_mut()?;
+            if needs_last_indexed {
+                tx.put::<tables::Meta>(
+                    META_LAST_INDEXED_BLOCK_KEY.to_string(),
+                    encode_json(&Option::<u64>::None)?,
+                )?;
+            }
+            if needs_head_seen {
+                tx.put::<tables::Meta>(
+                    META_HEAD_SEEN_KEY.to_string(),
+                    encode_json(&Option::<u64>::None)?,
+                )?;
+            }
+            tx.commit()?;
         }
+
+        Ok(())
+    }
+
+    /// Returns the last fully indexed block, if any.
+    pub fn last_indexed_block(&self) -> Result<Option<u64>> {
+        self.read_optional_u64(META_LAST_INDEXED_BLOCK_KEY)
+    }
+
+    /// Persist the last fully indexed block.
+    #[allow(dead_code)]
+    pub fn set_last_indexed_block(&self, value: u64) -> Result<()> {
+        self.write_optional_u64(META_LAST_INDEXED_BLOCK_KEY, Some(value))
+    }
+
+    /// Returns the latest head observed from the head source.
+    pub fn head_seen(&self) -> Result<Option<u64>> {
+        self.read_optional_u64(META_HEAD_SEEN_KEY)
+    }
+
+    /// Persist the latest head observed from the head source.
+    #[allow(dead_code)]
+    pub fn set_head_seen(&self, value: u64) -> Result<()> {
+        self.write_optional_u64(META_HEAD_SEEN_KEY, Some(value))
+    }
+
+    fn read_optional_u64(&self, key: &str) -> Result<Option<u64>> {
+        let tx = self.db.tx()?;
+        let bytes = tx.get::<tables::Meta>(key.to_string())?;
+        tx.commit()?;
+        match bytes {
+            Some(value) => decode_json::<Option<u64>>(value),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn write_optional_u64(&self, key: &str, value: Option<u64>) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::Meta>(key.to_string(), encode_json(&value)?)?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -194,9 +265,17 @@ mod tests {
         let config = base_config(dir.clone());
 
         let storage = Storage::open(&config).expect("open storage");
+        assert_eq!(storage.last_indexed_block().unwrap(), None);
+        assert_eq!(storage.head_seen().unwrap(), None);
+        storage.set_last_indexed_block(10).expect("set last indexed");
+        storage.set_head_seen(12).expect("set head seen");
+        assert_eq!(storage.last_indexed_block().unwrap(), Some(10));
+        assert_eq!(storage.head_seen().unwrap(), Some(12));
         drop(storage);
 
         let storage_again = Storage::open(&config).expect("reopen with same config");
+        assert_eq!(storage_again.last_indexed_block().unwrap(), Some(10));
+        assert_eq!(storage_again.head_seen().unwrap(), Some(12));
         drop(storage_again);
 
         let mut changed = config.clone();

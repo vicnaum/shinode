@@ -5,10 +5,14 @@ mod rpc;
 mod storage;
 mod sync;
 
+use chain::MemoryHeadTracker;
 use cli::NodeConfig;
 use eyre::Result;
+use sync::SyncController;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+const DEFAULT_SYNC_BATCH_SIZE: u64 = 100;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,7 +26,25 @@ async fn main() -> Result<()> {
         "starting stateless history node"
     );
 
-    let _storage = storage::Storage::open(&config)?;
+    let storage = storage::Storage::open(&config)?;
+    let head_seen = storage.head_seen()?;
+    let last_indexed = storage.last_indexed_block()?;
+    info!(
+        head_seen = ?head_seen,
+        last_indexed = ?last_indexed,
+        "sync checkpoints loaded"
+    );
+
+    let head_tracker = MemoryHeadTracker::new(head_seen);
+    let controller = SyncController::new(head_tracker, DEFAULT_SYNC_BATCH_SIZE);
+    match controller.next_range(&storage, config.start_block)? {
+        Some(range) => info!(
+            range_start = *range.start(),
+            range_end = *range.end(),
+            "planned sync range"
+        ),
+        None => info!("no sync range planned (no head or already at head)"),
+    }
     let rpc_handle = rpc::start(config.rpc_bind, config.chain_id).await?;
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
 
