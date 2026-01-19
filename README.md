@@ -64,12 +64,12 @@ Core:
 - Default without `-v` is errors only. `RUST_LOG` overrides all defaults.
 
 RPC safety limits:
-- `--rpc-max-request-body-bytes <u32>` (default: 5_242_880).
-- `--rpc-max-response-body-bytes <u32>` (default: 5_242_880).
+- `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).
+- `--rpc-max-response-body-bytes <u32>` (default: 104_857_600).
 - `--rpc-max-connections <u32>` (default: 100).
-- `--rpc-max-batch-requests <u32>` (default: 10).
-- `--rpc-max-blocks-per-filter <u64>` (default: 1000).
-- `--rpc-max-logs-per-response <u64>` (default: 10000).
+- `--rpc-max-batch-requests <u32>` (default: 100; `0` = unlimited).
+- `--rpc-max-blocks-per-filter <u64>` (default: 10000; `0` = unlimited).
+- `--rpc-max-logs-per-response <u64>` (default: 100000; `0` = unlimited).
 
 ## Configuration and storage
 

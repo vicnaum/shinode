@@ -67,9 +67,9 @@ async fn main() -> Result<()> {
                 let progress = if std::io::stderr().is_terminal() {
                     let bar = ProgressBar::new(0);
                     bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-                    let style = ProgressStyle::with_template(
-                        "{bar:40.cyan/blue} {pos}/{len} | {elapsed_precise} | {msg}",
-                    )
+                let style = ProgressStyle::with_template(
+                    "{bar:40.cyan/blue} blocks {pos}/{len} | {elapsed_precise} | {msg}",
+                )
                     .expect("progress style");
                     bar.set_style(style);
                     bar.set_message("ingesting range");

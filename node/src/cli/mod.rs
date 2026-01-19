@@ -4,12 +4,12 @@ use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf};
 
-pub const DEFAULT_RPC_MAX_REQUEST_BODY_BYTES: u32 = 5 * 1024 * 1024;
-pub const DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES: u32 = 5 * 1024 * 1024;
+pub const DEFAULT_RPC_MAX_REQUEST_BODY_BYTES: u32 = 10 * 1024 * 1024;
+pub const DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES: u32 = 100 * 1024 * 1024;
 pub const DEFAULT_RPC_MAX_CONNECTIONS: u32 = 100;
-pub const DEFAULT_RPC_MAX_BATCH_REQUESTS: u32 = 10;
-pub const DEFAULT_RPC_MAX_BLOCKS_PER_FILTER: u64 = 1000;
-pub const DEFAULT_RPC_MAX_LOGS_PER_RESPONSE: u64 = 10_000;
+pub const DEFAULT_RPC_MAX_BATCH_REQUESTS: u32 = 100;
+pub const DEFAULT_RPC_MAX_BLOCKS_PER_FILTER: u64 = 10_000;
+pub const DEFAULT_RPC_MAX_LOGS_PER_RESPONSE: u64 = 100_000;
 
 /// Retention mode for stored history.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,13 +75,13 @@ pub struct NodeConfig {
     /// Max concurrent JSON-RPC connections.
     #[arg(long, default_value_t = DEFAULT_RPC_MAX_CONNECTIONS)]
     pub rpc_max_connections: u32,
-    /// Max JSON-RPC batch size.
+    /// Max JSON-RPC batch size (0 = unlimited).
     #[arg(long, default_value_t = DEFAULT_RPC_MAX_BATCH_REQUESTS)]
     pub rpc_max_batch_requests: u32,
-    /// Max blocks per eth_getLogs filter.
+    /// Max blocks per eth_getLogs filter (0 = unlimited).
     #[arg(long, default_value_t = DEFAULT_RPC_MAX_BLOCKS_PER_FILTER)]
     pub rpc_max_blocks_per_filter: u64,
-    /// Max logs per eth_getLogs response.
+    /// Max logs per eth_getLogs response (0 = unlimited).
     #[arg(long, default_value_t = DEFAULT_RPC_MAX_LOGS_PER_RESPONSE)]
     pub rpc_max_logs_per_response: u64,
 }

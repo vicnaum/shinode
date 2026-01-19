@@ -77,11 +77,16 @@ pub async fn start(
     config: RpcConfig,
     storage: Arc<Storage>,
 ) -> Result<ServerHandle> {
+    let batch_config = if config.max_batch_requests == 0 {
+        BatchRequestConfig::Unlimited
+    } else {
+        BatchRequestConfig::Limit(config.max_batch_requests)
+    };
     let server_config = ServerConfig::builder()
         .max_request_body_size(config.max_request_body_bytes)
         .max_response_body_size(config.max_response_body_bytes)
         .max_connections(config.max_connections)
-        .set_batch_request_config(BatchRequestConfig::Limit(config.max_batch_requests))
+        .set_batch_request_config(batch_config)
         .build();
     let server = ServerBuilder::new()
         .set_config(server_config)
@@ -293,8 +298,10 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             if from_block > to_block {
                 return Ok(Value::Array(Vec::new()));
             }
-            let block_span = to_block.saturating_sub(from_block).saturating_add(1);
-            if block_span > ctx.config.max_blocks_per_filter {
+        let block_span = to_block.saturating_sub(from_block).saturating_add(1);
+        if ctx.config.max_blocks_per_filter != 0
+            && block_span > ctx.config.max_blocks_per_filter
+        {
                 return Err(invalid_params("block range exceeds max_blocks_per_filter"));
             }
 
@@ -347,9 +354,12 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                             .get(&block_number)
                             .expect("block logs cached");
                         if let Some(log) = logs.iter().find(|log| log.log_index == log_index) {
-                            if log_matches(log, address_filter.as_deref(), topics_filter.as_deref()) {
+                                    if log_matches(log, address_filter.as_deref(), topics_filter.as_deref()) {
                                 out.push(format_log(log));
-                                if out.len() > ctx.config.max_logs_per_response as usize {
+                                        if ctx.config.max_logs_per_response != 0
+                                            && out.len()
+                                                > ctx.config.max_logs_per_response as usize
+                                        {
                                     return Err(invalid_params("response exceeds max_logs_per_response"));
                                 }
                             }
@@ -365,10 +375,12 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                         .map_err(internal_error)?
                     {
                         for log in stored.logs {
-                            if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref())
-                            {
+                                    if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref()) {
                                 out.push(format_log(&log));
-                                if out.len() > ctx.config.max_logs_per_response as usize {
+                                        if ctx.config.max_logs_per_response != 0
+                                            && out.len()
+                                                > ctx.config.max_logs_per_response as usize
+                                        {
                                     return Err(invalid_params("response exceeds max_logs_per_response"));
                                 }
                             }
@@ -1022,6 +1034,57 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+
+        handle.stop().expect("stop server");
+        handle.stopped().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn eth_get_logs_allows_unlimited_limits() {
+        let dir = temp_dir();
+        let mut config = base_config(dir.clone());
+        config.rpc_max_blocks_per_filter = 0;
+        config.rpc_max_logs_per_response = 0;
+        let storage = Storage::open(&config).expect("storage");
+
+        let topic0 = B256::from([0x42u8; 32]);
+        let log = StoredLog {
+            address: Address::from([0x11u8; 20]),
+            topics: vec![topic0],
+            block_number: 1,
+            block_hash: B256::ZERO,
+            transaction_hash: B256::from([0x33u8; 32]),
+            transaction_index: 0,
+            log_index: 0,
+            removed: false,
+            data: alloy_primitives::Bytes::from(vec![0x01]),
+        };
+        storage
+            .write_block_logs(1, crate::storage::StoredLogs { logs: vec![log.clone()] })
+            .expect("write logs");
+        storage
+            .write_log_indexes(&[log.clone()])
+            .expect("write log indexes");
+        storage
+            .set_last_indexed_block(1)
+            .expect("set last indexed");
+
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
+        let client = HttpClientBuilder::default()
+            .build(&format!("http://{addr}"))
+            .expect("client");
+
+        let filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock": "0x100",
+        });
+        let result: Vec<Value> = client
+            .request("eth_getLogs", rpc_params![filter])
+            .await
+            .expect("get logs");
+        assert_eq!(result.len(), 1);
 
         handle.stop().expect("stop server");
         handle.stopped().await;
