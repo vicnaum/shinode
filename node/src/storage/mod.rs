@@ -1,6 +1,11 @@
 //! Storage bootstrap and metadata.
 
-use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+use crate::cli::{
+    HeadSource, NodeConfig, ReorgStrategy, RetentionMode, DEFAULT_RPC_MAX_BATCH_REQUESTS,
+    DEFAULT_RPC_MAX_BLOCKS_PER_FILTER, DEFAULT_RPC_MAX_CONNECTIONS,
+    DEFAULT_RPC_MAX_LOGS_PER_RESPONSE, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
+    DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+};
 use alloy_primitives::{Address, B256, Bytes};
 use eyre::{eyre, Result, WrapErr};
 use reth_db::{
@@ -243,6 +248,13 @@ struct StoredConfig {
     retention_mode: RetentionMode,
     head_source: HeadSource,
     reorg_strategy: ReorgStrategy,
+    verbosity: u8,
+    rpc_max_request_body_bytes: u32,
+    rpc_max_response_body_bytes: u32,
+    rpc_max_connections: u32,
+    rpc_max_batch_requests: u32,
+    rpc_max_blocks_per_filter: u64,
+    rpc_max_logs_per_response: u64,
 }
 
 impl From<&NodeConfig> for StoredConfig {
@@ -256,6 +268,13 @@ impl From<&NodeConfig> for StoredConfig {
             retention_mode: config.retention_mode,
             head_source: config.head_source,
             reorg_strategy: config.reorg_strategy,
+            verbosity: config.verbosity,
+            rpc_max_request_body_bytes: config.rpc_max_request_body_bytes,
+            rpc_max_response_body_bytes: config.rpc_max_response_body_bytes,
+            rpc_max_connections: config.rpc_max_connections,
+            rpc_max_batch_requests: config.rpc_max_batch_requests,
+            rpc_max_blocks_per_filter: config.rpc_max_blocks_per_filter,
+            rpc_max_logs_per_response: config.rpc_max_logs_per_response,
         }
     }
 }
@@ -271,6 +290,13 @@ impl Default for StoredConfig {
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
+            verbosity: 0,
+            rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
+            rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
+            rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
+            rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+            rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
         }
     }
 }
@@ -712,15 +738,21 @@ mod tests {
     use super::*;
     use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
     use reth_ethereum_primitives::TxType;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut path = std::env::temp_dir();
-        path.push(format!("stateless-history-node-test-{now}-{}", std::process::id()));
+        path.push(format!(
+            "stateless-history-node-test-{now}-{}-{suffix}",
+            std::process::id()
+        ));
         path
     }
 
@@ -734,6 +766,13 @@ mod tests {
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
+            verbosity: 0,
+            rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
+            rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
+            rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
+            rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+            rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
         }
     }
 

@@ -2,6 +2,14 @@
 
 This repo currently contains a working **receipt availability harness** (see Appendix A). The next product is a **stateless history node**: a long-running service that ingests history artifacts from the Ethereum Execution Layer (EL) P2P network and serves an indexer-compatible RPC subset.
 
+## Current status (v0.1.4)
+- Range backfill (single run) using P2P headers/bodies/receipts.
+- MDBX persistence for headers, tx hashes, receipts, logs, and log indexes.
+- Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
+  `eth_getBlockByNumber`, `eth_getLogs`).
+- Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
+- Not yet: follow mode, live reorg handling, extra RPC methods, metrics export.
+
 ## Goals
 - **Ship a usable v0.1 MVP quickly**: backfill → follow head → persist → serve RPC.
 - **Stay stateless**: no EVM execution, no state trie/database, no archive-state growth.

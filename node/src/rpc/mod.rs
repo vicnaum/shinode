@@ -1,6 +1,13 @@
 //! JSON-RPC server.
 
-use crate::storage::{Storage, StoredLog};
+use crate::{
+    cli::{
+        NodeConfig, DEFAULT_RPC_MAX_BATCH_REQUESTS, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+        DEFAULT_RPC_MAX_CONNECTIONS, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+        DEFAULT_RPC_MAX_REQUEST_BODY_BYTES, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+    },
+    storage::{Storage, StoredLog},
+};
 use alloy_primitives::{Address, B256};
 use eyre::{Result, WrapErr};
 use jsonrpsee::{
@@ -11,36 +18,77 @@ use jsonrpsee::{
 use reth_primitives_traits::SealedHeader;
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::{BTreeSet, HashMap}, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+};
 
-const RPC_MAX_REQUEST_BODY_BYTES: u32 = 5 * 1024 * 1024;
-const RPC_MAX_RESPONSE_BODY_BYTES: u32 = 5 * 1024 * 1024;
-const RPC_MAX_CONNECTIONS: u32 = 100;
-const RPC_MAX_BATCH_REQUESTS: u32 = 10;
-const MAX_BLOCKS_PER_FILTER: u64 = 1000;
-const MAX_LOGS_PER_RESPONSE: usize = 10_000;
+#[derive(Clone)]
+pub struct RpcConfig {
+    chain_id: u64,
+    max_request_body_bytes: u32,
+    max_response_body_bytes: u32,
+    max_connections: u32,
+    max_batch_requests: u32,
+    max_blocks_per_filter: u64,
+    max_logs_per_response: u64,
+}
+
+impl From<&NodeConfig> for RpcConfig {
+    fn from(config: &NodeConfig) -> Self {
+        Self {
+            chain_id: config.chain_id,
+            max_request_body_bytes: config.rpc_max_request_body_bytes,
+            max_response_body_bytes: config.rpc_max_response_body_bytes,
+            max_connections: config.rpc_max_connections,
+            max_batch_requests: config.rpc_max_batch_requests,
+            max_blocks_per_filter: config.rpc_max_blocks_per_filter,
+            max_logs_per_response: config.rpc_max_logs_per_response,
+        }
+    }
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: 1,
+            max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
+            max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+            max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
+            max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
+            max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+            max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct RpcContext {
-    chain_id: u64,
+    config: RpcConfig,
     storage: Arc<Storage>,
 }
 
 /// Start the JSON-RPC server and return its handle.
-pub async fn start(bind: SocketAddr, chain_id: u64, storage: Arc<Storage>) -> Result<ServerHandle> {
-    let config = ServerConfig::builder()
-        .max_request_body_size(RPC_MAX_REQUEST_BODY_BYTES)
-        .max_response_body_size(RPC_MAX_RESPONSE_BODY_BYTES)
-        .max_connections(RPC_MAX_CONNECTIONS)
-        .set_batch_request_config(BatchRequestConfig::Limit(RPC_MAX_BATCH_REQUESTS))
+pub async fn start(
+    bind: SocketAddr,
+    config: RpcConfig,
+    storage: Arc<Storage>,
+) -> Result<ServerHandle> {
+    let server_config = ServerConfig::builder()
+        .max_request_body_size(config.max_request_body_bytes)
+        .max_response_body_size(config.max_response_body_bytes)
+        .max_connections(config.max_connections)
+        .set_batch_request_config(BatchRequestConfig::Limit(config.max_batch_requests))
         .build();
     let server = ServerBuilder::new()
-        .set_config(config)
+        .set_config(server_config)
         .build(bind)
         .await
         .wrap_err("failed to bind RPC server")?;
 
-    Ok(server.start(module(RpcContext { chain_id, storage })?))
+    Ok(server.start(module(RpcContext { config, storage })?))
 }
 
 pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
@@ -52,7 +100,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             let params: Option<Value> = params.parse()?;
             ensure_empty_params(params, "eth_chainId expects no params")?;
 
-            Ok(format!("0x{:x}", ctx.chain_id))
+            Ok(format!("0x{:x}", ctx.config.chain_id))
             },
         )
         .wrap_err("failed to register eth_chainId")?;
@@ -168,7 +216,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 return Ok(Value::Array(Vec::new()));
             }
             let block_span = to_block.saturating_sub(from_block).saturating_add(1);
-            if block_span > MAX_BLOCKS_PER_FILTER {
+            if block_span > ctx.config.max_blocks_per_filter {
                 return Err(invalid_params("block range exceeds max_blocks_per_filter"));
             }
 
@@ -230,7 +278,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                         if let Some(log) = logs.iter().find(|log| log.log_index == log_index) {
                             if log_matches(log, address_filter.as_deref(), topics_filter.as_deref()) {
                                 out.push(format_log(log));
-                                if out.len() > MAX_LOGS_PER_RESPONSE {
+                                if out.len() > ctx.config.max_logs_per_response as usize {
                                     return Err(invalid_params("response exceeds max_logs_per_response"));
                                 }
                             }
@@ -249,7 +297,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                             if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref())
                             {
                                 out.push(format_log(&log));
-                                if out.len() > MAX_LOGS_PER_RESPONSE {
+                                if out.len() > ctx.config.max_logs_per_response as usize {
                                     return Err(invalid_params("response exceeds max_logs_per_response"));
                                 }
                             }
@@ -463,15 +511,21 @@ mod tests {
     use jsonrpsee::rpc_params;
     use reth_primitives_traits::Header;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut path = std::env::temp_dir();
-        path.push(format!("stateless-history-node-test-{now}-{}", std::process::id()));
+        path.push(format!(
+            "stateless-history-node-test-{now}-{}-{suffix}",
+            std::process::id()
+        ));
         path
     }
 
@@ -485,6 +539,13 @@ mod tests {
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
+            verbosity: 0,
+            rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
+            rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
+            rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
+            rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+            rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
         }
     }
 
@@ -494,21 +555,32 @@ mod tests {
         header
     }
 
-    async fn start_test_server(chain_id: u64, storage: Arc<Storage>) -> (SocketAddr, ServerHandle) {
+    async fn start_test_server(
+        chain_id: u64,
+        storage: Arc<Storage>,
+        rpc_config: RpcConfig,
+    ) -> (SocketAddr, ServerHandle) {
         let server = ServerBuilder::default()
             .build("127.0.0.1:0")
             .await
             .expect("bind test server");
         let addr = server.local_addr().expect("local addr");
-        let handle = server.start(module(RpcContext { chain_id, storage }).expect("module"));
+        let handle = server.start(
+            module(RpcContext {
+                config: RpcConfig { chain_id, ..rpc_config },
+                storage,
+            })
+            .expect("module"),
+        );
         (addr, handle)
     }
 
     #[tokio::test]
     async fn eth_chain_id_success() {
         let dir = temp_dir();
-        let storage = Arc::new(Storage::open(&base_config(dir.clone())).expect("storage"));
-        let (addr, handle) = start_test_server(1, storage).await;
+        let config = base_config(dir.clone());
+        let storage = Arc::new(Storage::open(&config).expect("storage"));
+        let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
@@ -526,8 +598,9 @@ mod tests {
     #[tokio::test]
     async fn eth_chain_id_rejects_params() {
         let dir = temp_dir();
-        let storage = Arc::new(Storage::open(&base_config(dir.clone())).expect("storage"));
-        let (addr, handle) = start_test_server(1, storage).await;
+        let config = base_config(dir.clone());
+        let storage = Arc::new(Storage::open(&config).expect("storage"));
+        let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
@@ -550,8 +623,9 @@ mod tests {
     #[tokio::test]
     async fn rpc_shutdown_stops_server() {
         let dir = temp_dir();
-        let storage = Arc::new(Storage::open(&base_config(dir.clone())).expect("storage"));
-        let (addr, handle) = start_test_server(1, storage).await;
+        let config = base_config(dir.clone());
+        let storage = Arc::new(Storage::open(&config).expect("storage"));
+        let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
@@ -574,8 +648,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
         let dir = temp_dir();
-        let storage = Arc::new(Storage::open(&base_config(dir.clone())).expect("storage"));
-        let (addr, handle) = start_test_server(1, storage).await;
+        let config = base_config(dir.clone());
+        let storage = Arc::new(Storage::open(&config).expect("storage"));
+        let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
@@ -598,11 +673,13 @@ mod tests {
     #[tokio::test]
     async fn eth_block_number_returns_last_indexed() {
         let dir = temp_dir();
-        let storage = Storage::open(&base_config(dir.clone())).expect("storage");
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
         storage
             .set_last_indexed_block(42)
             .expect("set last indexed");
-        let (addr, handle) = start_test_server(1, Arc::new(storage)).await;
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
 
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
@@ -621,7 +698,8 @@ mod tests {
     #[tokio::test]
     async fn eth_get_block_by_number_returns_header() {
         let dir = temp_dir();
-        let storage = Storage::open(&base_config(dir.clone())).expect("storage");
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
 
         let mut header = header_with_number(7);
         header.timestamp = 1000;
@@ -640,7 +718,8 @@ mod tests {
             .set_last_indexed_block(7)
             .expect("set last indexed");
 
-        let (addr, handle) = start_test_server(1, Arc::new(storage)).await;
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
@@ -663,7 +742,8 @@ mod tests {
     #[tokio::test]
     async fn eth_get_logs_filters_address_and_topic0() {
         let dir = temp_dir();
-        let storage = Storage::open(&base_config(dir.clone())).expect("storage");
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
 
         let topic0 = B256::from([0x11u8; 32]);
         let log = StoredLog {
@@ -687,7 +767,8 @@ mod tests {
             .set_last_indexed_block(5)
             .expect("set last indexed");
 
-        let (addr, handle) = start_test_server(1, Arc::new(storage)).await;
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
@@ -714,13 +795,15 @@ mod tests {
     #[tokio::test]
     async fn eth_get_logs_rejects_large_range() {
         let dir = temp_dir();
-        let storage = Storage::open(&base_config(dir.clone())).expect("storage");
-        let (addr, handle) = start_test_server(1, Arc::new(storage)).await;
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
         let client = HttpClientBuilder::default()
             .build(&format!("http://{addr}"))
             .expect("client");
 
-        let to_block = format!("0x{:x}", MAX_BLOCKS_PER_FILTER + 1);
+        let to_block = format!("0x{:x}", config.rpc_max_blocks_per_filter + 1);
         let filter = serde_json::json!({
             "fromBlock": "0x0",
             "toBlock": to_block,

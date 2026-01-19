@@ -2,6 +2,7 @@
 
 use crate::{
     chain::{ChainError, ChainTracker, ChainUpdate, HeadTracker, HeaderStub},
+    metrics::range_len,
     storage::{Storage, StoredLog, StoredLogs, StoredReceipts, StoredTxHashes},
 };
 use async_trait::async_trait;
@@ -205,6 +206,12 @@ pub enum IngestOutcome {
     Reorg { ancestor_number: u64 },
 }
 
+pub trait ProgressReporter {
+    fn set_length(&self, len: u64);
+    fn inc(&self, delta: u64);
+    fn finish(&self);
+}
+
 /// Ingest runner that derives logs and advances checkpoints.
 #[allow(dead_code)]
 pub struct IngestRunner<S> {
@@ -227,6 +234,15 @@ where
     }
 
     pub async fn run_once(&mut self, storage: &Storage, start_block: u64) -> Result<IngestOutcome> {
+        self.run_once_with_progress(storage, start_block, None).await
+    }
+
+    pub async fn run_once_with_progress(
+        &mut self,
+        storage: &Storage,
+        start_block: u64,
+        progress: Option<&dyn ProgressReporter>,
+    ) -> Result<IngestOutcome> {
         let head = self.source.head().await?;
         storage.set_head_seen(head)?;
 
@@ -236,6 +252,9 @@ where
             None => return Ok(IngestOutcome::UpToDate { head }),
         };
 
+        if let Some(progress) = progress {
+            progress.set_length(range_len(&range));
+        }
         let mut payloads = self.source.blocks_by_number(range.clone()).await?;
         if payloads.is_empty() {
             return Ok(IngestOutcome::UpToDate { head });
@@ -259,6 +278,9 @@ where
             match self.chain.insert_header(header_stub) {
                 Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
                     storage.rollback_to(ancestor_number)?;
+                    if let Some(progress) = progress {
+                        progress.finish();
+                    }
                     return Ok(IngestOutcome::Reorg { ancestor_number });
                 }
                 Ok(_) => {}
@@ -340,8 +362,15 @@ where
             storage.write_block_logs(header.number, StoredLogs { logs: block_logs.clone() })?;
             storage.write_log_indexes(&block_logs)?;
             storage.set_last_indexed_block(header.number)?;
+
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
         }
 
+        if let Some(progress) = progress {
+            progress.finish();
+        }
         Ok(IngestOutcome::RangeApplied { range, logs: derived_logs })
     }
 }
@@ -395,6 +424,7 @@ mod tests {
     use reth_primitives_traits::{Header, SealedHeader};
     use std::ops::RangeInclusive;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -419,12 +449,17 @@ mod tests {
     }
 
     fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time moves forward")
             .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut path = std::env::temp_dir();
-        path.push(format!("stateless-history-node-sync-test-{now}-{}", std::process::id()));
+        path.push(format!(
+            "stateless-history-node-sync-test-{now}-{}-{suffix}",
+            std::process::id()
+        ));
         path
     }
 
@@ -438,6 +473,13 @@ mod tests {
             retention_mode: RetentionMode::Full,
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
+            verbosity: 0,
+            rpc_max_request_body_bytes: crate::cli::DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
+            rpc_max_response_body_bytes: crate::cli::DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
+            rpc_max_connections: crate::cli::DEFAULT_RPC_MAX_CONNECTIONS,
+            rpc_max_batch_requests: crate::cli::DEFAULT_RPC_MAX_BATCH_REQUESTS,
+            rpc_max_blocks_per_filter: crate::cli::DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+            rpc_max_logs_per_response: crate::cli::DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
         }
     }
 

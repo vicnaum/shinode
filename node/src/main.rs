@@ -1,5 +1,6 @@
 mod chain;
 mod cli;
+mod metrics;
 mod p2p;
 mod rpc;
 mod storage;
@@ -7,17 +8,33 @@ mod sync;
 
 use cli::NodeConfig;
 use eyre::Result;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use metrics::{lag_to_head, range_len, rate_per_sec};
+use std::{io::IsTerminal, sync::Arc, time::Instant};
 use sync::IngestOutcome;
-use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SYNC_BATCH_SIZE: u64 = 100;
 
+impl sync::ProgressReporter for ProgressBar {
+    fn set_length(&self, len: u64) {
+        self.set_length(len);
+    }
+
+    fn inc(&self, delta: u64) {
+        self.inc(delta);
+    }
+
+    fn finish(&self) {
+        self.finish_and_clear();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = NodeConfig::from_args();
-    init_tracing();
+    init_tracing(config.verbosity);
 
     info!(
         chain_id = config.chain_id,
@@ -35,7 +52,8 @@ async fn main() -> Result<()> {
         "sync checkpoints loaded"
     );
 
-    let rpc_handle = rpc::start(config.rpc_bind, config.chain_id, Arc::clone(&storage)).await?;
+    let rpc_handle =
+        rpc::start(config.rpc_bind, rpc::RpcConfig::from(&config), Arc::clone(&storage)).await?;
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
 
     let mut _network_session = None;
@@ -46,20 +64,70 @@ async fn main() -> Result<()> {
 
         let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let mut ingest = sync::IngestRunner::new(source, DEFAULT_SYNC_BATCH_SIZE);
-            match ingest.run_once(storage.as_ref(), config.start_block).await? {
+                let progress = if std::io::stderr().is_terminal() {
+                    let bar = ProgressBar::new(0);
+                    bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+                    let style = ProgressStyle::with_template(
+                        "{bar:40.cyan/blue} {pos}/{len} | {elapsed_precise} | {msg}",
+                    )
+                    .expect("progress style");
+                    bar.set_style(style);
+                    bar.set_message("ingesting range");
+                    Some(bar)
+                } else {
+                    None
+                };
+
+                let ingest_started = Instant::now();
+                let outcome = match progress.as_ref() {
+                    Some(bar) => ingest
+                        .run_once_with_progress(storage.as_ref(), config.start_block, Some(bar))
+                        .await?,
+                    None => ingest.run_once(storage.as_ref(), config.start_block).await?,
+                };
+                let elapsed = ingest_started.elapsed();
+                let head_seen = storage.head_seen()?;
+                let last_indexed = storage.last_indexed_block()?;
+                let lag = lag_to_head(head_seen, last_indexed);
+                let peers = session.pool.len();
+                match outcome {
             IngestOutcome::UpToDate { head } => {
-                info!(head, "ingest up to date");
+                        info!(
+                            head,
+                            lag_blocks = ?lag,
+                            peers,
+                            elapsed_ms = elapsed.as_millis(),
+                            reorgs = 0u64,
+                            "ingest up to date"
+                        );
             }
             IngestOutcome::RangeApplied { range, logs } => {
+                        let blocks = range_len(&range);
+                        let blocks_per_sec = rate_per_sec(blocks, elapsed);
+                        let logs_per_sec = rate_per_sec(logs.len() as u64, elapsed);
                 info!(
                     range_start = *range.start(),
                     range_end = *range.end(),
+                            blocks,
                     logs = logs.len(),
+                            blocks_per_sec = ?blocks_per_sec,
+                            logs_per_sec = ?logs_per_sec,
+                            lag_blocks = ?lag,
+                            peers,
+                            elapsed_ms = elapsed.as_millis(),
+                            reorgs = 0u64,
                     "ingested range"
                 );
             }
             IngestOutcome::Reorg { ancestor_number } => {
-                warn!(ancestor_number, "reorg detected during ingest");
+                        warn!(
+                            ancestor_number,
+                            lag_blocks = ?lag,
+                            peers,
+                            elapsed_ms = elapsed.as_millis(),
+                            reorgs = 1u64,
+                            "reorg detected during ingest"
+                        );
             }
         }
 
@@ -79,7 +147,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_tracing(verbosity: u8) {
+    let default_level = match verbosity {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }

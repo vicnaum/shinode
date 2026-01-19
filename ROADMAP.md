@@ -90,11 +90,14 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - Verified: `cargo test --manifest-path node/Cargo.toml` (RPC limits + server config)
 
 ### v0.1.4 Operator experience (minimum to run unattended)
-- [ ] CLI/config: chain, start block, retention, DB path, RPC bind, resource limits
+- [x] CLI/config: chain, start block, retention, DB path, RPC bind, resource limits
 - [x] Graceful shutdown + safe flushing
-- [ ] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
-- [ ] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
+- [x] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
+- [x] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (graceful shutdown behavior)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (ingest metrics logging helpers)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (RPC limit CLI config)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (verbosity + progress UI)
 
 ### v0.1.5 Live sync + reorg resilience
 - [ ] **Follow mode**: loop until head, then keep up with new heads
