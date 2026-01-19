@@ -64,7 +64,6 @@ impl PeerSelector for RoundRobinPeerSelector {
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-const REQUEST_CHUNK_SIZE: usize = 25;
 const PEER_TARGET: usize = 3;
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PEER_ATTEMPTS: usize = 3;
@@ -433,19 +432,50 @@ async fn request_bodies_chunked(
     peer: &NetworkPeer,
     hashes: &[B256],
 ) -> Result<Vec<reth_ethereum_primitives::BlockBody>> {
-    let mut bodies = Vec::with_capacity(hashes.len());
-    for chunk in hashes.chunks(REQUEST_CHUNK_SIZE) {
-        let chunk_bodies = request_bodies(peer, chunk).await?;
-        if chunk_bodies.len() != chunk.len() {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results: Vec<Option<reth_ethereum_primitives::BlockBody>> =
+        vec![None; hashes.len()];
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((0usize, hashes.len()));
+
+    while let Some((start, end)) = queue.pop_front() {
+        let slice = &hashes[start..end];
+        let bodies = request_bodies(peer, slice).await?;
+        if bodies.len() == slice.len() {
+            for (offset, body) in bodies.into_iter().enumerate() {
+                results[start + offset] = Some(body);
+            }
+            continue;
+        }
+
+        if bodies.len() > slice.len() {
             return Err(eyre!(
                 "body count mismatch: expected {}, got {}",
-                chunk.len(),
-                chunk_bodies.len()
+                slice.len(),
+                bodies.len()
             ));
         }
-        bodies.extend(chunk_bodies);
+
+        if slice.len() == 1 {
+            return Err(eyre!(
+                "body not found for hash {:#x} from peer {:?}",
+                slice[0],
+                peer.peer_id
+            ));
+        }
+
+        let mid = start + (slice.len() / 2);
+        queue.push_back((start, mid));
+        queue.push_back((mid, end));
     }
-    Ok(bodies)
+
+    results
+        .into_iter()
+        .map(|body| body.ok_or_else(|| eyre!("body fetch incomplete")))
+        .collect()
 }
 
 async fn request_receipts(
