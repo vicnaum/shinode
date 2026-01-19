@@ -2,12 +2,13 @@
 
 use crate::{
     chain::{ChainError, ChainTracker, ChainUpdate, HeadTracker, HeaderStub},
-    storage::Storage,
+    storage::{Storage, StoredLog, StoredLogs, StoredReceipts, StoredTxHashes},
 };
 use async_trait::async_trait;
 use alloy_primitives::{Address, B256, Bytes, Log};
 use eyre::Result;
 use reth_ethereum_primitives::Receipt;
+use reth_primitives_traits::{Header, SealedHeader};
 use std::ops::RangeInclusive;
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
@@ -170,7 +171,7 @@ where
 /// Full payload for a block: header, tx hashes, receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockPayload {
-    pub header: HeaderStub,
+    pub header: Header,
     pub tx_hashes: Vec<B256>,
     pub receipts: Vec<Receipt>,
 }
@@ -244,8 +245,18 @@ where
         let mut derived_logs = Vec::new();
 
         for payload in payloads {
-            let header = payload.header;
-            match self.chain.insert_header(header) {
+            let BlockPayload {
+                header,
+                tx_hashes,
+                receipts,
+            } = payload;
+            let header_hash = SealedHeader::seal_slow(header.clone()).hash();
+            let header_stub = HeaderStub {
+                number: header.number,
+                hash: header_hash,
+                parent_hash: header.parent_hash,
+            };
+            match self.chain.insert_header(header_stub) {
                 Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
                     storage.set_last_indexed_block(ancestor_number)?;
                     return Ok(IngestOutcome::Reorg { ancestor_number });
@@ -261,38 +272,65 @@ where
                 }
             }
 
-            if payload.tx_hashes.len() != payload.receipts.len() {
+            if tx_hashes.len() != receipts.len() {
                 return Err(eyre::eyre!(
                     "tx hash count {} does not match receipts count {} for block {}",
-                    payload.tx_hashes.len(),
-                    payload.receipts.len(),
+                    tx_hashes.len(),
+                    receipts.len(),
                     header.number
                 ));
             }
 
-            for (tx_index, (tx_hash, receipt)) in payload
-                .tx_hashes
-                .into_iter()
-                .zip(payload.receipts.into_iter())
+            storage.write_block_header(header.number, header.clone())?;
+
+            let mut block_logs = Vec::new();
+            for (tx_index, (tx_hash, receipt)) in tx_hashes
+                .iter()
+                .zip(receipts.iter())
                 .enumerate()
             {
-                for (log_index, log) in receipt.logs.into_iter().enumerate() {
+                for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
                     let Log { address, data } = log;
                     let (topics, data) = data.split();
-                    derived_logs.push(DerivedLog {
+                    let stored_log = StoredLog {
                         address,
                         topics,
                         data,
                         block_number: header.number,
-                        block_hash: header.hash,
-                        transaction_hash: tx_hash,
+                        block_hash: header_hash,
+                        transaction_hash: *tx_hash,
                         transaction_index: tx_index as u64,
                         log_index: log_index as u64,
                         removed: false,
+                    };
+                    derived_logs.push(DerivedLog {
+                        address: stored_log.address,
+                        topics: stored_log.topics.clone(),
+                        data: stored_log.data.clone(),
+                        block_number: stored_log.block_number,
+                        block_hash: stored_log.block_hash,
+                        transaction_hash: stored_log.transaction_hash,
+                        transaction_index: stored_log.transaction_index,
+                        log_index: stored_log.log_index,
+                        removed: stored_log.removed,
                     });
+                    block_logs.push(stored_log);
                 }
             }
 
+            storage.write_block_tx_hashes(
+                header.number,
+                StoredTxHashes {
+                    hashes: tx_hashes.clone(),
+                },
+            )?;
+            storage.write_block_receipts(
+                header.number,
+                StoredReceipts {
+                    receipts: receipts,
+                },
+            )?;
+            storage.write_block_logs(header.number, StoredLogs { logs: block_logs })?;
             storage.set_last_indexed_block(header.number)?;
         }
 
@@ -346,6 +384,7 @@ mod tests {
     use alloy_primitives::{Address, B256, Bytes, Log};
     use eyre::Result;
     use reth_ethereum_primitives::{Receipt, TxType};
+    use reth_primitives_traits::{Header, SealedHeader};
     use std::ops::RangeInclusive;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -583,7 +622,7 @@ mod tests {
     }
 
     fn payload_for_block(
-        header: HeaderStub,
+        header: Header,
         tx_hashes: Vec<B256>,
         logs_per_tx: Vec<Vec<Log>>,
     ) -> BlockPayload {
@@ -598,15 +637,29 @@ mod tests {
         }
     }
 
+    fn header_with_number(number: u64, parent_hash: B256) -> Header {
+        let mut header = Header::default();
+        header.number = number;
+        header.parent_hash = parent_hash;
+        header
+    }
+
+    fn header_hash(header: &Header) -> B256 {
+        SealedHeader::seal_slow(header.clone()).hash()
+    }
+
     #[tokio::test]
     async fn ingest_runner_derives_log_metadata() {
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
-        let headers = linear_headers(0, 1, 400);
+        let header0 = header_with_number(0, B256::ZERO);
+        let header0_hash = header_hash(&header0);
+        let header1 = header_with_number(1, header0_hash);
+        let header1_hash = header_hash(&header1);
         let block0 = payload_for_block(
-            headers[0],
+            header0.clone(),
             vec![hash_from_u64(11), hash_from_u64(12)],
             vec![
                 vec![Log::new_unchecked(
@@ -622,7 +675,7 @@ mod tests {
             ],
         );
         let block1 = payload_for_block(
-            headers[1],
+            header1.clone(),
             vec![hash_from_u64(13)],
             vec![vec![
                 Log::new_unchecked(
@@ -659,7 +712,7 @@ mod tests {
                 topics: vec![hash_from_u64(100)],
                 data: Bytes::from(vec![0x01]),
                 block_number: 0,
-                block_hash: headers[0].hash,
+                block_hash: header0_hash,
                 transaction_hash: hash_from_u64(11),
                 transaction_index: 0,
                 log_index: 0,
@@ -670,7 +723,7 @@ mod tests {
                 topics: vec![hash_from_u64(200), hash_from_u64(201)],
                 data: Bytes::from(vec![0x02]),
                 block_number: 0,
-                block_hash: headers[0].hash,
+                block_hash: header0_hash,
                 transaction_hash: hash_from_u64(12),
                 transaction_index: 1,
                 log_index: 0,
@@ -681,7 +734,7 @@ mod tests {
                 topics: vec![hash_from_u64(300)],
                 data: Bytes::from(vec![0x03]),
                 block_number: 1,
-                block_hash: headers[1].hash,
+                block_hash: header1_hash,
                 transaction_hash: hash_from_u64(13),
                 transaction_index: 0,
                 log_index: 0,
@@ -692,7 +745,7 @@ mod tests {
                 topics: vec![],
                 data: Bytes::from(vec![0x04]),
                 block_number: 1,
-                block_hash: headers[1].hash,
+                block_hash: header1_hash,
                 transaction_hash: hash_from_u64(13),
                 transaction_index: 0,
                 log_index: 1,
@@ -701,6 +754,40 @@ mod tests {
         ];
 
         assert_eq!(logs, expected);
+        assert_eq!(
+            storage
+                .block_header(0)
+                .expect("block header")
+                .expect("header exists")
+                .number,
+            0
+        );
+        assert_eq!(
+            storage
+                .block_tx_hashes(0)
+                .expect("tx hashes")
+                .expect("tx hashes exist")
+                .hashes,
+            vec![hash_from_u64(11), hash_from_u64(12)]
+        );
+        assert_eq!(
+            storage
+                .block_receipts(0)
+                .expect("receipts")
+                .expect("receipts exist")
+                .receipts
+                .len(),
+            2
+        );
+        assert_eq!(
+            storage
+                .block_logs(0)
+                .expect("logs")
+                .expect("logs exist")
+                .logs
+                .len(),
+            2
+        );
         assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -712,13 +799,18 @@ mod tests {
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
-        let headers = linear_headers(0, 2, 600);
+        let header0 = header_with_number(0, B256::ZERO);
+        let header0_hash = header_hash(&header0);
+        let header1 = header_with_number(1, header0_hash);
+        let header1_hash = header_hash(&header1);
+        let header2 = header_with_number(2, header1_hash);
+        let headers = vec![header0.clone(), header1.clone(), header2.clone()];
         let blocks = headers
             .iter()
             .map(|header| {
                 payload_for_block(
-                    *header,
-                    vec![header.hash],
+                    header.clone(),
+                    vec![header_hash(header)],
                     vec![vec![Log::new_unchecked(
                         address_from_u64(header.number),
                         vec![],
@@ -736,11 +828,7 @@ mod tests {
         assert_eq!(storage.last_indexed_block().unwrap(), Some(2));
 
         storage.set_last_indexed_block(1).expect("rewind");
-        let alt_header = HeaderStub {
-            number: 2,
-            hash: hash_from_u64(999),
-            parent_hash: headers[1].hash,
-        };
+        let alt_header = header_with_number(2, header_hash(&header1));
         let alt_block = payload_for_block(
             alt_header,
             vec![hash_from_u64(888)],

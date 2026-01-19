@@ -14,6 +14,7 @@ use reth_db_api::{
     DatabaseError,
 };
 use reth_ethereum_primitives::Receipt;
+use reth_primitives_traits::Header;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -74,13 +75,13 @@ pub struct StoredTxHashes {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredReceipts {
     pub receipts: Vec<Receipt>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredLog {
     pub address: Address,
     pub topics: Vec<B256>,
@@ -94,7 +95,7 @@ pub struct StoredLog {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredLogs {
     pub logs: Vec<StoredLog>,
 }
@@ -120,7 +121,55 @@ macro_rules! impl_compact_value {
     };
 }
 
-impl_compact_value!(StoredTxHashes, StoredReceipts, StoredLog, StoredLogs);
+impl_compact_value!(StoredTxHashes);
+
+impl Compress for StoredReceipts {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let encoded = serde_json::to_vec(self)
+            .expect("stored receipts serialization should succeed");
+        buf.put_slice(&encoded);
+    }
+}
+
+impl Decompress for StoredReceipts {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
+    }
+}
+
+impl Compress for StoredLog {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let encoded = serde_json::to_vec(self)
+            .expect("stored log serialization should succeed");
+        buf.put_slice(&encoded);
+    }
+}
+
+impl Decompress for StoredLog {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
+    }
+}
+
+impl Compress for StoredLogs {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let encoded = serde_json::to_vec(self)
+            .expect("stored logs serialization should succeed");
+        buf.put_slice(&encoded);
+    }
+}
+
+impl Decompress for StoredLogs {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
+    }
+}
 
 #[derive(Debug)]
 pub struct Storage {
@@ -290,6 +339,78 @@ impl Storage {
     #[allow(dead_code)]
     pub fn set_head_seen(&self, value: u64) -> Result<()> {
         self.write_optional_u64(META_HEAD_SEEN_KEY, Some(value))
+    }
+
+    /// Persist a canonical header by block number.
+    #[allow(dead_code)]
+    pub fn write_block_header(&self, number: u64, header: Header) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockHeaders>(number, header)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist transaction hashes for a block.
+    #[allow(dead_code)]
+    pub fn write_block_tx_hashes(&self, number: u64, hashes: StoredTxHashes) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockTxHashes>(number, hashes)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist receipts for a block.
+    #[allow(dead_code)]
+    pub fn write_block_receipts(&self, number: u64, receipts: StoredReceipts) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockReceipts>(number, receipts)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist derived logs for a block.
+    #[allow(dead_code)]
+    pub fn write_block_logs(&self, number: u64, logs: StoredLogs) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockLogs>(number, logs)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fetch a canonical header by block number.
+    #[allow(dead_code)]
+    pub fn block_header(&self, number: u64) -> Result<Option<Header>> {
+        let tx = self.db.tx()?;
+        let header = tx.get::<tables::BlockHeaders>(number)?;
+        tx.commit()?;
+        Ok(header)
+    }
+
+    /// Fetch transaction hashes for a block.
+    #[allow(dead_code)]
+    pub fn block_tx_hashes(&self, number: u64) -> Result<Option<StoredTxHashes>> {
+        let tx = self.db.tx()?;
+        let hashes = tx.get::<tables::BlockTxHashes>(number)?;
+        tx.commit()?;
+        Ok(hashes)
+    }
+
+    /// Fetch receipts for a block.
+    #[allow(dead_code)]
+    pub fn block_receipts(&self, number: u64) -> Result<Option<StoredReceipts>> {
+        let tx = self.db.tx()?;
+        let receipts = tx.get::<tables::BlockReceipts>(number)?;
+        tx.commit()?;
+        Ok(receipts)
+    }
+
+    /// Fetch derived logs for a block.
+    #[allow(dead_code)]
+    pub fn block_logs(&self, number: u64) -> Result<Option<StoredLogs>> {
+        let tx = self.db.tx()?;
+        let logs = tx.get::<tables::BlockLogs>(number)?;
+        tx.commit()?;
+        Ok(logs)
     }
 
     fn read_optional_u64(&self, key: &str) -> Result<Option<u64>> {

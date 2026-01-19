@@ -330,15 +330,9 @@ async fn fetch_payloads_for_peer(
         ));
     }
 
-    let mut header_stubs = Vec::with_capacity(count);
     let mut hashes = Vec::with_capacity(count);
-    for header in headers {
+    for header in &headers {
         let hash = SealedHeader::seal_slow(header.clone()).hash();
-        header_stubs.push(crate::chain::HeaderStub {
-            number: header.number,
-            hash,
-            parent_hash: header.parent_hash,
-        });
         hashes.push(hash);
     }
 
@@ -346,7 +340,7 @@ async fn fetch_payloads_for_peer(
     let receipts = request_receipts_chunked(peer, &hashes).await?;
 
     let mut payloads = Vec::with_capacity(count);
-    for ((header, body), receipts) in header_stubs
+    for ((header, body), receipts) in headers
         .into_iter()
         .zip(bodies.into_iter())
         .zip(receipts.into_iter())

@@ -59,12 +59,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ### v0.1.2 Persistence (queryable, restart-safe)
 - [x] Define MDBX tables + codecs for v0.1 retention (blocks, tx hashes, receipts/logs)
-- [ ] Write path: persist headers + tx hashes + receipts/logs during ingest
+- [x] Write path: persist headers + tx hashes + receipts/logs during ingest
 - [ ] Compute/persist **logsBloom** from receipts (eth/69/70)
 - [ ] Read path: fetch stored blocks/receipts/logs by number/range (for upcoming RPC)
 - [ ] Indexes for fast `eth_getLogs` (at least by block range + address/topic0)
 - [ ] Reorg rollback: delete data past common ancestor (tombstones/“removed logs” support deferred)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (tables + codecs compile)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (ingest writes + storage reads)
 
 ### v0.1.3 JSON-RPC server (indexer-compatible subset)
 - [ ] Target v0.1 indexer: **rindexer** (polling-based; no `eth_subscribe` required)
