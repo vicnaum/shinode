@@ -1,5 +1,6 @@
 //! Canonical chain tracking.
 
+use alloy_primitives::B256;
 use std::collections::{BTreeMap, HashMap};
 
 /// Basic head tracker abstraction for v0.1.
@@ -35,8 +36,8 @@ impl HeadTracker for MemoryHeadTracker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderStub {
     pub number: u64,
-    pub hash: u64,
-    pub parent_hash: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
 }
 
 /// Chain update result after inserting a header.
@@ -54,7 +55,7 @@ pub enum ChainUpdate {
 /// Errors for header insertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
-    UnknownParent(u64),
+    UnknownParent(B256),
     NonContiguousNumber { expected: u64, got: u64 },
 }
 
@@ -62,9 +63,9 @@ pub enum ChainError {
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct ChainTracker {
-    headers: HashMap<u64, HeaderStub>,
-    canonical: BTreeMap<u64, u64>,
-    canonical_by_hash: HashMap<u64, u64>,
+    headers: HashMap<B256, HeaderStub>,
+    canonical: BTreeMap<u64, B256>,
+    canonical_by_hash: HashMap<B256, u64>,
     head: Option<HeaderStub>,
 }
 
@@ -78,7 +79,7 @@ impl ChainTracker {
         self.head
     }
 
-    pub fn canonical_hash(&self, number: u64) -> Option<u64> {
+    pub fn canonical_hash(&self, number: u64) -> Option<B256> {
         self.canonical.get(&number).copied()
     }
 
@@ -87,9 +88,6 @@ impl ChainTracker {
 
         match self.head {
             None => {
-                if header.number != 0 {
-                    return Err(ChainError::UnknownParent(header.parent_hash));
-                }
                 self.insert_canonical(header.number, header.hash);
                 self.head = Some(header);
                 return Ok(ChainUpdate::Initialized { head: header });
@@ -143,7 +141,7 @@ impl ChainTracker {
         })
     }
 
-    fn insert_canonical(&mut self, number: u64, hash: u64) {
+    fn insert_canonical(&mut self, number: u64, hash: B256) {
         self.canonical.insert(number, hash);
         self.canonical_by_hash.insert(hash, number);
     }
@@ -152,6 +150,12 @@ impl ChainTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hash_from_u64(value: u64) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        B256::from(bytes)
+    }
 
     #[test]
     fn memory_head_tracker_roundtrip() {
@@ -166,13 +170,13 @@ mod tests {
         let mut tracker = ChainTracker::new();
         let genesis = HeaderStub {
             number: 0,
-            hash: 1,
-            parent_hash: 0,
+            hash: hash_from_u64(1),
+            parent_hash: B256::ZERO,
         };
         let one = HeaderStub {
             number: 1,
-            hash: 2,
-            parent_hash: 1,
+            hash: hash_from_u64(2),
+            parent_hash: hash_from_u64(1),
         };
 
         assert_eq!(
@@ -183,7 +187,7 @@ mod tests {
             tracker.insert_header(one),
             Ok(ChainUpdate::Extended { new_head: one })
         );
-        assert_eq!(tracker.canonical_hash(1), Some(2));
+        assert_eq!(tracker.canonical_hash(1), Some(hash_from_u64(2)));
     }
 
     #[test]
@@ -191,23 +195,23 @@ mod tests {
         let mut tracker = ChainTracker::new();
         let genesis = HeaderStub {
             number: 0,
-            hash: 1,
-            parent_hash: 0,
+            hash: hash_from_u64(1),
+            parent_hash: B256::ZERO,
         };
         let one = HeaderStub {
             number: 1,
-            hash: 2,
-            parent_hash: 1,
+            hash: hash_from_u64(2),
+            parent_hash: hash_from_u64(1),
         };
         let two = HeaderStub {
             number: 2,
-            hash: 3,
-            parent_hash: 2,
+            hash: hash_from_u64(3),
+            parent_hash: hash_from_u64(2),
         };
         let two_alt = HeaderStub {
             number: 2,
-            hash: 4,
-            parent_hash: 2,
+            hash: hash_from_u64(4),
+            parent_hash: hash_from_u64(2),
         };
 
         tracker.insert_header(genesis).unwrap();
@@ -224,20 +228,26 @@ mod tests {
             }
         );
         assert_eq!(tracker.head(), Some(two_alt));
-        assert_eq!(tracker.canonical_hash(2), Some(4));
+        assert_eq!(tracker.canonical_hash(2), Some(hash_from_u64(4)));
     }
 
     #[test]
     fn chain_tracker_rejects_unknown_parent() {
         let mut tracker = ChainTracker::new();
+        let genesis = HeaderStub {
+            number: 0,
+            hash: hash_from_u64(1),
+            parent_hash: B256::ZERO,
+        };
+        tracker.insert_header(genesis).unwrap();
         let header = HeaderStub {
-            number: 1,
-            hash: 10,
-            parent_hash: 9,
+            number: 2,
+            hash: hash_from_u64(10),
+            parent_hash: hash_from_u64(9),
         };
         assert_eq!(
             tracker.insert_header(header),
-            Err(ChainError::UnknownParent(9))
+            Err(ChainError::UnknownParent(hash_from_u64(9)))
         );
     }
 }

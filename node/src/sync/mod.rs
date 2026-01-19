@@ -4,8 +4,13 @@ use crate::{
     chain::{ChainError, ChainTracker, ChainUpdate, HeadTracker, HeaderStub},
     storage::Storage,
 };
+use async_trait::async_trait;
+use alloy_primitives::{Address, B256, Bytes, Log};
 use eyre::Result;
+use reth_ethereum_primitives::Receipt;
 use std::ops::RangeInclusive;
+use tokio::task::JoinSet;
+use tokio::sync::Semaphore;
 
 /// Plans contiguous ranges to fetch from `start_block..=head`.
 #[derive(Debug, Clone)]
@@ -89,9 +94,10 @@ where
 }
 
 /// Source of block headers for sync.
+#[async_trait]
 pub trait BlockSource: Send + Sync {
-    fn head(&self) -> Result<u64>;
-    fn headers_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<HeaderStub>>;
+    async fn head(&self) -> Result<u64>;
+    async fn headers_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<HeaderStub>>;
 }
 
 /// Result of a sync runner step.
@@ -123,17 +129,17 @@ where
         }
     }
 
-    pub fn run_once(&mut self, storage: &Storage, start_block: u64) -> Result<SyncOutcome> {
-        let head = self.source.head()?;
+    pub async fn run_once(&mut self, storage: &Storage, start_block: u64) -> Result<SyncOutcome> {
+        let head = self.source.head().await?;
         storage.set_head_seen(head)?;
 
-        let controller = SyncController::new(super::MemoryHeadTracker::new(Some(head)), self.batch_size);
+        let controller = SyncController::new(crate::chain::MemoryHeadTracker::new(Some(head)), self.batch_size);
         let range = match controller.next_range(storage, start_block)? {
             Some(range) => range,
             None => return Ok(SyncOutcome::UpToDate { head }),
         };
 
-        let headers = self.source.headers_by_number(range.clone())?;
+        let headers = self.source.headers_by_number(range.clone()).await?;
         if headers.is_empty() {
             return Ok(SyncOutcome::UpToDate { head });
         }
@@ -161,15 +167,185 @@ where
     }
 }
 
+/// Full payload for a block: header, tx hashes, receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPayload {
+    pub header: HeaderStub,
+    pub tx_hashes: Vec<B256>,
+    pub receipts: Vec<Receipt>,
+}
+
+/// Log derived from receipts with metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub transaction_hash: B256,
+    pub transaction_index: u64,
+    pub log_index: u64,
+    pub removed: bool,
+}
+
+/// Source of block payloads for ingestion.
+#[async_trait]
+pub trait BlockPayloadSource: Send + Sync {
+    async fn head(&self) -> Result<u64>;
+    async fn blocks_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<BlockPayload>>;
+}
+
+/// Outcome from a single ingest step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestOutcome {
+    UpToDate { head: u64 },
+    RangeApplied { range: RangeInclusive<u64>, logs: Vec<DerivedLog> },
+    Reorg { ancestor_number: u64 },
+}
+
+/// Ingest runner that derives logs and advances checkpoints.
+#[allow(dead_code)]
+pub struct IngestRunner<S> {
+    source: S,
+    chain: ChainTracker,
+    batch_size: u64,
+}
+
+#[allow(dead_code)]
+impl<S> IngestRunner<S>
+where
+    S: BlockPayloadSource,
+{
+    pub fn new(source: S, batch_size: u64) -> Self {
+        Self {
+            source,
+            chain: ChainTracker::new(),
+            batch_size: batch_size.max(1),
+        }
+    }
+
+    pub async fn run_once(&mut self, storage: &Storage, start_block: u64) -> Result<IngestOutcome> {
+        let head = self.source.head().await?;
+        storage.set_head_seen(head)?;
+
+        let controller = SyncController::new(crate::chain::MemoryHeadTracker::new(Some(head)), self.batch_size);
+        let range = match controller.next_range(storage, start_block)? {
+            Some(range) => range,
+            None => return Ok(IngestOutcome::UpToDate { head }),
+        };
+
+        let mut payloads = self.source.blocks_by_number(range.clone()).await?;
+        if payloads.is_empty() {
+            return Ok(IngestOutcome::UpToDate { head });
+        }
+        payloads.sort_by_key(|payload| payload.header.number);
+
+        let mut derived_logs = Vec::new();
+
+        for payload in payloads {
+            let header = payload.header;
+            match self.chain.insert_header(header) {
+                Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
+                    storage.set_last_indexed_block(ancestor_number)?;
+                    return Ok(IngestOutcome::Reorg { ancestor_number });
+                }
+                Ok(_) => {}
+                Err(ChainError::UnknownParent(parent)) => {
+                    return Err(eyre::eyre!("unknown parent {parent}"));
+                }
+                Err(ChainError::NonContiguousNumber { expected, got }) => {
+                    return Err(eyre::eyre!(
+                        "non-contiguous header number: expected {expected}, got {got}"
+                    ));
+                }
+            }
+
+            if payload.tx_hashes.len() != payload.receipts.len() {
+                return Err(eyre::eyre!(
+                    "tx hash count {} does not match receipts count {} for block {}",
+                    payload.tx_hashes.len(),
+                    payload.receipts.len(),
+                    header.number
+                ));
+            }
+
+            for (tx_index, (tx_hash, receipt)) in payload
+                .tx_hashes
+                .into_iter()
+                .zip(payload.receipts.into_iter())
+                .enumerate()
+            {
+                for (log_index, log) in receipt.logs.into_iter().enumerate() {
+                    let Log { address, data } = log;
+                    let (topics, data) = data.split();
+                    derived_logs.push(DerivedLog {
+                        address,
+                        topics,
+                        data,
+                        block_number: header.number,
+                        block_hash: header.hash,
+                        transaction_hash: tx_hash,
+                        transaction_index: tx_index as u64,
+                        log_index: log_index as u64,
+                        removed: false,
+                    });
+                }
+            }
+
+            storage.set_last_indexed_block(header.number)?;
+        }
+
+        Ok(IngestOutcome::RangeApplied { range, logs: derived_logs })
+    }
+}
+
+/// Process ranges concurrently with a max concurrency limit.
+#[allow(dead_code)]
+pub async fn process_ranges_concurrently<F, Fut>(
+    ranges: Vec<RangeInclusive<u64>>,
+    max_concurrency: usize,
+    handler: F,
+) -> Result<()>
+where
+    F: Fn(RangeInclusive<u64>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let semaphore = std::sync::Arc::new(Semaphore::new(max_concurrency.max(1)));
+    let mut join_set = JoinSet::new();
+
+    for range in ranges {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let range = range.clone();
+        let handler = handler.clone();
+        join_set.spawn(async move {
+            let _permit = permit;
+            handler(range).await
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        result??;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BlockSource, RangeSyncPlanner, SyncController, SyncOutcome, SyncRunner};
+    use super::{
+        BlockPayload, BlockPayloadSource, BlockSource, DerivedLog, IngestOutcome, IngestRunner,
+        RangeSyncPlanner, SyncController, SyncOutcome, SyncRunner, process_ranges_concurrently,
+    };
+    use async_trait::async_trait;
     use crate::{
         chain::{HeaderStub, MemoryHeadTracker},
         cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode},
         storage::Storage,
     };
+    use alloy_primitives::{Address, B256, Bytes, Log};
     use eyre::Result;
+    use reth_ethereum_primitives::{Receipt, TxType};
     use std::ops::RangeInclusive;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,12 +427,13 @@ mod tests {
         headers: Vec<HeaderStub>,
     }
 
+    #[async_trait]
     impl BlockSource for VecBlockSource {
-        fn head(&self) -> Result<u64> {
+        async fn head(&self) -> Result<u64> {
             Ok(self.head)
         }
 
-        fn headers_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<HeaderStub>> {
+        async fn headers_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<HeaderStub>> {
             let start = *range.start();
             let end = *range.end();
             let mut headers = self
@@ -270,11 +447,23 @@ mod tests {
         }
     }
 
+    fn hash_from_u64(value: u64) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        B256::from(bytes)
+    }
+
+    fn address_from_u64(value: u64) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[12..].copy_from_slice(&value.to_be_bytes());
+        Address::from_slice(&bytes)
+    }
+
     fn linear_headers(start: u64, end: u64, base_hash: u64) -> Vec<HeaderStub> {
         let mut headers = Vec::new();
-        let mut prev_hash = base_hash;
+        let mut prev_hash = hash_from_u64(base_hash);
         for number in start..=end {
-            let hash = prev_hash + 1;
+            let hash = hash_from_u64(base_hash + number + 1);
             let header = HeaderStub {
                 number,
                 hash,
@@ -286,8 +475,8 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn sync_runner_advances_checkpoints() {
+    #[tokio::test]
+    async fn sync_runner_advances_checkpoints() {
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
@@ -298,6 +487,7 @@ mod tests {
 
         let outcome = runner
             .run_once(&storage, config.start_block)
+            .await
             .expect("run once");
         assert_eq!(
             outcome,
@@ -307,6 +497,7 @@ mod tests {
 
         let outcome = runner
             .run_once(&storage, config.start_block)
+            .await
             .expect("run second");
         assert_eq!(
             outcome,
@@ -316,14 +507,15 @@ mod tests {
 
         let outcome = runner
             .run_once(&storage, config.start_block)
+            .await
             .expect("run third");
         assert_eq!(outcome, SyncOutcome::UpToDate { head: 5 });
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn sync_runner_handles_reorg_by_rolling_back_checkpoint() {
+    #[tokio::test]
+    async fn sync_runner_handles_reorg_by_rolling_back_checkpoint() {
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
@@ -333,23 +525,277 @@ mod tests {
         let mut runner = SyncRunner::new(source, 3);
         runner
             .run_once(&storage, config.start_block)
+            .await
             .expect("initial sync");
         assert_eq!(storage.last_indexed_block().unwrap(), Some(2));
 
         storage.set_last_indexed_block(1).expect("rewind");
         let alt_header = HeaderStub {
             number: 2,
-            hash: 999,
+            hash: hash_from_u64(999),
             parent_hash: headers[1].hash,
         };
         let source = VecBlockSource { head: 2, headers: vec![alt_header] };
         runner.source = source;
         let outcome = runner
             .run_once(&storage, config.start_block)
+            .await
             .expect("reorg run");
         assert_eq!(outcome, SyncOutcome::Reorg { ancestor_number: 1 });
         assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Clone)]
+    struct VecPayloadSource {
+        head: u64,
+        blocks: Vec<BlockPayload>,
+    }
+
+    #[async_trait]
+    impl BlockPayloadSource for VecPayloadSource {
+        async fn head(&self) -> Result<u64> {
+            Ok(self.head)
+        }
+
+        async fn blocks_by_number(&self, range: RangeInclusive<u64>) -> Result<Vec<BlockPayload>> {
+            let start = *range.start();
+            let end = *range.end();
+            let mut blocks = self
+                .blocks
+                .iter()
+                .filter(|block| block.header.number >= start && block.header.number <= end)
+                .cloned()
+                .collect::<Vec<_>>();
+            blocks.sort_by_key(|block| block.header.number);
+            Ok(blocks)
+        }
+    }
+
+    fn receipt_with_logs(logs: Vec<Log>) -> Receipt {
+        Receipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 0,
+            logs,
+        }
+    }
+
+    fn payload_for_block(
+        header: HeaderStub,
+        tx_hashes: Vec<B256>,
+        logs_per_tx: Vec<Vec<Log>>,
+    ) -> BlockPayload {
+        let receipts = logs_per_tx
+            .into_iter()
+            .map(receipt_with_logs)
+            .collect::<Vec<_>>();
+        BlockPayload {
+            header,
+            tx_hashes,
+            receipts,
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_runner_derives_log_metadata() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
+
+        let headers = linear_headers(0, 1, 400);
+        let block0 = payload_for_block(
+            headers[0],
+            vec![hash_from_u64(11), hash_from_u64(12)],
+            vec![
+                vec![Log::new_unchecked(
+                    address_from_u64(1),
+                    vec![hash_from_u64(100)],
+                    Bytes::from(vec![0x01]),
+                )],
+                vec![Log::new_unchecked(
+                    address_from_u64(2),
+                    vec![hash_from_u64(200), hash_from_u64(201)],
+                    Bytes::from(vec![0x02]),
+                )],
+            ],
+        );
+        let block1 = payload_for_block(
+            headers[1],
+            vec![hash_from_u64(13)],
+            vec![vec![
+                Log::new_unchecked(
+                    address_from_u64(3),
+                    vec![hash_from_u64(300)],
+                    Bytes::from(vec![0x03]),
+                ),
+                Log::new_unchecked(
+                    address_from_u64(4),
+                    vec![],
+                    Bytes::from(vec![0x04]),
+                ),
+            ]],
+        );
+
+        let source = VecPayloadSource {
+            head: 1,
+            blocks: vec![block0, block1],
+        };
+        let mut runner = IngestRunner::new(source, 10);
+        let outcome = runner
+            .run_once(&storage, config.start_block)
+            .await
+            .expect("ingest");
+
+        let logs = match outcome {
+            IngestOutcome::RangeApplied { logs, .. } => logs,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+
+        let expected = vec![
+            DerivedLog {
+                address: address_from_u64(1),
+                topics: vec![hash_from_u64(100)],
+                data: Bytes::from(vec![0x01]),
+                block_number: 0,
+                block_hash: headers[0].hash,
+                transaction_hash: hash_from_u64(11),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            },
+            DerivedLog {
+                address: address_from_u64(2),
+                topics: vec![hash_from_u64(200), hash_from_u64(201)],
+                data: Bytes::from(vec![0x02]),
+                block_number: 0,
+                block_hash: headers[0].hash,
+                transaction_hash: hash_from_u64(12),
+                transaction_index: 1,
+                log_index: 0,
+                removed: false,
+            },
+            DerivedLog {
+                address: address_from_u64(3),
+                topics: vec![hash_from_u64(300)],
+                data: Bytes::from(vec![0x03]),
+                block_number: 1,
+                block_hash: headers[1].hash,
+                transaction_hash: hash_from_u64(13),
+                transaction_index: 0,
+                log_index: 0,
+                removed: false,
+            },
+            DerivedLog {
+                address: address_from_u64(4),
+                topics: vec![],
+                data: Bytes::from(vec![0x04]),
+                block_number: 1,
+                block_hash: headers[1].hash,
+                transaction_hash: hash_from_u64(13),
+                transaction_index: 0,
+                log_index: 1,
+                removed: false,
+            },
+        ];
+
+        assert_eq!(logs, expected);
+        assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ingest_runner_reorg_rolls_back_checkpoint() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
+
+        let headers = linear_headers(0, 2, 600);
+        let blocks = headers
+            .iter()
+            .map(|header| {
+                payload_for_block(
+                    *header,
+                    vec![header.hash],
+                    vec![vec![Log::new_unchecked(
+                        address_from_u64(header.number),
+                        vec![],
+                        Bytes::from(vec![0x01]),
+                    )]],
+                )
+            })
+            .collect::<Vec<_>>();
+        let source = VecPayloadSource { head: 2, blocks };
+        let mut runner = IngestRunner::new(source, 10);
+        runner
+            .run_once(&storage, config.start_block)
+            .await
+            .expect("initial ingest");
+        assert_eq!(storage.last_indexed_block().unwrap(), Some(2));
+
+        storage.set_last_indexed_block(1).expect("rewind");
+        let alt_header = HeaderStub {
+            number: 2,
+            hash: hash_from_u64(999),
+            parent_hash: headers[1].hash,
+        };
+        let alt_block = payload_for_block(
+            alt_header,
+            vec![hash_from_u64(888)],
+            vec![vec![Log::new_unchecked(
+                address_from_u64(9),
+                vec![],
+                Bytes::from(vec![0x09]),
+            )]],
+        );
+
+        runner.source = VecPayloadSource {
+            head: 2,
+            blocks: vec![alt_block],
+        };
+        let outcome = runner
+            .run_once(&storage, config.start_block)
+            .await
+            .expect("reorg ingest");
+        assert_eq!(outcome, IngestOutcome::Reorg { ancestor_number: 1 });
+        assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn range_processing_respects_concurrency() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::time::{sleep, Duration};
+
+        let ranges = vec![0..=0, 1..=1, 2..=2, 3..=3];
+        let max_concurrency = 2;
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        process_ranges_concurrently(ranges, max_concurrency, {
+            let current = current.clone();
+            let peak = peak.clone();
+            move |_range| {
+                let current = current.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    sleep(Duration::from_millis(10)).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect("process ranges");
+
+        assert!(peak.load(Ordering::SeqCst) <= max_concurrency);
     }
 }

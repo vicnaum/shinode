@@ -45,11 +45,18 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - Verified: `cargo test --manifest-path node/Cargo.toml` (runtime planning log wiring)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (canonical chain tracker + reorg detection)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (sync runner with checkpoints + reorg rollback)
-- [ ] Maintain a **canonical header chain** (parent links) and detect reorgs
-- [ ] Fetch **block bodies** (or at least tx hashes) so logs/receipts can be associated with tx hashes correctly
-- [ ] Fetch **receipts**, reconstruct missing blooms (eth/69/70), and derive logs with full metadata
-- [ ] **Checkpoint + resume**: idempotent writes, restart safety, and “last indexed block” tracking
-- [ ] Concurrency and peer selection informed by reth patterns (see `spec/reth_kb` Q015/Q016/Q034)
+- [x] Maintain a **canonical header chain** (parent links) and detect reorgs
+- [x] Fetch **block bodies** (or at least tx hashes) so logs/receipts can be associated with tx hashes correctly
+- [x] Fetch **receipts** (eth/69/70) and derive logs with full metadata
+- [ ] Reconstruct missing **blooms** (eth/69/70) for logsBloom validation/serving
+- [x] **Real P2P path**: connect to mainnet peer and fetch headers/bodies/receipts for a range
+- [x] **Checkpoint + resume**: idempotent writes, restart safety, and “last indexed block” tracking
+- [x] Concurrency and peer selection informed by reth patterns (see `spec/reth_kb` Q015/Q016/Q034)
+- [ ] **Follow mode**: loop until head, then keep up with new heads
+- [ ] **Live reorg handling**: detect reorgs while following and roll back checkpoints
+- [ ] **Multi-peer selection + retries/backoff**: rotate peers on failure, limit timeouts
+- Verified: `cargo test --manifest-path node/Cargo.toml` (ingest runner log derivation + concurrency/peer scaffolds)
+- Verified: `cargo run --manifest-path node/Cargo.toml -- --start-block 20000000 --rpc-bind 127.0.0.1:0 --data-dir data-p2p-test` (mainnet peer headers/bodies/receipts + ingest range)
 
 ### v0.1.2 Persistence (queryable, restart-safe)
 - [ ] Schema that supports MVP retention *and* future expansion:

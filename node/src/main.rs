@@ -5,10 +5,9 @@ mod rpc;
 mod storage;
 mod sync;
 
-use chain::MemoryHeadTracker;
 use cli::NodeConfig;
 use eyre::Result;
-use sync::SyncController;
+use sync::IngestOutcome;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -35,18 +34,41 @@ async fn main() -> Result<()> {
         "sync checkpoints loaded"
     );
 
-    let head_tracker = MemoryHeadTracker::new(head_seen);
-    let controller = SyncController::new(head_tracker, DEFAULT_SYNC_BATCH_SIZE);
-    match controller.next_range(&storage, config.start_block)? {
-        Some(range) => info!(
-            range_start = *range.start(),
-            range_end = *range.end(),
-            "planned sync range"
-        ),
-        None => info!("no sync range planned (no head or already at head)"),
-    }
     let rpc_handle = rpc::start(config.rpc_bind, config.chain_id).await?;
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
+
+    let mut _network_session = None;
+    if matches!(config.head_source, cli::HeadSource::P2p) {
+        info!("starting p2p network");
+        let session = p2p::connect_mainnet_peer().await?;
+        info!(
+            peer_id = ?session.peer.peer_id,
+            eth_version = ?session.peer.eth_version,
+            head_number = session.peer.head_number,
+            "p2p peer connected"
+        );
+
+        let source = p2p::NetworkBlockPayloadSource::new(session.peer.clone());
+        let mut ingest = sync::IngestRunner::new(source, DEFAULT_SYNC_BATCH_SIZE);
+        match ingest.run_once(&storage, config.start_block).await? {
+            IngestOutcome::UpToDate { head } => {
+                info!(head, "ingest up to date");
+            }
+            IngestOutcome::RangeApplied { range, logs } => {
+                info!(
+                    range_start = *range.start(),
+                    range_end = *range.end(),
+                    logs = logs.len(),
+                    "ingested range"
+                );
+            }
+            IngestOutcome::Reorg { ancestor_number } => {
+                warn!(ancestor_number, "reorg detected during ingest");
+            }
+        }
+
+        _network_session = Some(session);
+    }
 
     tokio::signal::ctrl_c().await?;
     warn!("shutdown signal received");

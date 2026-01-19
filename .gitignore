@@ -2,5 +2,6 @@
 ./reth/
 target/
 data/
+data-p2p-test/
 .DS_Store
 harness/output/
