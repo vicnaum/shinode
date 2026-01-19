@@ -3,13 +3,18 @@
 use crate::{
     chain::{ChainError, ChainTracker, ChainUpdate, HeadTracker, HeaderStub},
     metrics::range_len,
-    storage::{Storage, StoredLog, StoredLogs, StoredReceipts, StoredTxHashes},
+    storage::{
+        Storage, StoredBlockSize, StoredLog, StoredLogs, StoredReceipts, StoredTransaction,
+        StoredTransactions, StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
+    },
 };
 use async_trait::async_trait;
-use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
+use alloy_consensus::Transaction as _;
+use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, TxKind};
+use alloy_rlp::encode;
 use eyre::Result;
-use reth_ethereum_primitives::Receipt;
-use reth_primitives_traits::{Header, SealedHeader};
+use reth_ethereum_primitives::{Block, BlockBody, Receipt};
+use reth_primitives_traits::{Header, SealedHeader, SignerRecoverable};
 use std::ops::RangeInclusive;
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
@@ -169,11 +174,11 @@ where
     }
 }
 
-/// Full payload for a block: header, tx hashes, receipts.
+/// Full payload for a block: header, body, receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockPayload {
     pub header: Header,
-    pub tx_hashes: Vec<B256>,
+    pub body: BlockBody,
     pub receipts: Vec<Receipt>,
 }
 
@@ -266,7 +271,7 @@ where
         for payload in payloads {
             let BlockPayload {
                 header,
-                tx_hashes,
+                body,
                 receipts,
             } = payload;
             let header_hash = SealedHeader::seal_slow(header.clone()).hash();
@@ -294,6 +299,11 @@ where
                 }
             }
 
+            let tx_hashes = body
+                .transactions
+                .iter()
+                .map(|tx| *tx.hash())
+                .collect::<Vec<_>>();
             if tx_hashes.len() != receipts.len() {
                 return Err(eyre::eyre!(
                     "tx hash count {} does not match receipts count {} for block {}",
@@ -302,6 +312,41 @@ where
                     header.number
                 ));
             }
+
+            let mut stored_transactions = Vec::with_capacity(body.transactions.len());
+            for tx in &body.transactions {
+                let from = tx
+                    .recover_signer_unchecked()
+                    .map_err(|err| eyre::eyre!("failed to recover signer: {err}"))?;
+                let to = match tx.kind() {
+                    TxKind::Call(address) => Some(address),
+                    TxKind::Create => None,
+                };
+                stored_transactions.push(StoredTransaction {
+                    hash: *tx.hash(),
+                    from,
+                    to,
+                    value: tx.value(),
+                    nonce: tx.nonce(),
+                });
+            }
+
+            let stored_withdrawals = StoredWithdrawals {
+                withdrawals: body.withdrawals.as_ref().map(|withdrawals| {
+                    withdrawals
+                        .as_ref()
+                        .iter()
+                        .map(|withdrawal| StoredWithdrawal {
+                            index: withdrawal.index,
+                            validator_index: withdrawal.validator_index,
+                            address: withdrawal.address,
+                            amount: withdrawal.amount,
+                        })
+                        .collect()
+                }),
+            };
+
+            let block_size = block_rlp_size(&header, &body);
 
             let computed_bloom = logs_bloom(
                 receipts
@@ -353,6 +398,14 @@ where
                     hashes: tx_hashes.clone(),
                 },
             )?;
+            storage.write_block_transactions(
+                header.number,
+                StoredTransactions {
+                    txs: stored_transactions,
+                },
+            )?;
+            storage.write_block_withdrawals(header.number, stored_withdrawals)?;
+            storage.write_block_size(header.number, StoredBlockSize { size: block_size })?;
             storage.write_block_receipts(
                 header.number,
                 StoredReceipts {
@@ -373,6 +426,14 @@ where
         }
         Ok(IngestOutcome::RangeApplied { range, logs: derived_logs })
     }
+}
+
+fn block_rlp_size(header: &Header, body: &BlockBody) -> u64 {
+    let block = Block {
+        header: header.clone(),
+        body: body.clone(),
+    };
+    encode(&block).len() as u64
 }
 
 /// Process ranges concurrently with a max concurrency limit.
@@ -418,9 +479,10 @@ mod tests {
         cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode},
         storage::Storage,
     };
-    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
+    use alloy_consensus::{Signed, TxLegacy};
+    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, Signature, TxKind, U256};
     use eyre::Result;
-    use reth_ethereum_primitives::{Receipt, TxType};
+    use reth_ethereum_primitives::{BlockBody, Receipt, Transaction, TransactionSigned, TxType};
     use reth_primitives_traits::{Header, SealedHeader};
     use std::ops::RangeInclusive;
     use std::path::PathBuf;
@@ -680,11 +742,34 @@ mod tests {
             .into_iter()
             .map(receipt_with_logs)
             .collect::<Vec<_>>();
+        let transactions = tx_hashes
+            .iter()
+            .enumerate()
+            .map(|(idx, hash)| signed_legacy_tx(*hash, idx as u64))
+            .collect::<Vec<_>>();
+        let body = BlockBody {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals: None,
+        };
         BlockPayload {
             header,
-            tx_hashes,
+            body,
             receipts,
         }
+    }
+
+    fn signed_legacy_tx(hash: B256, nonce: u64) -> TransactionSigned {
+        let tx = Transaction::Legacy(TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::from(1),
+            input: Bytes::new(),
+        });
+        Signed::new_unchecked(tx, Signature::test_signature(), hash).into()
     }
 
     fn header_with_number(number: u64, parent_hash: B256) -> Header {
@@ -822,6 +907,23 @@ mod tests {
         );
         assert_eq!(
             storage
+                .block_transactions(0)
+                .expect("txs")
+                .expect("txs exist")
+                .txs
+                .len(),
+            2
+        );
+        assert!(
+            storage
+                .block_size(0)
+                .expect("size")
+                .expect("size exists")
+                .size
+                > 0
+        );
+        assert_eq!(
+            storage
                 .block_receipts(0)
                 .expect("receipts")
                 .expect("receipts exist")
@@ -916,6 +1018,9 @@ mod tests {
         assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
         assert!(storage.block_header(2).expect("header lookup").is_none());
         assert!(storage.block_logs(2).expect("logs lookup").is_none());
+        assert!(storage.block_transactions(2).expect("txs lookup").is_none());
+        assert!(storage.block_withdrawals(2).expect("withdrawals lookup").is_none());
+        assert!(storage.block_size(2).expect("size lookup").is_none());
         let addr_index = storage
             .log_index_by_address_range(address_from_u64(2), 2..=2)
             .expect("address index lookup");

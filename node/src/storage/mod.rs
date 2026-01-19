@@ -6,7 +6,7 @@ use crate::cli::{
     DEFAULT_RPC_MAX_LOGS_PER_RESPONSE, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
     DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
 };
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use eyre::{eyre, Result, WrapErr};
 use reth_db::{
     mdbx::{init_db_for, DatabaseArguments, DatabaseEnv},
@@ -30,7 +30,10 @@ use std::{
 use tracing::info;
 
 mod tables {
-    use super::{LogIndexEntry, StoredLogs, StoredReceipts, StoredTxHashes};
+    use super::{
+        LogIndexEntry, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransactions,
+        StoredTxHashes, StoredWithdrawals,
+    };
     use alloy_primitives::{Address, B256};
     use reth_db_api::{table::{DupSort, TableInfo}, tables, TableSet, TableType, TableViewer};
     use reth_primitives_traits::Header;
@@ -53,6 +56,24 @@ mod tables {
         table BlockTxHashes {
             type Key = u64;
             type Value = StoredTxHashes;
+        }
+
+        /// Transactions (metadata, no calldata) per block.
+        table BlockTransactions {
+            type Key = u64;
+            type Value = StoredTransactions;
+        }
+
+        /// Withdrawals per block (post-Shanghai).
+        table BlockWithdrawals {
+            type Key = u64;
+            type Value = StoredWithdrawals;
+        }
+
+        /// RLP-encoded block size in bytes.
+        table BlockSizes {
+            type Key = u64;
+            type Value = StoredBlockSize;
         }
 
         /// Receipts per block.
@@ -94,6 +115,43 @@ const META_HEAD_SEEN_KEY: &str = "head_seen";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
 pub struct StoredTxHashes {
     pub hashes: Vec<B256>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTransaction {
+    pub hash: B256,
+    pub from: Address,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub nonce: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTransactions {
+    pub txs: Vec<StoredTransaction>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWithdrawal {
+    pub index: u64,
+    pub validator_index: u64,
+    pub address: Address,
+    pub amount: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWithdrawals {
+    pub withdrawals: Option<Vec<StoredWithdrawal>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Compact)]
+pub struct StoredBlockSize {
+    pub size: u64,
 }
 
 #[allow(dead_code)]
@@ -182,7 +240,7 @@ macro_rules! impl_compact_value {
     };
 }
 
-impl_compact_value!(StoredTxHashes, LogIndexEntry);
+impl_compact_value!(StoredTxHashes, LogIndexEntry, StoredBlockSize);
 
 impl Compress for StoredReceipts {
     type Compressed = Vec<u8>;
@@ -195,6 +253,38 @@ impl Compress for StoredReceipts {
 }
 
 impl Decompress for StoredReceipts {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
+    }
+}
+
+impl Compress for StoredTransactions {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let encoded =
+            serde_json::to_vec(self).expect("stored transactions serialization should succeed");
+        buf.put_slice(&encoded);
+    }
+}
+
+impl Decompress for StoredTransactions {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
+    }
+}
+
+impl Compress for StoredWithdrawals {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let encoded =
+            serde_json::to_vec(self).expect("stored withdrawals serialization should succeed");
+        buf.put_slice(&encoded);
+    }
+}
+
+impl Decompress for StoredWithdrawals {
     fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
         serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
     }
@@ -470,6 +560,41 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist transaction metadata for a block.
+    #[allow(dead_code)]
+    pub fn write_block_transactions(
+        &self,
+        number: u64,
+        transactions: StoredTransactions,
+    ) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockTransactions>(number, transactions)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist withdrawals for a block (if any).
+    #[allow(dead_code)]
+    pub fn write_block_withdrawals(
+        &self,
+        number: u64,
+        withdrawals: StoredWithdrawals,
+    ) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockWithdrawals>(number, withdrawals)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist the RLP-encoded block size.
+    #[allow(dead_code)]
+    pub fn write_block_size(&self, number: u64, size: StoredBlockSize) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::BlockSizes>(number, size)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Persist receipts for a block.
     #[allow(dead_code)]
     pub fn write_block_receipts(&self, number: u64, receipts: StoredReceipts) -> Result<()> {
@@ -525,6 +650,27 @@ impl Storage {
 
         let mut tx_hashes = tx.cursor_write::<tables::BlockTxHashes>()?;
         let mut walker = tx_hashes.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut transactions = tx.cursor_write::<tables::BlockTransactions>()?;
+        let mut walker = transactions.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut withdrawals = tx.cursor_write::<tables::BlockWithdrawals>()?;
+        let mut walker = withdrawals.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut sizes = tx.cursor_write::<tables::BlockSizes>()?;
+        let mut walker = sizes.walk_range(rollback_start..)?;
         while let Some(entry) = walker.next() {
             entry?;
             walker.delete_current()?;
@@ -587,6 +733,33 @@ impl Storage {
         let hashes = tx.get::<tables::BlockTxHashes>(number)?;
         tx.commit()?;
         Ok(hashes)
+    }
+
+    /// Fetch transaction metadata for a block.
+    #[allow(dead_code)]
+    pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
+        let tx = self.db.tx()?;
+        let transactions = tx.get::<tables::BlockTransactions>(number)?;
+        tx.commit()?;
+        Ok(transactions)
+    }
+
+    /// Fetch withdrawals for a block.
+    #[allow(dead_code)]
+    pub fn block_withdrawals(&self, number: u64) -> Result<Option<StoredWithdrawals>> {
+        let tx = self.db.tx()?;
+        let withdrawals = tx.get::<tables::BlockWithdrawals>(number)?;
+        tx.commit()?;
+        Ok(withdrawals)
+    }
+
+    /// Fetch stored block size.
+    #[allow(dead_code)]
+    pub fn block_size(&self, number: u64) -> Result<Option<StoredBlockSize>> {
+        let tx = self.db.tx()?;
+        let size = tx.get::<tables::BlockSizes>(number)?;
+        tx.commit()?;
+        Ok(size)
     }
 
     /// Fetch receipts for a block.
@@ -761,7 +934,7 @@ fn decode_json<T: DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
+    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, U256};
     use reth_ethereum_primitives::TxType;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -928,6 +1101,83 @@ mod tests {
 
         let logs = storage.block_logs_range(0..=1).expect("logs range");
         assert_eq!(logs.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_block_metadata_roundtrip() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let tx0 = StoredTransaction {
+            hash: B256::from([0x11u8; 32]),
+            from: Address::from([0x01u8; 20]),
+            to: Some(Address::from([0x02u8; 20])),
+            value: U256::from(42),
+            nonce: 7,
+        };
+        let tx1 = StoredTransaction {
+            hash: B256::from([0x22u8; 32]),
+            from: Address::from([0x03u8; 20]),
+            to: None,
+            value: U256::from(7),
+            nonce: 9,
+        };
+        storage
+            .write_block_transactions(1, StoredTransactions { txs: vec![tx0.clone()] })
+            .expect("write txs 1");
+        storage
+            .write_block_transactions(2, StoredTransactions { txs: vec![tx1.clone()] })
+            .expect("write txs 2");
+
+        storage
+            .write_block_withdrawals(
+                1,
+                StoredWithdrawals {
+                    withdrawals: Some(vec![StoredWithdrawal {
+                        index: 0,
+                        validator_index: 1,
+                        address: Address::from([0x10u8; 20]),
+                        amount: 2,
+                    }]),
+                },
+            )
+            .expect("write withdrawals");
+
+        storage
+            .write_block_size(1, StoredBlockSize { size: 1234 })
+            .expect("write size");
+
+        assert_eq!(
+            storage
+                .block_transactions(1)
+                .expect("read txs")
+                .expect("txs exist"),
+            StoredTransactions { txs: vec![tx0] }
+        );
+        assert_eq!(
+            storage
+                .block_transactions(2)
+                .expect("read txs")
+                .expect("txs exist"),
+            StoredTransactions { txs: vec![tx1] }
+        );
+
+        let withdrawals = storage
+            .block_withdrawals(1)
+            .expect("read withdrawals")
+            .expect("withdrawals exist");
+        assert_eq!(withdrawals.withdrawals.as_ref().unwrap().len(), 1);
+
+        assert_eq!(
+            storage
+                .block_size(1)
+                .expect("read size")
+                .expect("size exists"),
+            StoredBlockSize { size: 1234 }
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

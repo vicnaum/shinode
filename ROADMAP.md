@@ -24,8 +24,8 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ### v0.1.0 Product contract + architecture skeleton (no redesign later)
 - [x] **Retention (v0.1 simple default)**:
-  - Store **headers + tx hashes + full receipts/logs** for retained ranges (no log filtering in v0.1)
-  - Defer “filtered logs only” / “tx metadata” / “calldata retention” to later versions
+  - Store **headers + tx hashes + tx metadata (no calldata) + full receipts/logs** for retained ranges (no log filtering in v0.1)
+  - Defer “filtered logs only” / “calldata retention” to later versions
 - [x] **Canonicality & head source contract** (explicit trust model):
   - MVP default: follow a best-effort head from the P2P view and handle reorgs within a rollback window
   - Later option: integrate a local CL or beacon API for finalized/safe head
@@ -136,6 +136,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] Stronger log indexing (topic1-3, composite indexes, partitioning)
 - [ ] Compression tuning (zstd) and cold storage formats (e.g., reth-style static files / NippyJar segments)
 - [ ] Pipeline improvements: overlap headers/receipts/bodies fetching
+- [ ] Optional calldata retention (config/CLI) + full transaction objects
 
 ---
 

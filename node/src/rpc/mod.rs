@@ -177,14 +177,58 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 .into_iter()
                 .map(|tx| format!("{:#x}", tx))
                 .collect::<Vec<_>>();
+            let size = ctx
+                .storage
+                .block_size(number)
+                .map_err(internal_error)?
+                .map(|stored| stored.size)
+                .unwrap_or(0);
+            let withdrawals = ctx
+                .storage
+                .block_withdrawals(number)
+                .map_err(internal_error)?
+                .and_then(|stored| stored.withdrawals)
+                .map(|withdrawals| {
+                    withdrawals
+                        .into_iter()
+                        .map(|withdrawal| RpcWithdrawal {
+                            index: format!("0x{:x}", withdrawal.index),
+                            validator_index: format!("0x{:x}", withdrawal.validator_index),
+                            address: format!("{:#x}", withdrawal.address),
+                            amount: format!("0x{:x}", withdrawal.amount),
+                        })
+                        .collect::<Vec<_>>()
+                });
 
             let response = RpcBlock {
                 number: format!("0x{:x}", header.number),
                 hash: format!("{:#x}", hash),
                 parent_hash: format!("{:#x}", header.parent_hash),
+                nonce: format!("{:#x}", header.nonce),
+                sha3_uncles: format!("{:#x}", header.ommers_hash),
                 timestamp: format!("0x{:x}", header.timestamp),
                 logs_bloom: format!("{:#x}", header.logs_bloom),
+                transactions_root: format!("{:#x}", header.transactions_root),
+                state_root: format!("{:#x}", header.state_root),
+                receipts_root: format!("{:#x}", header.receipts_root),
+                miner: format!("{:#x}", header.beneficiary),
+                difficulty: format!("{:#x}", header.difficulty),
+                total_difficulty: "0x0".to_string(),
+                extra_data: format!("{:#x}", header.extra_data),
+                size: format!("0x{:x}", size),
+                gas_limit: format!("0x{:x}", header.gas_limit),
+                gas_used: format!("0x{:x}", header.gas_used),
                 transactions: txs,
+                uncles: Vec::new(),
+                mix_hash: format!("{:#x}", header.mix_hash),
+                base_fee_per_gas: header.base_fee_per_gas.map(|fee| format!("0x{:x}", fee)),
+                withdrawals_root: header.withdrawals_root.map(|root| format!("{:#x}", root)),
+                withdrawals,
+                blob_gas_used: header.blob_gas_used.map(|gas| format!("0x{:x}", gas)),
+                excess_blob_gas: header.excess_blob_gas.map(|gas| format!("0x{:x}", gas)),
+                parent_beacon_block_root: header
+                    .parent_beacon_block_root
+                    .map(|root| format!("{:#x}", root)),
             };
 
             info!(
@@ -511,9 +555,38 @@ struct RpcBlock {
     number: String,
     hash: String,
     parent_hash: String,
+    nonce: String,
+    sha3_uncles: String,
     timestamp: String,
     logs_bloom: String,
+    transactions_root: String,
+    state_root: String,
+    receipts_root: String,
+    miner: String,
+    difficulty: String,
+    total_difficulty: String,
+    extra_data: String,
+    size: String,
+    gas_limit: String,
+    gas_used: String,
     transactions: Vec<String>,
+    uncles: Vec<String>,
+    mix_hash: String,
+    base_fee_per_gas: Option<String>,
+    withdrawals_root: Option<String>,
+    withdrawals: Option<Vec<RpcWithdrawal>>,
+    blob_gas_used: Option<String>,
+    excess_blob_gas: Option<String>,
+    parent_beacon_block_root: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcWithdrawal {
+    index: String,
+    validator_index: String,
+    address: String,
+    amount: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -743,6 +816,9 @@ mod tests {
             )
             .expect("write tx hashes");
         storage
+            .write_block_size(7, crate::storage::StoredBlockSize { size: 123 })
+            .expect("write size");
+        storage
             .set_last_indexed_block(7)
             .expect("set last indexed");
 
@@ -761,6 +837,105 @@ mod tests {
         assert!(result["hash"].as_str().is_some());
         assert!(result["logsBloom"].as_str().is_some());
         assert_eq!(result["transactions"].as_array().unwrap().len(), 2);
+        assert_eq!(result["totalDifficulty"], Value::String("0x0".to_string()));
+        assert_eq!(result["size"], Value::String("0x7b".to_string()));
+        assert!(result["nonce"].as_str().is_some());
+        assert!(result["sha3Uncles"].as_str().is_some());
+        assert!(result["stateRoot"].as_str().is_some());
+        assert!(result["transactionsRoot"].as_str().is_some());
+        assert!(result["receiptsRoot"].as_str().is_some());
+        assert!(result["mixHash"].as_str().is_some());
+
+        handle.stop().expect("stop server");
+        handle.stopped().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn eth_get_block_by_number_rejects_include_transactions() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
+        storage
+            .write_block_header(1, header_with_number(1))
+            .expect("write header");
+        storage
+            .set_last_indexed_block(1)
+            .expect("set last indexed");
+
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
+        let client = HttpClientBuilder::default()
+            .build(&format!("http://{addr}"))
+            .expect("client");
+
+        let err = client
+            .request::<Value, _>("eth_getBlockByNumber", rpc_params!["latest", true])
+            .await
+            .expect_err("includeTransactions=true should fail");
+        match err {
+            jsonrpsee::core::ClientError::Call(err_obj) => {
+                assert_eq!(err_obj.code(), -32602);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        handle.stop().expect("stop server");
+        handle.stopped().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn eth_get_block_by_number_includes_withdrawals() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
+
+        let mut header = header_with_number(9);
+        header.withdrawals_root = Some(B256::from([0x55u8; 32]));
+        storage
+            .write_block_header(9, header.clone())
+            .expect("write header");
+        storage
+            .write_block_withdrawals(
+                9,
+                crate::storage::StoredWithdrawals {
+                    withdrawals: Some(vec![crate::storage::StoredWithdrawal {
+                        index: 1,
+                        validator_index: 2,
+                        address: Address::from([0x11u8; 20]),
+                        amount: 3,
+                    }]),
+                },
+            )
+            .expect("write withdrawals");
+        storage
+            .set_last_indexed_block(9)
+            .expect("set last indexed");
+
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
+        let client = HttpClientBuilder::default()
+            .build(&format!("http://{addr}"))
+            .expect("client");
+        let result: Value = client
+            .request("eth_getBlockByNumber", rpc_params!["latest", false])
+            .await
+            .expect("block by number");
+
+        let withdrawals = result["withdrawals"].as_array().expect("withdrawals array");
+        assert_eq!(withdrawals.len(), 1);
+        assert_eq!(withdrawals[0]["index"], Value::String("0x1".to_string()));
+        assert_eq!(withdrawals[0]["validatorIndex"], Value::String("0x2".to_string()));
+        assert_eq!(
+            withdrawals[0]["address"],
+            Value::String("0x1111111111111111111111111111111111111111".to_string())
+        );
+        assert_eq!(withdrawals[0]["amount"], Value::String("0x3".to_string()));
+        assert_eq!(
+            result["withdrawalsRoot"],
+            Value::String(format!("{:#x}", header.withdrawals_root.unwrap()))
+        );
 
         handle.stop().expect("stop server");
         handle.stopped().await;

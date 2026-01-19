@@ -344,22 +344,17 @@ async fn fetch_payloads_for_peer(
         .zip(bodies.into_iter())
         .zip(receipts.into_iter())
     {
-        let tx_hashes = body
-            .transactions
-            .iter()
-            .map(|tx| *tx.hash())
-            .collect::<Vec<_>>();
-        if tx_hashes.len() != receipts.len() {
+        if body.transactions.len() != receipts.len() {
             return Err(eyre!(
                 "tx/receipt mismatch for block {}: {} txs vs {} receipts",
                 header.number,
-                tx_hashes.len(),
+                body.transactions.len(),
                 receipts.len()
             ));
         }
         payloads.push(BlockPayload {
             header,
-            tx_hashes,
+            body,
             receipts,
         });
     }

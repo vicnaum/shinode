@@ -8,7 +8,8 @@ subset. It does not execute transactions or keep state.
 
 What works:
 - P2P range backfill from `start_block..head` (single run).
-- MDBX persistence of headers, tx hashes, receipts, logs, and log indexes.
+- MDBX persistence of headers, tx hashes, receipts, logs, log indexes, tx metadata
+  (no calldata), withdrawals, and block size.
 - RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`,
   `eth_getLogs`, with request limits.
 - Graceful shutdown, restart-safe checkpoints, and basic ingest stats.
@@ -82,8 +83,11 @@ settings (verbosity, RPC limits) can be changed freely.
 Implemented:
 - `eth_chainId`
 - `eth_blockNumber`
-- `eth_getBlockByNumber` (with `includeTransactions=false`)
+- `eth_getBlockByNumber` (with `includeTransactions=false`, full block shape)
 - `eth_getLogs` (filtered by block range, address, and topic0)
+
+Notes:
+- `totalDifficulty` is currently mocked to `0x0`.
 
 All other methods are unimplemented and return `-32601`.
 

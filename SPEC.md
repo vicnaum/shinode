@@ -4,9 +4,11 @@ This repo currently contains a working **receipt availability harness** (see App
 
 ## Current status (v0.1.4)
 - Range backfill (single run) using P2P headers/bodies/receipts.
-- MDBX persistence for headers, tx hashes, receipts, logs, and log indexes.
+- MDBX persistence for headers, tx hashes, tx metadata (no calldata), receipts,
+  logs, log indexes, withdrawals, and block size.
 - Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
   `eth_getBlockByNumber`, `eth_getLogs`).
+- `eth_getBlockByNumber` returns full block shape; `totalDifficulty` is mocked to `0x0`.
 - Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
 - Not yet: follow mode, live reorg handling, extra RPC methods, metrics export.
 
@@ -53,10 +55,10 @@ To serve `eth_getLogs` correctly (including `transactionHash`/`transactionIndex`
 
 ### Retention modes (persisted settings)
 Retention is a product-contract decision and must be explicit up-front to avoid DB redesign:
-- **v0.1 (simple default)**: store headers + tx hashes + full receipts/logs for retained ranges
+- **v0.1 (simple default)**: store headers + tx hashes + tx metadata (no calldata) +
+  full receipts/logs + withdrawals for retained ranges
 - **Later (v0.2+)**:
   - optional “filtered logs only” retention
-  - optional minimal tx metadata retention (`from`, `to`, `value`)
   - optional tx calldata retention (`input`)
 
 ### Canonicality and head source (trust model)
