@@ -35,7 +35,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] **Crate/module boundaries** (match reth’s separation of concerns): `p2p`, `sync/ingest`, `chain`, `storage`, `rpc`, `cli/config`
 - [x] **Test strategy**: unit tests for parsing/mapping + integration tests for reorg rollback + RPC conformance fixtures
 - Verified: `cargo test --manifest-path node/Cargo.toml`; `curl -s -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:8545` → `0x1`
-- Verified: `cargo test --manifest-path node/Cargo.toml` (test strategy scaffold)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (test strategy scaffold + storage metadata unit test)
 
 ### v0.1.1 Sync + ingest loop (backfill → follow)
 - [ ] Replace anchor-window probing with **range sync** (`start_block..head`)

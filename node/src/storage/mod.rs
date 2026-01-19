@@ -159,3 +159,55 @@ fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode_json<T: DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
     serde_json::from_slice(&bytes).wrap_err("failed to deserialize metadata")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!("stateless-history-node-test-{now}-{}", std::process::id()));
+        path
+    }
+
+    fn base_config(data_dir: PathBuf) -> NodeConfig {
+        NodeConfig {
+            chain_id: 1,
+            data_dir,
+            rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
+            start_block: 0,
+            rollback_window: 64,
+            retention_mode: RetentionMode::Full,
+            head_source: HeadSource::P2p,
+            reorg_strategy: ReorgStrategy::Delete,
+        }
+    }
+
+    #[test]
+    fn storage_bootstrap_and_config_validation() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+
+        let storage = Storage::open(&config).expect("open storage");
+        drop(storage);
+
+        let storage_again = Storage::open(&config).expect("reopen with same config");
+        drop(storage_again);
+
+        let mut changed = config.clone();
+        changed.chain_id = 2;
+        let err = Storage::open(&changed).expect_err("chain id mismatch should error");
+        let err_string = format!("{err:?}");
+        assert!(
+            err_string.contains("chain_id mismatch"),
+            "unexpected error: {err_string}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
