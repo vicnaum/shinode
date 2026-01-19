@@ -64,3 +64,22 @@ impl NodeConfig {
         Self::parse()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_contract() {
+        let config = NodeConfig::parse_from(["stateless-history-node"]);
+
+        assert_eq!(config.chain_id, 1);
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.rpc_bind, "127.0.0.1:8545".parse().unwrap());
+        assert_eq!(config.start_block, 0);
+        assert_eq!(config.rollback_window, 64);
+        assert_eq!(config.retention_mode, RetentionMode::Full);
+        assert_eq!(config.head_source, HeadSource::P2p);
+        assert_eq!(config.reorg_strategy, ReorgStrategy::Delete);
+    }
+}
