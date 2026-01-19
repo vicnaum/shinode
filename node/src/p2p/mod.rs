@@ -14,11 +14,18 @@ use reth_eth_wire_types::{
 use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network::NetworkHandle;
-use reth_network_api::{NetworkEvent, NetworkEventListenerProvider, PeerId, PeerRequest, PeerRequestSender};
+use reth_network_api::{
+    events::PeerEvent, NetworkEvent, NetworkEventListenerProvider, PeerId, PeerRequest,
+    PeerRequestSender,
+};
 use reth_primitives_traits::{Header, SealedHeader};
 use reth_ethereum_primitives::Receipt;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, RwLock,
+};
 use tokio::sync::oneshot;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// Identifier for a peer in the selection pool.
 #[allow(dead_code)]
@@ -58,6 +65,10 @@ impl PeerSelector for RoundRobinPeerSelector {
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_CHUNK_SIZE: usize = 25;
+const PEER_TARGET: usize = 3;
+const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_PEER_ATTEMPTS: usize = 3;
+const RETRY_BACKOFF_MS: u64 = 250;
 
 /// Active peer session information used for requests.
 #[derive(Clone, Debug)]
@@ -72,11 +83,11 @@ pub struct NetworkPeer {
 #[derive(Debug)]
 pub struct NetworkSession {
     pub _handle: NetworkHandle<EthNetworkPrimitives>,
-    pub peer: NetworkPeer,
+    pub pool: Arc<PeerPool>,
 }
 
-/// Start the devp2p network and wait for the first compatible peer.
-pub async fn connect_mainnet_peer() -> Result<NetworkSession> {
+/// Start the devp2p network and wait for compatible peers.
+pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
     let secret_key = rng_secret_key();
     let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
         .mainnet_boot_nodes()
@@ -89,17 +100,79 @@ pub async fn connect_mainnet_peer() -> Result<NetworkSession> {
         .start_network()
         .await
         .wrap_err("failed to start p2p network")?;
-    let peer = wait_for_peer(&handle).await?;
+    let pool = Arc::new(PeerPool::new(MAX_PEER_ATTEMPTS));
+    spawn_peer_watcher(handle.clone(), Arc::clone(&pool));
+    wait_for_peer_pool(Arc::clone(&pool), PEER_TARGET, PEER_DISCOVERY_TIMEOUT).await;
 
-    Ok(NetworkSession { _handle: handle, peer })
+    Ok(NetworkSession {
+        _handle: handle,
+        pool,
+    })
+}
+
+#[derive(Debug)]
+pub struct PeerPool {
+    peers: RwLock<Vec<NetworkPeer>>,
+    next_index: AtomicUsize,
+    max_attempts: usize,
+}
+
+impl PeerPool {
+    fn new(max_attempts: usize) -> Self {
+        Self {
+            peers: RwLock::new(Vec::new()),
+            next_index: AtomicUsize::new(0),
+            max_attempts: max_attempts.max(1),
+        }
+    }
+
+    fn next_peer(&self) -> Option<NetworkPeer> {
+        let peers = self.peers.read().expect("peer pool lock");
+        let len = peers.len();
+        if len == 0 {
+            return None;
+        }
+        let idx = self.next_index.fetch_add(1, Ordering::Relaxed) % len;
+        Some(peers[idx].clone())
+    }
+
+    fn attempts(&self) -> usize {
+        let len = self.len();
+        self.max_attempts.min(len.max(1))
+    }
+
+    fn best_head(&self) -> Option<u64> {
+        let peers = self.peers.read().expect("peer pool lock");
+        peers.iter().map(|peer| peer.head_number).max()
+    }
+
+    pub fn len(&self) -> usize {
+        let peers = self.peers.read().expect("peer pool lock");
+        peers.len()
+    }
+
+    fn add_peer(&self, peer: NetworkPeer) {
+        let mut peers = self.peers.write().expect("peer pool lock");
+        if peers.iter().any(|existing| existing.peer_id == peer.peer_id) {
+            return;
+        }
+        peers.push(peer);
+    }
+
+    fn remove_peer(&self, peer_id: PeerId) {
+        let mut peers = self.peers.write().expect("peer pool lock");
+        peers.retain(|peer| peer.peer_id != peer_id);
+    }
 }
 
 /// P2P-backed block payload source.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct NetworkBlockPayloadSource {
     peer: NetworkPeer,
 }
 
+#[allow(dead_code)]
 impl NetworkBlockPayloadSource {
     pub fn new(peer: NetworkPeer) -> Self {
         Self { peer }
@@ -113,82 +186,110 @@ impl BlockPayloadSource for NetworkBlockPayloadSource {
     }
 
     async fn blocks_by_number(&self, range: std::ops::RangeInclusive<u64>) -> Result<Vec<BlockPayload>> {
-        let start = *range.start();
-        let end = *range.end();
-        let count = (end - start + 1) as usize;
-
-        let headers = request_headers(&self.peer, start, count).await?;
-        if headers.len() != count {
-            return Err(eyre!(
-                "header count mismatch: expected {}, got {}",
-                count,
-                headers.len()
-            ));
-        }
-
-        let mut header_stubs = Vec::with_capacity(count);
-        let mut hashes = Vec::with_capacity(count);
-        for header in headers {
-            let hash = SealedHeader::seal_slow(header.clone()).hash();
-            header_stubs.push(crate::chain::HeaderStub {
-                number: header.number,
-                hash,
-                parent_hash: header.parent_hash,
-            });
-            hashes.push(hash);
-        }
-
-        let bodies = request_bodies_chunked(&self.peer, &hashes).await?;
-        let receipts = request_receipts_chunked(&self.peer, &hashes).await?;
-
-        let mut payloads = Vec::with_capacity(count);
-        for ((header, body), receipts) in header_stubs
-            .into_iter()
-            .zip(bodies.into_iter())
-            .zip(receipts.into_iter())
-        {
-            let tx_hashes = body
-                .transactions
-                .iter()
-                .map(|tx| *tx.hash())
-                .collect::<Vec<_>>();
-            if tx_hashes.len() != receipts.len() {
-                return Err(eyre!(
-                    "tx/receipt mismatch for block {}: {} txs vs {} receipts",
-                    header.number,
-                    tx_hashes.len(),
-                    receipts.len()
-                ));
-            }
-            payloads.push(BlockPayload {
-                header,
-                tx_hashes,
-                receipts,
-            });
-        }
-
-        Ok(payloads)
+        fetch_payloads_for_peer(&self.peer, range).await
     }
 }
 
-async fn wait_for_peer(handle: &NetworkHandle<EthNetworkPrimitives>) -> Result<NetworkPeer> {
-    let mut events = handle.event_listener();
-    while let Some(event) = events.next().await {
-        if let NetworkEvent::ActivePeerSession { info, messages } = event {
-            if info.status.genesis != MAINNET.genesis_hash() {
-                continue;
-            }
-            let head_number =
-                request_head_number(info.peer_id, info.status.blockhash, &messages).await?;
-            return Ok(NetworkPeer {
-                peer_id: info.peer_id,
-                eth_version: info.version,
-                messages,
-                head_number,
-            });
+/// P2P-backed block payload source with multi-peer retries.
+#[derive(Debug)]
+pub struct MultiPeerBlockPayloadSource {
+    pool: Arc<PeerPool>,
+}
+
+impl MultiPeerBlockPayloadSource {
+    pub fn new(pool: Arc<PeerPool>) -> Self {
+        Self {
+            pool,
         }
     }
-    Err(eyre!("no active peer sessions available"))
+}
+
+#[async_trait]
+impl BlockPayloadSource for MultiPeerBlockPayloadSource {
+    async fn head(&self) -> Result<u64> {
+        self.pool
+            .best_head()
+            .ok_or_else(|| eyre!("no peers available for head"))
+    }
+
+    async fn blocks_by_number(&self, range: std::ops::RangeInclusive<u64>) -> Result<Vec<BlockPayload>> {
+        let mut last_err = None;
+        let attempts = self.pool.attempts();
+
+        for attempt in 0..attempts {
+            let Some(peer) = self.pool.next_peer() else {
+                return Err(eyre!("no peers available for request"));
+            };
+            match fetch_payloads_for_peer(&peer, range.clone()).await {
+                Ok(payloads) => return Ok(payloads),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt + 1 < attempts {
+                        sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| eyre!("all peer attempts failed")))
+    }
+}
+
+fn spawn_peer_watcher(
+    handle: NetworkHandle<EthNetworkPrimitives>,
+    pool: Arc<PeerPool>,
+) {
+    tokio::spawn(async move {
+        let mut events = handle.event_listener();
+        while let Some(event) = events.next().await {
+            match event {
+                NetworkEvent::ActivePeerSession { info, messages } => {
+                    if info.status.genesis != MAINNET.genesis_hash() {
+                        continue;
+                    }
+                    let head_number =
+                        match request_head_number(info.peer_id, info.status.blockhash, &messages)
+                            .await
+                        {
+                            Ok(head_number) => head_number,
+                            Err(_) => continue,
+                        };
+                    pool.add_peer(NetworkPeer {
+                        peer_id: info.peer_id,
+                        eth_version: info.version,
+                        messages,
+                        head_number,
+                    });
+                }
+                NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. })
+                | NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
+                    pool.remove_peer(peer_id);
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+async fn wait_for_peer_pool(
+    pool: Arc<PeerPool>,
+    target: usize,
+    timeout_after: Duration,
+) {
+    let deadline = Instant::now() + timeout_after;
+
+    loop {
+        if pool.len() >= target {
+            break;
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn request_head_number(
@@ -210,6 +311,67 @@ async fn request_headers(
 ) -> Result<Vec<Header>> {
     request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages)
         .await
+}
+
+async fn fetch_payloads_for_peer(
+    peer: &NetworkPeer,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<Vec<BlockPayload>> {
+    let start = *range.start();
+    let end = *range.end();
+    let count = (end - start + 1) as usize;
+
+    let headers = request_headers(peer, start, count).await?;
+    if headers.len() != count {
+        return Err(eyre!(
+            "header count mismatch: expected {}, got {}",
+            count,
+            headers.len()
+        ));
+    }
+
+    let mut header_stubs = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(count);
+    for header in headers {
+        let hash = SealedHeader::seal_slow(header.clone()).hash();
+        header_stubs.push(crate::chain::HeaderStub {
+            number: header.number,
+            hash,
+            parent_hash: header.parent_hash,
+        });
+        hashes.push(hash);
+    }
+
+    let bodies = request_bodies_chunked(peer, &hashes).await?;
+    let receipts = request_receipts_chunked(peer, &hashes).await?;
+
+    let mut payloads = Vec::with_capacity(count);
+    for ((header, body), receipts) in header_stubs
+        .into_iter()
+        .zip(bodies.into_iter())
+        .zip(receipts.into_iter())
+    {
+        let tx_hashes = body
+            .transactions
+            .iter()
+            .map(|tx| *tx.hash())
+            .collect::<Vec<_>>();
+        if tx_hashes.len() != receipts.len() {
+            return Err(eyre!(
+                "tx/receipt mismatch for block {}: {} txs vs {} receipts",
+                header.number,
+                tx_hashes.len(),
+                receipts.len()
+            ));
+        }
+        payloads.push(BlockPayload {
+            header,
+            tx_hashes,
+            receipts,
+        });
+    }
+
+    Ok(payloads)
 }
 
 async fn request_headers_by_number(

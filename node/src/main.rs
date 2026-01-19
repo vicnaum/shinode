@@ -40,15 +40,10 @@ async fn main() -> Result<()> {
     let mut _network_session = None;
     if matches!(config.head_source, cli::HeadSource::P2p) {
         info!("starting p2p network");
-        let session = p2p::connect_mainnet_peer().await?;
-        info!(
-            peer_id = ?session.peer.peer_id,
-            eth_version = ?session.peer.eth_version,
-            head_number = session.peer.head_number,
-            "p2p peer connected"
-        );
+        let session = p2p::connect_mainnet_peers().await?;
+        info!(peers = session.pool.len(), "p2p peers connected");
 
-        let source = p2p::NetworkBlockPayloadSource::new(session.peer.clone());
+        let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let mut ingest = sync::IngestRunner::new(source, DEFAULT_SYNC_BATCH_SIZE);
         match ingest.run_once(&storage, config.start_block).await? {
             IngestOutcome::UpToDate { head } => {

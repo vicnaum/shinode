@@ -48,21 +48,20 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Maintain a **canonical header chain** (parent links) and detect reorgs
 - [x] Fetch **block bodies** (or at least tx hashes) so logs/receipts can be associated with tx hashes correctly
 - [x] Fetch **receipts** (eth/69/70) and derive logs with full metadata
-- [ ] Reconstruct missing **blooms** (eth/69/70) for logsBloom validation/serving
 - [x] **Real P2P path**: connect to mainnet peer and fetch headers/bodies/receipts for a range
 - [x] **Checkpoint + resume**: idempotent writes, restart safety, and “last indexed block” tracking
 - [x] Concurrency and peer selection informed by reth patterns (see `spec/reth_kb` Q015/Q016/Q034)
-- [ ] **Follow mode**: loop until head, then keep up with new heads
-- [ ] **Live reorg handling**: detect reorgs while following and roll back checkpoints
-- [ ] **Multi-peer selection + retries/backoff**: rotate peers on failure, limit timeouts
+- [x] **Multi-peer selection + retries/backoff**: rotate peers on failure, limit timeouts
+- [x] **Continuous peer discovery**: keep listening for sessions and update peer pool
 - Verified: `cargo test --manifest-path node/Cargo.toml` (ingest runner log derivation + concurrency/peer scaffolds)
 - Verified: `cargo run --manifest-path node/Cargo.toml -- --start-block 20000000 --rpc-bind 127.0.0.1:0 --data-dir data-p2p-test` (mainnet peer headers/bodies/receipts + ingest range)
+- Verified: `cargo run --manifest-path node/Cargo.toml -- --start-block 20000000 --rpc-bind 127.0.0.1:0 --data-dir data-p2p-test2` (multi-peer code path; ingest range)
 
 ### v0.1.2 Persistence (queryable, restart-safe)
-- [ ] Schema that supports MVP retention *and* future expansion:
-  - blocks: number, hash, parent, timestamp, `logsBloom`
-  - txs: per-block tx hashes
-  - receipts/logs: enough to answer `eth_getLogs` (and optionally `eth_getTransactionReceipt` later)
+- [ ] Define MDBX tables + codecs for v0.1 retention (blocks, tx hashes, receipts/logs)
+- [ ] Write path: persist headers + tx hashes + receipts/logs during ingest
+- [ ] Compute/persist **logsBloom** from receipts (eth/69/70)
+- [ ] Read path: fetch stored blocks/receipts/logs by number/range (for upcoming RPC)
 - [ ] Indexes for fast `eth_getLogs` (at least by block range + address/topic0)
 - [ ] Reorg rollback: delete data past common ancestor (tombstones/“removed logs” support deferred)
 
@@ -87,6 +86,11 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] CLI/config: chain, start block, retention, DB path, RPC bind, resource limits
 - [ ] Graceful shutdown + safe flushing
 - [ ] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
+- [ ] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
+
+### v0.1.5 Live sync + reorg resilience
+- [ ] **Follow mode**: loop until head, then keep up with new heads
+- [ ] **Live reorg handling**: detect reorgs while following and roll back checkpoints
 
 ### v0.1 release criteria (definition of “usable MVP”)
 - [ ] Fresh start: backfills from configured start block to “head”
@@ -101,7 +105,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] Persist known good peers (warm start)
 - [ ] **Adaptive concurrency control** (avoid throughput dropping when peers increase)
   - Observed: 10 peers → 1150 b/s, 20 peers → 800 b/s, 50 peers → 500 b/s
-- [ ] Better peer scoring/backoff (timeouts, slow peers, disconnect reasons)
+- [ ] Peer scoring/backoff beyond simple rotation (timeouts, slow peers, disconnect reasons)
 - [ ] Backpressure + memory caps for queues
 - [ ] Tests: sync loop + reorg handling + retry/escalation
 - [ ] Metrics export (Prometheus/OTel)
