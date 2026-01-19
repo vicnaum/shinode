@@ -548,6 +548,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_shutdown_stops_server() {
+        let dir = temp_dir();
+        let storage = Arc::new(Storage::open(&base_config(dir.clone())).expect("storage"));
+        let (addr, handle) = start_test_server(1, storage).await;
+        let client = HttpClientBuilder::default()
+            .build(&format!("http://{addr}"))
+            .expect("client");
+        let _: String = client
+            .request("eth_chainId", rpc_params![])
+            .await
+            .expect("chain id");
+
+        handle.stop().expect("stop server");
+        handle.stopped().await;
+
+        let err = client
+            .request::<String, _>("eth_chainId", rpc_params![])
+            .await;
+        assert!(err.is_err(), "expected request to fail after shutdown");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
         let dir = temp_dir();
         let storage = Arc::new(Storage::open(&base_config(dir.clone())).expect("storage"));

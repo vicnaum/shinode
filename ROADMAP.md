@@ -87,18 +87,21 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - optional call traces: `debug_traceBlockByNumber` / `debug_traceBlockByHash`
 - [x] Adopt reth-style query limits (`max_blocks_per_filter`, `max_logs_per_response`) and return a clear error when exceeded
 - [x] Security defaults: bind **localhost by default**, configurable host/port, request/response limits, basic rate limiting
-- [ ] Deferred beyond v0.1: `net_version`, `web3_clientVersion`, tx/receipt endpoints, WS subscriptions
 - Verified: `cargo test --manifest-path node/Cargo.toml` (RPC limits + server config)
 
 ### v0.1.4 Operator experience (minimum to run unattended)
 - [ ] CLI/config: chain, start block, retention, DB path, RPC bind, resource limits
-- [ ] Graceful shutdown + safe flushing
+- [x] Graceful shutdown + safe flushing
 - [ ] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
 - [ ] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (graceful shutdown behavior)
 
 ### v0.1.5 Live sync + reorg resilience
 - [ ] **Follow mode**: loop until head, then keep up with new heads
 - [ ] **Live reorg handling**: detect reorgs while following and roll back checkpoints
+
+### Deferred RPC extras (post v0.1)
+- [ ] `net_version`, `web3_clientVersion`, tx/receipt endpoints, WS subscriptions
 
 ### v0.1 release criteria (definition of “usable MVP”)
 - [ ] Fresh start: backfills from configured start block to “head”

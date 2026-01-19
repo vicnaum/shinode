@@ -68,7 +68,13 @@ async fn main() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     warn!("shutdown signal received");
-    drop(rpc_handle);
+    if let Err(err) = rpc_handle.stop() {
+        warn!(error = %err, "failed to stop rpc server");
+    }
+    rpc_handle.stopped().await;
+    drop(_network_session);
+    drop(storage);
+    warn!("shutdown complete");
 
     Ok(())
 }
