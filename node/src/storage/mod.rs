@@ -9,6 +9,7 @@ use reth_db::{
 };
 use reth_codecs::Compact;
 use reth_db_api::{
+    cursor::DbCursorRO,
     table::{Compress, Decompress},
     transaction::{DbTx, DbTxMut},
     DatabaseError,
@@ -19,6 +20,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    ops::RangeInclusive,
 };
 use tracing::info;
 
@@ -413,6 +415,74 @@ impl Storage {
         Ok(logs)
     }
 
+    /// Fetch canonical headers for an inclusive block range.
+    #[allow(dead_code)]
+    pub fn block_headers_range(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<(u64, Header)>> {
+        let tx = self.db.tx()?;
+        let mut cursor = tx.cursor_read::<tables::BlockHeaders>()?;
+        let mut out = Vec::new();
+        for entry in cursor.walk_range(range)? {
+            let (key, value) = entry?;
+            out.push((key, value));
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Fetch transaction hashes for an inclusive block range.
+    #[allow(dead_code)]
+    pub fn block_tx_hashes_range(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<(u64, StoredTxHashes)>> {
+        let tx = self.db.tx()?;
+        let mut cursor = tx.cursor_read::<tables::BlockTxHashes>()?;
+        let mut out = Vec::new();
+        for entry in cursor.walk_range(range)? {
+            let (key, value) = entry?;
+            out.push((key, value));
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Fetch receipts for an inclusive block range.
+    #[allow(dead_code)]
+    pub fn block_receipts_range(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<(u64, StoredReceipts)>> {
+        let tx = self.db.tx()?;
+        let mut cursor = tx.cursor_read::<tables::BlockReceipts>()?;
+        let mut out = Vec::new();
+        for entry in cursor.walk_range(range)? {
+            let (key, value) = entry?;
+            out.push((key, value));
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Fetch derived logs for an inclusive block range.
+    #[allow(dead_code)]
+    pub fn block_logs_range(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<(u64, StoredLogs)>> {
+        let tx = self.db.tx()?;
+        let mut cursor = tx.cursor_read::<tables::BlockLogs>()?;
+        let mut out = Vec::new();
+        for entry in cursor.walk_range(range)? {
+            let (key, value) = entry?;
+            out.push((key, value));
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     fn read_optional_u64(&self, key: &str) -> Result<Option<u64>> {
         let tx = self.db.tx()?;
         let bytes = tx.get::<tables::Meta>(key.to_string())?;
@@ -443,6 +513,8 @@ fn decode_json<T: DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
+    use reth_ethereum_primitives::TxType;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
@@ -466,6 +538,21 @@ mod tests {
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
         }
+    }
+
+    fn receipt_with_logs(logs: Vec<Log>) -> Receipt {
+        Receipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 0,
+            logs,
+        }
+    }
+
+    fn header_with_number(number: u64) -> Header {
+        let mut header = Header::default();
+        header.number = number;
+        header
     }
 
     #[test]
@@ -495,6 +582,77 @@ mod tests {
             err_string.contains("chain_id mismatch"),
             "unexpected error: {err_string}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_range_reads_roundtrip() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let log0 = Log::new_unchecked(Address::ZERO, vec![B256::ZERO], Bytes::from(vec![0x01]));
+        let log1 = Log::new_unchecked(Address::ZERO, vec![B256::ZERO], Bytes::from(vec![0x02]));
+
+        let receipts0 = vec![receipt_with_logs(vec![log0.clone()])];
+        let receipts1 = vec![receipt_with_logs(vec![log1.clone()])];
+
+        let mut header0 = header_with_number(0);
+        header0.logs_bloom = logs_bloom(
+            receipts0
+                .iter()
+                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
+        );
+        let mut header1 = header_with_number(1);
+        header1.logs_bloom = logs_bloom(
+            receipts1
+                .iter()
+                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
+        );
+
+        storage
+            .write_block_header(0, header0.clone())
+            .expect("write header 0");
+        storage
+            .write_block_header(1, header1.clone())
+            .expect("write header 1");
+        storage
+            .write_block_tx_hashes(0, StoredTxHashes { hashes: vec![B256::ZERO] })
+            .expect("write tx hashes 0");
+        storage
+            .write_block_tx_hashes(1, StoredTxHashes { hashes: vec![B256::ZERO] })
+            .expect("write tx hashes 1");
+        storage
+            .write_block_receipts(0, StoredReceipts { receipts: receipts0.clone() })
+            .expect("write receipts 0");
+        storage
+            .write_block_receipts(1, StoredReceipts { receipts: receipts1.clone() })
+            .expect("write receipts 1");
+        storage
+            .write_block_logs(0, StoredLogs { logs: vec![] })
+            .expect("write logs 0");
+        storage
+            .write_block_logs(1, StoredLogs { logs: vec![] })
+            .expect("write logs 1");
+
+        let headers = storage.block_headers_range(0..=1).expect("headers range");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0, 0);
+        assert_eq!(headers[1].0, 1);
+
+        let hashes = storage
+            .block_tx_hashes_range(0..=1)
+            .expect("hashes range");
+        assert_eq!(hashes.len(), 2);
+
+        let receipts = storage
+            .block_receipts_range(0..=1)
+            .expect("receipts range");
+        assert_eq!(receipts.len(), 2);
+
+        let logs = storage.block_logs_range(0..=1).expect("logs range");
+        assert_eq!(logs.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

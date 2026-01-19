@@ -5,7 +5,7 @@ use crate::{
     storage::{Storage, StoredLog, StoredLogs, StoredReceipts, StoredTxHashes},
 };
 use async_trait::async_trait;
-use alloy_primitives::{Address, B256, Bytes, Log};
+use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
 use eyre::Result;
 use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{Header, SealedHeader};
@@ -281,7 +281,14 @@ where
                 ));
             }
 
-            storage.write_block_header(header.number, header.clone())?;
+            let computed_bloom = logs_bloom(
+                receipts
+                    .iter()
+                    .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
+            );
+            let mut stored_header = header.clone();
+            stored_header.logs_bloom = computed_bloom;
+            storage.write_block_header(header.number, stored_header)?;
 
             let mut block_logs = Vec::new();
             for (tx_index, (tx_hash, receipt)) in tx_hashes
@@ -381,7 +388,7 @@ mod tests {
         cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode},
         storage::Storage,
     };
-    use alloy_primitives::{Address, B256, Bytes, Log};
+    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log};
     use eyre::Result;
     use reth_ethereum_primitives::{Receipt, TxType};
     use reth_primitives_traits::{Header, SealedHeader};
@@ -779,6 +786,21 @@ mod tests {
                 .len(),
             2
         );
+        let stored_header = storage
+            .block_header(0)
+            .expect("block header")
+            .expect("header exists");
+        let stored_receipts = storage
+            .block_receipts(0)
+            .expect("receipts")
+            .expect("receipts exist");
+        let expected_bloom = logs_bloom(
+            stored_receipts
+                .receipts
+                .iter()
+                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
+        );
+        assert_eq!(stored_header.logs_bloom, expected_bloom);
         assert_eq!(
             storage
                 .block_logs(0)
