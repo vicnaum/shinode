@@ -258,7 +258,7 @@ where
             };
             match self.chain.insert_header(header_stub) {
                 Ok(ChainUpdate::Reorg { ancestor_number, .. }) => {
-                    storage.set_last_indexed_block(ancestor_number)?;
+                    storage.rollback_to(ancestor_number)?;
                     return Ok(IngestOutcome::Reorg { ancestor_number });
                 }
                 Ok(_) => {}
@@ -872,6 +872,12 @@ mod tests {
             .expect("reorg ingest");
         assert_eq!(outcome, IngestOutcome::Reorg { ancestor_number: 1 });
         assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
+        assert!(storage.block_header(2).expect("header lookup").is_none());
+        assert!(storage.block_logs(2).expect("logs lookup").is_none());
+        let addr_index = storage
+            .log_index_by_address_range(address_from_u64(2), 2..=2)
+            .expect("address index lookup");
+        assert!(addr_index.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

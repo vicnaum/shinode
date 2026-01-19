@@ -459,6 +459,67 @@ impl Storage {
         Ok(())
     }
 
+    /// Roll back stored data to the provided ancestor block (inclusive).
+    #[allow(dead_code)]
+    pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
+        let rollback_start = ancestor_number.saturating_add(1);
+        let tx = self.db.tx_mut()?;
+
+        let mut headers = tx.cursor_write::<tables::BlockHeaders>()?;
+        let mut walker = headers.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut tx_hashes = tx.cursor_write::<tables::BlockTxHashes>()?;
+        let mut walker = tx_hashes.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut receipts = tx.cursor_write::<tables::BlockReceipts>()?;
+        let mut walker = receipts.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut logs = tx.cursor_write::<tables::BlockLogs>()?;
+        let mut walker = logs.walk_range(rollback_start..)?;
+        while let Some(entry) = walker.next() {
+            entry?;
+            walker.delete_current()?;
+        }
+
+        let mut address_index = tx.cursor_dup_write::<tables::LogIndexByAddress>()?;
+        let mut walker = address_index.walk(None)?;
+        while let Some(entry) = walker.next() {
+            let (_, value) = entry?;
+            if value.block_number > ancestor_number {
+                walker.delete_current()?;
+            }
+        }
+
+        let mut topic_index = tx.cursor_dup_write::<tables::LogIndexByTopic0>()?;
+        let mut walker = topic_index.walk(None)?;
+        while let Some(entry) = walker.next() {
+            let (_, value) = entry?;
+            if value.block_number > ancestor_number {
+                walker.delete_current()?;
+            }
+        }
+
+        tx.put::<tables::Meta>(
+            META_LAST_INDEXED_BLOCK_KEY.to_string(),
+            encode_json(&Some(ancestor_number))?,
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Fetch a canonical header by block number.
     #[allow(dead_code)]
     pub fn block_header(&self, number: u64) -> Result<Option<Header>> {
