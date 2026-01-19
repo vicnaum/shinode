@@ -4,7 +4,7 @@ use crate::storage::{Storage, StoredLog};
 use alloy_primitives::{Address, B256};
 use eyre::{Result, WrapErr};
 use jsonrpsee::{
-    server::{ServerBuilder, ServerHandle},
+    server::{BatchRequestConfig, ServerBuilder, ServerConfig, ServerHandle},
     types::ErrorObjectOwned,
     RpcModule,
 };
@@ -12,6 +12,13 @@ use reth_primitives_traits::SealedHeader;
 use serde::Serialize;
 use serde_json::Value;
 use std::{collections::{BTreeSet, HashMap}, net::SocketAddr, str::FromStr, sync::Arc};
+
+const RPC_MAX_REQUEST_BODY_BYTES: u32 = 5 * 1024 * 1024;
+const RPC_MAX_RESPONSE_BODY_BYTES: u32 = 5 * 1024 * 1024;
+const RPC_MAX_CONNECTIONS: u32 = 100;
+const RPC_MAX_BATCH_REQUESTS: u32 = 10;
+const MAX_BLOCKS_PER_FILTER: u64 = 1000;
+const MAX_LOGS_PER_RESPONSE: usize = 10_000;
 
 #[derive(Clone)]
 pub struct RpcContext {
@@ -21,7 +28,14 @@ pub struct RpcContext {
 
 /// Start the JSON-RPC server and return its handle.
 pub async fn start(bind: SocketAddr, chain_id: u64, storage: Arc<Storage>) -> Result<ServerHandle> {
-    let server = ServerBuilder::default()
+    let config = ServerConfig::builder()
+        .max_request_body_size(RPC_MAX_REQUEST_BODY_BYTES)
+        .max_response_body_size(RPC_MAX_RESPONSE_BODY_BYTES)
+        .max_connections(RPC_MAX_CONNECTIONS)
+        .set_batch_request_config(BatchRequestConfig::Limit(RPC_MAX_BATCH_REQUESTS))
+        .build();
+    let server = ServerBuilder::new()
+        .set_config(config)
         .build(bind)
         .await
         .wrap_err("failed to bind RPC server")?;
@@ -153,6 +167,10 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
             if from_block > to_block {
                 return Ok(Value::Array(Vec::new()));
             }
+            let block_span = to_block.saturating_sub(from_block).saturating_add(1);
+            if block_span > MAX_BLOCKS_PER_FILTER {
+                return Err(invalid_params("block range exceeds max_blocks_per_filter"));
+            }
 
             let address_filter = filter.get("address").map(parse_address_filter).transpose()?;
             let topics_filter = filter.get("topics").map(parse_topics_filter).transpose()?;
@@ -212,6 +230,9 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                         if let Some(log) = logs.iter().find(|log| log.log_index == log_index) {
                             if log_matches(log, address_filter.as_deref(), topics_filter.as_deref()) {
                                 out.push(format_log(log));
+                                if out.len() > MAX_LOGS_PER_RESPONSE {
+                                    return Err(invalid_params("response exceeds max_logs_per_response"));
+                                }
                             }
                         }
                     }
@@ -228,6 +249,9 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                             if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref())
                             {
                                 out.push(format_log(&log));
+                                if out.len() > MAX_LOGS_PER_RESPONSE {
+                                    return Err(invalid_params("response exceeds max_logs_per_response"));
+                                }
                             }
                         }
                     }
@@ -657,6 +681,37 @@ mod tests {
             .expect("get logs");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["blockNumber"], Value::String("0x5".to_string()));
+
+        handle.stop().expect("stop server");
+        handle.stopped().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn eth_get_logs_rejects_large_range() {
+        let dir = temp_dir();
+        let storage = Storage::open(&base_config(dir.clone())).expect("storage");
+        let (addr, handle) = start_test_server(1, Arc::new(storage)).await;
+        let client = HttpClientBuilder::default()
+            .build(&format!("http://{addr}"))
+            .expect("client");
+
+        let to_block = format!("0x{:x}", MAX_BLOCKS_PER_FILTER + 1);
+        let filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock": to_block,
+        });
+
+        let err = client
+            .request::<Vec<Value>, _>("eth_getLogs", rpc_params![filter])
+            .await
+            .expect_err("range too large");
+        match err {
+            jsonrpsee::core::ClientError::Call(err_obj) => {
+                assert_eq!(err_obj.code(), -32602);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
 
         handle.stop().expect("stop server");
         handle.stopped().await;

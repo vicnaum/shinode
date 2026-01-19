@@ -85,9 +85,10 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - optional WS: `eth_subscribe` (`newHeads`) with polling fallback
   - optional receipts: `eth_getBlockReceipts` / `eth_getTransactionReceipt`
   - optional call traces: `debug_traceBlockByNumber` / `debug_traceBlockByHash`
-- [ ] Adopt reth-style query limits (`max_blocks_per_filter`, `max_logs_per_response`) and return a clear error when exceeded
-- [ ] Security defaults: bind **localhost by default**, configurable host/port, request/response limits, basic rate limiting
+- [x] Adopt reth-style query limits (`max_blocks_per_filter`, `max_logs_per_response`) and return a clear error when exceeded
+- [x] Security defaults: bind **localhost by default**, configurable host/port, request/response limits, basic rate limiting
 - [ ] Deferred beyond v0.1: `net_version`, `web3_clientVersion`, tx/receipt endpoints, WS subscriptions
+- Verified: `cargo test --manifest-path node/Cargo.toml` (RPC limits + server config)
 
 ### v0.1.4 Operator experience (minimum to run unattended)
 - [ ] CLI/config: chain, start block, retention, DB path, RPC bind, resource limits
