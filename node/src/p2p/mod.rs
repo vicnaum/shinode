@@ -591,6 +591,11 @@ async fn request_receipts70(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_eth_wire_types::BlockBodies;
+    use reth_network_api::PeerRequestSender;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     #[test]
     fn round_robin_cycles_peers() {
@@ -614,5 +619,54 @@ mod tests {
                 Some("peer-a".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn request_bodies_chunked_splits_partial_responses() {
+        let peer_id = PeerId::random();
+        let (tx, mut rx) = mpsc::channel(8);
+        let messages = PeerRequestSender::new(peer_id, tx);
+        let peer = NetworkPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages,
+            head_number: 0,
+        };
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_task = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Some(request) = rx.recv().await {
+                match request {
+                    PeerRequest::GetBlockBodies { request, response } => {
+                        request_count_task.fetch_add(1, Ordering::SeqCst);
+                        let count = request.0.len();
+                        let body_count = if first {
+                            first = false;
+                            count.saturating_sub(1)
+                        } else {
+                            count
+                        };
+                        let bodies =
+                            vec![reth_ethereum_primitives::BlockBody::default(); body_count];
+                        let _ = response.send(Ok(BlockBodies::from(bodies)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let hashes = vec![
+            B256::from([0x01u8; 32]),
+            B256::from([0x02u8; 32]),
+            B256::from([0x03u8; 32]),
+            B256::from([0x04u8; 32]),
+        ];
+        let bodies = request_bodies_chunked(&peer, &hashes)
+            .await
+            .expect("bodies");
+        assert_eq!(bodies.len(), hashes.len());
+        assert!(request_count.load(Ordering::SeqCst) > 1);
     }
 }
