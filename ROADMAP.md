@@ -30,10 +30,11 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - MVP default: follow a best-effort head from the P2P view and handle reorgs within a rollback window
   - Later option: integrate a local CL or beacon API for finalized/safe head
 - [ ] **Reorg semantics**: rollback window, rollback strategy (v0.1 default: delete-on-rollback), and define what `eth_blockNumber` means (e.g., last fully indexed block)
-- [ ] **Storage choice (early)**: pick a backend that won’t block future work
+- [x] **Storage choice (early)**: pick a backend that won’t block future work
   - Recommended baseline: **MDBX** (reth-style), with a schema designed for later “static files” / cold storage
-- [ ] **Crate/module boundaries** (match reth’s separation of concerns): `p2p`, `sync/ingest`, `chain`, `storage`, `rpc`, `cli/config`
+- [x] **Crate/module boundaries** (match reth’s separation of concerns): `p2p`, `sync/ingest`, `chain`, `storage`, `rpc`, `cli/config`
 - [ ] **Test strategy**: unit tests for parsing/mapping + integration tests for reorg rollback + RPC conformance fixtures
+- Verified: `cargo test --manifest-path node/Cargo.toml`; `curl -s -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:8545` → `0x1`
 
 ### v0.1.1 Sync + ingest loop (backfill → follow)
 - [ ] Replace anchor-window probing with **range sync** (`start_block..head`)

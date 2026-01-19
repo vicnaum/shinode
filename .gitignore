@@ -1,3 +1,4 @@
+./rindexer/
 ./reth/
 target/
 .DS_Store
