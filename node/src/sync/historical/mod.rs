@@ -145,7 +145,6 @@ pub async fn run_benchmark_probe(
                 fetch_probe_batch(&peer, &batch.blocks, receipts_per_request).await;
             match result {
                 Ok(outcome) => {
-                    scheduler.record_peer_success(peer.peer_id).await;
                     let completed: Vec<u64> =
                         outcome.records.iter().map(|record| record.number).collect();
                     if !completed.is_empty() {
@@ -160,6 +159,8 @@ pub async fn run_benchmark_probe(
                         }
                     }
                     if !outcome.missing_blocks.is_empty() {
+                        // Record as partial response - peer returned something but not everything
+                        scheduler.record_peer_partial(peer.peer_id).await;
                         match batch.mode {
                             FetchMode::Normal => {
                                 let newly_failed =
@@ -176,11 +177,14 @@ pub async fn run_benchmark_probe(
                                 }
                             }
                         }
-                        tracing::warn!(
+                        tracing::debug!(
                             peer_id = ?peer.peer_id,
                             missing = outcome.missing_blocks.len(),
                             "probe batch missing receipts or headers"
                         );
+                    } else {
+                        // Full success - reset failure counters
+                        scheduler.record_peer_success(peer.peer_id).await;
                     }
                 }
                 Err(err) => {
@@ -201,7 +205,7 @@ pub async fn run_benchmark_probe(
                         }
                     }
                     stats.record_peer_failure();
-                    tracing::warn!(
+                    tracing::debug!(
                         peer_id = ?peer.peer_id,
                         error = %err,
                         "probe batch failed"
@@ -565,12 +569,12 @@ pub async fn run_ingest_pipeline(
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
-    let peers_to_seed = pool.len();
-    for _ in 0..peers_to_seed {
-        if let Some(peer) = pool.next_peer() {
-            let _ = ready_tx.send(peer);
-        }
-    }
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let peer_feeder_handle = spawn_peer_feeder(
+        Arc::clone(&pool),
+        ready_tx.clone(),
+        shutdown_rx,
+    );
 
     let fetch_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.fast_sync_max_inflight.max(1) as usize,
@@ -656,7 +660,7 @@ pub async fn run_ingest_pipeline(
                             }
                         }
                     }
-                    tracing::warn!(peer_id = ?peer.peer_id, error = %err, "ingest batch failed");
+                    tracing::debug!(peer_id = ?peer.peer_id, error = %err, "ingest batch failed");
                 }
             }
             if let Some(stats) = stats.as_ref() {
@@ -670,6 +674,8 @@ pub async fn run_ingest_pipeline(
     }
 
     while fetch_tasks.join_next().await.is_some() {}
+    let _ = shutdown_tx.send(true);
+    let _ = peer_feeder_handle.await;
     drop(fetched_blocks_tx);
     for handle in processor_handles {
         let _ = handle.await;

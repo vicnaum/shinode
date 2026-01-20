@@ -33,6 +33,7 @@ impl Default for SchedulerConfig {
 #[derive(Debug, Default)]
 struct PeerHealth {
     consecutive_failures: u32,
+    consecutive_partials: u32,
     banned_until: Option<Instant>,
 }
 
@@ -381,7 +382,25 @@ impl PeerWorkScheduler {
         let mut health = self.peer_health.lock().await;
         let entry = health.entry(peer_id).or_default();
         entry.consecutive_failures = 0;
+        entry.consecutive_partials = 0;
         entry.banned_until = None;
+    }
+
+    /// Record a partial response (some blocks returned, some missing).
+    /// This is worse than success but not as bad as a full failure.
+    /// Multiple consecutive partials will lead to a temporary ban.
+    pub async fn record_peer_partial(&self, peer_id: PeerId) {
+        let mut health = self.peer_health.lock().await;
+        let entry = health.entry(peer_id).or_default();
+        // Don't reset consecutive_failures, but increment partials
+        entry.consecutive_partials = entry.consecutive_partials.saturating_add(1);
+        // Ban after 3x the normal threshold of partial responses
+        let partial_threshold = self.config.peer_failure_threshold.saturating_mul(3);
+        if entry.consecutive_partials >= partial_threshold {
+            // Shorter ban for partials (30 seconds instead of 120)
+            entry.banned_until = Some(Instant::now() + Duration::from_secs(30));
+            entry.consecutive_partials = 0;
+        }
     }
 
     /// Record a peer failure and apply bans if needed.

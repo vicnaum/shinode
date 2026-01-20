@@ -544,57 +544,118 @@ fn spawn_progress_updater(
     tokio::spawn(async move {
         let mut window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        let mut initial_sync_done = false;
+        let mut follow_bar: Option<ProgressBar> = None;
+        
         loop {
             ticker.tick().await;
             let peers = peer_pool.len() as u64;
             stats.set_peers(peers, peers);
             let snapshot = stats.snapshot();
-            let processed = snapshot.processed.min(total_len);
-            let now = Instant::now();
-            window.push_back((now, processed));
-            while let Some((t, _)) = window.front() {
-                if now.duration_since(*t) > Duration::from_secs(1) && window.len() > 1 {
-                    window.pop_front();
-                } else {
-                    break;
+            
+            // Check if initial sync is complete and we're now in follow mode
+            if !initial_sync_done {
+                let processed = snapshot.processed.min(total_len);
+                let now = Instant::now();
+                window.push_back((now, processed));
+                while let Some((t, _)) = window.front() {
+                    if now.duration_since(*t) > Duration::from_secs(1) && window.len() > 1 {
+                        window.pop_front();
+                    } else {
+                        break;
+                    }
                 }
-            }
-            let speed = if let (Some((t0, v0)), Some((t1, v1))) =
-                (window.front(), window.back())
-            {
-                let dt = t1.duration_since(*t0).as_secs_f64();
-                if dt > 0.0 && v1 >= v0 {
-                    (v1 - v0) as f64 / dt
+                let speed = if let (Some((t0, v0)), Some((t1, v1))) =
+                    (window.front(), window.back())
+                {
+                    let dt = t1.duration_since(*t0).as_secs_f64();
+                    if dt > 0.0 && v1 >= v0 {
+                        (v1 - v0) as f64 / dt
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.0
+                };
+                let remaining = total_len.saturating_sub(processed) as f64;
+                let eta = if speed > 0.0 {
+                    format!("{:.0}s", remaining / speed)
+                } else {
+                    "--".to_string()
+                };
+                let peers_active = snapshot.peers_active.min(snapshot.peers_total);
+                let msg = format_progress_message(
+                    snapshot.status,
+                    peers_active,
+                    snapshot.peers_total,
+                    snapshot.queue,
+                    snapshot.inflight,
+                    snapshot.failed,
+                    speed,
+                    &eta,
+                );
+                bar.set_message(msg);
+                bar.set_position(processed);
+                
+                // Transition to follow mode when initial sync completes
+                if (snapshot.status == SyncStatus::UpToDate || snapshot.status == SyncStatus::Following)
+                    && snapshot.queue == 0
+                    && snapshot.inflight == 0
+                    && processed >= total_len
+                {
+                    initial_sync_done = true;
+                    bar.finish_and_clear();
+                    
+                    // Create the live follow status bar
+                    let fb = ProgressBar::with_draw_target(
+                        Some(100),
+                        ProgressDrawTarget::stderr_with_hz(2),
+                    );
+                    let style = ProgressStyle::with_template(
+                        "{bar:40.green/black} {msg}",
+                    )
+                    .expect("progress style")
+                    .progress_chars("█▓░");
+                    fb.set_style(style);
+                    fb.set_position(100); // Full green bar
+                    follow_bar = Some(fb);
                 }
             } else {
-                0.0
-            };
-            let remaining = total_len.saturating_sub(processed) as f64;
-            let eta = if speed > 0.0 {
-                format!("{:.0}s", remaining / speed)
-            } else {
-                "--".to_string()
-            };
-            let peers_active = snapshot.peers_active.min(snapshot.peers_total);
-            let msg = format_progress_message(
-                snapshot.status,
-                peers_active,
-                snapshot.peers_total,
-                snapshot.queue,
-                snapshot.inflight,
-                snapshot.failed,
-                speed,
-                &eta,
-            );
-            bar.set_message(msg);
-            bar.set_position(processed);
-            if snapshot.status == SyncStatus::UpToDate
-                && snapshot.queue == 0
-                && snapshot.inflight == 0
-            {
-                break;
+                // Live follow mode - show synced status
+                if let Some(ref fb) = follow_bar {
+                    let head_block = snapshot.head_block;
+                    let head_seen = snapshot.head_seen;
+                    let peers_active = snapshot.peers_active;
+                    
+                    let status_str = if snapshot.status == SyncStatus::Following {
+                        "synced"
+                    } else if snapshot.status == SyncStatus::Fetching {
+                        "catching up"
+                    } else if snapshot.status == SyncStatus::LookingForPeers {
+                        "waiting for peers"
+                    } else {
+                        snapshot.status.as_str()
+                    };
+                    
+                    let msg = format!(
+                        "block {} | head {} | peers {} | {}",
+                        head_block,
+                        head_seen,
+                        peers_active,
+                        status_str,
+                    );
+                    fb.set_message(msg);
+                    
+                    // Adjust bar position based on sync status
+                    if snapshot.status == SyncStatus::Following {
+                        fb.set_position(100);
+                    } else if snapshot.status == SyncStatus::Fetching {
+                        // Show partial progress when catching up
+                        let behind = head_seen.saturating_sub(head_block);
+                        let progress = if behind > 100 { 50 } else { 100 - behind };
+                        fb.set_position(progress);
+                    }
+                }
             }
         }
     });
