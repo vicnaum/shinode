@@ -10,7 +10,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use alloy_consensus::Transaction as _;
-use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, TxKind};
+use alloy_primitives::{Address, B256, Bytes, Log, TxKind};
 use alloy_rlp::encode;
 use eyre::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -700,13 +700,7 @@ where
 
         let block_size = block_rlp_size(&header, &body);
 
-        let computed_bloom = logs_bloom(
-            receipts
-                .iter()
-                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
-        );
-        let mut stored_header = header.clone();
-        stored_header.logs_bloom = computed_bloom;
+        let stored_header = header.clone();
 
         let mut block_logs = Vec::new();
         let mut derived_logs = Vec::new();
@@ -861,13 +855,7 @@ where
                         }
                     }
 
-                    let computed_bloom = logs_bloom(
-                        receipts
-                            .iter()
-                            .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
-                    );
-                    let mut stored_header = header.clone();
-                    stored_header.logs_bloom = computed_bloom;
+                    let stored_header = header.clone();
                     bundles.push(ReceiptBundle {
                         number: header.number,
                         header: stored_header,
@@ -1306,41 +1294,56 @@ mod tests {
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
-        let header0 = header_with_number(0, B256::ZERO);
+        let mut header0 = header_with_number(0, B256::ZERO);
+        let block0_logs = vec![
+            vec![Log::new_unchecked(
+                address_from_u64(1),
+                vec![hash_from_u64(100)],
+                Bytes::from(vec![0x01]),
+            )],
+            vec![Log::new_unchecked(
+                address_from_u64(2),
+                vec![hash_from_u64(200), hash_from_u64(201)],
+                Bytes::from(vec![0x02]),
+            )],
+        ];
+        let expected_bloom0 = logs_bloom(
+            block0_logs
+                .iter()
+                .flat_map(|logs| logs.iter().map(|log| log.as_ref())),
+        );
+        header0.logs_bloom = expected_bloom0;
         let header0_hash = header_hash(&header0);
-        let header1 = header_with_number(1, header0_hash);
+
+        let mut header1 = header_with_number(1, header0_hash);
+        let block1_logs = vec![vec![
+            Log::new_unchecked(
+                address_from_u64(3),
+                vec![hash_from_u64(300)],
+                Bytes::from(vec![0x03]),
+            ),
+            Log::new_unchecked(
+                address_from_u64(4),
+                vec![],
+                Bytes::from(vec![0x04]),
+            ),
+        ]];
+        let expected_bloom1 = logs_bloom(
+            block1_logs
+                .iter()
+                .flat_map(|logs| logs.iter().map(|log| log.as_ref())),
+        );
+        header1.logs_bloom = expected_bloom1;
         let header1_hash = header_hash(&header1);
         let block0 = payload_for_block(
             header0.clone(),
             vec![hash_from_u64(11), hash_from_u64(12)],
-            vec![
-                vec![Log::new_unchecked(
-                    address_from_u64(1),
-                    vec![hash_from_u64(100)],
-                    Bytes::from(vec![0x01]),
-                )],
-                vec![Log::new_unchecked(
-                    address_from_u64(2),
-                    vec![hash_from_u64(200), hash_from_u64(201)],
-                    Bytes::from(vec![0x02]),
-                )],
-            ],
+            block0_logs,
         );
         let block1 = payload_for_block(
             header1.clone(),
             vec![hash_from_u64(13)],
-            vec![vec![
-                Log::new_unchecked(
-                    address_from_u64(3),
-                    vec![hash_from_u64(300)],
-                    Bytes::from(vec![0x03]),
-                ),
-                Log::new_unchecked(
-                    address_from_u64(4),
-                    vec![],
-                    Bytes::from(vec![0x04]),
-                ),
-            ]],
+            block1_logs,
         );
 
         let source = VecPayloadSource {

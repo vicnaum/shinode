@@ -547,7 +547,7 @@ pub async fn run_ingest_pipeline(
 
     let db_config = DbWriteConfig::new(
         config.db_write_batch_blocks,
-        config.db_write_flush_interval_ms,
+        None,
     );
     let db_handle = tokio::spawn(run_db_writer(
         Arc::clone(&storage),

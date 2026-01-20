@@ -13,7 +13,7 @@ pub const DEFAULT_RPC_MAX_LOGS_PER_RESPONSE: u64 = 100_000;
 pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 32;
 pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 15;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 2048;
-pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 32;
+pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 
 /// Retention mode for stored history.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

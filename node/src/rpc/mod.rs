@@ -18,12 +18,7 @@ use jsonrpsee::{
 use reth_primitives_traits::SealedHeader;
 use serde::Serialize;
 use serde_json::Value;
-use std::{
-    collections::{BTreeSet, HashMap},
-    net::SocketAddr,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tracing::info;
 
 #[derive(Clone)]
@@ -305,90 +300,24 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 return Err(invalid_params("block range exceeds max_blocks_per_filter"));
             }
 
-            let mut candidates: Option<BTreeSet<(u64, u64)>> = None;
-            if let Some(addresses) = address_filter.as_ref().filter(|a| !a.is_empty()) {
-                let mut set = BTreeSet::new();
-                for address in addresses {
-                    for entry in ctx
-                        .storage
-                        .log_index_by_address_range(*address, from_block..=to_block)
-                        .map_err(internal_error)?
-                    {
-                        set.insert((entry.block_number, entry.log_index));
+            let mut out = Vec::new();
+            for (_, stored) in ctx
+                .storage
+                .block_logs_range(from_block..=to_block)
+                .map_err(internal_error)?
+            {
+                for log in stored.logs {
+                    if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref()) {
+                        out.push(format_log(&log));
+                        if ctx.config.max_logs_per_response != 0
+                            && out.len() > ctx.config.max_logs_per_response as usize
+                        {
+                            return Err(invalid_params("response exceeds max_logs_per_response"));
+                        }
                     }
                 }
-                candidates = Some(set);
             }
-            if let Some(topic0s) = topic0_filter.as_ref().filter(|t| !t.is_empty()) {
-                let mut set = BTreeSet::new();
-                for topic0 in topic0s {
-                    for entry in ctx
-                        .storage
-                        .log_index_by_topic0_range(*topic0, from_block..=to_block)
-                        .map_err(internal_error)?
-                    {
-                        set.insert((entry.block_number, entry.log_index));
-                    }
-                }
-                candidates = Some(match candidates {
-                    Some(prev) => prev.intersection(&set).cloned().collect(),
-                    None => set,
-                });
-            }
-
-            let logs = match candidates {
-                Some(entries) => {
-                    let mut by_block = HashMap::<u64, Vec<StoredLog>>::new();
-                    let mut out = Vec::new();
-                    for (block_number, log_index) in entries {
-                        if !by_block.contains_key(&block_number) {
-                            let stored = ctx
-                                .storage
-                                .block_logs(block_number)
-                                .map_err(internal_error)?
-                                .map(|stored| stored.logs)
-                                .unwrap_or_default();
-                            by_block.insert(block_number, stored);
-                        }
-                        let logs = by_block
-                            .get(&block_number)
-                            .expect("block logs cached");
-                        if let Some(log) = logs.iter().find(|log| log.log_index == log_index) {
-                                    if log_matches(log, address_filter.as_deref(), topics_filter.as_deref()) {
-                                out.push(format_log(log));
-                                        if ctx.config.max_logs_per_response != 0
-                                            && out.len()
-                                                > ctx.config.max_logs_per_response as usize
-                                        {
-                                    return Err(invalid_params("response exceeds max_logs_per_response"));
-                                }
-                            }
-                        }
-                    }
-                    out
-                }
-                None => {
-                    let mut out = Vec::new();
-                    for (_, stored) in ctx
-                        .storage
-                        .block_logs_range(from_block..=to_block)
-                        .map_err(internal_error)?
-                    {
-                        for log in stored.logs {
-                                    if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref()) {
-                                out.push(format_log(&log));
-                                        if ctx.config.max_logs_per_response != 0
-                                            && out.len()
-                                                > ctx.config.max_logs_per_response as usize
-                                        {
-                                    return Err(invalid_params("response exceeds max_logs_per_response"));
-                                }
-                            }
-                        }
-                    }
-                    out
-                }
-            };
+            let logs = out;
 
             info!(method = "eth_getLogs", logs = logs.len(), "rpc response");
             serde_json::to_value(logs).map_err(internal_error)

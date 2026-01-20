@@ -25,9 +25,11 @@ use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{Header, ValueWithSubKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
+    cmp::Reverse,
+    collections::HashSet,
     net::SocketAddr,
-    path::{Path, PathBuf},
     ops::RangeInclusive,
+    path::{Path, PathBuf},
 };
 use tracing::info;
 
@@ -44,6 +46,12 @@ mod tables {
     tables! {
         /// Stateless history node metadata.
         table Meta {
+            type Key = String;
+            type Value = Vec<u8>;
+        }
+
+        /// Cached peers for warm-starting discovery.
+        table PeerCache {
             type Key = String;
             type Value = Vec<u8>;
         }
@@ -200,6 +208,24 @@ pub struct StoredLog {
     pub log_index: u64,
     pub removed: bool,
     pub data: Bytes,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPeer {
+    pub peer_id: String,
+    pub tcp_addr: SocketAddr,
+    pub udp_addr: Option<SocketAddr>,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCacheLoad {
+    pub peers: Vec<StoredPeer>,
+    pub total: usize,
+    pub expired: usize,
+    pub corrupted: usize,
+    pub capped: usize,
 }
 
 #[allow(dead_code)]
@@ -466,6 +492,15 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Open existing MDBX environment if it already exists.
+    pub fn open_existing(config: &NodeConfig) -> Result<Option<Self>> {
+        let db_path = config.data_dir.join("db");
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Self::open(config)?))
+    }
+
     fn bootstrap(&self, config: &NodeConfig, db_path: &Path) -> Result<()> {
         let tx = self.db.tx()?;
         let schema_bytes = tx.get::<tables::Meta>(META_SCHEMA_VERSION_KEY.to_string())?;
@@ -656,17 +691,6 @@ impl Storage {
             tx.put::<tables::BlockSizes>(bundle.number, bundle.size)?;
             tx.put::<tables::BlockReceipts>(bundle.number, bundle.receipts.clone())?;
             tx.put::<tables::BlockLogs>(bundle.number, bundle.logs.clone())?;
-
-            for log in &bundle.logs.logs {
-                let entry = LogIndexEntry {
-                    block_number: log.block_number,
-                    log_index: log.log_index,
-                };
-                tx.put::<tables::LogIndexByAddress>(log.address, entry)?;
-                if let Some(topic0) = log.topics.first().copied() {
-                    tx.put::<tables::LogIndexByTopic0>(topic0, entry)?;
-                }
-            }
         }
 
         let last_number = bundles
@@ -1026,6 +1050,81 @@ impl Storage {
         tx.commit()?;
         Ok(())
     }
+
+    /// Insert or update a cached peer entry.
+    pub fn upsert_peer(&self, peer: StoredPeer) -> Result<()> {
+        let tx = self.db.tx_mut()?;
+        tx.put::<tables::PeerCache>(peer.peer_id.clone(), encode_json(&peer)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load cached peers, pruning expired entries and enforcing a cap.
+    pub fn load_peers(
+        &self,
+        expire_before_ms: u64,
+        max_peers: usize,
+    ) -> Result<PeerCacheLoad> {
+        let mut peers: Vec<StoredPeer> = Vec::new();
+        let mut total = 0usize;
+        let mut expired = 0usize;
+        let mut corrupted = 0usize;
+        let mut capped = 0usize;
+        let tx = self.db.tx_mut()?;
+        {
+            let mut cursor = tx.cursor_write::<tables::PeerCache>()?;
+            let mut walker = cursor.walk(None)?;
+            while let Some(entry) = walker.next() {
+                let (peer_id, bytes) = entry?;
+                total += 1;
+                let mut stored: StoredPeer = match decode_json(bytes) {
+                    Ok(stored) => stored,
+                    Err(_) => {
+                        corrupted += 1;
+                        walker.delete_current()?;
+                        continue;
+                    }
+                };
+                if stored.peer_id.is_empty() {
+                    stored.peer_id = peer_id.clone();
+                }
+                if stored.last_seen_ms < expire_before_ms {
+                    expired += 1;
+                    walker.delete_current()?;
+                    continue;
+                }
+                peers.push(stored);
+            }
+        }
+
+        peers.sort_by_key(|peer| Reverse(peer.last_seen_ms));
+        if peers.len() > max_peers {
+            capped = peers.len().saturating_sub(max_peers);
+            let keep: HashSet<String> = peers
+                .iter()
+                .take(max_peers)
+                .map(|peer| peer.peer_id.clone())
+                .collect();
+            let mut cursor = tx.cursor_write::<tables::PeerCache>()?;
+            let mut walker = cursor.walk(None)?;
+            while let Some(entry) = walker.next() {
+                let (peer_id, _) = entry?;
+                if !keep.contains(&peer_id) {
+                    walker.delete_current()?;
+                }
+            }
+            peers.truncate(max_peers);
+        }
+
+        tx.commit()?;
+        Ok(PeerCacheLoad {
+            peers,
+            total,
+            expired,
+            corrupted,
+            capped,
+        })
+    }
 }
 
 fn log_index_subkey(block_number: u64) -> u64 {
@@ -1043,11 +1142,11 @@ fn decode_json<T: DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, U256};
+    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, Signature, U256};
     use reth_primitives_traits::SealedHeader;
     use reth_ethereum_primitives::TxType;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1228,14 +1327,18 @@ mod tests {
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("open storage");
 
+        let sig0 = Signature::new(U256::from(1), U256::from(2), false);
+        let sig1 = Signature::new(U256::from(3), U256::from(4), true);
+        let sig_hash0 = B256::from([0x44u8; 32]);
+        let sig_hash1 = B256::from([0x55u8; 32]);
         let tx0 = StoredTransaction {
             hash: B256::from([0x11u8; 32]),
             from: Some(Address::from([0x01u8; 20])),
             to: Some(Address::from([0x02u8; 20])),
             value: U256::from(42),
             nonce: 7,
-            signature: None,
-            signing_hash: None,
+            signature: Some(sig0),
+            signing_hash: Some(sig_hash0),
         };
         let tx1 = StoredTransaction {
             hash: B256::from([0x22u8; 32]),
@@ -1243,8 +1346,8 @@ mod tests {
             to: None,
             value: U256::from(7),
             nonce: 9,
-            signature: None,
-            signing_hash: None,
+            signature: Some(sig1),
+            signing_hash: Some(sig_hash1),
         };
         storage
             .write_block_transactions(1, StoredTransactions { txs: vec![tx0.clone()] })
@@ -1432,7 +1535,7 @@ mod tests {
         let addr_index = storage
             .log_index_by_address_range(Address::from([0x01u8; 20]), 0..=0)
             .expect("address index lookup");
-        assert_eq!(addr_index.len(), 1);
+        assert!(addr_index.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1486,6 +1589,66 @@ mod tests {
             .log_index_by_address_range(Address::ZERO, 6..=10)
             .expect("address range query");
         assert!(empty.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_peer_cache_prunes_and_caps() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time moves forward")
+            .as_millis() as u64;
+        let day_ms = Duration::from_secs(24 * 60 * 60).as_millis() as u64;
+        let expire_before = now_ms.saturating_sub(day_ms.saturating_mul(7));
+
+        let expired = StoredPeer {
+            peer_id: "peer-expired".to_string(),
+            tcp_addr: "127.0.0.1:30303".parse().expect("valid addr"),
+            udp_addr: None,
+            last_seen_ms: now_ms.saturating_sub(day_ms.saturating_mul(8)),
+        };
+        let recent1 = StoredPeer {
+            peer_id: "peer-recent-1".to_string(),
+            tcp_addr: "127.0.0.2:30303".parse().expect("valid addr"),
+            udp_addr: Some("127.0.0.2:30303".parse().expect("valid addr")),
+            last_seen_ms: now_ms.saturating_sub(day_ms.saturating_mul(2)),
+        };
+        let recent2 = StoredPeer {
+            peer_id: "peer-recent-2".to_string(),
+            tcp_addr: "127.0.0.3:30303".parse().expect("valid addr"),
+            udp_addr: None,
+            last_seen_ms: now_ms.saturating_sub(day_ms),
+        };
+        let recent3 = StoredPeer {
+            peer_id: "peer-recent-3".to_string(),
+            tcp_addr: "127.0.0.4:30303".parse().expect("valid addr"),
+            udp_addr: None,
+            last_seen_ms: now_ms,
+        };
+
+        storage.upsert_peer(expired).expect("insert expired");
+        storage.upsert_peer(recent1).expect("insert recent1");
+        storage.upsert_peer(recent2).expect("insert recent2");
+        storage.upsert_peer(recent3).expect("insert recent3");
+
+        let load = storage
+            .load_peers(expire_before, 2)
+            .expect("load peers");
+        assert_eq!(load.total, 4);
+        assert_eq!(load.expired, 1);
+        assert_eq!(load.capped, 1);
+        assert_eq!(load.peers.len(), 2);
+        assert_eq!(load.peers[0].peer_id, "peer-recent-3");
+        assert_eq!(load.peers[1].peer_id, "peer-recent-2");
+
+        let peers_after = storage.load_peers(0, 10).expect("load peers");
+        assert_eq!(peers_after.total, 2);
+        assert_eq!(peers_after.peers.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -7,11 +7,13 @@ use crate::storage::{
 use crate::sync::{BlockPayload};
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
 use crate::sync::historical::types::{FetchedBlock, ProbeRecord};
-use alloy_consensus::Transaction as _;
-use alloy_primitives::{logs_bloom, TxKind};
+use alloy_consensus::{SignableTransaction, Transaction as _};
+use alloy_primitives::{B256, Keccak256, TxKind};
+use bytes::buf::UninitSlice;
 use eyre::{eyre, Result};
-use reth_ethereum_primitives::{Block, BlockBody};
+use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
 use reth_primitives_traits::SealedHeader;
+use std::mem::MaybeUninit;
 use std::time::Instant;
 
 /// Process a fetched block in probe mode.
@@ -23,6 +25,74 @@ pub fn process_probe(block: FetchedBlock) -> ProbeRecord {
         receipts,
         timing: block.timing,
     }
+}
+
+const KECCAK_SCRATCH_LEN: usize = 4096;
+
+struct KeccakBuf {
+    hasher: Keccak256,
+    scratch: [MaybeUninit<u8>; KECCAK_SCRATCH_LEN],
+}
+
+impl KeccakBuf {
+    fn new() -> Self {
+        Self {
+            hasher: Keccak256::new(),
+            scratch: [MaybeUninit::uninit(); KECCAK_SCRATCH_LEN],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.hasher = Keccak256::new();
+    }
+
+    fn finalize_reset(&mut self) -> B256 {
+        let hasher = std::mem::replace(&mut self.hasher, Keccak256::new());
+        hasher.finalize()
+    }
+}
+
+unsafe impl bytes::BufMut for KeccakBuf {
+    fn remaining_mut(&self) -> usize {
+        usize::MAX
+    }
+
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        UninitSlice::uninit(&mut self.scratch)
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        if cnt == 0 {
+            return;
+        }
+        debug_assert!(cnt <= self.scratch.len());
+        let slice = std::slice::from_raw_parts(self.scratch.as_ptr().cast::<u8>(), cnt);
+        self.hasher.update(slice);
+    }
+}
+
+fn tx_hash_fast(buf: &mut KeccakBuf, tx: &TransactionSigned) -> B256 {
+    buf.reset();
+    match tx {
+        TransactionSigned::Legacy(signed) => signed.eip2718_encode(buf),
+        TransactionSigned::Eip2930(signed) => signed.eip2718_encode(buf),
+        TransactionSigned::Eip1559(signed) => signed.eip2718_encode(buf),
+        TransactionSigned::Eip4844(signed) => signed.eip2718_encode(buf),
+        TransactionSigned::Eip7702(signed) => signed.eip2718_encode(buf),
+    }
+    buf.finalize_reset()
+}
+
+fn signing_hash_fast(buf: &mut KeccakBuf, tx: &TransactionSigned) -> B256 {
+    buf.reset();
+    match tx {
+        TransactionSigned::Legacy(signed) => signed.tx().encode_for_signing(buf),
+        TransactionSigned::Eip2930(signed) => signed.tx().encode_for_signing(buf),
+        TransactionSigned::Eip1559(signed) => signed.tx().encode_for_signing(buf),
+        TransactionSigned::Eip4844(signed) => signed.tx().encode_for_signing(buf),
+        TransactionSigned::Eip7702(signed) => signed.tx().encode_for_signing(buf),
+    }
+    buf.finalize_reset()
 }
 
 /// Process a full payload into a storage bundle (ingest mode).
@@ -43,10 +113,11 @@ pub fn process_ingest(
     let header_hash_us = header_hash_start.elapsed().as_micros() as u64;
 
     let tx_hashes_start = Instant::now();
+    let mut tx_hasher = KeccakBuf::new();
     let tx_hashes = body
         .transactions
         .iter()
-        .map(|tx| *tx.hash())
+        .map(|tx| tx_hash_fast(&mut tx_hasher, tx))
         .collect::<Vec<_>>();
     let tx_hashes_us = tx_hashes_start.elapsed().as_micros() as u64;
     if tx_hashes.len() != receipts.len() {
@@ -59,17 +130,18 @@ pub fn process_ingest(
     }
 
     let txs_start = Instant::now();
+    let mut signing_hasher = KeccakBuf::new();
     let mut stored_transactions = Vec::with_capacity(body.transactions.len());
-    for tx in &body.transactions {
+    for (tx, tx_hash) in body.transactions.iter().zip(tx_hashes.iter()) {
         let value = tx.value();
         let signature = tx.signature().clone();
-        let signing_hash = tx.signature_hash();
+        let signing_hash = signing_hash_fast(&mut signing_hasher, tx);
         let to = match tx.kind() {
             TxKind::Call(address) => Some(address),
             TxKind::Create => None,
         };
         stored_transactions.push(StoredTransaction {
-            hash: *tx.hash(),
+            hash: *tx_hash,
             from: None,
             to,
             value,
@@ -101,15 +173,7 @@ pub fn process_ingest(
     let block_size = block_rlp_size(&header, &body);
     let block_size_us = block_size_start.elapsed().as_micros() as u64;
 
-    let bloom_start = Instant::now();
-    let computed_bloom = logs_bloom(
-        receipts
-            .iter()
-            .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
-    );
-    let logs_bloom_us = bloom_start.elapsed().as_micros() as u64;
-    let mut stored_header = header.clone();
-    stored_header.logs_bloom = computed_bloom;
+    let stored_header = header.clone();
 
     let logs_start = Instant::now();
     let mut block_logs = Vec::new();
@@ -160,7 +224,6 @@ pub fn process_ingest(
             transactions_us,
             withdrawals_us,
             block_size_us,
-            logs_bloom_us,
             logs_build_us,
         });
     }

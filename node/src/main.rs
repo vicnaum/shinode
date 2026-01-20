@@ -89,8 +89,10 @@ async fn main() -> Result<()> {
         if !matches!(config.head_source, cli::HeadSource::P2p) {
             return Err(eyre::eyre!("benchmark probe requires --head-source p2p"));
         }
+        let peer_cache = storage::Storage::open_existing(&config)?
+            .map(Arc::new);
         info!("starting p2p network");
-        let session = p2p::connect_mainnet_peers().await?;
+        let session = p2p::connect_mainnet_peers(peer_cache).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
         let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let head_at_startup = source.head().await?;
@@ -100,8 +102,16 @@ async fn main() -> Result<()> {
             head_at_startup,
             config.rollback_window,
         );
-        sync::historical::run_benchmark_probe(&config, session.pool, range, head_at_startup)
+        sync::historical::run_benchmark_probe(
+            &config,
+            Arc::clone(&session.pool),
+            range,
+            head_at_startup,
+        )
             .await?;
+        if let Err(err) = session.flush_peer_cache() {
+            warn!(error = %err, "failed to flush peer cache");
+        }
         return Ok(());
     }
 
@@ -118,7 +128,7 @@ async fn main() -> Result<()> {
         let storage = Arc::new(storage::Storage::open(&config)?);
 
         info!("starting p2p network");
-        let session = p2p::connect_mainnet_peers().await?;
+        let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
         let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let head_at_startup = source.head().await?;
@@ -198,6 +208,9 @@ async fn main() -> Result<()> {
         );
         let summary_json = serde_json::to_string_pretty(&summary)?;
         println!("{summary_json}");
+        if let Err(err) = session.flush_peer_cache() {
+            warn!(error = %err, "failed to flush peer cache");
+        }
         return Ok(());
     }
 
@@ -224,7 +237,7 @@ async fn main() -> Result<()> {
     let mut _network_session = None;
     if matches!(config.head_source, cli::HeadSource::P2p) {
         info!("starting p2p network");
-        let session = p2p::connect_mainnet_peers().await?;
+        let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
         let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let initial_head = source.head().await?;
@@ -367,6 +380,11 @@ async fn main() -> Result<()> {
         warn!(error = %err, "failed to stop rpc server");
     }
     rpc_handle.stopped().await;
+    if let Some(session) = _network_session.as_ref() {
+        if let Err(err) = session.flush_peer_cache() {
+            warn!(error = %err, "failed to flush peer cache");
+        }
+    }
     drop(_network_session);
     drop(storage);
     warn!("shutdown complete");

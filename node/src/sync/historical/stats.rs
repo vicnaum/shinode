@@ -225,7 +225,6 @@ pub struct ProcessTiming {
     pub transactions_us: u64,
     pub withdrawals_us: u64,
     pub block_size_us: u64,
-    pub logs_bloom_us: u64,
     pub logs_build_us: u64,
 }
 
@@ -247,7 +246,6 @@ pub struct IngestBenchStats {
     process_transactions_us: AtomicU64,
     process_withdrawals_us: AtomicU64,
     process_block_size_us: AtomicU64,
-    process_logs_bloom_us: AtomicU64,
     process_logs_build_us: AtomicU64,
     db_write_blocks: AtomicU64,
     db_write_batches: AtomicU64,
@@ -273,7 +271,6 @@ impl IngestBenchStats {
             process_transactions_us: AtomicU64::new(0),
             process_withdrawals_us: AtomicU64::new(0),
             process_block_size_us: AtomicU64::new(0),
-            process_logs_bloom_us: AtomicU64::new(0),
             process_logs_build_us: AtomicU64::new(0),
             db_write_blocks: AtomicU64::new(0),
             db_write_batches: AtomicU64::new(0),
@@ -309,8 +306,6 @@ impl IngestBenchStats {
             .fetch_add(timing.withdrawals_us, Ordering::SeqCst);
         self.process_block_size_us
             .fetch_add(timing.block_size_us, Ordering::SeqCst);
-        self.process_logs_bloom_us
-            .fetch_add(timing.logs_bloom_us, Ordering::SeqCst);
         self.process_logs_build_us
             .fetch_add(timing.logs_build_us, Ordering::SeqCst);
     }
@@ -367,7 +362,6 @@ impl IngestBenchStats {
             transactions_us: self.process_transactions_us.load(Ordering::SeqCst),
             withdrawals_us: self.process_withdrawals_us.load(Ordering::SeqCst),
             block_size_us: self.process_block_size_us.load(Ordering::SeqCst),
-            logs_bloom_us: self.process_logs_bloom_us.load(Ordering::SeqCst),
             logs_build_us: self.process_logs_build_us.load(Ordering::SeqCst),
         };
         let process_breakdown_avg = ProcessBreakdownSummary {
@@ -376,7 +370,6 @@ impl IngestBenchStats {
             transactions_us: avg_us(process_breakdown.transactions_us, process_blocks),
             withdrawals_us: avg_us(process_breakdown.withdrawals_us, process_blocks),
             block_size_us: avg_us(process_breakdown.block_size_us, process_blocks),
-            logs_bloom_us: avg_us(process_breakdown.logs_bloom_us, process_blocks),
             logs_build_us: avg_us(process_breakdown.logs_build_us, process_blocks),
         };
 
@@ -494,7 +487,6 @@ pub struct ProcessBreakdownSummary {
     pub transactions_us: u64,
     pub withdrawals_us: u64,
     pub block_size_us: u64,
-    pub logs_bloom_us: u64,
     pub logs_build_us: u64,
 }
 

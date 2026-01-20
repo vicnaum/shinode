@@ -62,13 +62,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Write path: persist headers + tx hashes + receipts/logs during ingest
 - [x] Compute/persist **logsBloom** from receipts (eth/69/70)
 - [x] Read path: fetch stored blocks/receipts/logs by number/range (for upcoming RPC)
-- [x] Indexes for fast `eth_getLogs` (at least by block range + address/topic0)
+- [ ] Indexes for fast `eth_getLogs` (address/topic0) — deferred to post-sync indexing
 - [x] Reorg rollback: delete data past common ancestor (tombstones/“removed logs” support deferred)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (tables + codecs compile)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (ingest writes + storage reads)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (logsBloom persisted from receipts)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (range reads for headers/receipts/logs)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (log index tables + queries)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (log index tables + query helpers)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (rollback deletes block/index data)
 
 ### v0.1.3 JSON-RPC server (indexer-compatible subset)
@@ -109,6 +109,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] Atomic per-chunk MDBX writes + checkpoint updates
 - [ ] Safe boundary switch to slow path near the reorg window
 - [ ] Progress bar: harness-style status line (peers/queue/inflight/speed/eta)
+- [ ] Post-sync log index build (address/topic0) to restore fast `eth_getLogs`
 
 ### v0.1.6 Live sync + reorg resilience
 - [ ] **Follow mode**: loop until head, then keep up with new heads

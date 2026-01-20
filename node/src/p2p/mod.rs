@@ -1,7 +1,7 @@
 //! P2P subsystem.
 
-use crate::sync::{BlockPayload, BlockPayloadSource};
-use crate::sync::ReceiptPayload;
+use crate::storage::{Storage, StoredPeer};
+use crate::sync::{BlockPayload, BlockPayloadSource, ReceiptPayload};
 use alloy_primitives::B256;
 use async_trait::async_trait;
 use eyre::{eyre, Result, WrapErr};
@@ -17,15 +17,28 @@ use reth_network::PeersConfig;
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network::NetworkHandle;
 use reth_network_api::{
-    events::PeerEvent, NetworkEvent, NetworkEventListenerProvider, PeerId, PeerRequest,
+    events::PeerEvent,
+    DiscoveryEvent,
+    DiscoveredEvent,
+    NetworkEvent,
+    NetworkEventListenerProvider,
+    PeerId,
+    PeerKind,
+    PeerRequest,
     PeerRequestSender,
+    Peers,
 };
-use tracing::warn;
+use tracing::{info, warn};
 use reth_primitives_traits::{Header, SealedHeader};
 use reth_ethereum_primitives::Receipt;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, RwLock,
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -67,7 +80,6 @@ impl PeerSelector for RoundRobinPeerSelector {
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
-const PEER_TARGET: usize = 15;
 const MIN_PEER_START: usize = 1;
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PEER_ATTEMPTS: usize = 3;
@@ -76,6 +88,54 @@ const MAX_OUTBOUND: usize = 400;
 const MAX_CONCURRENT_DIALS: usize = 100;
 const PEER_REFILL_INTERVAL_MS: u64 = 500;
 const MAX_HEADERS_PER_REQUEST: usize = 1024;
+const PEER_CACHE_TTL_DAYS: u64 = 7;
+const PEER_CACHE_MAX: usize = 5000;
+
+#[derive(Debug)]
+struct PeerCacheBuffer {
+    closed: AtomicBool,
+    peers: RwLock<HashMap<String, StoredPeer>>,
+}
+
+impl PeerCacheBuffer {
+    fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            peers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn upsert(&self, peer: StoredPeer) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut peers = self.peers.write().expect("peer cache lock");
+        match peers.get_mut(&peer.peer_id) {
+            Some(existing) => {
+                existing.last_seen_ms = existing.last_seen_ms.max(peer.last_seen_ms);
+                existing.tcp_addr = peer.tcp_addr;
+                if peer.udp_addr.is_some() {
+                    existing.udp_addr = peer.udp_addr;
+                }
+            }
+            None => {
+                peers.insert(peer.peer_id.clone(), peer);
+            }
+        }
+    }
+
+    fn close_and_drain(&self) -> Vec<StoredPeer> {
+        self.closed.store(true, Ordering::SeqCst);
+        let mut peers = self.peers.write().expect("peer cache lock");
+        peers.drain().map(|(_, peer)| peer).collect()
+    }
+}
+
+#[derive(Debug)]
+struct PeerCacheHandle {
+    storage: Arc<Storage>,
+    buffer: Arc<PeerCacheBuffer>,
+}
 
 /// Active peer session information used for requests.
 #[derive(Clone, Debug)]
@@ -91,10 +151,11 @@ pub struct NetworkPeer {
 pub struct NetworkSession {
     pub _handle: NetworkHandle<EthNetworkPrimitives>,
     pub pool: Arc<PeerPool>,
+    peer_cache: Option<PeerCacheHandle>,
 }
 
 /// Start the devp2p network and wait for compatible peers.
-pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
+pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<NetworkSession> {
     let secret_key = rng_secret_key();
     let peers_config = PeersConfig::default()
         .with_max_outbound(MAX_OUTBOUND)
@@ -113,25 +174,56 @@ pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
         .await
         .wrap_err("failed to start p2p network")?;
     let pool = Arc::new(PeerPool::new(MAX_PEER_ATTEMPTS));
-    spawn_peer_watcher(handle.clone(), Arc::clone(&pool));
-    let connected = wait_for_peer_pool(
+    let peer_cache = storage.map(|storage| PeerCacheHandle {
+        storage,
+        buffer: Arc::new(PeerCacheBuffer::new()),
+    });
+    if let Some(cache) = peer_cache.as_ref() {
+        seed_peer_cache(&handle, &cache.storage)?;
+        spawn_peer_discovery_watcher(handle.clone(), Arc::clone(&cache.buffer));
+    }
+    spawn_peer_watcher(
+        handle.clone(),
+        Arc::clone(&pool),
+        peer_cache.as_ref().map(|cache| Arc::clone(&cache.buffer)),
+    );
+    let _connected = wait_for_peer_pool(
         Arc::clone(&pool),
         MIN_PEER_START,
         PEER_DISCOVERY_TIMEOUT,
     )
     .await?;
-    if connected < PEER_TARGET {
-        warn!(
-            peers = connected,
-            target = PEER_TARGET,
-            "p2p peer target not reached"
-        );
-    }
-
     Ok(NetworkSession {
         _handle: handle,
         pool,
+        peer_cache,
     })
+}
+
+impl NetworkSession {
+    pub fn flush_peer_cache(&self) -> Result<()> {
+        let Some(cache) = self.peer_cache.as_ref() else {
+            return Ok(());
+        };
+        let peers = cache.buffer.close_and_drain();
+        if peers.is_empty() {
+            info!("peer cache flush: no entries");
+            return Ok(());
+        }
+        let mut failed = 0usize;
+        for peer in peers.iter() {
+            if let Err(err) = cache.storage.upsert_peer(peer.clone()) {
+                failed += 1;
+                warn!(peer_id = peer.peer_id, error = %err, "failed to persist cached peer");
+            }
+        }
+        info!(
+            cache_flush_total = peers.len(),
+            cache_flush_failed = failed,
+            "peer cache flush complete"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -308,6 +400,7 @@ impl BlockPayloadSource for MultiPeerBlockPayloadSource {
 fn spawn_peer_watcher(
     handle: NetworkHandle<EthNetworkPrimitives>,
     pool: Arc<PeerPool>,
+    peer_cache: Option<Arc<PeerCacheBuffer>>,
 ) {
     tokio::spawn(async move {
         let mut events = handle.event_listener();
@@ -330,6 +423,15 @@ fn spawn_peer_watcher(
                         messages,
                         head_number,
                     });
+                    if let Some(peer_cache) = peer_cache.as_ref() {
+                        let peer = StoredPeer {
+                            peer_id: info.peer_id.to_string(),
+                            tcp_addr: info.remote_addr,
+                            udp_addr: None,
+                            last_seen_ms: now_ms(),
+                        };
+                        peer_cache.upsert(peer);
+                    }
                 }
                 NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. })
                 | NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
@@ -339,6 +441,71 @@ fn spawn_peer_watcher(
             }
         }
     });
+}
+
+fn spawn_peer_discovery_watcher(
+    handle: NetworkHandle<EthNetworkPrimitives>,
+    peer_cache: Arc<PeerCacheBuffer>,
+) {
+    tokio::spawn(async move {
+        let mut events = handle.discovery_listener();
+        while let Some(event) = events.next().await {
+            if let DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, addr, .. }) =
+                event
+            {
+                let peer = StoredPeer {
+                    peer_id: peer_id.to_string(),
+                    tcp_addr: addr.tcp(),
+                    udp_addr: addr.udp(),
+                    last_seen_ms: now_ms(),
+                };
+                peer_cache.upsert(peer);
+            }
+        }
+    });
+}
+
+fn seed_peer_cache(
+    handle: &NetworkHandle<EthNetworkPrimitives>,
+    storage: &Storage,
+) -> Result<()> {
+    let ttl_ms = Duration::from_secs(PEER_CACHE_TTL_DAYS * 24 * 60 * 60)
+        .as_millis() as u64;
+    let expire_before_ms = now_ms().saturating_sub(ttl_ms);
+    let load = storage.load_peers(expire_before_ms, PEER_CACHE_MAX)?;
+    let mut seeded = 0usize;
+    let mut invalid = 0usize;
+    let kept = load.peers.len();
+    for peer in &load.peers {
+        match PeerId::from_str(&peer.peer_id) {
+            Ok(peer_id) => {
+                handle.add_peer_kind(peer_id, PeerKind::Static, peer.tcp_addr, peer.udp_addr);
+                seeded += 1;
+            }
+            Err(err) => {
+                invalid += 1;
+                warn!(peer_id = peer.peer_id, error = %err, "invalid cached peer id");
+            }
+        }
+    }
+    info!(
+        cache_total = load.total,
+        cache_expired = load.expired,
+        cache_corrupted = load.corrupted,
+        cache_capped = load.capped,
+        cache_kept = kept,
+        cache_seeded = seeded,
+        cache_invalid = invalid,
+        "peer cache summary"
+    );
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn wait_for_peer_pool(
