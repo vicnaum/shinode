@@ -8,8 +8,9 @@ subset. It does not execute transactions or keep state.
 
 What works:
 - P2P range backfill from `start_block..head` (single run).
-- MDBX persistence of headers, tx hashes, receipts, logs, log indexes, tx metadata
-  (no calldata; signature + signing hash stored for sender recovery), withdrawals, and block size.
+- Static-file persistence (NippyJar) of headers, tx hashes, receipts, tx metadata
+  (no calldata; signature + signing hash stored for sender recovery), and block size.
+- Logs are derived on-demand from receipts; withdrawals are not stored.
 - RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`,
   `eth_getLogs`, with request limits.
 - Graceful shutdown, restart-safe checkpoints, and basic ingest stats.
@@ -25,7 +26,7 @@ What does not yet:
 
 - **Stateless by design**: no EVM execution or state trie.
 - **Small, auditable surface**: minimal persistence and RPC for indexers.
-- **Reuse Reth primitives**: networking, MDBX, and safety defaults.
+- **Reuse Reth primitives**: networking, static-file storage, and safety defaults.
 
 ## Installation
 
@@ -85,15 +86,19 @@ RPC safety limits:
 - `--rpc-max-logs-per-response <u64>` (default: 100000; `0` = unlimited).
 
 Ingest tuning:
-- `--db-write-batch-blocks <u64>`: DB batch size (default: 32).
+- `--db-write-batch-blocks <u64>`: batch size for static-file writes (default: 512).
 - `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
 
 ## Configuration and storage
 
-The MDBX database lives under `data_dir/db`. A serialized config is persisted
-on first run and validated on startup. If you change storage-affecting settings
-(retention, head source, reorg strategy), use a new `data_dir`. Runtime-only
-settings (verbosity, RPC limits) can be changed freely.
+Storage is under `data_dir`:
+- `meta.json`: schema version, chain id, start block, checkpoints.
+- `peers.json`: cached peers (TTL + cap applied on load).
+- `static/`: NippyJar segments (`headers`, `tx_hashes`, `tx_meta`, `receipts`, `block_sizes`).
+
+The config is validated on startup. If you change storage-affecting settings
+(retention, head source, reorg strategy, start block), use a new `data_dir`.
+Runtime-only settings (verbosity, RPC limits) can be changed freely.
 
 ## RPC support
 
@@ -105,6 +110,7 @@ Implemented:
 
 Notes:
 - `totalDifficulty` is currently mocked to `0x0`.
+- `withdrawals` are always `null` (not stored).
 
 All other methods are unimplemented and return `-32601`.
 

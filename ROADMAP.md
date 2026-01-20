@@ -24,14 +24,15 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ### v0.1.0 Product contract + architecture skeleton (no redesign later)
 - [x] **Retention (v0.1 simple default)**:
-  - Store **headers + tx hashes + tx metadata (no calldata) + full receipts/logs** for retained ranges (no log filtering in v0.1)
+  - Store **headers + tx hashes + tx metadata (no calldata) + full receipts** for retained ranges
+  - Logs are derived at query time; withdrawals are not stored
   - Defer “filtered logs only” / “calldata retention” to later versions
 - [x] **Canonicality & head source contract** (explicit trust model):
   - MVP default: follow a best-effort head from the P2P view and handle reorgs within a rollback window
   - Later option: integrate a local CL or beacon API for finalized/safe head
 - [x] **Reorg semantics**: rollback window, rollback strategy (v0.1 default: delete-on-rollback), and define what `eth_blockNumber` means (e.g., last fully indexed block)
 - [x] **Storage choice (early)**: pick a backend that won’t block future work
-  - Recommended baseline: **MDBX** (reth-style), with a schema designed for later “static files” / cold storage
+  - **Static-file storage (NippyJar)** with rollback by tail pruning
 - [x] **Crate/module boundaries** (match reth’s separation of concerns): `p2p`, `sync/ingest`, `chain`, `storage`, `rpc`, `cli/config`
 - [x] **Test strategy**: unit tests for parsing/mapping + integration tests for reorg rollback + RPC conformance fixtures
 - Verified: `cargo test --manifest-path node/Cargo.toml`; `curl -s -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:8545` → `0x1`
@@ -58,18 +59,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - Verified: `cargo run --manifest-path node/Cargo.toml -- --start-block 20000000 --rpc-bind 127.0.0.1:0 --data-dir data-p2p-test2` (multi-peer code path; ingest range)
 
 ### v0.1.2 Persistence (queryable, restart-safe)
-- [x] Define MDBX tables + codecs for v0.1 retention (blocks, tx hashes, receipts/logs)
-- [x] Write path: persist headers + tx hashes + receipts/logs during ingest
-- [x] Compute/persist **logsBloom** from receipts (eth/69/70)
-- [x] Read path: fetch stored blocks/receipts/logs by number/range (for upcoming RPC)
+- [x] Define static-file segments for v0.1 retention (headers, tx hashes, receipts, tx metadata, block sizes)
+- [x] Write path: append headers + tx hashes + receipts + tx metadata during ingest
+- [x] Read path: fetch stored blocks/receipts by number/range (for RPC)
 - [ ] Indexes for fast `eth_getLogs` (address/topic0) — deferred to post-sync indexing
-- [x] Reorg rollback: delete data past common ancestor (tombstones/“removed logs” support deferred)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (tables + codecs compile)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (ingest writes + storage reads)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (logsBloom persisted from receipts)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (range reads for headers/receipts/logs)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (log index tables + query helpers)
-- Verified: `cargo test --manifest-path node/Cargo.toml` (rollback deletes block/index data)
+- [x] Reorg rollback: tail-prune static segments past common ancestor
+- Verified: `cargo test --manifest-path node/Cargo.toml` (storage writes + reads)
+- Verified: `cargo test --manifest-path node/Cargo.toml` (range reads for headers/receipts)
 
 ### v0.1.3 JSON-RPC server (indexer-compatible subset)
 - [x] Target v0.1 indexer: **rindexer** (polling-based; no `eth_subscribe` required)
@@ -94,7 +90,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Graceful shutdown + safe flushing
 - [x] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
 - [x] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
-- [x] Ingest benchmark mode with per-stage timing (fetch/process/db)
+- [x] Ingest benchmark mode with per-stage timing (fetch/process/static write)
 - [x] Defer sender recovery by storing signature + signing hash
 - Verified: `cargo test --manifest-path node/Cargo.toml` (graceful shutdown behavior)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (ingest metrics logging helpers)
@@ -106,7 +102,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] Chunked range planner for historical blocks (default 32)
 - [ ] Concurrent chunk fetch with bounded in-flight requests
 - [ ] Buffer out-of-order chunks and **write in block order**
-- [ ] Atomic per-chunk MDBX writes + checkpoint updates
+- [ ] Atomic per-chunk static-file appends + checkpoint updates
 - [ ] Safe boundary switch to slow path near the reorg window
 - [ ] Progress bar: harness-style status line (peers/queue/inflight/speed/eta)
 - [ ] Post-sync log index build (address/topic0) to restore fast `eth_getLogs`
@@ -146,7 +142,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 ## 🚀 Later (Optimization): Performance & storage efficiency (v0.3+)
 - [ ] Bloom-based short-circuiting (use stored `logsBloom` to skip blocks fast when scanning)
 - [ ] Stronger log indexing (topic1-3, composite indexes, partitioning)
-- [ ] Compression tuning (zstd) and cold storage formats (e.g., reth-style static files / NippyJar segments)
+- [ ] Compression tuning (zstd) and additional cold storage formats
 - [ ] Pipeline improvements: overlap headers/receipts/bodies fetching
 - [ ] Optional calldata retention (config/CLI) + full transaction objects
 

@@ -1,6 +1,6 @@
 //! CLI and config handling.
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, ops::RangeInclusive, path::PathBuf};
 
@@ -51,6 +51,30 @@ pub enum BenchmarkMode {
     Ingest,
 }
 
+/// Top-level CLI commands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Database/static-file inspection commands.
+    #[command(subcommand)]
+    Db(DbCommand),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DbCommand {
+    /// Print storage statistics.
+    Stats(DbStatsArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DbStatsArgs {
+    /// Override data directory for stats.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+    /// Print JSON instead of a table.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 /// Stateless history node configuration.
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 #[command(name = "stateless-history-node", about = "Stateless history node v0.1")]
@@ -88,6 +112,10 @@ pub struct NodeConfig {
     /// Benchmark mode (probe only, exits after range).
     #[arg(long, value_enum, default_value_t = BenchmarkMode::Disabled)]
     pub benchmark: BenchmarkMode,
+    /// Optional command.
+    #[command(subcommand)]
+    #[serde(skip)]
+    pub command: Option<Command>,
     /// Max JSON-RPC request body size in bytes.
     #[arg(long, default_value_t = DEFAULT_RPC_MAX_REQUEST_BODY_BYTES)]
     pub rpc_max_request_body_bytes: u32,
@@ -162,6 +190,7 @@ mod tests {
         assert_eq!(config.reorg_strategy, ReorgStrategy::Delete);
         assert_eq!(config.verbosity, 0);
         assert_eq!(config.benchmark, BenchmarkMode::Disabled);
+        assert!(config.command.is_none());
         assert_eq!(config.rpc_max_request_body_bytes, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES);
         assert_eq!(config.rpc_max_response_body_bytes, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES);
         assert_eq!(config.rpc_max_connections, DEFAULT_RPC_MAX_CONNECTIONS);
@@ -176,5 +205,14 @@ mod tests {
         );
         assert_eq!(config.db_write_batch_blocks, DEFAULT_DB_WRITE_BATCH_BLOCKS);
         assert_eq!(config.db_write_flush_interval_ms, None);
+    }
+
+    #[test]
+    fn parse_db_stats_command() {
+        let config = NodeConfig::parse_from(["stateless-history-node", "db", "stats"]);
+        assert!(matches!(
+            config.command,
+            Some(Command::Db(DbCommand::Stats(_)))
+        ));
     }
 }

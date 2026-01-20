@@ -183,22 +183,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 .map_err(internal_error)?
                 .map(|stored| stored.size)
                 .unwrap_or(0);
-            let withdrawals = ctx
-                .storage
-                .block_withdrawals(number)
-                .map_err(internal_error)?
-                .and_then(|stored| stored.withdrawals)
-                .map(|withdrawals| {
-                    withdrawals
-                        .into_iter()
-                        .map(|withdrawal| RpcWithdrawal {
-                            index: format!("0x{:x}", withdrawal.index),
-                            validator_index: format!("0x{:x}", withdrawal.validator_index),
-                            address: format!("{:#x}", withdrawal.address),
-                            amount: format!("0x{:x}", withdrawal.amount),
-                        })
-                        .collect::<Vec<_>>()
-                });
+            let withdrawals = None;
 
             let response = RpcBlock {
                 number: format!("0x{:x}", header.number),
@@ -633,6 +618,7 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Disabled,
+            command: None,
             rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
@@ -903,19 +889,6 @@ mod tests {
             .write_block_header(9, header.clone())
             .expect("write header");
         storage
-            .write_block_withdrawals(
-                9,
-                crate::storage::StoredWithdrawals {
-                    withdrawals: Some(vec![crate::storage::StoredWithdrawal {
-                        index: 1,
-                        validator_index: 2,
-                        address: Address::from([0x11u8; 20]),
-                        amount: 3,
-                    }]),
-                },
-            )
-            .expect("write withdrawals");
-        storage
             .set_last_indexed_block(9)
             .expect("set last indexed");
 
@@ -929,15 +902,7 @@ mod tests {
             .await
             .expect("block by number");
 
-        let withdrawals = result["withdrawals"].as_array().expect("withdrawals array");
-        assert_eq!(withdrawals.len(), 1);
-        assert_eq!(withdrawals[0]["index"], Value::String("0x1".to_string()));
-        assert_eq!(withdrawals[0]["validatorIndex"], Value::String("0x2".to_string()));
-        assert_eq!(
-            withdrawals[0]["address"],
-            Value::String("0x1111111111111111111111111111111111111111".to_string())
-        );
-        assert_eq!(withdrawals[0]["amount"], Value::String("0x3".to_string()));
+        assert!(result["withdrawals"].is_null());
         assert_eq!(
             result["withdrawalsRoot"],
             Value::String(format!("{:#x}", header.withdrawals_root.unwrap()))

@@ -13,6 +13,7 @@ use metrics::{lag_to_head, range_len, rate_per_sec};
 use std::{
     collections::VecDeque,
     io::IsTerminal,
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -79,6 +80,20 @@ impl sync::ProgressReporter for IngestProgress {
 async fn main() -> Result<()> {
     let config = NodeConfig::from_args();
     init_tracing(config.verbosity);
+
+    if let Some(command) = &config.command {
+        match command {
+            cli::Command::Db(cli::DbCommand::Stats(args)) => {
+                let data_dir = args
+                    .data_dir
+                    .clone()
+                    .unwrap_or_else(|| config.data_dir.clone());
+                let stats = storage::Storage::disk_usage_at(&data_dir)?;
+                print_db_stats(&data_dir, &stats, args.json)?;
+                return Ok(());
+            }
+        }
+    }
 
     if matches!(config.benchmark, BenchmarkMode::Probe) {
         info!(
@@ -198,6 +213,13 @@ async fn main() -> Result<()> {
             sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
             sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
         };
+        let storage_stats = match storage.disk_usage() {
+            Ok(stats) => Some(stats),
+            Err(err) => {
+                warn!(error = %err, "failed to collect storage disk stats");
+                None
+            }
+        };
         let summary = bench.summary(
             *range.start(),
             *range.end(),
@@ -205,6 +227,7 @@ async fn main() -> Result<()> {
             config.rollback_window > 0,
             session.pool.len() as u64,
             logs_total,
+            storage_stats,
         );
         let summary_json = serde_json::to_string_pretty(&summary)?;
         println!("{summary_json}");
@@ -418,6 +441,7 @@ fn select_start_from(start_block: u64, last_indexed: Option<u64>) -> u64 {
         .max(start_block)
 }
 
+#[allow(dead_code)]
 fn total_blocks_to_head(start_from: u64, head: u64) -> u64 {
     if head >= start_from {
         head.saturating_sub(start_from).saturating_add(1)
@@ -447,6 +471,71 @@ fn format_progress_message(
         speed,
         eta
     )
+}
+
+fn print_db_stats(
+    data_dir: &Path,
+    stats: &storage::StorageDiskStats,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let payload = serde_json::to_string_pretty(stats)?;
+        println!("{payload}");
+        return Ok(());
+    }
+
+    println!("DB stats for {}", data_dir.display());
+    println!(
+        "{:<18} {:>14} {:>12}",
+        "Component", "Bytes", "Size"
+    );
+    println!("{}", "-".repeat(46));
+    print_row("total", stats.total_bytes);
+    print_row("static", stats.static_total_bytes);
+    print_row("meta", stats.meta_bytes);
+    print_row("peers", stats.peers_bytes);
+
+    println!();
+    println!(
+        "{:<18} {:>14} {:>12} {:>8}",
+        "Segment", "Bytes", "Size", "Share"
+    );
+    println!("{}", "-".repeat(54));
+    for segment in &stats.segments {
+        let share = if stats.static_total_bytes > 0 {
+            segment.bytes as f64 / stats.static_total_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "{:<18} {:>14} {:>12} {:>7.2}%",
+            segment.name,
+            segment.bytes,
+            human_bytes(segment.bytes),
+            share
+        );
+    }
+    Ok(())
+}
+
+fn print_row(label: &str, bytes: u64) {
+    println!(
+        "{:<18} {:>14} {:>12}",
+        label,
+        bytes,
+        human_bytes(bytes)
+    );
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut idx = 0;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    format!("{value:.2} {}", UNITS[idx])
 }
 
 fn spawn_progress_updater(

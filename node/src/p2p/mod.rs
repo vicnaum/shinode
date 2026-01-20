@@ -217,6 +217,9 @@ impl NetworkSession {
                 warn!(peer_id = peer.peer_id, error = %err, "failed to persist cached peer");
             }
         }
+        if let Err(err) = cache.storage.flush_peer_cache() {
+            warn!(error = %err, "failed to flush peer cache");
+        }
         info!(
             cache_flush_total = peers.len(),
             cache_flush_failed = failed,

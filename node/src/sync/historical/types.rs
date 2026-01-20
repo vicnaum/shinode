@@ -8,6 +8,7 @@ use reth_primitives_traits::Header;
 use std::time::Duration;
 
 /// Mode of the historical pipeline.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessingMode {
     /// Harness-like probe mode (headers + receipts only, no DB).
@@ -59,6 +60,7 @@ pub struct FetchTiming {
 }
 
 /// Raw fetched data before processing.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FetchedBlock {
     pub number: u64,
@@ -74,6 +76,7 @@ pub struct FetchedBlock {
 #[derive(Debug, Clone)]
 pub struct ProbeRecord {
     pub number: u64,
+    #[allow(dead_code)]
     pub peer_id: PeerId,
     pub receipts: u64,
     pub timing: FetchTiming,

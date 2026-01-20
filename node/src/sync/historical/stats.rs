@@ -1,5 +1,6 @@
 //! Probe/benchmark statistics aggregation.
 
+use crate::storage::StorageDiskStats;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -75,10 +76,12 @@ impl ProbeStats {
         self.blocks_failed.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub fn receipts_total(&self) -> u64 {
         self.receipts_total.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
     }
@@ -383,6 +386,7 @@ impl IngestBenchStats {
         rollback_window_applied: bool,
         peers_used: u64,
         logs_total: u64,
+        storage_stats: Option<StorageDiskStats>,
     ) -> IngestBenchSummary {
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         let fetch_blocks = self.fetch_blocks.load(Ordering::SeqCst);
@@ -427,6 +431,13 @@ impl IngestBenchStats {
         };
         let blocks_per_sec = rate_per_sec(blocks_completed, elapsed_ms);
         let logs_per_sec = rate_per_sec(logs_total, elapsed_ms);
+        let fetch_seconds = fetch_total_us as f64 / 1_000_000.0;
+        let fetch_bytes_per_sec = if fetch_seconds > 0.0 {
+            fetch_bytes_total as f64 / fetch_seconds
+        } else {
+            0.0
+        };
+        let fetch_mib_per_sec = fetch_bytes_per_sec / (1024.0 * 1024.0);
 
         let process_breakdown = ProcessBreakdownSummary {
             header_hash_us: self.process_header_hash_us.load(Ordering::SeqCst),
@@ -483,6 +494,8 @@ impl IngestBenchStats {
                 bytes_logs: fetch_bytes_logs,
                 avg_bytes_per_block: avg_u64(fetch_bytes_total, fetch_blocks),
                 avg_bytes_per_batch: avg_u64(fetch_bytes_total, fetch_batches),
+                download_bytes_per_sec_avg: fetch_bytes_per_sec,
+                download_mib_per_sec_avg: fetch_mib_per_sec,
             },
             process: IngestProcessSummary {
                 total_us: process_total_us,
@@ -509,6 +522,7 @@ impl IngestBenchStats {
                 avg_bytes_per_block: avg_u64(db_bytes_total, db_write_blocks),
                 avg_bytes_per_batch: avg_u64(db_bytes_total, db_write_batches),
             },
+            storage: storage_stats,
             peers: PeerSummary {
                 peers_used,
                 peer_failures_total: peer_failures,
@@ -526,6 +540,7 @@ pub struct IngestBenchSummary {
     pub fetch: IngestFetchSummary,
     pub process: IngestProcessSummary,
     pub db_write: IngestDbWriteSummary,
+    pub storage: Option<StorageDiskStats>,
     pub peers: PeerSummary,
 }
 
@@ -564,6 +579,8 @@ pub struct IngestFetchSummary {
     pub bytes_logs: u64,
     pub avg_bytes_per_block: u64,
     pub avg_bytes_per_batch: u64,
+    pub download_bytes_per_sec_avg: f64,
+    pub download_mib_per_sec_avg: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -650,6 +667,7 @@ pub struct DbWriteByteTotals {
 }
 
 impl DbWriteByteTotals {
+    #[allow(dead_code)]
     pub fn add(&mut self, other: DbWriteByteTotals) {
         self.headers = self.headers.saturating_add(other.headers);
         self.tx_hashes = self.tx_hashes.saturating_add(other.tx_hashes);

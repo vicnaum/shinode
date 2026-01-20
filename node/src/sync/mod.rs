@@ -5,7 +5,7 @@ use crate::{
     metrics::range_len,
     storage::{
     BlockBundle, ReceiptBundle, Storage, StoredBlockSize, StoredLogs, StoredReceipts,
-        StoredTransaction, StoredTransactions, StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
+        StoredTransaction, StoredTransactions, StoredTxHashes, StoredWithdrawals,
     },
 };
 use async_trait::async_trait;
@@ -344,6 +344,7 @@ pub struct FastSyncConfig {
 }
 
 impl FastSyncConfig {
+    #[allow(dead_code)]
     pub fn new(chunk_size: u64, max_inflight: u32, max_buffered_blocks: u64) -> Self {
         let chunk_size = chunk_size.max(1);
         let max_inflight = max_inflight.max(1) as usize;
@@ -683,20 +684,7 @@ where
             });
         }
 
-        let stored_withdrawals = StoredWithdrawals {
-            withdrawals: body.withdrawals.as_ref().map(|withdrawals| {
-                withdrawals
-                    .as_ref()
-                    .iter()
-                    .map(|withdrawal| StoredWithdrawal {
-                        index: withdrawal.index,
-                        validator_index: withdrawal.validator_index,
-                        address: withdrawal.address,
-                        amount: withdrawal.amount,
-                    })
-                    .collect()
-            }),
-        };
+        let stored_withdrawals = StoredWithdrawals { withdrawals: None };
 
         let block_size = block_rlp_size(&header, &body);
 
@@ -860,7 +848,7 @@ where
                         .expect("bundles is not empty")
                         .number
                         .saturating_add(1);
-                    storage.write_header_receipts_batch(&bundles)?;
+                    storage.write_receipts_batch(&bundles)?;
                     if let Some(stats) = stats {
                         let remaining = if next_expected <= *range.end() {
                             range
@@ -1023,6 +1011,7 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Disabled,
+            command: None,
             rpc_max_request_body_bytes: crate::cli::DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: crate::cli::DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: crate::cli::DEFAULT_RPC_MAX_CONNECTIONS,

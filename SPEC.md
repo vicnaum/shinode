@@ -4,9 +4,9 @@ This repo currently contains a working **receipt availability harness** (see App
 
 ## Current status (v0.1.4)
 - Range backfill (single run) using P2P headers/bodies/receipts.
-- MDBX persistence for headers, tx hashes, tx metadata (no calldata; signature +
-  signing hash stored for sender recovery), receipts, logs, log indexes, withdrawals,
-  and block size.
+- Static-file persistence (NippyJar) for headers, tx hashes, tx metadata (no calldata;
+  signature + signing hash stored for sender recovery), receipts, and block size.
+- Logs are derived on demand; withdrawals are not stored.
 - Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
   `eth_getBlockByNumber`, `eth_getLogs`).
 - `eth_getBlockByNumber` returns full block shape; `totalDifficulty` is mocked to `0x0`.
@@ -21,7 +21,7 @@ This repo currently contains a working **receipt availability harness** (see App
 - **Reuse Reth components and patterns** wherever feasible:
   - Networking (`reth/crates/net/**`)
   - Proven download/concurrency patterns (see `spec/reth_kb` Q034/Q035)
-  - Storage primitives (MDBX, static-file patterns) and safety knobs
+  - Storage primitives (static-file patterns) and safety knobs
   - RPC safety defaults and query limits (see `spec/reth_kb` Q021/Q022/Q023)
 
 ## Non-goals (for v0.1)
@@ -58,7 +58,7 @@ To serve `eth_getLogs` correctly (including `transactionHash`/`transactionIndex`
 ### Retention modes (persisted settings)
 Retention is a product-contract decision and must be explicit up-front to avoid DB redesign:
 - **v0.1 (simple default)**: store headers + tx hashes + tx metadata (no calldata) +
-  full receipts/logs + withdrawals for retained ranges
+  full receipts; logs derived at query time; withdrawals not stored
 - **Later (v0.2+)**:
   - optional “filtered logs only” retention
   - optional tx calldata retention (`input`)
@@ -75,9 +75,9 @@ High-level components (mirrors reth’s separation of concerns):
 2. **Sync/ingest orchestrator**: a coordinator loop that decides “what to fetch next” and manages concurrency and retries (informed by reth’s engine download coordination patterns, Q034).
 3. **Chain tracker**: maintains the canonical header chain view, detects reorgs, and provides rollback points.
 4. **Storage**: a durable store with:
-   - schema + versioning
-   - indexes to make `eth_getLogs` fast
-   - rollback (delete/mark) semantics for reorgs
+  - schema + versioning
+  - append-only static files with rollback via tail pruning
+  - logs derived from receipts at query time
 5. **RPC**: a minimal JSON-RPC server with safe defaults (localhost bind by default, query limits) and only the namespaces we support.
 
 ## Historical fast sync (v0.1.5)
@@ -85,7 +85,7 @@ For blocks **older than the reorg window**, we use a fast backfill mode:
 - split the historical range into fixed-size chunks (default 32)
 - fetch chunks concurrently across peers with bounded in-flight requests
 - buffer out-of-order chunks and write in block order
-- persist each chunk in a single MDBX transaction
+- persist each chunk in a single static-file append batch
 
 For blocks **inside the reorg window**, use the existing safe sequential path.
 

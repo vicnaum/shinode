@@ -555,6 +555,7 @@ pub async fn run_ingest_pipeline(
         processed_blocks_rx,
         db_config,
         bench.clone(),
+        *range.start(),
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
@@ -740,6 +741,7 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Probe,
+            command: None,
             rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
             rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
@@ -826,7 +828,8 @@ mod tests {
 
         run_probe_with_test_peer(&config).await;
 
-        assert!(!config.data_dir.join("db").exists());
+        assert!(!config.data_dir.join("meta.json").exists());
+        assert!(!config.data_dir.join("static").exists());
     }
 
     #[tokio::test]

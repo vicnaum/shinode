@@ -43,6 +43,7 @@ impl PeerHealth {
             .unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     fn ban_remaining(&self) -> Option<Duration> {
         self.banned_until.and_then(|until| {
             let now = Instant::now();
@@ -411,6 +412,7 @@ impl PeerWorkScheduler {
     }
 
     /// Number of completed blocks.
+    #[allow(dead_code)]
     pub async fn completed_count(&self) -> usize {
         let completed = self.completed.lock().await;
         completed.len()
@@ -445,6 +447,7 @@ impl PeerWorkScheduler {
     }
 
     /// Number of failed blocks.
+    #[allow(dead_code)]
     pub async fn failed_count(&self) -> usize {
         let failed = self.failed.lock().await;
         failed.len()

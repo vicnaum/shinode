@@ -11,17 +11,16 @@ clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 futures = "0.3"
 jsonrpsee = { version = "0.26.0", features = ["client", "http-client", "server"] }
+bincode = "1"
 modular-bitfield = "0.11.2"
-reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
-reth-codecs = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["serde", "serde-bincode-compat"] }
+reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["secp256k1"] }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["secp256k1", "serde-bincode-compat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -29,4 +28,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18.3"
 alloy-rlp = "0.3.12"
-alloy-consensus = "1.4.3"
+alloy-consensus = { version = "1.4.3", features = ["serde", "serde-bincode-compat"] }

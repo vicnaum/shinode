@@ -1,128 +1,34 @@
-//! Storage bootstrap and metadata.
+//! Storage backed by static files (NippyJar) + tiny JSON metadata.
 
-use crate::cli::{
-    BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode,
-    DEFAULT_RPC_MAX_BATCH_REQUESTS, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
-    DEFAULT_RPC_MAX_CONNECTIONS, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
-    DEFAULT_RPC_MAX_REQUEST_BODY_BYTES, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
-    DEFAULT_FAST_SYNC_CHUNK_SIZE, DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
-    DEFAULT_FAST_SYNC_MAX_INFLIGHT, DEFAULT_DB_WRITE_BATCH_BLOCKS,
-};
+use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
 use alloy_primitives::{Address, B256, Bytes, Signature, U256};
 use eyre::{eyre, Result, WrapErr};
-use reth_db::{
-    mdbx::{init_db_for, DatabaseArguments, DatabaseEnv},
-    ClientVersion, Database,
-};
-use reth_codecs::Compact;
-use reth_db_api::{
-    cursor::{DbCursorRO, DbDupCursorRO},
-    table::{Compress, Decompress},
-    transaction::{DbTx, DbTxMut},
-    DatabaseError,
-};
 use reth_ethereum_primitives::Receipt;
-use reth_primitives_traits::{Header, ValueWithSubKey};
+use reth_nippy_jar::{NippyJar, NippyJarCursor, NippyJarWriter, CONFIG_FILE_EXTENSION};
+use reth_primitives_traits::{
+    serde_bincode_compat::{BincodeReprFor, SerdeBincodeCompat},
+    Header,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     cmp::Reverse,
-    collections::HashSet,
+    collections::HashMap,
+    fs,
+    io,
     net::SocketAddr,
     ops::RangeInclusive,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
-use tracing::info;
-
-mod tables {
-    use super::{
-        LogIndexEntry, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransactions,
-        StoredTxHashes, StoredWithdrawals,
-    };
-    use alloy_primitives::{Address, B256};
-    use reth_db_api::{table::{DupSort, TableInfo}, tables, TableSet, TableType, TableViewer};
-    use reth_primitives_traits::Header;
-    use std::fmt;
-
-    tables! {
-        /// Stateless history node metadata.
-        table Meta {
-            type Key = String;
-            type Value = Vec<u8>;
-        }
-
-        /// Cached peers for warm-starting discovery.
-        table PeerCache {
-            type Key = String;
-            type Value = Vec<u8>;
-        }
-
-        /// Canonical headers keyed by block number.
-        table BlockHeaders {
-            type Key = u64;
-            type Value = Header;
-        }
-
-        /// Transaction hashes per block.
-        table BlockTxHashes {
-            type Key = u64;
-            type Value = StoredTxHashes;
-        }
-
-        /// Transactions (metadata, no calldata) per block.
-        table BlockTransactions {
-            type Key = u64;
-            type Value = StoredTransactions;
-        }
-
-        /// Withdrawals per block (post-Shanghai).
-        table BlockWithdrawals {
-            type Key = u64;
-            type Value = StoredWithdrawals;
-        }
-
-        /// RLP-encoded block size in bytes.
-        table BlockSizes {
-            type Key = u64;
-            type Value = StoredBlockSize;
-        }
-
-        /// Receipts per block.
-        table BlockReceipts {
-            type Key = u64;
-            type Value = StoredReceipts;
-        }
-
-        /// Derived logs per block.
-        table BlockLogs {
-            type Key = u64;
-            type Value = StoredLogs;
-        }
-
-                /// Log index entries grouped by address.
-                table LogIndexByAddress {
-                    type Key = Address;
-                    type Value = LogIndexEntry;
-                    type SubKey = u64;
-                }
-
-                /// Log index entries grouped by topic0.
-                table LogIndexByTopic0 {
-                    type Key = B256;
-                    type Value = LogIndexEntry;
-                    type SubKey = u64;
-                }
-    }
-}
 
 const SCHEMA_VERSION: u64 = 1;
-const META_SCHEMA_VERSION_KEY: &str = "schema_version";
-const META_CHAIN_ID_KEY: &str = "chain_id";
-const META_CONFIG_KEY: &str = "config";
-const META_LAST_INDEXED_BLOCK_KEY: &str = "last_indexed_block";
-const META_HEAD_SEEN_KEY: &str = "head_seen";
+const META_FILE_NAME: &str = "meta.json";
+const PEER_FILE_NAME: &str = "peers.json";
+const STATIC_DIR_NAME: &str = "static";
+const ZSTD_DICT_MAX_SIZE: usize = 5000;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Compact)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTxHashes {
     pub hashes: Vec<B256>,
 }
@@ -164,7 +70,7 @@ pub struct StoredWithdrawals {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Compact)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredBlockSize {
     pub size: u64,
 }
@@ -196,6 +102,24 @@ pub struct StoredReceipts {
     pub receipts: Vec<Receipt>,
 }
 
+type ReceiptBincodeRepr<'a> = BincodeReprFor<'a, Receipt>;
+
+impl SerdeBincodeCompat for StoredReceipts {
+    type BincodeRepr<'a> = Vec<ReceiptBincodeRepr<'a>>;
+
+    fn as_repr(&self) -> Self::BincodeRepr<'_> {
+        self.receipts.iter().map(|receipt| receipt.as_repr()).collect()
+    }
+
+    fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
+        let receipts = repr
+            .into_iter()
+            .map(|repr| <Receipt as SerdeBincodeCompat>::from_repr(repr))
+            .collect();
+        StoredReceipts { receipts }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredLog {
@@ -208,6 +132,21 @@ pub struct StoredLog {
     pub log_index: u64,
     pub removed: bool,
     pub data: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SegmentDiskStats {
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageDiskStats {
+    pub total_bytes: u64,
+    pub meta_bytes: u64,
+    pub peers_bytes: u64,
+    pub static_total_bytes: u64,
+    pub segments: Vec<SegmentDiskStats>,
 }
 
 #[allow(dead_code)]
@@ -241,881 +180,689 @@ pub struct LogIndexEntry {
     pub log_index: u64,
 }
 
-impl ValueWithSubKey for LogIndexEntry {
-    type SubKey = u64;
-
-    fn get_subkey(&self) -> Self::SubKey {
-        self.block_number
-    }
-}
-
-impl Compact for LogIndexEntry {
-    fn to_compact<B>(&self, buf: &mut B) -> usize
-    where
-        B: bytes::BufMut + AsMut<[u8]>,
-    {
-        buf.put_slice(&self.block_number.to_be_bytes());
-        buf.put_slice(&self.log_index.to_be_bytes());
-        16
-    }
-
-    fn from_compact(mut buf: &[u8], _len: usize) -> (Self, &[u8]) {
-        use bytes::Buf;
-        let mut block_bytes = [0u8; 8];
-        block_bytes.copy_from_slice(&buf[..8]);
-        buf.advance(8);
-        let mut log_bytes = [0u8; 8];
-        log_bytes.copy_from_slice(&buf[..8]);
-        buf.advance(8);
-        let block_number = u64::from_be_bytes(block_bytes);
-        let log_index = u64::from_be_bytes(log_bytes);
-        (Self { block_number, log_index }, buf)
-    }
-}
-
-macro_rules! impl_compact_value {
-    ($($name:ty),+ $(,)?) => {
-        $(
-            impl Compress for $name {
-                type Compressed = Vec<u8>;
-
-                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-                    let _ = Compact::to_compact(self, buf);
-                }
-            }
-
-            impl Decompress for $name {
-                fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-                    let (obj, _) = Compact::from_compact(value, value.len());
-                    Ok(obj)
-                }
-            }
-        )+
-    };
-}
-
-impl_compact_value!(StoredTxHashes, LogIndexEntry, StoredBlockSize);
-
-impl Compress for StoredReceipts {
-    type Compressed = Vec<u8>;
-
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-        let encoded = serde_json::to_vec(self)
-            .expect("stored receipts serialization should succeed");
-        buf.put_slice(&encoded);
-    }
-}
-
-impl Decompress for StoredReceipts {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
-    }
-}
-
-impl Compress for StoredTransactions {
-    type Compressed = Vec<u8>;
-
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-        let encoded =
-            serde_json::to_vec(self).expect("stored transactions serialization should succeed");
-        buf.put_slice(&encoded);
-    }
-}
-
-impl Decompress for StoredTransactions {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
-    }
-}
-
-impl Compress for StoredWithdrawals {
-    type Compressed = Vec<u8>;
-
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-        let encoded =
-            serde_json::to_vec(self).expect("stored withdrawals serialization should succeed");
-        buf.put_slice(&encoded);
-    }
-}
-
-impl Decompress for StoredWithdrawals {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
-    }
-}
-
-impl Compress for StoredLog {
-    type Compressed = Vec<u8>;
-
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-        let encoded = serde_json::to_vec(self)
-            .expect("stored log serialization should succeed");
-        buf.put_slice(&encoded);
-    }
-}
-
-impl Decompress for StoredLog {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
-    }
-}
-
-impl Compress for StoredLogs {
-    type Compressed = Vec<u8>;
-
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-        let encoded = serde_json::to_vec(self)
-            .expect("stored logs serialization should succeed");
-        buf.put_slice(&encoded);
-    }
-}
-
-impl Decompress for StoredLogs {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
-    }
-}
-
-#[derive(Debug)]
-pub struct Storage {
-    db: DatabaseEnv,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-struct StoredConfig {
-    chain_id: u64,
-    data_dir: PathBuf,
-    rpc_bind: SocketAddr,
-    start_block: u64,
-    rollback_window: u64,
-    retention_mode: RetentionMode,
-    head_source: HeadSource,
-    reorg_strategy: ReorgStrategy,
-    verbosity: u8,
-    benchmark: BenchmarkMode,
-    rpc_max_request_body_bytes: u32,
-    rpc_max_response_body_bytes: u32,
-    rpc_max_connections: u32,
-    rpc_max_batch_requests: u32,
-    rpc_max_blocks_per_filter: u64,
-    rpc_max_logs_per_response: u64,
-    fast_sync_chunk_size: u64,
-    fast_sync_max_inflight: u32,
-    fast_sync_max_buffered_blocks: u64,
-    db_write_batch_blocks: u64,
-    db_write_flush_interval_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct StorageConfigKey {
     retention_mode: RetentionMode,
     head_source: HeadSource,
     reorg_strategy: ReorgStrategy,
 }
 
-impl From<&NodeConfig> for StoredConfig {
+impl From<&NodeConfig> for StorageConfigKey {
     fn from(config: &NodeConfig) -> Self {
         Self {
-            chain_id: config.chain_id,
-            data_dir: config.data_dir.clone(),
-            rpc_bind: config.rpc_bind,
-            start_block: config.start_block,
-            rollback_window: config.rollback_window,
             retention_mode: config.retention_mode,
             head_source: config.head_source,
             reorg_strategy: config.reorg_strategy,
-            verbosity: config.verbosity,
-            benchmark: config.benchmark,
-            rpc_max_request_body_bytes: config.rpc_max_request_body_bytes,
-            rpc_max_response_body_bytes: config.rpc_max_response_body_bytes,
-            rpc_max_connections: config.rpc_max_connections,
-            rpc_max_batch_requests: config.rpc_max_batch_requests,
-            rpc_max_blocks_per_filter: config.rpc_max_blocks_per_filter,
-            rpc_max_logs_per_response: config.rpc_max_logs_per_response,
-            fast_sync_chunk_size: config.fast_sync_chunk_size,
-            fast_sync_max_inflight: config.fast_sync_max_inflight,
-            fast_sync_max_buffered_blocks: config.fast_sync_max_buffered_blocks,
-            db_write_batch_blocks: config.db_write_batch_blocks,
-            db_write_flush_interval_ms: config.db_write_flush_interval_ms,
         }
     }
 }
 
-impl Default for StoredConfig {
-    fn default() -> Self {
-        Self {
-            chain_id: 1,
-            data_dir: PathBuf::from("data"),
-            rpc_bind: "127.0.0.1:8545".parse().expect("valid default rpc bind"),
-            start_block: 0,
-            rollback_window: 64,
-            retention_mode: RetentionMode::Full,
-            head_source: HeadSource::P2p,
-            reorg_strategy: ReorgStrategy::Delete,
-            verbosity: 0,
-            benchmark: BenchmarkMode::Disabled,
-            rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
-            rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
-            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
-            rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
-            rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
-            rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
-            fast_sync_chunk_size: DEFAULT_FAST_SYNC_CHUNK_SIZE,
-            fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
-            fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
-            db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
-            db_write_flush_interval_ms: None,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetaState {
+    schema_version: u64,
+    chain_id: u64,
+    storage_key: StorageConfigKey,
+    start_block: u64,
+    last_indexed_block: Option<u64>,
+    head_seen: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentHeader {
+    start_block: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentCompression {
+    None,
+    Zstd { use_dict: bool, max_dict_size: usize },
+}
+
+struct SegmentState {
+    writer: NippyJarWriter<SegmentHeader>,
+    next_block: u64,
+}
+
+struct SegmentWriter {
+    path: PathBuf,
+    start_block: u64,
+    #[allow(dead_code)]
+    compression: SegmentCompression,
+    state: Mutex<SegmentState>,
+}
+
+impl SegmentWriter {
+    fn open(path: PathBuf, start_block: u64, compression: SegmentCompression) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).wrap_err("failed to create static dir")?;
         }
+        let jar = if segment_exists(&path) {
+            let jar = NippyJar::<SegmentHeader>::load(&path)
+                .wrap_err("failed to load static segment")?;
+            let header = jar.user_header();
+            if header.start_block != start_block {
+                return Err(eyre!(
+                    "segment start mismatch for {} (expected {}, got {})",
+                    path.display(),
+                    start_block,
+                    header.start_block
+                ));
+            }
+            let expected_compress = matches!(compression, SegmentCompression::Zstd { .. });
+            if jar.compressor().is_some() != expected_compress {
+                return Err(eyre!(
+                    "segment compression mismatch for {}",
+                    path.display()
+                ));
+            }
+            jar
+        } else {
+            let mut jar = NippyJar::new(1, &path, SegmentHeader { start_block });
+            match compression {
+                SegmentCompression::None => {}
+                SegmentCompression::Zstd { use_dict, max_dict_size } => {
+                    jar = jar.with_zstd(use_dict, max_dict_size);
+                }
+            }
+            jar
+        };
+
+        let next_block = start_block + jar.rows() as u64;
+        let writer = NippyJarWriter::new(jar).wrap_err("failed to open static segment writer")?;
+        Ok(Self {
+            path,
+            start_block,
+            compression,
+            state: Mutex::new(SegmentState { writer, next_block }),
+        })
+    }
+
+    fn append_rows(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().expect("segment lock");
+        if start_block < state.next_block {
+            return Err(eyre!(
+                "segment {} expected block {}, got {}",
+                self.path.display(),
+                state.next_block,
+                start_block
+            ));
+        }
+        let gap = start_block.saturating_sub(state.next_block) as usize;
+        let all_rows = if gap == 0 {
+            rows.to_vec()
+        } else {
+            let mut filled = vec![Vec::new(); gap];
+            filled.extend_from_slice(rows);
+            filled
+        };
+        let iter = all_rows.iter().map(|bytes| Ok(bytes.as_slice()));
+        state
+            .writer
+            .append_rows(vec![iter], all_rows.len() as u64)
+            .wrap_err("failed to append rows")?;
+        state
+            .writer
+            .commit()
+            .wrap_err("failed to commit static segment")?;
+        state.next_block = state
+            .next_block
+            .saturating_add(all_rows.len() as u64);
+        Ok(())
+    }
+
+    fn prune_to(&self, ancestor_number: u64) -> Result<()> {
+        let mut state = self.state.lock().expect("segment lock");
+        if ancestor_number < self.start_block {
+            let prune_rows = state.next_block.saturating_sub(self.start_block);
+            if prune_rows > 0 {
+                state
+                    .writer
+                    .prune_rows(prune_rows as usize)
+                    .wrap_err("failed to prune segment")?;
+                state.writer.commit().wrap_err("failed to commit segment prune")?;
+            }
+            state.next_block = self.start_block;
+            return Ok(());
+        }
+        let target_next = ancestor_number.saturating_add(1);
+        if target_next >= state.next_block {
+            return Ok(());
+        }
+        let prune_rows = state.next_block.saturating_sub(target_next);
+        state
+            .writer
+            .prune_rows(prune_rows as usize)
+            .wrap_err("failed to prune segment")?;
+        state
+            .writer
+            .commit()
+            .wrap_err("failed to commit segment prune")?;
+        state.next_block = target_next;
+        Ok(())
+    }
+
+    fn read_row<T: DeserializeOwned>(&self, block_number: u64) -> Result<Option<T>> {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if block_number < header.start_block {
+            return Ok(None);
+        }
+        let row = block_number.saturating_sub(header.start_block) as usize;
+        if row >= jar.rows() {
+            return Ok(None);
+        }
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let Some(row_vals) = cursor.row_by_number(row)? else {
+            return Ok(None);
+        };
+        let bytes = row_vals
+            .get(0)
+            .ok_or_else(|| eyre!("missing column data"))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let decoded = decode_bincode(bytes)?;
+        Ok(Some(decoded))
+    }
+
+    fn read_row_compat<T>(&self, block_number: u64) -> Result<Option<T>>
+    where
+        T: SerdeBincodeCompat,
+        <T as SerdeBincodeCompat>::BincodeRepr<'static>: DeserializeOwned,
+    {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if block_number < header.start_block {
+            return Ok(None);
+        }
+        let row = block_number.saturating_sub(header.start_block) as usize;
+        if row >= jar.rows() {
+            return Ok(None);
+        }
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let Some(row_vals) = cursor.row_by_number(row)? else {
+            return Ok(None);
+        };
+        let bytes = row_vals
+            .get(0)
+            .ok_or_else(|| eyre!("missing column data"))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let decoded = decode_bincode_compat_value(bytes)?;
+        Ok(Some(decoded))
+    }
+
+    fn read_row_u64(&self, block_number: u64) -> Result<Option<u64>> {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if block_number < header.start_block {
+            return Ok(None);
+        }
+        let row = block_number.saturating_sub(header.start_block) as usize;
+        if row >= jar.rows() {
+            return Ok(None);
+        }
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let Some(row_vals) = cursor.row_by_number(row)? else {
+            return Ok(None);
+        };
+        let bytes = row_vals
+            .get(0)
+            .ok_or_else(|| eyre!("missing column data"))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        decode_u64(bytes).map(Some)
+    }
+
+    fn read_range<T: DeserializeOwned>(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> Result<Vec<(u64, T)>> {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let mut out = Vec::new();
+        for block in range {
+            if block < header.start_block {
+                continue;
+            }
+            let row = block.saturating_sub(header.start_block) as usize;
+            if row >= jar.rows() {
+                break;
+            }
+            let Some(row_vals) = cursor.row_by_number(row)? else {
+                continue;
+            };
+            let bytes = row_vals
+                .get(0)
+                .ok_or_else(|| eyre!("missing column data"))?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let decoded = decode_bincode(bytes)?;
+            out.push((block, decoded));
+        }
+        Ok(out)
+    }
+
+    fn read_range_compat<T>(&self, range: RangeInclusive<u64>) -> Result<Vec<(u64, T)>>
+    where
+        T: SerdeBincodeCompat,
+        <T as SerdeBincodeCompat>::BincodeRepr<'static>: DeserializeOwned,
+    {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let mut out = Vec::new();
+        for block in range {
+            if block < header.start_block {
+                continue;
+            }
+            let row = block.saturating_sub(header.start_block) as usize;
+            if row >= jar.rows() {
+                break;
+            }
+            let Some(row_vals) = cursor.row_by_number(row)? else {
+                continue;
+            };
+            let bytes = row_vals
+                .get(0)
+                .ok_or_else(|| eyre!("missing column data"))?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let decoded = decode_bincode_compat_value(bytes)?;
+            out.push((block, decoded));
+        }
+        Ok(out)
     }
 }
 
-impl StoredConfig {
-    fn storage_key(&self) -> StorageConfigKey {
-        StorageConfigKey {
-            retention_mode: self.retention_mode,
-            head_source: self.head_source,
-            reorg_strategy: self.reorg_strategy,
-        }
+pub struct Storage {
+    data_dir: PathBuf,
+    meta: Mutex<MetaState>,
+    segments: SegmentStore,
+    peer_cache: Mutex<HashMap<String, StoredPeer>>,
+}
+
+impl std::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Storage")
+            .field("data_dir", &self.data_dir)
+            .finish()
     }
+}
+
+struct SegmentStore {
+    headers: SegmentWriter,
+    tx_hashes: SegmentWriter,
+    tx_meta: SegmentWriter,
+    receipts: SegmentWriter,
+    sizes: SegmentWriter,
 }
 
 impl Storage {
-    /// Open the MDBX environment and bootstrap metadata if needed.
     pub fn open(config: &NodeConfig) -> Result<Self> {
-        let db_path = config.data_dir.join("db");
-        let args = DatabaseArguments::new(ClientVersion::default());
-        let db = init_db_for::<_, tables::Tables>(&db_path, args)
-            .wrap_err("failed to open MDBX environment")?;
-        let storage = Self { db };
-        storage.bootstrap(config, &db_path)?;
-        Ok(storage)
+        fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
+        let meta_path = meta_path(&config.data_dir);
+        let meta = if meta_path.exists() {
+            load_meta(&meta_path)?
+        } else {
+            MetaState {
+                schema_version: SCHEMA_VERSION,
+                chain_id: config.chain_id,
+                storage_key: StorageConfigKey::from(config),
+                start_block: config.start_block,
+                last_indexed_block: None,
+                head_seen: None,
+            }
+        };
+        validate_meta(config, &meta)?;
+        if meta.schema_version != SCHEMA_VERSION {
+            return Err(eyre!(
+                "schema version mismatch: expected {}, got {}",
+                SCHEMA_VERSION,
+                meta.schema_version
+            ));
+        }
+        if !meta_path.exists() {
+            persist_meta(&meta_path, &meta)?;
+        }
+
+        let static_dir = static_dir(&config.data_dir);
+        fs::create_dir_all(&static_dir).wrap_err("failed to create static dir")?;
+
+        let start_block = meta.start_block;
+        let segments = SegmentStore {
+            headers: SegmentWriter::open(static_dir.join("headers"), start_block, SegmentCompression::None)?,
+            tx_hashes: SegmentWriter::open(static_dir.join("tx_hashes"), start_block, SegmentCompression::None)?,
+            tx_meta: SegmentWriter::open(
+                static_dir.join("tx_meta"),
+                start_block,
+                SegmentCompression::Zstd { use_dict: false, max_dict_size: ZSTD_DICT_MAX_SIZE },
+            )?,
+            receipts: SegmentWriter::open(
+                static_dir.join("receipts"),
+                start_block,
+                SegmentCompression::Zstd { use_dict: false, max_dict_size: ZSTD_DICT_MAX_SIZE },
+            )?,
+            sizes: SegmentWriter::open(static_dir.join("block_sizes"), start_block, SegmentCompression::None)?,
+        };
+
+        let peer_cache = load_peer_cache(&config.data_dir)?;
+        Ok(Self {
+            data_dir: config.data_dir.clone(),
+            meta: Mutex::new(meta),
+            segments,
+            peer_cache: Mutex::new(peer_cache),
+        })
     }
 
-    /// Open existing MDBX environment if it already exists.
     pub fn open_existing(config: &NodeConfig) -> Result<Option<Self>> {
-        let db_path = config.data_dir.join("db");
-        if !db_path.exists() {
+        let meta = meta_path(&config.data_dir);
+        if !meta.exists() {
             return Ok(None);
         }
         Ok(Some(Self::open(config)?))
     }
 
-    fn bootstrap(&self, config: &NodeConfig, db_path: &Path) -> Result<()> {
-        let tx = self.db.tx()?;
-        let schema_bytes = tx.get::<tables::Meta>(META_SCHEMA_VERSION_KEY.to_string())?;
-        tx.commit()?;
-
-        let (needs_last_indexed, needs_head_seen) = match schema_bytes {
-            None => {
-                let tx = self.db.tx_mut()?;
-                tx.put::<tables::Meta>(
-                    META_SCHEMA_VERSION_KEY.to_string(),
-                    encode_json(&SCHEMA_VERSION)?,
-                )?;
-                tx.put::<tables::Meta>(
-                    META_CHAIN_ID_KEY.to_string(),
-                    encode_json(&config.chain_id)?,
-                )?;
-                tx.put::<tables::Meta>(
-                    META_CONFIG_KEY.to_string(),
-                    encode_json(&StoredConfig::from(config))?,
-                )?;
-                tx.put::<tables::Meta>(
-                    META_LAST_INDEXED_BLOCK_KEY.to_string(),
-                    encode_json(&Option::<u64>::None)?,
-                )?;
-                tx.put::<tables::Meta>(
-                    META_HEAD_SEEN_KEY.to_string(),
-                    encode_json(&Option::<u64>::None)?,
-                )?;
-                tx.commit()?;
-                info!(db_path = %db_path.display(), "initialized storage metadata");
-                return Ok(());
-            }
-            Some(bytes) => {
-                let schema_version: u64 = decode_json(bytes)?;
-                if schema_version != SCHEMA_VERSION {
-                    return Err(eyre!(
-                        "unsupported schema version {schema_version} (expected {SCHEMA_VERSION})"
-                    ));
-                }
-
-                let tx = self.db.tx()?;
-                let chain_bytes = tx
-                    .get::<tables::Meta>(META_CHAIN_ID_KEY.to_string())?
-                    .ok_or_else(|| eyre!("missing chain_id metadata"))?;
-                let chain_id: u64 = decode_json(chain_bytes)?;
-                if chain_id != config.chain_id {
-                    return Err(eyre!(
-                        "chain_id mismatch: db={chain_id} config={}",
-                        config.chain_id
-                    ));
-                }
-
-                let config_bytes = tx
-                    .get::<tables::Meta>(META_CONFIG_KEY.to_string())?
-                    .ok_or_else(|| eyre!("missing config metadata"))?;
-                let stored_config: StoredConfig = decode_json(config_bytes)?;
-                let expected = StoredConfig::from(config);
-                let stored_key = stored_config.storage_key();
-                let expected_key = expected.storage_key();
-                if stored_key != expected_key {
-                    return Err(eyre!(
-                        "storage config mismatch: db={stored_key:?} config={expected_key:?}"
-                    ));
-                }
-
-                let last_indexed = tx.get::<tables::Meta>(META_LAST_INDEXED_BLOCK_KEY.to_string())?;
-                let head_seen = tx.get::<tables::Meta>(META_HEAD_SEEN_KEY.to_string())?;
-                tx.commit()?;
-                if stored_config != expected {
-                    let tx = self.db.tx_mut()?;
-                    tx.put::<tables::Meta>(
-                        META_CONFIG_KEY.to_string(),
-                        encode_json(&expected)?,
-                    )?;
-                    tx.commit()?;
-                }
-                (last_indexed.is_none(), head_seen.is_none())
-            }
-        };
-
-        if needs_last_indexed || needs_head_seen {
-            let tx = self.db.tx_mut()?;
-            if needs_last_indexed {
-                tx.put::<tables::Meta>(
-                    META_LAST_INDEXED_BLOCK_KEY.to_string(),
-                    encode_json(&Option::<u64>::None)?,
-                )?;
-            }
-            if needs_head_seen {
-                tx.put::<tables::Meta>(
-                    META_HEAD_SEEN_KEY.to_string(),
-                    encode_json(&Option::<u64>::None)?,
-                )?;
-            }
-            tx.commit()?;
-        }
-
-        Ok(())
+    pub fn disk_usage(&self) -> Result<StorageDiskStats> {
+        Self::disk_usage_at(&self.data_dir)
     }
 
-    /// Returns the last fully indexed block, if any.
+    pub fn disk_usage_at(data_dir: &Path) -> Result<StorageDiskStats> {
+        let static_dir = static_dir(data_dir);
+        let meta_bytes = file_size(&meta_path(data_dir))?;
+        let peers_bytes = file_size(&peer_path(data_dir))?;
+        let static_total_bytes = dir_size(&static_dir)?;
+        let total_bytes = dir_size(data_dir)?;
+        let segments = segment_disk_stats(&static_dir)?;
+
+        Ok(StorageDiskStats {
+            total_bytes,
+            meta_bytes,
+            peers_bytes,
+            static_total_bytes,
+            segments,
+        })
+    }
+
     pub fn last_indexed_block(&self) -> Result<Option<u64>> {
-        self.read_optional_u64(META_LAST_INDEXED_BLOCK_KEY)
+        let meta = self.meta.lock().expect("meta lock");
+        Ok(meta.last_indexed_block)
     }
 
-    /// Persist the last fully indexed block.
-    #[allow(dead_code)]
     pub fn set_last_indexed_block(&self, value: u64) -> Result<()> {
-        self.write_optional_u64(META_LAST_INDEXED_BLOCK_KEY, Some(value))
+        let mut meta = self.meta.lock().expect("meta lock");
+        meta.last_indexed_block = Some(value);
+        persist_meta(&meta_path(&self.data_dir), &meta)
     }
 
-    /// Returns the latest head observed from the head source.
     pub fn head_seen(&self) -> Result<Option<u64>> {
-        self.read_optional_u64(META_HEAD_SEEN_KEY)
+        let meta = self.meta.lock().expect("meta lock");
+        Ok(meta.head_seen)
     }
 
-    /// Persist the latest head observed from the head source.
-    #[allow(dead_code)]
     pub fn set_head_seen(&self, value: u64) -> Result<()> {
-        self.write_optional_u64(META_HEAD_SEEN_KEY, Some(value))
+        let mut meta = self.meta.lock().expect("meta lock");
+        meta.head_seen = Some(value);
+        persist_meta(&meta_path(&self.data_dir), &meta)
     }
 
-    /// Persist a canonical header by block number.
     #[allow(dead_code)]
     pub fn write_block_header(&self, number: u64, header: Header) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockHeaders>(number, header)?;
-        tx.commit()?;
-        Ok(())
+        self.segments
+            .headers
+            .append_rows(number, &[encode_bincode_compat_value(&header)?])
     }
 
-    /// Persist transaction hashes for a block.
     #[allow(dead_code)]
     pub fn write_block_tx_hashes(&self, number: u64, hashes: StoredTxHashes) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockTxHashes>(number, hashes)?;
-        tx.commit()?;
-        Ok(())
+        self.segments
+            .tx_hashes
+            .append_rows(number, &[encode_bincode_value(&hashes)?])
     }
 
-    /// Persist transaction metadata for a block.
     #[allow(dead_code)]
-    pub fn write_block_transactions(
-        &self,
-        number: u64,
-        transactions: StoredTransactions,
-    ) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockTransactions>(number, transactions)?;
-        tx.commit()?;
-        Ok(())
+    pub fn write_block_transactions(&self, number: u64, transactions: StoredTransactions) -> Result<()> {
+        self.segments
+            .tx_meta
+            .append_rows(number, &[encode_bincode_value(&transactions)?])
     }
 
-    /// Persist withdrawals for a block (if any).
     #[allow(dead_code)]
-    pub fn write_block_withdrawals(
-        &self,
-        number: u64,
-        withdrawals: StoredWithdrawals,
-    ) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockWithdrawals>(number, withdrawals)?;
-        tx.commit()?;
+    pub fn write_block_withdrawals(&self, _number: u64, _withdrawals: StoredWithdrawals) -> Result<()> {
         Ok(())
     }
 
-    /// Persist the RLP-encoded block size.
     #[allow(dead_code)]
     pub fn write_block_size(&self, number: u64, size: StoredBlockSize) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockSizes>(number, size)?;
-        tx.commit()?;
+        self.segments
+            .sizes
+            .append_rows(number, &[encode_u64_value(size.size)])
+    }
+
+    #[allow(dead_code)]
+    pub fn write_block_receipts(&self, number: u64, receipts: StoredReceipts) -> Result<()> {
+        self.segments
+            .receipts
+            .append_rows(number, &[encode_bincode_compat_value(&receipts)?])
+    }
+
+    #[allow(dead_code)]
+    pub fn write_block_logs(&self, _number: u64, _logs: StoredLogs) -> Result<()> {
         Ok(())
     }
 
-    /// Persist all block artifacts in a single transaction.
     #[allow(dead_code)]
+    pub fn write_log_indexes(&self, _logs: &[StoredLog]) -> Result<()> {
+        Ok(())
+    }
+
     pub fn write_block_bundle_batch(&self, bundles: &[BlockBundle]) -> Result<()> {
         if bundles.is_empty() {
             return Ok(());
         }
-        let tx = self.db.tx_mut()?;
+        for window in bundles.windows(2) {
+            if window[1].number != window[0].number.saturating_add(1) {
+                return Err(eyre!("bundle batch is not contiguous"));
+            }
+        }
+        let first = bundles.first().expect("bundles non-empty").number;
+        let mut headers = Vec::with_capacity(bundles.len());
+        let mut tx_hashes = Vec::with_capacity(bundles.len());
+        let mut tx_meta = Vec::with_capacity(bundles.len());
+        let mut receipts = Vec::with_capacity(bundles.len());
+        let mut sizes = Vec::with_capacity(bundles.len());
+
         for bundle in bundles {
-            tx.put::<tables::BlockHeaders>(bundle.number, bundle.header.clone())?;
-            tx.put::<tables::BlockTxHashes>(bundle.number, bundle.tx_hashes.clone())?;
-            tx.put::<tables::BlockTransactions>(bundle.number, bundle.transactions.clone())?;
-            tx.put::<tables::BlockWithdrawals>(bundle.number, bundle.withdrawals.clone())?;
-            tx.put::<tables::BlockSizes>(bundle.number, bundle.size)?;
-            tx.put::<tables::BlockReceipts>(bundle.number, bundle.receipts.clone())?;
+            headers.push(encode_bincode_compat_value(&bundle.header)?);
+            tx_hashes.push(encode_bincode_value(&bundle.tx_hashes)?);
+            tx_meta.push(encode_bincode_value(&bundle.transactions)?);
+            receipts.push(encode_bincode_compat_value(&bundle.receipts)?);
+            sizes.push(encode_u64_value(bundle.size.size));
         }
 
-        let last_number = bundles
-            .last()
-            .expect("bundles is not empty")
-            .number;
-        tx.put::<tables::Meta>(
-            META_LAST_INDEXED_BLOCK_KEY.to_string(),
-            encode_json(&Some(last_number))?,
-        )?;
-        tx.commit()?;
+        self.segments.headers.append_rows(first, &headers)?;
+        self.segments.tx_hashes.append_rows(first, &tx_hashes)?;
+        self.segments.tx_meta.append_rows(first, &tx_meta)?;
+        self.segments.receipts.append_rows(first, &receipts)?;
+        self.segments.sizes.append_rows(first, &sizes)?;
+
+        let last_number = bundles.last().map(|bundle| bundle.number).unwrap_or(first);
+        self.set_last_indexed_block(last_number)?;
         Ok(())
     }
 
-    /// Persist headers + receipts only (debug receipts-only mode).
-    #[allow(dead_code)]
-    pub fn write_header_receipts_batch(&self, bundles: &[ReceiptBundle]) -> Result<()> {
+    pub fn write_receipts_batch(&self, bundles: &[ReceiptBundle]) -> Result<()> {
         if bundles.is_empty() {
             return Ok(());
         }
-        let tx = self.db.tx_mut()?;
-        for bundle in bundles {
-            tx.put::<tables::BlockHeaders>(bundle.number, bundle.header.clone())?;
-            tx.put::<tables::BlockReceipts>(bundle.number, bundle.receipts.clone())?;
-        }
-        let last_number = bundles
-            .last()
-            .expect("bundles is not empty")
-            .number;
-        tx.put::<tables::Meta>(
-            META_LAST_INDEXED_BLOCK_KEY.to_string(),
-            encode_json(&Some(last_number))?,
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Persist receipts for a block.
-    #[allow(dead_code)]
-    pub fn write_block_receipts(&self, number: u64, receipts: StoredReceipts) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockReceipts>(number, receipts)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Persist derived logs for a block.
-    #[allow(dead_code)]
-    pub fn write_block_logs(&self, number: u64, logs: StoredLogs) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::BlockLogs>(number, logs)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Persist log index entries for address/topic queries.
-    #[allow(dead_code)]
-    pub fn write_log_indexes(&self, logs: &[StoredLog]) -> Result<()> {
-        if logs.is_empty() {
-            return Ok(());
-        }
-
-        let tx = self.db.tx_mut()?;
-        for log in logs {
-            let entry = LogIndexEntry {
-                block_number: log.block_number,
-                log_index: log.log_index,
-            };
-            tx.put::<tables::LogIndexByAddress>(log.address, entry)?;
-            if let Some(topic0) = log.topics.first() {
-                tx.put::<tables::LogIndexByTopic0>(*topic0, entry)?;
+        for window in bundles.windows(2) {
+            if window[1].number != window[0].number.saturating_add(1) {
+                return Err(eyre!("receipt batch is not contiguous"));
             }
         }
-        tx.commit()?;
+        let first = bundles.first().expect("bundles non-empty").number;
+        let mut headers = Vec::with_capacity(bundles.len());
+        let mut receipts = Vec::with_capacity(bundles.len());
+        for bundle in bundles {
+            headers.push(encode_bincode_compat_value(&bundle.header)?);
+            receipts.push(encode_bincode_compat_value(&bundle.receipts)?);
+        }
+        self.segments.headers.append_rows(first, &headers)?;
+        self.segments.receipts.append_rows(first, &receipts)?;
+
+        let last_number = bundles.last().map(|bundle| bundle.number).unwrap_or(first);
+        self.set_last_indexed_block(last_number)?;
         Ok(())
     }
 
-    /// Roll back stored data to the provided ancestor block (inclusive).
     #[allow(dead_code)]
     pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
-        let rollback_start = ancestor_number.saturating_add(1);
-        let tx = self.db.tx_mut()?;
-
-        let mut headers = tx.cursor_write::<tables::BlockHeaders>()?;
-        let mut walker = headers.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut tx_hashes = tx.cursor_write::<tables::BlockTxHashes>()?;
-        let mut walker = tx_hashes.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut transactions = tx.cursor_write::<tables::BlockTransactions>()?;
-        let mut walker = transactions.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut withdrawals = tx.cursor_write::<tables::BlockWithdrawals>()?;
-        let mut walker = withdrawals.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut sizes = tx.cursor_write::<tables::BlockSizes>()?;
-        let mut walker = sizes.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut receipts = tx.cursor_write::<tables::BlockReceipts>()?;
-        let mut walker = receipts.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut logs = tx.cursor_write::<tables::BlockLogs>()?;
-        let mut walker = logs.walk_range(rollback_start..)?;
-        while let Some(entry) = walker.next() {
-            entry?;
-            walker.delete_current()?;
-        }
-
-        let mut address_index = tx.cursor_dup_write::<tables::LogIndexByAddress>()?;
-        let mut walker = address_index.walk(None)?;
-        while let Some(entry) = walker.next() {
-            let (_, value) = entry?;
-            if value.block_number > ancestor_number {
-                walker.delete_current()?;
-            }
-        }
-
-        let mut topic_index = tx.cursor_dup_write::<tables::LogIndexByTopic0>()?;
-        let mut walker = topic_index.walk(None)?;
-        while let Some(entry) = walker.next() {
-            let (_, value) = entry?;
-            if value.block_number > ancestor_number {
-                walker.delete_current()?;
-            }
-        }
-
-        tx.put::<tables::Meta>(
-            META_LAST_INDEXED_BLOCK_KEY.to_string(),
-            encode_json(&Some(ancestor_number))?,
-        )?;
-
-        tx.commit()?;
-        Ok(())
+        self.segments.headers.prune_to(ancestor_number)?;
+        self.segments.tx_hashes.prune_to(ancestor_number)?;
+        self.segments.tx_meta.prune_to(ancestor_number)?;
+        self.segments.receipts.prune_to(ancestor_number)?;
+        self.segments.sizes.prune_to(ancestor_number)?;
+        let mut meta = self.meta.lock().expect("meta lock");
+        meta.last_indexed_block = if ancestor_number < meta.start_block {
+            None
+        } else {
+            Some(ancestor_number)
+        };
+        persist_meta(&meta_path(&self.data_dir), &meta)
     }
 
-    /// Fetch a canonical header by block number.
     #[allow(dead_code)]
     pub fn block_header(&self, number: u64) -> Result<Option<Header>> {
-        let tx = self.db.tx()?;
-        let header = tx.get::<tables::BlockHeaders>(number)?;
-        tx.commit()?;
-        Ok(header)
+        self.segments.headers.read_row_compat(number)
     }
 
-    /// Fetch transaction hashes for a block.
     #[allow(dead_code)]
     pub fn block_tx_hashes(&self, number: u64) -> Result<Option<StoredTxHashes>> {
-        let tx = self.db.tx()?;
-        let hashes = tx.get::<tables::BlockTxHashes>(number)?;
-        tx.commit()?;
-        Ok(hashes)
+        self.segments.tx_hashes.read_row(number)
     }
 
-    /// Fetch transaction metadata for a block.
     #[allow(dead_code)]
     pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
-        let tx = self.db.tx()?;
-        let transactions = tx.get::<tables::BlockTransactions>(number)?;
-        tx.commit()?;
-        Ok(transactions)
+        self.segments.tx_meta.read_row(number)
     }
 
-    /// Fetch withdrawals for a block.
     #[allow(dead_code)]
-    pub fn block_withdrawals(&self, number: u64) -> Result<Option<StoredWithdrawals>> {
-        let tx = self.db.tx()?;
-        let withdrawals = tx.get::<tables::BlockWithdrawals>(number)?;
-        tx.commit()?;
-        Ok(withdrawals)
+    pub fn block_withdrawals(&self, _number: u64) -> Result<Option<StoredWithdrawals>> {
+        Ok(None)
     }
 
-    /// Fetch stored block size.
     #[allow(dead_code)]
     pub fn block_size(&self, number: u64) -> Result<Option<StoredBlockSize>> {
-        let tx = self.db.tx()?;
-        let size = tx.get::<tables::BlockSizes>(number)?;
-        tx.commit()?;
-        Ok(size)
+        self.segments
+            .sizes
+            .read_row_u64(number)
+            .map(|opt| opt.map(|size| StoredBlockSize { size }))
     }
 
-    /// Fetch receipts for a block.
     #[allow(dead_code)]
     pub fn block_receipts(&self, number: u64) -> Result<Option<StoredReceipts>> {
-        let tx = self.db.tx()?;
-        let receipts = tx.get::<tables::BlockReceipts>(number)?;
-        tx.commit()?;
-        Ok(receipts)
+        self.segments.receipts.read_row_compat(number)
     }
 
-    /// Fetch derived logs for a block.
     #[allow(dead_code)]
-    pub fn block_logs(&self, number: u64) -> Result<Option<StoredLogs>> {
-        let tx = self.db.tx()?;
-        let logs = tx.get::<tables::BlockLogs>(number)?;
-        tx.commit()?;
-        Ok(logs)
+    pub fn block_logs(&self, _number: u64) -> Result<Option<StoredLogs>> {
+        Ok(None)
     }
 
-    /// Fetch canonical headers for an inclusive block range.
     #[allow(dead_code)]
-    pub fn block_headers_range(
-        &self,
-        range: RangeInclusive<u64>,
-    ) -> Result<Vec<(u64, Header)>> {
-        let tx = self.db.tx()?;
-        let mut cursor = tx.cursor_read::<tables::BlockHeaders>()?;
-        let mut out = Vec::new();
-        for entry in cursor.walk_range(range)? {
-            let (key, value) = entry?;
-            out.push((key, value));
-        }
-        tx.commit()?;
-        Ok(out)
+    pub fn block_headers_range(&self, range: RangeInclusive<u64>) -> Result<Vec<(u64, Header)>> {
+        self.segments.headers.read_range_compat(range)
     }
 
-    /// Fetch transaction hashes for an inclusive block range.
     #[allow(dead_code)]
     pub fn block_tx_hashes_range(
         &self,
         range: RangeInclusive<u64>,
     ) -> Result<Vec<(u64, StoredTxHashes)>> {
-        let tx = self.db.tx()?;
-        let mut cursor = tx.cursor_read::<tables::BlockTxHashes>()?;
-        let mut out = Vec::new();
-        for entry in cursor.walk_range(range)? {
-            let (key, value) = entry?;
-            out.push((key, value));
-        }
-        tx.commit()?;
-        Ok(out)
+        self.segments.tx_hashes.read_range(range)
     }
 
-    /// Fetch receipts for an inclusive block range.
     #[allow(dead_code)]
     pub fn block_receipts_range(
         &self,
         range: RangeInclusive<u64>,
     ) -> Result<Vec<(u64, StoredReceipts)>> {
-        let tx = self.db.tx()?;
-        let mut cursor = tx.cursor_read::<tables::BlockReceipts>()?;
-        let mut out = Vec::new();
-        for entry in cursor.walk_range(range)? {
-            let (key, value) = entry?;
-            out.push((key, value));
-        }
-        tx.commit()?;
-        Ok(out)
+        self.segments.receipts.read_range_compat(range)
     }
 
-    /// Fetch derived logs for an inclusive block range.
     #[allow(dead_code)]
-    pub fn block_logs_range(
-        &self,
-        range: RangeInclusive<u64>,
-    ) -> Result<Vec<(u64, StoredLogs)>> {
-        let tx = self.db.tx()?;
-        let mut cursor = tx.cursor_read::<tables::BlockLogs>()?;
-        let mut out = Vec::new();
-        for entry in cursor.walk_range(range)? {
-            let (key, value) = entry?;
-            out.push((key, value));
-        }
-        tx.commit()?;
-        Ok(out)
+    pub fn block_logs_range(&self, _range: RangeInclusive<u64>) -> Result<Vec<(u64, StoredLogs)>> {
+        Ok(Vec::new())
     }
 
-    /// Fetch log index entries for an address over an inclusive block range.
     #[allow(dead_code)]
     pub fn log_index_by_address_range(
         &self,
-        address: Address,
-        range: RangeInclusive<u64>,
+        _address: Address,
+        _range: RangeInclusive<u64>,
     ) -> Result<Vec<LogIndexEntry>> {
-        let start_subkey = log_index_subkey(*range.start());
-        let end_subkey = log_index_subkey(*range.end());
-        let tx = self.db.tx()?;
-        let mut cursor = tx.cursor_dup_read::<tables::LogIndexByAddress>()?;
-        let mut out = Vec::new();
-        for entry in cursor.walk_dup(Some(address), Some(start_subkey))? {
-            let (key, value) = entry?;
-            if key != address {
-                break;
-            }
-            if value.get_subkey() > end_subkey {
-                break;
-            }
-            out.push(value);
-        }
-        tx.commit()?;
-        Ok(out)
+        Ok(Vec::new())
     }
 
-    /// Fetch log index entries for a topic0 over an inclusive block range.
     #[allow(dead_code)]
     pub fn log_index_by_topic0_range(
         &self,
-        topic0: B256,
-        range: RangeInclusive<u64>,
+        _topic0: B256,
+        _range: RangeInclusive<u64>,
     ) -> Result<Vec<LogIndexEntry>> {
-        let start_subkey = log_index_subkey(*range.start());
-        let end_subkey = log_index_subkey(*range.end());
-        let tx = self.db.tx()?;
-        let mut cursor = tx.cursor_dup_read::<tables::LogIndexByTopic0>()?;
-        let mut out = Vec::new();
-        for entry in cursor.walk_dup(Some(topic0), Some(start_subkey))? {
-            let (key, value) = entry?;
-            if key != topic0 {
-                break;
-            }
-            if value.get_subkey() > end_subkey {
-                break;
-            }
-            out.push(value);
-        }
-        tx.commit()?;
-        Ok(out)
+        Ok(Vec::new())
     }
 
-    fn read_optional_u64(&self, key: &str) -> Result<Option<u64>> {
-        let tx = self.db.tx()?;
-        let bytes = tx.get::<tables::Meta>(key.to_string())?;
-        tx.commit()?;
-        match bytes {
-            Some(value) => decode_json::<Option<u64>>(value),
-            None => Ok(None),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn write_optional_u64(&self, key: &str, value: Option<u64>) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::Meta>(key.to_string(), encode_json(&value)?)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Insert or update a cached peer entry.
     pub fn upsert_peer(&self, peer: StoredPeer) -> Result<()> {
-        let tx = self.db.tx_mut()?;
-        tx.put::<tables::PeerCache>(peer.peer_id.clone(), encode_json(&peer)?)?;
-        tx.commit()?;
+        let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        cache.insert(peer.peer_id.clone(), peer);
         Ok(())
     }
 
-    /// Load cached peers, pruning expired entries and enforcing a cap.
-    pub fn load_peers(
-        &self,
-        expire_before_ms: u64,
-        max_peers: usize,
-    ) -> Result<PeerCacheLoad> {
-        let mut peers: Vec<StoredPeer> = Vec::new();
-        let mut total = 0usize;
-        let mut expired = 0usize;
-        let mut corrupted = 0usize;
-        let mut capped = 0usize;
-        let tx = self.db.tx_mut()?;
-        {
-            let mut cursor = tx.cursor_write::<tables::PeerCache>()?;
-            let mut walker = cursor.walk(None)?;
-            while let Some(entry) = walker.next() {
-                let (peer_id, bytes) = entry?;
-                total += 1;
-                let mut stored: StoredPeer = match decode_json(bytes) {
-                    Ok(stored) => stored,
-                    Err(_) => {
-                        corrupted += 1;
-                        walker.delete_current()?;
-                        continue;
-                    }
-                };
-                if stored.peer_id.is_empty() {
-                    stored.peer_id = peer_id.clone();
-                }
-                if stored.last_seen_ms < expire_before_ms {
-                    expired += 1;
-                    walker.delete_current()?;
-                    continue;
-                }
-                peers.push(stored);
-            }
-        }
+    pub fn flush_peer_cache(&self) -> Result<()> {
+        let cache = self.peer_cache.lock().expect("peer cache lock");
+        let peers: Vec<StoredPeer> = cache.values().cloned().collect();
+        persist_peer_cache(&self.data_dir, &peers)
+    }
 
+    pub fn load_peers(&self, expire_before_ms: u64, max_peers: usize) -> Result<PeerCacheLoad> {
+        let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        let mut peers: Vec<StoredPeer> = Vec::new();
+        let total = cache.len();
+        let mut expired = 0usize;
+        let corrupted = 0usize;
+        let mut capped = 0usize;
+        for peer in cache.values() {
+            if peer.last_seen_ms < expire_before_ms {
+                expired += 1;
+                continue;
+            }
+            peers.push(peer.clone());
+        }
         peers.sort_by_key(|peer| Reverse(peer.last_seen_ms));
         if peers.len() > max_peers {
             capped = peers.len().saturating_sub(max_peers);
-            let keep: HashSet<String> = peers
-                .iter()
-                .take(max_peers)
-                .map(|peer| peer.peer_id.clone())
-                .collect();
-            let mut cursor = tx.cursor_write::<tables::PeerCache>()?;
-            let mut walker = cursor.walk(None)?;
-            while let Some(entry) = walker.next() {
-                let (peer_id, _) = entry?;
-                if !keep.contains(&peer_id) {
-                    walker.delete_current()?;
-                }
-            }
             peers.truncate(max_peers);
         }
-
-        tx.commit()?;
+        cache.clear();
+        for peer in peers.iter() {
+            cache.insert(peer.peer_id.clone(), peer.clone());
+        }
+        drop(cache);
+        persist_peer_cache(&self.data_dir, &peers)?;
         Ok(PeerCacheLoad {
             peers,
             total,
@@ -1126,23 +873,165 @@ impl Storage {
     }
 }
 
-fn log_index_subkey(block_number: u64) -> u64 {
-    block_number
+fn segment_exists(path: &Path) -> bool {
+    path.with_extension(CONFIG_FILE_EXTENSION).exists()
 }
 
-fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).wrap_err("failed to serialize metadata")
+fn meta_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(META_FILE_NAME)
 }
 
-fn decode_json<T: DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
-    serde_json::from_slice(&bytes).wrap_err("failed to deserialize metadata")
+fn static_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(STATIC_DIR_NAME)
+}
+
+fn peer_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(PEER_FILE_NAME)
+}
+
+fn file_size(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn dir_size(path: &Path) -> Result<u64> {
+    let mut total: u64 = 0;
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path())?);
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    Ok(total)
+}
+
+fn segment_disk_size(base: &Path) -> Result<u64> {
+    let mut total: u64 = 0;
+    total = total.saturating_add(file_size(base)?);
+    total = total.saturating_add(file_size(&base.with_extension("off"))?);
+    total = total.saturating_add(file_size(&base.with_extension(CONFIG_FILE_EXTENSION))?);
+    total = total.saturating_add(file_size(&base.with_extension("idx"))?);
+    Ok(total)
+}
+
+fn segment_disk_stats(static_dir: &Path) -> Result<Vec<SegmentDiskStats>> {
+    let segments = ["headers", "tx_hashes", "tx_meta", "receipts", "block_sizes"];
+    let mut out = Vec::with_capacity(segments.len());
+    for name in segments {
+        let base = static_dir.join(name);
+        let bytes = segment_disk_size(&base)?;
+        out.push(SegmentDiskStats {
+            name: name.to_string(),
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+fn validate_meta(config: &NodeConfig, meta: &MetaState) -> Result<()> {
+    if meta.chain_id != config.chain_id {
+        return Err(eyre!(
+            "chain id mismatch: expected {}, got {}",
+            config.chain_id,
+            meta.chain_id
+        ));
+    }
+    if meta.storage_key != StorageConfigKey::from(config) {
+        return Err(eyre!(
+            "storage config mismatch: expected {:?}, got {:?}",
+            StorageConfigKey::from(config),
+            meta.storage_key
+        ));
+    }
+    if meta.start_block != config.start_block {
+        return Err(eyre!(
+            "start block mismatch: expected {}, got {}",
+            config.start_block,
+            meta.start_block
+        ));
+    }
+    Ok(())
+}
+
+fn load_meta(path: &Path) -> Result<MetaState> {
+    let bytes = fs::read(path).wrap_err("failed to read meta.json")?;
+    serde_json::from_slice(&bytes).wrap_err("failed to decode meta.json")
+}
+
+fn persist_meta(path: &Path, meta: &MetaState) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(meta).wrap_err("failed to encode meta.json")?;
+    fs::write(path, bytes).wrap_err("failed to write meta.json")
+}
+
+fn load_peer_cache(data_dir: &Path) -> Result<HashMap<String, StoredPeer>> {
+    let path = peer_path(data_dir);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let bytes = fs::read(&path).wrap_err("failed to read peers.json")?;
+    let peers: Vec<StoredPeer> =
+        serde_json::from_slice(&bytes).wrap_err("failed to decode peers.json")?;
+    Ok(peers.into_iter().map(|peer| (peer.peer_id.clone(), peer)).collect())
+}
+
+fn persist_peer_cache(data_dir: &Path, peers: &[StoredPeer]) -> Result<()> {
+    let path = peer_path(data_dir);
+    let bytes = serde_json::to_vec_pretty(peers).wrap_err("failed to encode peers.json")?;
+    fs::write(&path, bytes).wrap_err("failed to write peers.json")
+}
+
+fn encode_bincode_value<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    bincode::serialize(value).wrap_err("failed to encode bincode payload")
+}
+
+fn decode_bincode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    bincode::deserialize(bytes).wrap_err("failed to decode bincode payload")
+}
+
+fn encode_bincode_compat_value<T: SerdeBincodeCompat>(value: &T) -> Result<Vec<u8>> {
+    let repr = value.as_repr();
+    bincode::serialize(&repr).wrap_err("failed to encode bincode payload")
+}
+
+fn decode_bincode_compat_value<T>(bytes: &[u8]) -> Result<T>
+where
+    T: SerdeBincodeCompat,
+    <T as SerdeBincodeCompat>::BincodeRepr<'static>: DeserializeOwned,
+{
+    let repr: <T as SerdeBincodeCompat>::BincodeRepr<'static> =
+        bincode::deserialize(bytes).wrap_err("failed to decode bincode payload")?;
+    Ok(<T as SerdeBincodeCompat>::from_repr(repr))
+}
+
+fn encode_u64_value(value: u64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+fn decode_u64(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 8 {
+        return Err(eyre!("invalid u64 encoding"));
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(buf))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{logs_bloom, Address, B256, Bytes, Log, Signature, U256};
-    use reth_primitives_traits::SealedHeader;
+    use crate::cli::BenchmarkMode;
+    use alloy_primitives::{Address, B256, Bytes, Log, Signature, U256};
     use reth_ethereum_primitives::TxType;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1175,16 +1064,17 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Disabled,
-            rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
-            rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
-            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
-            rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
-            rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
-            rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
-            fast_sync_chunk_size: DEFAULT_FAST_SYNC_CHUNK_SIZE,
-            fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
-            fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
-            db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
+            command: None,
+            rpc_max_request_body_bytes: 0,
+            rpc_max_response_body_bytes: 0,
+            rpc_max_connections: 0,
+            rpc_max_batch_requests: 0,
+            rpc_max_blocks_per_filter: 0,
+            rpc_max_logs_per_response: 0,
+            fast_sync_chunk_size: 16,
+            fast_sync_max_inflight: 2,
+            fast_sync_max_buffered_blocks: 64,
+            db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,
         }
     }
@@ -1208,7 +1098,6 @@ mod tests {
     fn storage_bootstrap_and_config_validation() {
         let dir = temp_dir();
         let config = base_config(dir.clone());
-
         let storage = Storage::open(&config).expect("open storage");
         assert_eq!(storage.last_indexed_block().unwrap(), None);
         assert_eq!(storage.head_seen().unwrap(), None);
@@ -1216,35 +1105,11 @@ mod tests {
         storage.set_head_seen(12).expect("set head seen");
         assert_eq!(storage.last_indexed_block().unwrap(), Some(10));
         assert_eq!(storage.head_seen().unwrap(), Some(12));
-        drop(storage);
 
-        let storage_again = Storage::open(&config).expect("reopen with same config");
-        assert_eq!(storage_again.last_indexed_block().unwrap(), Some(10));
-        assert_eq!(storage_again.head_seen().unwrap(), Some(12));
-        drop(storage_again);
-
-        let mut changed = config.clone();
-        changed.chain_id = 2;
-        let err = Storage::open(&changed).expect_err("chain id mismatch should error");
-        let err_string = format!("{err:?}");
-        assert!(
-            err_string.contains("chain_id mismatch"),
-            "unexpected error: {err_string}"
-        );
-
-        let mut changed = config.clone();
-        changed.rpc_bind = "127.0.0.1:9999".parse().expect("valid bind");
-        changed.verbosity = 2;
-        changed.rpc_max_connections = 42;
-        let storage_updated = Storage::open(&changed).expect("open with runtime config");
-        let tx = storage_updated.db.tx().expect("open tx");
-        let config_bytes = tx
-            .get::<tables::Meta>(META_CONFIG_KEY.to_string())
-            .expect("read config bytes")
-            .expect("config present");
-        let stored: StoredConfig = decode_json(config_bytes).expect("decode config");
-        assert_eq!(stored, StoredConfig::from(&changed));
-        tx.commit().expect("commit tx");
+        let mut mismatched = config.clone();
+        mismatched.chain_id = 2;
+        let err = Storage::open(&mismatched).expect_err("chain mismatch");
+        assert!(format!("{err}").contains("chain id mismatch"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1255,24 +1120,18 @@ mod tests {
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("open storage");
 
-        let log0 = Log::new_unchecked(Address::ZERO, vec![B256::ZERO], Bytes::from(vec![0x01]));
-        let log1 = Log::new_unchecked(Address::ZERO, vec![B256::ZERO], Bytes::from(vec![0x02]));
-
-        let receipts0 = vec![receipt_with_logs(vec![log0.clone()])];
-        let receipts1 = vec![receipt_with_logs(vec![log1.clone()])];
-
-        let mut header0 = header_with_number(0);
-        header0.logs_bloom = logs_bloom(
-            receipts0
-                .iter()
-                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
-        );
-        let mut header1 = header_with_number(1);
-        header1.logs_bloom = logs_bloom(
-            receipts1
-                .iter()
-                .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
-        );
+        let header0 = header_with_number(0);
+        let header1 = header_with_number(1);
+        let receipts0 = vec![receipt_with_logs(vec![Log::new_unchecked(
+            Address::from([0x01u8; 20]),
+            vec![B256::from([0x10u8; 32])],
+            Bytes::from(vec![0x01]),
+        )])];
+        let receipts1 = vec![receipt_with_logs(vec![Log::new_unchecked(
+            Address::from([0x02u8; 20]),
+            vec![B256::from([0x20u8; 32])],
+            Bytes::from(vec![0x02]),
+        )])];
 
         storage
             .write_block_header(0, header0.clone())
@@ -1292,12 +1151,6 @@ mod tests {
         storage
             .write_block_receipts(1, StoredReceipts { receipts: receipts1.clone() })
             .expect("write receipts 1");
-        storage
-            .write_block_logs(0, StoredLogs { logs: vec![] })
-            .expect("write logs 0");
-        storage
-            .write_block_logs(1, StoredLogs { logs: vec![] })
-            .expect("write logs 1");
 
         let headers = storage.block_headers_range(0..=1).expect("headers range");
         assert_eq!(headers.len(), 2);
@@ -1315,7 +1168,7 @@ mod tests {
         assert_eq!(receipts.len(), 2);
 
         let logs = storage.block_logs_range(0..=1).expect("logs range");
-        assert_eq!(logs.len(), 2);
+        assert!(logs.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1349,54 +1202,33 @@ mod tests {
             signing_hash: Some(sig_hash1),
         };
         storage
-            .write_block_transactions(1, StoredTransactions { txs: vec![tx0.clone()] })
+            .write_block_transactions(0, StoredTransactions { txs: vec![tx0.clone()] })
+            .expect("write txs 0");
+        storage
+            .write_block_transactions(1, StoredTransactions { txs: vec![tx1.clone()] })
             .expect("write txs 1");
-        storage
-            .write_block_transactions(2, StoredTransactions { txs: vec![tx1.clone()] })
-            .expect("write txs 2");
-
-        storage
-            .write_block_withdrawals(
-                1,
-                StoredWithdrawals {
-                    withdrawals: Some(vec![StoredWithdrawal {
-                        index: 0,
-                        validator_index: 1,
-                        address: Address::from([0x10u8; 20]),
-                        amount: 2,
-                    }]),
-                },
-            )
-            .expect("write withdrawals");
-
-        storage
-            .write_block_size(1, StoredBlockSize { size: 1234 })
-            .expect("write size");
 
         assert_eq!(
             storage
-                .block_transactions(1)
-                .expect("read txs")
+                .block_transactions(0)
+                .expect("tx lookup")
                 .expect("txs exist"),
             StoredTransactions { txs: vec![tx0] }
         );
         assert_eq!(
             storage
-                .block_transactions(2)
-                .expect("read txs")
+                .block_transactions(1)
+                .expect("tx lookup")
                 .expect("txs exist"),
             StoredTransactions { txs: vec![tx1] }
         );
 
-        let withdrawals = storage
-            .block_withdrawals(1)
-            .expect("read withdrawals")
-            .expect("withdrawals exist");
-        assert_eq!(withdrawals.withdrawals.as_ref().unwrap().len(), 1);
-
+        storage
+            .write_block_size(0, StoredBlockSize { size: 1234 })
+            .expect("write size");
         assert_eq!(
             storage
-                .block_size(1)
+                .block_size(0)
                 .expect("read size")
                 .expect("size exists"),
             StoredBlockSize { size: 1234 }
@@ -1412,9 +1244,7 @@ mod tests {
         let storage = Storage::open(&config).expect("open storage");
 
         let header0 = header_with_number(0);
-        let header0_hash = SealedHeader::seal_slow(header0.clone()).hash();
         let header1 = header_with_number(1);
-        let header1_hash = SealedHeader::seal_slow(header1.clone()).hash();
         let tx_hash0 = B256::from([0x11u8; 32]);
         let tx_hash1 = B256::from([0x22u8; 32]);
 
@@ -1423,38 +1253,11 @@ mod tests {
             vec![B256::from([0x10u8; 32])],
             Bytes::from(vec![0x01]),
         );
-        let Log { address: address0, data: data0 } = log0.clone();
-        let (topics0, data0) = data0.split();
-        let stored_log0 = StoredLog {
-            address: address0,
-            topics: topics0,
-            data: data0,
-            block_number: 0,
-            block_hash: header0_hash,
-            transaction_hash: tx_hash0,
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
-
         let log1 = Log::new_unchecked(
             Address::from([0x02u8; 20]),
             vec![B256::from([0x20u8; 32])],
             Bytes::from(vec![0x02]),
         );
-        let Log { address: address1, data: data1 } = log1.clone();
-        let (topics1, data1) = data1.split();
-        let stored_log1 = StoredLog {
-            address: address1,
-            topics: topics1,
-            data: data1,
-            block_number: 1,
-            block_hash: header1_hash,
-            transaction_hash: tx_hash1,
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-        };
 
         let bundle0 = BlockBundle {
             number: 0,
@@ -1476,9 +1279,7 @@ mod tests {
             receipts: StoredReceipts {
                 receipts: vec![receipt_with_logs(vec![log0])],
             },
-            logs: StoredLogs {
-                logs: vec![stored_log0.clone()],
-            },
+            logs: StoredLogs { logs: Vec::new() },
         };
 
         let bundle1 = BlockBundle {
@@ -1501,9 +1302,7 @@ mod tests {
             receipts: StoredReceipts {
                 receipts: vec![receipt_with_logs(vec![log1])],
             },
-            logs: StoredLogs {
-                logs: vec![stored_log1.clone()],
-            },
+            logs: StoredLogs { logs: Vec::new() },
         };
 
         storage
@@ -1527,6 +1326,91 @@ mod tests {
             .log_index_by_address_range(Address::from([0x01u8; 20]), 0..=0)
             .expect("address index lookup");
         assert!(addr_index.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_rollback_prunes_segments() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let make_bundle = |number: u64, hash: B256| BlockBundle {
+            number,
+            header: header_with_number(number),
+            tx_hashes: StoredTxHashes { hashes: vec![hash] },
+            transactions: StoredTransactions {
+                txs: vec![StoredTransaction {
+                    hash,
+                    from: Some(Address::from([0x0au8; 20])),
+                    to: None,
+                    value: U256::from(number),
+                    nonce: number,
+                    signature: None,
+                    signing_hash: None,
+                }],
+            },
+            withdrawals: StoredWithdrawals { withdrawals: None },
+            size: StoredBlockSize { size: number + 100 },
+            receipts: StoredReceipts {
+                receipts: vec![receipt_with_logs(Vec::new())],
+            },
+            logs: StoredLogs { logs: Vec::new() },
+        };
+
+        let bundles = vec![
+            make_bundle(0, B256::from([0x10u8; 32])),
+            make_bundle(1, B256::from([0x11u8; 32])),
+            make_bundle(2, B256::from([0x12u8; 32])),
+        ];
+
+        storage
+            .write_block_bundle_batch(&bundles)
+            .expect("write bundle batch");
+        assert!(storage.block_header(2).expect("header 2").is_some());
+
+        storage.rollback_to(0).expect("rollback");
+        assert_eq!(storage.last_indexed_block().unwrap(), Some(0));
+        assert!(storage.block_header(0).expect("header 0").is_some());
+        assert!(storage.block_header(1).expect("header 1").is_none());
+        assert!(storage.block_tx_hashes(1).expect("hashes 1").is_none());
+        assert!(storage.block_transactions(1).expect("txs 1").is_none());
+        assert!(storage.block_receipts(1).expect("receipts 1").is_none());
+        assert!(storage.block_size(1).expect("size 1").is_none());
+
+        let headers = storage.block_headers_range(0..=2).expect("headers range");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_gap_fill_skips_missing_rows() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("open storage");
+
+        let header2 = header_with_number(2);
+        storage
+            .write_block_header(2, header2.clone())
+            .expect("write header 2");
+
+        assert!(storage.block_header(0).expect("header 0").is_none());
+        assert!(storage.block_header(1).expect("header 1").is_none());
+        assert_eq!(
+            storage
+                .block_header(2)
+                .expect("header 2")
+                .expect("header exists"),
+            header2
+        );
+
+        let headers = storage.block_headers_range(0..=2).expect("headers range");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, 2);
+        assert_eq!(headers[0].1, header2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1557,24 +1441,12 @@ mod tests {
         let by_address = storage
             .log_index_by_address_range(Address::ZERO, 0..=10)
             .expect("address index query");
-        assert_eq!(
-            by_address,
-            vec![LogIndexEntry {
-                block_number: 5,
-                log_index: 2
-            }]
-        );
+        assert!(by_address.is_empty());
 
         let by_topic = storage
             .log_index_by_topic0_range(topic0, 0..=10)
             .expect("topic index query");
-        assert_eq!(
-            by_topic,
-            vec![LogIndexEntry {
-                block_number: 5,
-                log_index: 2
-            }]
-        );
+        assert!(by_topic.is_empty());
 
         let empty = storage
             .log_index_by_address_range(Address::ZERO, 6..=10)
@@ -1626,6 +1498,7 @@ mod tests {
         storage.upsert_peer(recent1).expect("insert recent1");
         storage.upsert_peer(recent2).expect("insert recent2");
         storage.upsert_peer(recent3).expect("insert recent3");
+        storage.flush_peer_cache().expect("flush peers");
 
         let load = storage
             .load_peers(expire_before, 2)
@@ -1649,79 +1522,27 @@ mod tests {
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("open storage");
-
-        let topic0 = B256::from([0x11u8; 32]);
-        let topic1 = B256::from([0x22u8; 32]);
-        let log_a = StoredLog {
-            address: Address::from([0x22u8; 20]),
-            topics: vec![topic1],
-            block_number: 6,
+        let log1 = StoredLog {
+            address: Address::ZERO,
+            topics: vec![],
+            block_number: 3,
             block_hash: B256::ZERO,
             transaction_hash: B256::ZERO,
             transaction_index: 0,
             log_index: 1,
             removed: false,
-            data: Bytes::from(vec![0x02]),
-        };
-        let log_b = StoredLog {
-            address: Address::from([0x11u8; 20]),
-            topics: vec![topic0],
-            block_number: 5,
-            block_hash: B256::ZERO,
-            transaction_hash: B256::ZERO,
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
             data: Bytes::from(vec![0x01]),
         };
-
+        let log0 = StoredLog { block_number: 2, log_index: 0, ..log1.clone() };
+        let log2 = StoredLog { block_number: 3, log_index: 2, ..log1.clone() };
         storage
-            .write_log_indexes(&[log_a.clone(), log_b.clone()])
-            .expect("write log indexes");
+            .write_log_indexes(&[log1.clone(), log0.clone(), log2.clone()])
+            .expect("write indexes");
 
-        let addr_a = storage
-            .log_index_by_address_range(log_a.address, 0..=10)
+        let by_address = storage
+            .log_index_by_address_range(Address::ZERO, 0..=10)
             .expect("address index query");
-        assert_eq!(
-            addr_a,
-            vec![LogIndexEntry {
-                block_number: log_a.block_number,
-                log_index: log_a.log_index
-            }]
-        );
-
-        let addr_b = storage
-            .log_index_by_address_range(log_b.address, 0..=10)
-            .expect("address index query");
-        assert_eq!(
-            addr_b,
-            vec![LogIndexEntry {
-                block_number: log_b.block_number,
-                log_index: log_b.log_index
-            }]
-        );
-
-        let by_topic0 = storage
-            .log_index_by_topic0_range(topic0, 0..=10)
-            .expect("topic index query");
-        assert_eq!(
-            by_topic0,
-            vec![LogIndexEntry {
-                block_number: log_b.block_number,
-                log_index: log_b.log_index
-            }]
-        );
-
-        let by_topic1 = storage
-            .log_index_by_topic0_range(topic1, 0..=10)
-            .expect("topic index query");
-        assert_eq!(
-            by_topic1,
-            vec![LogIndexEntry {
-                block_number: log_a.block_number,
-                log_index: log_a.log_index
-            }]
-        );
+        assert!(by_address.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

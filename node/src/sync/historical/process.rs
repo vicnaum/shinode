@@ -2,7 +2,7 @@
 
 use crate::storage::{
     BlockBundle, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransaction, StoredTransactions,
-    StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
+    StoredTxHashes, StoredWithdrawals,
 };
 use crate::sync::{BlockPayload};
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
@@ -17,6 +17,7 @@ use std::mem::MaybeUninit;
 use std::time::Instant;
 
 /// Process a fetched block in probe mode.
+#[allow(dead_code)]
 pub fn process_probe(block: FetchedBlock) -> ProbeRecord {
     let receipts = block.receipts.len() as u64;
     ProbeRecord {
@@ -152,22 +153,8 @@ pub fn process_ingest(
     }
     let transactions_us = txs_start.elapsed().as_micros() as u64;
 
-    let withdrawals_start = Instant::now();
-    let stored_withdrawals = StoredWithdrawals {
-        withdrawals: body.withdrawals.as_ref().map(|withdrawals| {
-            withdrawals
-                .as_ref()
-                .iter()
-                .map(|withdrawal| StoredWithdrawal {
-                    index: withdrawal.index,
-                    validator_index: withdrawal.validator_index,
-                    address: withdrawal.address,
-                    amount: withdrawal.amount,
-                })
-                .collect()
-        }),
-    };
-    let withdrawals_us = withdrawals_start.elapsed().as_micros() as u64;
+    let stored_withdrawals = StoredWithdrawals { withdrawals: None };
+    let withdrawals_us = 0;
 
     let block_size_start = Instant::now();
     let block_size = block_rlp_size(&header, &body);
