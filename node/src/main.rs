@@ -24,7 +24,7 @@ use p2p::PeerPool;
 use sync::{
     BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus,
 };
-use sync::historical::IngestBenchStats;
+use sync::historical::{IngestBenchStats, ProbeStats};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -117,13 +117,39 @@ async fn main() -> Result<()> {
             head_at_startup,
             config.rollback_window,
         );
-        sync::historical::run_benchmark_probe(
+        let blocks_total = range_len(&range);
+        if blocks_total == 0 {
+            return Err(eyre::eyre!("benchmark range is empty"));
+        }
+        let stats = Arc::new(ProbeStats::new(blocks_total));
+        let probe_future = sync::historical::run_benchmark_probe(
             &config,
             Arc::clone(&session.pool),
-            range,
+            range.clone(),
             head_at_startup,
-        )
-            .await?;
+            Arc::clone(&stats),
+        );
+        tokio::pin!(probe_future);
+        tokio::select! {
+            res = &mut probe_future => {
+                res?;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                let summary = stats.summary(
+                    *range.start(),
+                    *range.end(),
+                    head_at_startup,
+                    config.rollback_window > 0,
+                    session.pool.len() as u64,
+                );
+                let summary_json = serde_json::to_string_pretty(&summary)?;
+                println!("{summary_json}");
+                if let Err(err) = session.flush_peer_cache() {
+                    warn!(error = %err, "failed to flush peer cache");
+                }
+                return Ok(());
+            }
+        }
         if let Err(err) = session.flush_peer_cache() {
             warn!(error = %err, "failed to flush peer cache");
         }
@@ -197,7 +223,7 @@ async fn main() -> Result<()> {
         let progress_ref = progress
             .as_ref()
             .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-        let outcome = sync::historical::run_ingest_pipeline(
+        let ingest_future = sync::historical::run_ingest_pipeline(
             Arc::clone(&storage),
             Arc::clone(&session.pool),
             &config,
@@ -206,8 +232,35 @@ async fn main() -> Result<()> {
             progress_ref,
             progress_stats.clone(),
             Some(Arc::clone(&bench)),
-        )
-        .await?;
+        );
+        tokio::pin!(ingest_future);
+        let outcome = tokio::select! {
+            res = &mut ingest_future => res?,
+            _ = tokio::signal::ctrl_c() => {
+                let storage_stats = match storage.disk_usage() {
+                    Ok(stats) => Some(stats),
+                    Err(err) => {
+                        warn!(error = %err, "failed to collect storage disk stats");
+                        None
+                    }
+                };
+                let summary = bench.summary(
+                    *range.start(),
+                    *range.end(),
+                    head_at_startup,
+                    config.rollback_window > 0,
+                    session.pool.len() as u64,
+                    bench.logs_total(),
+                    storage_stats,
+                );
+                let summary_json = serde_json::to_string_pretty(&summary)?;
+                println!("{summary_json}");
+                if let Err(err) = session.flush_peer_cache() {
+                    warn!(error = %err, "failed to flush peer cache");
+                }
+                return Ok(());
+            }
+        };
 
         let logs_total = match outcome {
             sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => logs,

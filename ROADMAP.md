@@ -60,6 +60,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ### v0.1.2 Persistence (queryable, restart-safe)
 - [x] Define static-file segments for v0.1 retention (headers, tx hashes, receipts, tx metadata, block sizes)
+- [x] Storage refactor: replace MDBX with NippyJar static files
 - [x] Write path: append headers + tx hashes + receipts + tx metadata during ingest
 - [x] Read path: fetch stored blocks/receipts by number/range (for RPC)
 - [ ] Indexes for fast `eth_getLogs` (address/topic0) — deferred to post-sync indexing
@@ -91,6 +92,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
 - [x] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
 - [x] Ingest benchmark mode with per-stage timing (fetch/process/static write)
+- [x] DB stats CLI for static-file storage sizes
 - [x] Defer sender recovery by storing signature + signing hash
 - Verified: `cargo test --manifest-path node/Cargo.toml` (graceful shutdown behavior)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (ingest metrics logging helpers)

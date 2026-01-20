@@ -6,11 +6,13 @@ This repo currently contains a working **receipt availability harness** (see App
 - Range backfill (single run) using P2P headers/bodies/receipts.
 - Static-file persistence (NippyJar) for headers, tx hashes, tx metadata (no calldata;
   signature + signing hash stored for sender recovery), receipts, and block size.
+- Storage refactor: MDBX replaced by NippyJar static files.
 - Logs are derived on demand; withdrawals are not stored.
 - Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
   `eth_getBlockByNumber`, `eth_getLogs`).
 - `eth_getBlockByNumber` returns full block shape; `totalDifficulty` is mocked to `0x0`.
 - Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
+- DB stats CLI for on-disk static-file sizes.
 - Benchmark modes: probe (headers/receipts only) and ingest (full pipeline timing).
 - Not yet: follow mode, live reorg handling, extra RPC methods, metrics export.
 

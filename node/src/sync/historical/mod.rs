@@ -29,8 +29,8 @@ use db_writer::{DbWriteConfig, DbWriterMessage, run_db_writer};
 use process::process_ingest;
 use scheduler::{PeerWorkScheduler, SchedulerConfig};
 use sink::run_probe_sink;
-pub use stats::IngestBenchStats;
-use stats::{FetchByteTotals, ProbeStats};
+pub use stats::{IngestBenchStats, ProbeStats};
+use stats::FetchByteTotals;
 use types::{BenchmarkConfig, ProbeRecord, FetchMode};
 use crate::storage::Storage;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +44,7 @@ pub async fn run_benchmark_probe(
     pool: Arc<PeerPool>,
     range: RangeInclusive<u64>,
     head_at_startup: u64,
+    stats: Arc<ProbeStats>,
 ) -> Result<()> {
     let mut benchmark = BenchmarkConfig::default();
     benchmark.blocks_per_assignment = config.fast_sync_chunk_size.max(1) as usize;
@@ -60,8 +61,6 @@ pub async fn run_benchmark_probe(
         },
         blocks,
     ));
-
-    let stats = Arc::new(ProbeStats::new(blocks_total));
 
     let buffer_cap = config
         .fast_sync_max_buffered_blocks
@@ -529,6 +528,9 @@ pub async fn run_ingest_pipeline(
                         if let Some(stats) = stats.as_ref() {
                             stats.inc_processed(1);
                         }
+                        if let Some(bench) = bench.as_ref() {
+                            bench.record_logs(log_count);
+                        }
                         if tx.send(DbWriterMessage::Block(bundle)).await.is_err() {
                             break;
                         }
@@ -708,7 +710,7 @@ fn fetch_payload_bytes(payload: &BlockPayload) -> FetchByteTotals {
 
 #[cfg(test)]
 mod tests {
-    use super::run_benchmark_probe;
+    use super::{run_benchmark_probe, ProbeStats};
     use crate::cli::{BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
     use crate::p2p::{peer_pool_for_tests, NetworkPeer};
     use crate::cli::{
@@ -808,10 +810,14 @@ mod tests {
         });
 
         let pool = Arc::new(peer_pool_for_tests(vec![peer]));
-        let range = 0..=1;
+        let range = 0u64..=1u64;
         let head_at_startup = 1;
 
-        run_benchmark_probe(config, pool, range, head_at_startup)
+        let blocks_total = (*range.end())
+            .saturating_sub(*range.start())
+            .saturating_add(1);
+        let stats = Arc::new(ProbeStats::new(blocks_total));
+        run_benchmark_probe(config, pool, range, head_at_startup, stats)
             .await
             .expect("probe run");
     }

@@ -264,6 +264,7 @@ pub struct IngestBenchStats {
     db_bytes_sizes: AtomicU64,
     db_bytes_receipts: AtomicU64,
     db_bytes_logs: AtomicU64,
+    logs_total: AtomicU64,
 }
 
 impl IngestBenchStats {
@@ -300,6 +301,7 @@ impl IngestBenchStats {
             db_bytes_sizes: AtomicU64::new(0),
             db_bytes_receipts: AtomicU64::new(0),
             db_bytes_logs: AtomicU64::new(0),
+            logs_total: AtomicU64::new(0),
         }
     }
 
@@ -376,6 +378,14 @@ impl IngestBenchStats {
             .fetch_add(bytes.receipts, Ordering::SeqCst);
         self.db_bytes_logs
             .fetch_add(bytes.logs, Ordering::SeqCst);
+    }
+
+    pub fn record_logs(&self, count: u64) {
+        self.logs_total.fetch_add(count, Ordering::SeqCst);
+    }
+
+    pub fn logs_total(&self) -> u64 {
+        self.logs_total.load(Ordering::SeqCst)
     }
 
     pub fn summary(

@@ -10,6 +10,7 @@ What works:
 - P2P range backfill from `start_block..head` (single run).
 - Static-file persistence (NippyJar) of headers, tx hashes, receipts, tx metadata
   (no calldata; signature + signing hash stored for sender recovery), and block size.
+- Storage backend refactor: MDBX replaced by NippyJar static files to minimize footprint.
 - Logs are derived on-demand from receipts; withdrawals are not stored.
 - RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`,
   `eth_getLogs`, with request limits.
@@ -88,6 +89,10 @@ RPC safety limits:
 Ingest tuning:
 - `--db-write-batch-blocks <u64>`: batch size for static-file writes (default: 512).
 - `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
+
+DB stats:
+- `stateless-history-node db stats --data-dir <path>`: print static-file storage sizes.
+- `stateless-history-node db stats --data-dir <path> --json`: JSON output for tooling.
 
 ## Configuration and storage
 
