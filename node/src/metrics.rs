@@ -3,6 +3,7 @@
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
+#[allow(dead_code)]
 pub fn lag_to_head(head_seen: Option<u64>, last_indexed: Option<u64>) -> Option<u64> {
     match (head_seen, last_indexed) {
         (Some(head), Some(indexed)) => Some(head.saturating_sub(indexed)),
@@ -10,6 +11,7 @@ pub fn lag_to_head(head_seen: Option<u64>, last_indexed: Option<u64>) -> Option<
     }
 }
 
+#[allow(dead_code)]
 pub fn rate_per_sec(count: u64, elapsed: Duration) -> Option<f64> {
     let secs = elapsed.as_secs_f64();
     if secs > 0.0 {

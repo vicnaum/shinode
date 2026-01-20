@@ -8,7 +8,7 @@ mod sync;
 use cli::{compute_target_range, BenchmarkMode, NodeConfig};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use metrics::{lag_to_head, range_len, rate_per_sec};
+use metrics::range_len;
 use std::{
     collections::VecDeque,
     io::IsTerminal,
@@ -225,6 +225,7 @@ async fn main() -> Result<()> {
             progress_ref,
             progress_stats.clone(),
             Some(Arc::clone(&bench)),
+            None,
         );
         tokio::pin!(ingest_future);
         let outcome = tokio::select! {
@@ -304,6 +305,8 @@ async fn main() -> Result<()> {
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
 
     let mut _network_session = None;
+    let mut follow_error: Option<eyre::Report> = None;
+    let mut progress: Option<Arc<IngestProgress>> = None;
     if matches!(config.head_source, cli::HeadSource::P2p) {
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
@@ -326,7 +329,7 @@ async fn main() -> Result<()> {
             None
         };
 
-        let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
+        progress = if std::io::stderr().is_terminal() {
             let bar = ProgressBar::new(total_len);
             bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
             let style = ProgressStyle::with_template(
@@ -358,93 +361,37 @@ async fn main() -> Result<()> {
             None
         };
 
-        loop {
-            let ingest_started = Instant::now();
-            let head_at_startup = source.head().await?;
-            let last_indexed = storage.last_indexed_block()?;
-            let start_from = select_start_from(config.start_block, last_indexed);
-            let range = compute_target_range(
-                start_from,
-                config.end_block,
-                head_at_startup,
-                config.rollback_window,
-            );
-            let progress_ref = progress
-                .as_ref()
-                .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-            let outcome = sync::historical::run_ingest_pipeline(
-                Arc::clone(&storage),
-                Arc::clone(&session.pool),
-                &config,
-                range.clone(),
-                head_at_startup,
-                progress_ref,
-                progress_stats.clone(),
-                None,
-            )
-            .await?;
-            let elapsed = ingest_started.elapsed();
-            let head_seen = storage.head_seen()?;
-            if let (Some(tracker), Some(head_seen)) = (progress.as_ref(), head_seen) {
-                let last_indexed = storage.last_indexed_block()?;
-                let start_from = select_start_from(config.start_block, last_indexed);
-                let range = compute_target_range(
-                    start_from,
-                    config.end_block,
-                    head_seen,
-                    config.rollback_window,
-                );
-                tracker.set_length(range_len(&range));
-            }
-            let last_indexed = storage.last_indexed_block()?;
-            let lag = lag_to_head(head_seen, last_indexed);
-            let peers = session.pool.len();
-            if let Some(stats) = progress_stats.as_ref() {
-                stats.set_peers(peers as u64, peers as u64);
-                if matches!(outcome, sync::historical::IngestPipelineOutcome::UpToDate { .. }) {
-                    stats.set_status(SyncStatus::UpToDate);
-                }
-            }
-            match outcome {
-                sync::historical::IngestPipelineOutcome::UpToDate { head } => {
-                    info!(
-                        head,
-                        lag_blocks = ?lag,
-                        peers,
-                        elapsed_ms = elapsed.as_millis(),
-                        "ingest up to date"
-                    );
-                    break;
-                }
-                sync::historical::IngestPipelineOutcome::RangeApplied { range, logs } => {
-                    let blocks = range_len(&range);
-                    let blocks_per_sec = rate_per_sec(blocks, elapsed);
-                    let logs_per_sec = rate_per_sec(logs, elapsed);
-                    tracing::debug!(
-                        range_start = *range.start(),
-                        range_end = *range.end(),
-                        blocks,
-                        logs,
-                        blocks_per_sec = ?blocks_per_sec,
-                        logs_per_sec = ?logs_per_sec,
-                        lag_blocks = ?lag,
-                        peers,
-                        elapsed_ms = elapsed.as_millis(),
-                        "ingested range"
-                    );
-                }
-            }
-        }
-
-        if let Some(tracker) = progress.as_ref() {
-            tracker.finish();
-        }
+        let progress_ref = progress
+            .as_ref()
+            .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
+        let follow_future = sync::historical::run_follow_loop(
+            Arc::clone(&storage),
+            Arc::clone(&session.pool),
+            &config,
+            progress_ref,
+            progress_stats.clone(),
+        );
 
         _network_session = Some(session);
+        tokio::pin!(follow_future);
+        tokio::select! {
+            res = &mut follow_future => {
+                if let Err(err) = res {
+                    follow_error = Some(err);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                warn!("shutdown signal received");
+            }
+        }
+    } else {
+        tokio::signal::ctrl_c().await?;
+        warn!("shutdown signal received");
     }
 
-    tokio::signal::ctrl_c().await?;
-    warn!("shutdown signal received");
+    if let Some(tracker) = progress.as_ref() {
+        tracker.finish();
+    }
     if let Err(err) = rpc_handle.stop() {
         warn!(error = %err, "failed to stop rpc server");
     }
@@ -457,6 +404,10 @@ async fn main() -> Result<()> {
     drop(_network_session);
     drop(storage);
     warn!("shutdown complete");
+
+    if let Some(err) = follow_error {
+        return Err(err);
+    }
 
     Ok(())
 }

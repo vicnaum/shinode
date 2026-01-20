@@ -100,18 +100,20 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - Verified: `cargo test --manifest-path node/Cargo.toml` (verbosity + progress UI)
 
 ### v0.1.5 Historical sync speedup
-- [ ] Define **historical head** = `head - rollback_window`
-- [ ] Chunked range planner for historical blocks (default 32)
-- [ ] Concurrent chunk fetch with bounded in-flight requests
-- [ ] Buffer out-of-order chunks and **write in block order**
-- [ ] Atomic per-chunk static-file appends + checkpoint updates
+- [x] Define **historical head** = `head - rollback_window`
+- [x] Chunked range planner for historical blocks (default 32)
+- [x] Concurrent chunk fetch with bounded in-flight requests
+- [x] Buffer out-of-order chunks and **write in block order**
+- [x] Atomic per-chunk static-file appends + checkpoint updates
 - [ ] Safe boundary switch to slow path near the reorg window
-- [ ] Progress bar: harness-style status line (peers/queue/inflight/speed/eta)
+- [x] Progress bar: harness-style status line (peers/queue/inflight/speed/eta)
 - [ ] Post-sync log index build (address/topic0) to restore fast `eth_getLogs`
 
 ### v0.1.6 Live sync + reorg resilience
-- [ ] **Follow mode**: loop until head, then keep up with new heads
-- [ ] **Live reorg handling**: detect reorgs while following and roll back checkpoints
+- [x] **Follow mode**: loop until head, then keep up with new heads
+- [x] **Live reorg handling**: detect reorgs while following and roll back checkpoints
+- [ ] **Additional head sources**: RPC-consensus (reth-style) + beacon light client for `safe`/`finalized`
+- [ ] **Deep reorg recovery**: optional auto-rebootstrap (policy B)
 
 ### Deferred RPC extras (post v0.1)
 - [ ] `net_version`, `web3_clientVersion`, tx/receipt endpoints, WS subscriptions

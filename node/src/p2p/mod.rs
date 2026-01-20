@@ -472,6 +472,72 @@ pub(crate) async fn request_headers_batch(
         .await
 }
 
+pub(crate) async fn discover_head_p2p(
+    pool: &PeerPool,
+    baseline: u64,
+    probe_peers: usize,
+    probe_limit: usize,
+) -> Result<Option<u64>> {
+    let peers = pool.snapshot();
+    if peers.is_empty() {
+        return Ok(None);
+    }
+
+    // IMPORTANT: do not trust `peer.head_number` as a head signal for follow mode.
+    //
+    // Many peers will return a `Status` best hash, but later refuse to serve headers by number
+    // (or will be behind / on a different fork). If we treat `head_number` as authoritative, we
+    // will tip-chase and spam `GetBlockHeaders` beyond the peer's view.
+    //
+    // Instead, only advance the observed head if we can actually fetch headers above `baseline`.
+    let mut best = baseline;
+    let probe_peers = probe_peers.max(1);
+    let probe_limit = probe_limit.max(1).min(MAX_HEADERS_PER_REQUEST);
+    let start = baseline.saturating_add(1);
+
+    let mut probed = 0usize;
+    for peer in peers.iter() {
+        if probed >= probe_peers {
+            break;
+        }
+        probed += 1;
+        match request_headers_batch(peer, start, probe_limit).await {
+            Ok(headers) => {
+                if let Some(last) = headers.last() {
+                    best = best.max(last.number);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer_id = ?peer.peer_id,
+                    error = %err,
+                    "head probe failed"
+                );
+            }
+        }
+    }
+
+    Ok(Some(best))
+}
+
+#[derive(Debug)]
+pub(crate) struct HeaderCountMismatch {
+    expected: usize,
+    got: usize,
+}
+
+impl std::fmt::Display for HeaderCountMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "header count mismatch: expected {}, got {}",
+            self.expected, self.got
+        )
+    }
+}
+
+impl std::error::Error for HeaderCountMismatch {}
+
 pub(crate) async fn request_headers_chunked(
     peer: &NetworkPeer,
     start_block: u64,
@@ -487,11 +553,11 @@ pub(crate) async fn request_headers_chunked(
         let batch = remaining.min(MAX_HEADERS_PER_REQUEST);
         let mut batch_headers = request_headers_batch(peer, current, batch).await?;
         if batch_headers.len() != batch {
-            return Err(eyre!(
-                "header count mismatch: expected {}, got {}",
-                batch,
-                batch_headers.len()
-            ));
+            return Err(HeaderCountMismatch {
+                expected: batch,
+                got: batch_headers.len(),
+            }
+            .into());
         }
         headers.append(&mut batch_headers);
         current = current.saturating_add(batch as u64);
@@ -934,5 +1000,46 @@ mod tests {
             .expect("headers");
         assert_eq!(headers.len(), count);
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn discover_head_p2p_uses_header_probes() {
+        let peer_id = PeerId::random();
+        let (tx, mut rx) = mpsc::channel(8);
+        let messages = PeerRequestSender::new(peer_id, tx);
+        let peer = NetworkPeer {
+            peer_id,
+            eth_version: EthVersion::Eth68,
+            messages,
+            head_number: 90,
+        };
+
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                match request {
+                    PeerRequest::GetBlockHeaders { request, response } => {
+                        let start = match request.start_block {
+                            BlockHashOrNumber::Number(start) => start,
+                            _ => 0,
+                        };
+                        let mut headers = Vec::new();
+                        for idx in 0..2u64 {
+                            let mut header = Header::default();
+                            header.number = start + idx;
+                            headers.push(header);
+                        }
+                        let _ = response.send(Ok(BlockHeaders::from(headers)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let pool = peer_pool_for_tests(vec![peer]);
+        let head = discover_head_p2p(&pool, 100, 1, 3)
+            .await
+            .expect("discover head")
+            .expect("head");
+        assert_eq!(head, 102);
     }
 }

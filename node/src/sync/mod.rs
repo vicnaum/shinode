@@ -32,6 +32,7 @@ pub enum SyncStatus {
     Fetching,
     Finalizing,
     UpToDate,
+    Following,
 }
 
 impl SyncStatus {
@@ -41,6 +42,7 @@ impl SyncStatus {
             SyncStatus::Fetching => "fetching",
             SyncStatus::Finalizing => "finalizing",
             SyncStatus::UpToDate => "up_to_date",
+            SyncStatus::Following => "following",
         }
     }
 }
@@ -54,6 +56,8 @@ pub struct SyncProgressStats {
     peers_active: std::sync::atomic::AtomicU64,
     peers_total: std::sync::atomic::AtomicU64,
     status: std::sync::atomic::AtomicU8,
+    head_block: std::sync::atomic::AtomicU64,
+    head_seen: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +69,8 @@ pub struct SyncProgressSnapshot {
     pub peers_active: u64,
     pub peers_total: u64,
     pub status: SyncStatus,
+    pub head_block: u64,
+    pub head_seen: u64,
 }
 
 impl SyncProgressStats {
@@ -80,8 +86,11 @@ impl SyncProgressStats {
                 1 => SyncStatus::Fetching,
                 2 => SyncStatus::Finalizing,
                 3 => SyncStatus::UpToDate,
+                4 => SyncStatus::Following,
                 _ => SyncStatus::LookingForPeers,
             },
+            head_block: self.head_block.load(std::sync::atomic::Ordering::SeqCst),
+            head_seen: self.head_seen.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -91,6 +100,7 @@ impl SyncProgressStats {
             SyncStatus::Fetching => 1,
             SyncStatus::Finalizing => 2,
             SyncStatus::UpToDate => 3,
+            SyncStatus::Following => 4,
         };
         self.status
             .store(value, std::sync::atomic::Ordering::SeqCst);
@@ -116,5 +126,15 @@ impl SyncProgressStats {
             .store(active, std::sync::atomic::Ordering::SeqCst);
         self.peers_total
             .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_head_block(&self, block: u64) {
+        self.head_block
+            .store(block, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_head_seen(&self, block: u64) {
+        self.head_seen
+            .store(block, std::sync::atomic::Ordering::SeqCst);
     }
 }

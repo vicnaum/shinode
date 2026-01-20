@@ -2,7 +2,9 @@
 
 mod db_writer;
 mod fetch;
+mod follow;
 mod process;
+mod reorg;
 mod scheduler;
 mod sink;
 mod stats;
@@ -30,6 +32,7 @@ use process::process_ingest;
 use scheduler::{PeerWorkScheduler, SchedulerConfig};
 use sink::run_probe_sink;
 pub use stats::{IngestBenchStats, ProbeStats};
+pub use follow::run_follow_loop;
 use stats::FetchByteTotals;
 use types::{BenchmarkConfig, ProbeRecord, FetchMode};
 use crate::storage::Storage;
@@ -457,6 +460,7 @@ pub async fn run_ingest_pipeline(
     progress: Option<Arc<dyn ProgressReporter>>,
     stats: Option<Arc<SyncProgressStats>>,
     bench: Option<Arc<IngestBenchStats>>,
+    head_cap_override: Option<u64>,
 ) -> Result<IngestPipelineOutcome> {
     let total = range_len(&range);
     if total == 0 {
@@ -580,8 +584,9 @@ pub async fn run_ingest_pipeline(
         }
 
         let active_peers = pool.len();
+        let head_cap = head_cap_override.unwrap_or(peer.head_number);
         let batch = scheduler
-            .next_batch_for_peer(peer.peer_id, peer.head_number, active_peers)
+            .next_batch_for_peer(peer.peer_id, head_cap, active_peers)
             .await;
         if batch.blocks.is_empty() {
             let ready_tx = ready_tx.clone();
