@@ -2,6 +2,7 @@
 
 use crate::p2p::{
     fetch_payloads_for_peer, request_headers_batch, request_receipt_counts, NetworkPeer,
+    PayloadFetchOutcome,
 };
 use crate::sync::{BlockPayload};
 use crate::sync::historical::types::{FetchTiming, ProbeRecord};
@@ -13,6 +14,12 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct FetchProbeOutcome {
     pub records: Vec<ProbeRecord>,
+    pub missing_blocks: Vec<u64>,
+}
+
+#[derive(Debug)]
+pub struct FetchIngestOutcome {
+    pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
 }
 
@@ -89,14 +96,27 @@ pub async fn fetch_probe_batch(
 }
 
 /// Fetch full block payloads for ingest mode.
-pub async fn fetch_ingest_batch(peer: &NetworkPeer, blocks: &[u64]) -> Result<Vec<BlockPayload>> {
+pub async fn fetch_ingest_batch(
+    peer: &NetworkPeer,
+    blocks: &[u64],
+) -> Result<FetchIngestOutcome> {
     if blocks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FetchIngestOutcome {
+            payloads: Vec::new(),
+            missing_blocks: Vec::new(),
+        });
     }
     ensure_consecutive(blocks)?;
     let start = blocks[0];
     let end = blocks[blocks.len() - 1];
-    fetch_payloads_for_peer(peer, start..=end).await
+    let PayloadFetchOutcome {
+        payloads,
+        missing_blocks,
+    } = fetch_payloads_for_peer(peer, start..=end).await?;
+    Ok(FetchIngestOutcome {
+        payloads,
+        missing_blocks,
+    })
 }
 
 fn ensure_consecutive(blocks: &[u64]) -> Result<()> {

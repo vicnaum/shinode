@@ -9,13 +9,67 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
-use super::{run_ingest_pipeline, IngestPipelineOutcome};
+use super::{run_ingest_pipeline, IngestPipelineOutcome, PeerHealthTracker};
 use super::reorg::{find_common_ancestor, preflight_reorg, ReorgCheck};
 
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+
 const FOLLOW_POLL_MS: u64 = 1000;
+const FOLLOW_NEAR_TIP_BACKOFF_MS: u64 = 500;
+const FOLLOW_NEAR_TIP_BLOCKS: u64 = 2;
 const HEAD_PROBE_PEERS: usize = 3;
 const HEAD_PROBE_LIMIT: usize = 1024;
 const REORG_PROBE_PEERS: usize = 3;
+
+async fn dump_follow_debug(
+    storage: &Storage,
+    pool: &PeerPool,
+    stats: Option<&SyncProgressStats>,
+    peer_health: &super::scheduler::PeerHealthTracker,
+) {
+    let last_indexed = storage.last_indexed_block().ok().flatten();
+    let head_seen = storage.head_seen().ok().flatten();
+    let peers = pool.snapshot();
+    let peers_len = peers.len();
+    let snapshot = stats.map(|s| s.snapshot());
+    let health = peer_health.snapshot().await;
+
+    tracing::info!(
+        last_indexed = ?last_indexed,
+        head_seen = ?head_seen,
+        peers = peers_len,
+        progress = ?snapshot,
+        "debug dump (SIGUSR1)"
+    );
+
+    tracing::info!("peers:");
+    for peer in &peers {
+        tracing::info!(peer_id = ?peer.peer_id, head_number = peer.head_number, "peer");
+    }
+
+    tracing::info!("peer health (best quality first):");
+    for entry in health.into_iter().take(50) {
+        tracing::info!(
+            peer_id = ?entry.peer_id,
+            banned = entry.is_banned,
+            ban_remaining_ms = entry.ban_remaining_ms,
+            inflight_blocks = entry.inflight_blocks,
+            last_assigned_age_ms = entry.last_assigned_age_ms,
+            quality = entry.quality_score,
+            samples = entry.quality_samples,
+            succ = entry.successes,
+            fail = entry.failures,
+            partial = entry.partials,
+            cons_fail = entry.consecutive_failures,
+            cons_partial = entry.consecutive_partials,
+            last_err = entry.last_error,
+            last_err_age_ms = entry.last_error_age_ms,
+            last_err_count = entry.last_error_count,
+            "health"
+        );
+    }
+}
 
 pub async fn run_follow_loop(
     storage: Arc<Storage>,
@@ -23,8 +77,35 @@ pub async fn run_follow_loop(
     config: &NodeConfig,
     progress: Option<Arc<dyn ProgressReporter>>,
     stats: Option<Arc<SyncProgressStats>>,
+    peer_health: Arc<PeerHealthTracker>,
 ) -> Result<()> {
     let poll = Duration::from_millis(FOLLOW_POLL_MS);
+
+    #[cfg(unix)]
+    {
+        let storage = Arc::clone(&storage);
+        let pool = Arc::clone(&pool);
+        let stats = stats.clone();
+        let peer_health = Arc::clone(&peer_health);
+        tokio::spawn(async move {
+            let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+                Ok(sig) => sig,
+                Err(err) => {
+                    tracing::debug!(error = %err, "failed to install SIGUSR1 handler");
+                    return;
+                }
+            };
+            while sigusr1.recv().await.is_some() {
+                dump_follow_debug(
+                    storage.as_ref(),
+                    pool.as_ref(),
+                    stats.as_deref(),
+                    peer_health.as_ref(),
+                )
+                .await;
+            }
+        });
+    }
 
     loop {
         let last_indexed = storage.last_indexed_block()?;
@@ -51,6 +132,9 @@ pub async fn run_follow_loop(
         };
 
         storage.set_head_seen(observed_head)?;
+        if let Some(stats) = stats.as_ref() {
+            stats.set_head_seen(observed_head);
+        }
 
         let start = last_indexed
             .map(|block| block.saturating_add(1))
@@ -73,6 +157,10 @@ pub async fn run_follow_loop(
             }
             sleep(poll).await;
             continue;
+        }
+
+        if target_head.saturating_sub(start) <= FOLLOW_NEAR_TIP_BLOCKS {
+            sleep(Duration::from_millis(FOLLOW_NEAR_TIP_BACKOFF_MS)).await;
         }
 
         if let Some(last_indexed) = last_indexed {
@@ -145,6 +233,7 @@ pub async fn run_follow_loop(
             stats.clone(),
             None,
             Some(target_head),
+            Arc::clone(&peer_health),
         )
         .await?;
         let elapsed = ingest_started.elapsed();

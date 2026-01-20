@@ -23,7 +23,7 @@ use p2p::PeerPool;
 use sync::{
     BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus,
 };
-use sync::historical::{IngestBenchStats, ProbeStats};
+use sync::historical::{IngestBenchStats, PeerHealthTracker, ProbeStats};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -179,6 +179,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        let peer_health = sync::historical::build_peer_health_tracker(&config);
 
         let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
             let bar = ProgressBar::new(total_len);
@@ -199,12 +200,14 @@ async fn main() -> Result<()> {
                 "--",
             ));
             if let Some(stats) = progress_stats.as_ref() {
-                stats.set_peers(session.pool.len() as u64, session.pool.len() as u64);
+                stats.set_peers_active(0);
+                stats.set_peers_total(session.pool.len() as u64);
                 spawn_progress_updater(
                     bar.clone(),
                     Arc::clone(stats),
                     total_len,
                     Arc::clone(&session.pool),
+                    Some(Arc::clone(&peer_health)),
                 );
             }
             Some(Arc::new(IngestProgress::new(bar, total_len)))
@@ -226,6 +229,7 @@ async fn main() -> Result<()> {
             progress_stats.clone(),
             Some(Arc::clone(&bench)),
             None,
+            peer_health,
         );
         tokio::pin!(ingest_future);
         let outcome = tokio::select! {
@@ -328,6 +332,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        let peer_health = sync::historical::build_peer_health_tracker(&config);
 
         progress = if std::io::stderr().is_terminal() {
             let bar = ProgressBar::new(total_len);
@@ -348,12 +353,14 @@ async fn main() -> Result<()> {
                 "--",
             ));
             if let Some(stats) = progress_stats.as_ref() {
-                stats.set_peers(session.pool.len() as u64, session.pool.len() as u64);
+                stats.set_peers_active(0);
+                stats.set_peers_total(session.pool.len() as u64);
                 spawn_progress_updater(
                     bar.clone(),
                     Arc::clone(stats),
                     total_len,
                     Arc::clone(&session.pool),
+                    Some(Arc::clone(&peer_health)),
                 );
             }
             Some(Arc::new(IngestProgress::new(bar, total_len)))
@@ -370,6 +377,7 @@ async fn main() -> Result<()> {
             &config,
             progress_ref,
             progress_stats.clone(),
+            peer_health,
         );
 
         _network_session = Some(session);
@@ -540,23 +548,76 @@ fn spawn_progress_updater(
     stats: Arc<SyncProgressStats>,
     total_len: u64,
     peer_pool: Arc<PeerPool>,
+    peer_health: Option<Arc<PeerHealthTracker>>,
 ) {
     tokio::spawn(async move {
         let mut window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
         let mut initial_sync_done = false;
         let mut follow_bar: Option<ProgressBar> = None;
+        let mut failed_bar: Option<ProgressBar> = None;
+        let mut failed_total = 0u64;
+        let mut catchup_start_block: Option<u64> = None;
+        let mut last_peer_update = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
         
         loop {
             ticker.tick().await;
-            let peers = peer_pool.len() as u64;
-            stats.set_peers(peers, peers);
+            let now = Instant::now();
+            if now.duration_since(last_peer_update) >= Duration::from_millis(500) {
+                last_peer_update = now;
+                let connected = peer_pool.len() as u64;
+                let available = if let Some(peer_health) = peer_health.as_ref() {
+                    let peers = peer_pool.snapshot();
+                    let peer_ids: Vec<_> = peers.iter().map(|peer| peer.peer_id).collect();
+                    let banned = peer_health.count_banned_peers(&peer_ids).await;
+                    connected.saturating_sub(banned)
+                } else {
+                    connected
+                };
+                stats.set_peers_total(available);
+            }
             let snapshot = stats.snapshot();
+            let failed = snapshot.failed;
+
+            if failed > failed_total {
+                failed_total = failed;
+                if let Some(ref bar) = failed_bar {
+                    bar.set_length(failed_total.max(1));
+                }
+            }
+            if failed_total > 0 && failed_bar.is_none() {
+                let fb = ProgressBar::with_draw_target(
+                    Some(failed_total.max(1)),
+                    ProgressDrawTarget::stderr_with_hz(2),
+                );
+                let style = ProgressStyle::with_template(
+                    "{bar:40.red/black} {pos}/{len} | {msg}",
+                )
+                .expect("progress style")
+                .progress_chars("▓▒░");
+                fb.set_style(style);
+                failed_bar = Some(fb);
+            }
+            if let Some(ref fb) = failed_bar {
+                let remaining = failed;
+                let done = failed_total.saturating_sub(remaining);
+                fb.set_length(failed_total.max(1));
+                fb.set_position(done);
+                fb.set_message(format!(
+                    "recovering failed: remaining {remaining}/{failed_total}"
+                ));
+                if remaining == 0 {
+                    fb.finish_and_clear();
+                    failed_bar = None;
+                    failed_total = 0;
+                }
+            }
             
             // Check if initial sync is complete and we're now in follow mode
             if !initial_sync_done {
                 let processed = snapshot.processed.min(total_len);
-                let now = Instant::now();
                 window.push_back((now, processed));
                 while let Some((t, _)) = window.front() {
                     if now.duration_since(*t) > Duration::from_secs(1) && window.len() > 1 {
@@ -598,63 +659,78 @@ fn spawn_progress_updater(
                 bar.set_position(processed);
                 
                 // Transition to follow mode when initial sync completes
-                if (snapshot.status == SyncStatus::UpToDate || snapshot.status == SyncStatus::Following)
-                    && snapshot.queue == 0
-                    && snapshot.inflight == 0
-                    && processed >= total_len
-                {
+                if processed >= total_len {
                     initial_sync_done = true;
                     bar.finish_and_clear();
                     
-                    // Create the live follow status bar
+                    // Create the live follow status bar (message only, we format the bar ourselves)
                     let fb = ProgressBar::with_draw_target(
                         Some(100),
                         ProgressDrawTarget::stderr_with_hz(2),
                     );
-                    let style = ProgressStyle::with_template(
-                        "{bar:40.green/black} {msg}",
-                    )
-                    .expect("progress style")
-                    .progress_chars("█▓░");
+                    let style = ProgressStyle::with_template("{msg}")
+                        .expect("progress style");
                     fb.set_style(style);
-                    fb.set_position(100); // Full green bar
                     follow_bar = Some(fb);
                 }
             } else {
-                // Live follow mode - show synced status
+                // Live follow mode - show synced status with block number in a colored bar
                 if let Some(ref fb) = follow_bar {
                     let head_block = snapshot.head_block;
                     let head_seen = snapshot.head_seen;
-                    let peers_active = snapshot.peers_active;
+                    let peers_active = snapshot.peers_active.min(snapshot.peers_total);
+                    let peers_total = snapshot.peers_total;
                     
                     let status_str = if snapshot.status == SyncStatus::Following {
-                        "synced"
+                        "Synced"
                     } else if snapshot.status == SyncStatus::Fetching {
-                        "catching up"
+                        "Catching up"
                     } else if snapshot.status == SyncStatus::LookingForPeers {
-                        "waiting for peers"
+                        "Waiting for peers"
                     } else {
                         snapshot.status.as_str()
                     };
+
+                    let catching_up =
+                        snapshot.status == SyncStatus::Fetching || snapshot.status == SyncStatus::Finalizing;
+                    let catchup_suffix = if catching_up {
+                        let start = catchup_start_block.get_or_insert(head_block);
+                        let done = head_block.saturating_sub(*start);
+                        let remaining = head_seen.saturating_sub(head_block);
+                        Some(format!(" {done}/{remaining}"))
+                    } else {
+                        catchup_start_block = None;
+                        None
+                    };
+                    
+                    // Format block number centered in a fixed-width field
+                    let content = match catchup_suffix {
+                        Some(suffix) => format!("[ {} ]{}", head_block, suffix),
+                        None => format!("[ {} ]", head_block),
+                    };
+                    let bar_width: usize = 40; // Match main progress bar width
+                    let padding = bar_width.saturating_sub(content.len());
+                    let left_pad = padding / 2;
+                    let right_pad = padding - left_pad;
+                    
+                    // ANSI: white text (97) on green background (42), then reset (0)
+                    let bar = format!(
+                        "\x1b[97;42m{:>width_l$}{}{:<width_r$}\x1b[0m",
+                        "", content, "",
+                        width_l = left_pad,
+                        width_r = right_pad,
+                    );
                     
                     let msg = format!(
-                        "block {} | head {} | peers {} | {}",
-                        head_block,
+                        "{} {} | head {} | peers {}/{} | failed {}",
+                        bar,
+                        status_str,
                         head_seen,
                         peers_active,
-                        status_str,
+                        peers_total,
+                        failed,
                     );
                     fb.set_message(msg);
-                    
-                    // Adjust bar position based on sync status
-                    if snapshot.status == SyncStatus::Following {
-                        fb.set_position(100);
-                    } else if snapshot.status == SyncStatus::Fetching {
-                        // Show partial progress when catching up
-                        let behind = head_seen.saturating_sub(head_block);
-                        let progress = if behind > 100 { 50 } else { 100 - behind };
-                        fb.set_position(progress);
-                    }
                 }
             }
         }

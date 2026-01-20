@@ -1,6 +1,8 @@
 //! Reorg detection and common-ancestor search for follow mode.
 
-use crate::p2p::{request_headers_batch, request_headers_chunked, NetworkPeer, PeerPool};
+use crate::p2p::{
+    request_headers_batch, request_headers_chunked_strict, NetworkPeer, PeerPool,
+};
 use crate::storage::Storage;
 use alloy_primitives::B256;
 use eyre::{eyre, Result};
@@ -74,7 +76,7 @@ pub async fn find_common_ancestor(
         return Ok(None);
     }
     let count = (high - low + 1) as usize;
-    let headers = request_headers_chunked(anchor, low, count).await?;
+    let headers = request_headers_chunked_strict(anchor, low, count).await?;
     let network_hashes = headers
         .into_iter()
         .map(|header| (header.number, SealedHeader::seal_slow(header).hash()))
@@ -173,6 +175,7 @@ mod tests {
             rpc_max_logs_per_response: 0,
             fast_sync_chunk_size: 16,
             fast_sync_max_inflight: 2,
+            fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,

@@ -111,6 +111,22 @@ impl SyncProgressStats {
             .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub fn inc_failed(&self, delta: u64) {
+        self.failed
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn record_block_recovered(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let _ = self.failed.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| Some(current.saturating_sub(count)),
+        );
+    }
+
     pub fn set_queue(&self, queue: u64) {
         self.queue
             .store(queue, std::sync::atomic::Ordering::SeqCst);
@@ -121,9 +137,12 @@ impl SyncProgressStats {
             .store(inflight, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub fn set_peers(&self, active: u64, total: u64) {
+    pub fn set_peers_active(&self, active: u64) {
         self.peers_active
             .store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_peers_total(&self, total: u64) {
         self.peers_total
             .store(total, std::sync::atomic::Ordering::SeqCst);
     }
@@ -131,6 +150,14 @@ impl SyncProgressStats {
     pub fn set_head_block(&self, block: u64) {
         self.head_block
             .store(block, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn update_head_block_max(&self, block: u64) {
+        let _ = self.head_block.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| Some(current.max(block)),
+        );
     }
 
     pub fn set_head_seen(&self, block: u64) {

@@ -148,6 +148,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] Stronger log indexing (topic1-3, composite indexes, partitioning)
 - [ ] Compression tuning (zstd) and additional cold storage formats
 - [ ] Pipeline improvements: overlap headers/receipts/bodies fetching
+- [ ] (Optional) Multi-peer “scatter/gather” fetching: headers from one peer, bodies/receipts from others (more complexity, potentially higher throughput)
 - [ ] Optional calldata retention (config/CLI) + full transaction objects
 
 ---

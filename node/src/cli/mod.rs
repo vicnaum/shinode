@@ -10,9 +10,10 @@ pub const DEFAULT_RPC_MAX_CONNECTIONS: u32 = 100;
 pub const DEFAULT_RPC_MAX_BATCH_REQUESTS: u32 = 100;
 pub const DEFAULT_RPC_MAX_BLOCKS_PER_FILTER: u64 = 10_000;
 pub const DEFAULT_RPC_MAX_LOGS_PER_RESPONSE: u64 = 100_000;
-pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 32;
+pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 16;
 pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 15;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 2048;
+pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 
 /// Retention mode for stored history.
@@ -140,6 +141,11 @@ pub struct NodeConfig {
     /// Max in-flight chunk requests for fast sync.
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_INFLIGHT)]
     pub fast_sync_max_inflight: u32,
+    /// Timeout (ms) for a single peer ingest batch (headers + bodies + receipts).
+    ///
+    /// This bounds "stuck" peers so work can move to other peers.
+    #[arg(long, default_value_t = DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS)]
+    pub fast_sync_batch_timeout_ms: u64,
     /// Max buffered blocks (across completed chunks) for fast sync.
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS)]
     pub fast_sync_max_buffered_blocks: u64,
@@ -199,6 +205,10 @@ mod tests {
         assert_eq!(config.rpc_max_logs_per_response, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE);
         assert_eq!(config.fast_sync_chunk_size, DEFAULT_FAST_SYNC_CHUNK_SIZE);
         assert_eq!(config.fast_sync_max_inflight, DEFAULT_FAST_SYNC_MAX_INFLIGHT);
+        assert_eq!(
+            config.fast_sync_batch_timeout_ms,
+            DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS
+        );
         assert_eq!(
             config.fast_sync_max_buffered_blocks,
             DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS

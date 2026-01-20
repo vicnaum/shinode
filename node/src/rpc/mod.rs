@@ -627,6 +627,7 @@ mod tests {
             rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
             fast_sync_chunk_size: crate::cli::DEFAULT_FAST_SYNC_CHUNK_SIZE,
             fast_sync_max_inflight: crate::cli::DEFAULT_FAST_SYNC_MAX_INFLIGHT,
+            fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
             db_write_batch_blocks: crate::cli::DEFAULT_DB_WRITE_BATCH_BLOCKS,
             db_write_flush_interval_ms: None,
