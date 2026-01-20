@@ -89,14 +89,6 @@ pub struct BlockBundle {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiptBundle {
-    pub number: u64,
-    pub header: Header,
-    pub receipts: StoredReceipts,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredReceipts {
     pub receipts: Vec<Receipt>,
@@ -698,30 +690,6 @@ impl Storage {
         self.segments.tx_meta.append_rows(first, &tx_meta)?;
         self.segments.receipts.append_rows(first, &receipts)?;
         self.segments.sizes.append_rows(first, &sizes)?;
-
-        let last_number = bundles.last().map(|bundle| bundle.number).unwrap_or(first);
-        self.set_last_indexed_block(last_number)?;
-        Ok(())
-    }
-
-    pub fn write_receipts_batch(&self, bundles: &[ReceiptBundle]) -> Result<()> {
-        if bundles.is_empty() {
-            return Ok(());
-        }
-        for window in bundles.windows(2) {
-            if window[1].number != window[0].number.saturating_add(1) {
-                return Err(eyre!("receipt batch is not contiguous"));
-            }
-        }
-        let first = bundles.first().expect("bundles non-empty").number;
-        let mut headers = Vec::with_capacity(bundles.len());
-        let mut receipts = Vec::with_capacity(bundles.len());
-        for bundle in bundles {
-            headers.push(encode_bincode_compat_value(&bundle.header)?);
-            receipts.push(encode_bincode_compat_value(&bundle.receipts)?);
-        }
-        self.segments.headers.append_rows(first, &headers)?;
-        self.segments.receipts.append_rows(first, &receipts)?;
 
         let last_number = bundles.last().map(|bundle| bundle.number).unwrap_or(first);
         self.set_last_indexed_block(last_number)?;

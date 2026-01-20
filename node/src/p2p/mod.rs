@@ -1,7 +1,7 @@
 //! P2P subsystem.
 
 use crate::storage::{Storage, StoredPeer};
-use crate::sync::{BlockPayload, BlockPayloadSource, ReceiptPayload};
+use crate::sync::{BlockPayload, BlockPayloadSource};
 use alloy_primitives::B256;
 use async_trait::async_trait;
 use eyre::{eyre, Result, WrapErr};
@@ -82,8 +82,6 @@ impl PeerSelector for RoundRobinPeerSelector {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const MIN_PEER_START: usize = 1;
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_PEER_ATTEMPTS: usize = 3;
-const RETRY_BACKOFF_MS: u64 = 250;
 const MAX_OUTBOUND: usize = 400;
 const MAX_CONCURRENT_DIALS: usize = 100;
 const PEER_REFILL_INTERVAL_MS: u64 = 500;
@@ -173,7 +171,7 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
         .start_network()
         .await
         .wrap_err("failed to start p2p network")?;
-    let pool = Arc::new(PeerPool::new(MAX_PEER_ATTEMPTS));
+    let pool = Arc::new(PeerPool::new());
     let peer_cache = storage.map(|storage| PeerCacheHandle {
         storage,
         buffer: Arc::new(PeerCacheBuffer::new()),
@@ -233,15 +231,13 @@ impl NetworkSession {
 pub struct PeerPool {
     peers: RwLock<Vec<NetworkPeer>>,
     next_index: AtomicUsize,
-    max_attempts: usize,
 }
 
 impl PeerPool {
-    fn new(max_attempts: usize) -> Self {
+    fn new() -> Self {
         Self {
             peers: RwLock::new(Vec::new()),
             next_index: AtomicUsize::new(0),
-            max_attempts: max_attempts.max(1),
         }
     }
 
@@ -253,11 +249,6 @@ impl PeerPool {
         }
         let idx = self.next_index.fetch_add(1, Ordering::Relaxed) % len;
         Some(peers[idx].clone())
-    }
-
-    fn attempts(&self) -> usize {
-        let len = self.len();
-        self.max_attempts.min(len.max(1))
     }
 
     fn best_head(&self) -> Option<u64> {
@@ -291,43 +282,11 @@ impl PeerPool {
 
 #[cfg(test)]
 pub(crate) fn peer_pool_for_tests(peers: Vec<NetworkPeer>) -> PeerPool {
-    let pool = PeerPool::new(1);
+    let pool = PeerPool::new();
     for peer in peers {
         pool.add_peer(peer);
     }
     pool
-}
-
-/// P2P-backed block payload source.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct NetworkBlockPayloadSource {
-    peer: NetworkPeer,
-}
-
-#[allow(dead_code)]
-impl NetworkBlockPayloadSource {
-    pub fn new(peer: NetworkPeer) -> Self {
-        Self { peer }
-    }
-}
-
-#[async_trait]
-impl BlockPayloadSource for NetworkBlockPayloadSource {
-    async fn head(&self) -> Result<u64> {
-        Ok(self.peer.head_number)
-    }
-
-    async fn blocks_by_number(&self, range: std::ops::RangeInclusive<u64>) -> Result<Vec<BlockPayload>> {
-        fetch_payloads_for_peer(&self.peer, range).await
-    }
-
-    async fn receipts_only_by_number(
-        &self,
-        range: std::ops::RangeInclusive<u64>,
-    ) -> Result<Vec<ReceiptPayload>> {
-        fetch_receipts_only_for_peer(&self.peer, range).await
-    }
 }
 
 /// P2P-backed block payload source with multi-peer retries.
@@ -350,53 +309,6 @@ impl BlockPayloadSource for MultiPeerBlockPayloadSource {
         self.pool
             .best_head()
             .ok_or_else(|| eyre!("no peers available for head"))
-    }
-
-    async fn blocks_by_number(&self, range: std::ops::RangeInclusive<u64>) -> Result<Vec<BlockPayload>> {
-        let mut last_err = None;
-        let attempts = self.pool.attempts();
-
-        for attempt in 0..attempts {
-            let Some(peer) = self.pool.next_peer() else {
-                return Err(eyre!("no peers available for request"));
-            };
-            match fetch_payloads_for_peer(&peer, range.clone()).await {
-                Ok(payloads) => return Ok(payloads),
-                Err(err) => {
-                    last_err = Some(err);
-                    if attempt + 1 < attempts {
-                        sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
-                    }
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| eyre!("all peer attempts failed")))
-    }
-
-    async fn receipts_only_by_number(
-        &self,
-        range: std::ops::RangeInclusive<u64>,
-    ) -> Result<Vec<ReceiptPayload>> {
-        let mut last_err = None;
-        let attempts = self.pool.attempts();
-
-        for attempt in 0..attempts {
-            let Some(peer) = self.pool.next_peer() else {
-                return Err(eyre!("no peers available for request"));
-            };
-            match fetch_receipts_only_for_peer(&peer, range.clone()).await {
-                Ok(payloads) => return Ok(payloads),
-                Err(err) => {
-                    last_err = Some(err);
-                    if attempt + 1 < attempts {
-                        sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
-                    }
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| eyre!("all peer attempts failed")))
     }
 }
 
@@ -630,30 +542,6 @@ pub(crate) async fn fetch_payloads_for_peer(
         });
     }
 
-    Ok(payloads)
-}
-
-async fn fetch_receipts_only_for_peer(
-    peer: &NetworkPeer,
-    range: std::ops::RangeInclusive<u64>,
-) -> Result<Vec<ReceiptPayload>> {
-    let start = *range.start();
-    let end = *range.end();
-    let count = (end - start + 1) as usize;
-
-    let headers = request_headers_chunked(peer, start, count).await?;
-
-    let mut hashes = Vec::with_capacity(count);
-    for header in &headers {
-        let hash = SealedHeader::seal_slow(header.clone()).hash();
-        hashes.push(hash);
-    }
-
-    let receipts = request_receipts_chunked(peer, &hashes).await?;
-    let mut payloads = Vec::with_capacity(count);
-    for (header, receipts) in headers.into_iter().zip(receipts.into_iter()) {
-        payloads.push(ReceiptPayload { header, receipts });
-    }
     Ok(payloads)
 }
 

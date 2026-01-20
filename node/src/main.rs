@@ -1,4 +1,3 @@
-mod chain;
 mod cli;
 mod metrics;
 mod p2p;
@@ -36,10 +35,6 @@ impl sync::ProgressReporter for ProgressBar {
     fn inc(&self, delta: u64) {
         self.inc(delta);
     }
-
-    fn finish(&self) {
-        self.finish_and_clear();
-    }
 }
 
 struct IngestProgress {
@@ -73,8 +68,6 @@ impl sync::ProgressReporter for IngestProgress {
     fn inc(&self, delta: u64) {
         self.bar.inc(delta);
     }
-
-    fn finish(&self) {}
 }
 #[tokio::main]
 async fn main() -> Result<()> {
