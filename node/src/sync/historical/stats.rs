@@ -216,3 +216,301 @@ fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
     let idx = ((sorted.len() - 1) as f64 * clamped).round() as usize;
     sorted.get(idx).copied()
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessTiming {
+    pub total_us: u64,
+    pub header_hash_us: u64,
+    pub tx_hashes_us: u64,
+    pub transactions_us: u64,
+    pub withdrawals_us: u64,
+    pub block_size_us: u64,
+    pub logs_bloom_us: u64,
+    pub logs_build_us: u64,
+}
+
+#[derive(Debug)]
+pub struct IngestBenchStats {
+    started_at: Instant,
+    blocks_total: u64,
+    fetch_blocks: AtomicU64,
+    fetch_failed_blocks: AtomicU64,
+    fetch_batches: AtomicU64,
+    fetch_failures: AtomicU64,
+    fetch_total_us: AtomicU64,
+    peer_failures: AtomicU64,
+    process_blocks: AtomicU64,
+    process_failures: AtomicU64,
+    process_total_us: AtomicU64,
+    process_header_hash_us: AtomicU64,
+    process_tx_hashes_us: AtomicU64,
+    process_transactions_us: AtomicU64,
+    process_withdrawals_us: AtomicU64,
+    process_block_size_us: AtomicU64,
+    process_logs_bloom_us: AtomicU64,
+    process_logs_build_us: AtomicU64,
+    db_write_blocks: AtomicU64,
+    db_write_batches: AtomicU64,
+    db_write_total_us: AtomicU64,
+}
+
+impl IngestBenchStats {
+    pub fn new(blocks_total: u64) -> Self {
+        Self {
+            started_at: Instant::now(),
+            blocks_total,
+            fetch_blocks: AtomicU64::new(0),
+            fetch_failed_blocks: AtomicU64::new(0),
+            fetch_batches: AtomicU64::new(0),
+            fetch_failures: AtomicU64::new(0),
+            fetch_total_us: AtomicU64::new(0),
+            peer_failures: AtomicU64::new(0),
+            process_blocks: AtomicU64::new(0),
+            process_failures: AtomicU64::new(0),
+            process_total_us: AtomicU64::new(0),
+            process_header_hash_us: AtomicU64::new(0),
+            process_tx_hashes_us: AtomicU64::new(0),
+            process_transactions_us: AtomicU64::new(0),
+            process_withdrawals_us: AtomicU64::new(0),
+            process_block_size_us: AtomicU64::new(0),
+            process_logs_bloom_us: AtomicU64::new(0),
+            process_logs_build_us: AtomicU64::new(0),
+            db_write_blocks: AtomicU64::new(0),
+            db_write_batches: AtomicU64::new(0),
+            db_write_total_us: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_fetch_success(&self, blocks: u64, elapsed: std::time::Duration) {
+        self.fetch_blocks.fetch_add(blocks, Ordering::SeqCst);
+        self.fetch_batches.fetch_add(1, Ordering::SeqCst);
+        self.fetch_total_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    pub fn record_fetch_failure(&self, blocks: u64, elapsed: std::time::Duration) {
+        self.fetch_failed_blocks.fetch_add(blocks, Ordering::SeqCst);
+        self.fetch_failures.fetch_add(1, Ordering::SeqCst);
+        self.fetch_total_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    pub fn record_process(&self, timing: ProcessTiming) {
+        self.process_blocks.fetch_add(1, Ordering::SeqCst);
+        self.process_total_us
+            .fetch_add(timing.total_us, Ordering::SeqCst);
+        self.process_header_hash_us
+            .fetch_add(timing.header_hash_us, Ordering::SeqCst);
+        self.process_tx_hashes_us
+            .fetch_add(timing.tx_hashes_us, Ordering::SeqCst);
+        self.process_transactions_us
+            .fetch_add(timing.transactions_us, Ordering::SeqCst);
+        self.process_withdrawals_us
+            .fetch_add(timing.withdrawals_us, Ordering::SeqCst);
+        self.process_block_size_us
+            .fetch_add(timing.block_size_us, Ordering::SeqCst);
+        self.process_logs_bloom_us
+            .fetch_add(timing.logs_bloom_us, Ordering::SeqCst);
+        self.process_logs_build_us
+            .fetch_add(timing.logs_build_us, Ordering::SeqCst);
+    }
+
+    pub fn record_process_failure(&self) {
+        self.process_failures.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn record_peer_failure(&self) {
+        self.peer_failures.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn record_db_write(&self, blocks: u64, elapsed: std::time::Duration) {
+        self.db_write_blocks.fetch_add(blocks, Ordering::SeqCst);
+        self.db_write_batches.fetch_add(1, Ordering::SeqCst);
+        self.db_write_total_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    pub fn summary(
+        &self,
+        range_start: u64,
+        range_end: u64,
+        head_at_startup: u64,
+        rollback_window_applied: bool,
+        peers_used: u64,
+        logs_total: u64,
+    ) -> IngestBenchSummary {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        let fetch_blocks = self.fetch_blocks.load(Ordering::SeqCst);
+        let fetch_failed_blocks = self.fetch_failed_blocks.load(Ordering::SeqCst);
+        let fetch_batches = self.fetch_batches.load(Ordering::SeqCst);
+        let fetch_failures = self.fetch_failures.load(Ordering::SeqCst);
+        let fetch_total_us = self.fetch_total_us.load(Ordering::SeqCst);
+        let peer_failures = self.peer_failures.load(Ordering::SeqCst);
+        let process_blocks = self.process_blocks.load(Ordering::SeqCst);
+        let process_failures = self.process_failures.load(Ordering::SeqCst);
+        let process_total_us = self.process_total_us.load(Ordering::SeqCst);
+        let db_write_blocks = self.db_write_blocks.load(Ordering::SeqCst);
+        let db_write_batches = self.db_write_batches.load(Ordering::SeqCst);
+        let db_write_total_us = self.db_write_total_us.load(Ordering::SeqCst);
+
+        let blocks_completed = if db_write_blocks > 0 {
+            db_write_blocks
+        } else {
+            process_blocks
+        };
+        let blocks_per_sec = rate_per_sec(blocks_completed, elapsed_ms);
+        let logs_per_sec = rate_per_sec(logs_total, elapsed_ms);
+
+        let process_breakdown = ProcessBreakdownSummary {
+            header_hash_us: self.process_header_hash_us.load(Ordering::SeqCst),
+            tx_hashes_us: self.process_tx_hashes_us.load(Ordering::SeqCst),
+            transactions_us: self.process_transactions_us.load(Ordering::SeqCst),
+            withdrawals_us: self.process_withdrawals_us.load(Ordering::SeqCst),
+            block_size_us: self.process_block_size_us.load(Ordering::SeqCst),
+            logs_bloom_us: self.process_logs_bloom_us.load(Ordering::SeqCst),
+            logs_build_us: self.process_logs_build_us.load(Ordering::SeqCst),
+        };
+        let process_breakdown_avg = ProcessBreakdownSummary {
+            header_hash_us: avg_us(process_breakdown.header_hash_us, process_blocks),
+            tx_hashes_us: avg_us(process_breakdown.tx_hashes_us, process_blocks),
+            transactions_us: avg_us(process_breakdown.transactions_us, process_blocks),
+            withdrawals_us: avg_us(process_breakdown.withdrawals_us, process_blocks),
+            block_size_us: avg_us(process_breakdown.block_size_us, process_blocks),
+            logs_bloom_us: avg_us(process_breakdown.logs_bloom_us, process_blocks),
+            logs_build_us: avg_us(process_breakdown.logs_build_us, process_blocks),
+        };
+
+        IngestBenchSummary {
+            mode: "ingest-bench",
+            range: RangeSummary {
+                start_block: range_start,
+                end_block: range_end,
+                head_at_startup,
+                rollback_window_applied,
+            },
+            totals: IngestTotalsSummary {
+                blocks_total: self.blocks_total,
+                blocks_fetched: fetch_blocks,
+                blocks_processed: process_blocks,
+                blocks_written: db_write_blocks,
+                logs_total,
+                fetch_failed_blocks,
+                fetch_failures,
+                process_failures,
+            },
+            performance: IngestPerformanceSummary {
+                elapsed_ms,
+                blocks_per_sec_avg: blocks_per_sec,
+                logs_per_sec_avg: logs_per_sec,
+            },
+            fetch: IngestFetchSummary {
+                total_us: fetch_total_us,
+                batches: fetch_batches,
+                blocks: fetch_blocks,
+                failed_blocks: fetch_failed_blocks,
+                failures: fetch_failures,
+                avg_us_per_block: avg_us(fetch_total_us, fetch_blocks),
+                avg_us_per_batch: avg_us(fetch_total_us, fetch_batches),
+            },
+            process: IngestProcessSummary {
+                total_us: process_total_us,
+                blocks: process_blocks,
+                failures: process_failures,
+                avg_us_per_block: avg_us(process_total_us, process_blocks),
+                breakdown_us: process_breakdown,
+                breakdown_avg_us: process_breakdown_avg,
+            },
+            db_write: IngestDbWriteSummary {
+                total_us: db_write_total_us,
+                batches: db_write_batches,
+                blocks: db_write_blocks,
+                avg_us_per_block: avg_us(db_write_total_us, db_write_blocks),
+                avg_us_per_batch: avg_us(db_write_total_us, db_write_batches),
+            },
+            peers: PeerSummary {
+                peers_used,
+                peer_failures_total: peer_failures,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestBenchSummary {
+    pub mode: &'static str,
+    pub range: RangeSummary,
+    pub totals: IngestTotalsSummary,
+    pub performance: IngestPerformanceSummary,
+    pub fetch: IngestFetchSummary,
+    pub process: IngestProcessSummary,
+    pub db_write: IngestDbWriteSummary,
+    pub peers: PeerSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestTotalsSummary {
+    pub blocks_total: u64,
+    pub blocks_fetched: u64,
+    pub blocks_processed: u64,
+    pub blocks_written: u64,
+    pub logs_total: u64,
+    pub fetch_failed_blocks: u64,
+    pub fetch_failures: u64,
+    pub process_failures: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestPerformanceSummary {
+    pub elapsed_ms: u64,
+    pub blocks_per_sec_avg: f64,
+    pub logs_per_sec_avg: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestFetchSummary {
+    pub total_us: u64,
+    pub batches: u64,
+    pub blocks: u64,
+    pub failed_blocks: u64,
+    pub failures: u64,
+    pub avg_us_per_block: u64,
+    pub avg_us_per_batch: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestProcessSummary {
+    pub total_us: u64,
+    pub blocks: u64,
+    pub failures: u64,
+    pub avg_us_per_block: u64,
+    pub breakdown_us: ProcessBreakdownSummary,
+    pub breakdown_avg_us: ProcessBreakdownSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProcessBreakdownSummary {
+    pub header_hash_us: u64,
+    pub tx_hashes_us: u64,
+    pub transactions_us: u64,
+    pub withdrawals_us: u64,
+    pub block_size_us: u64,
+    pub logs_bloom_us: u64,
+    pub logs_build_us: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestDbWriteSummary {
+    pub total_us: u64,
+    pub batches: u64,
+    pub blocks: u64,
+    pub avg_us_per_block: u64,
+    pub avg_us_per_batch: u64,
+}
+
+fn avg_us(total_us: u64, count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        total_us / count
+    }
+}

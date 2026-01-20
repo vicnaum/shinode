@@ -1,9 +1,10 @@
 //! Batched DB writer for ingest mode.
 
 use crate::storage::{BlockBundle, Storage};
+use crate::sync::historical::stats::IngestBenchStats;
 use eyre::Result;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +33,7 @@ pub async fn run_db_writer(
     storage: Arc<Storage>,
     mut rx: mpsc::Receiver<DbWriterMessage>,
     config: DbWriteConfig,
+    bench: Option<Arc<IngestBenchStats>>,
 ) -> Result<()> {
     let mut buffer: Vec<BlockBundle> = Vec::with_capacity(config.batch_blocks);
     let mut interval = config.flush_interval.map(tokio::time::interval);
@@ -43,17 +45,17 @@ pub async fn run_db_writer(
                     Some(DbWriterMessage::Block(block)) => {
                         buffer.push(block);
                         if buffer.len() >= config.batch_blocks {
-                            flush_buffer(&storage, &mut buffer)?;
+                            flush_buffer(&storage, &mut buffer, bench.as_ref())?;
                         }
                     }
                     Some(DbWriterMessage::Flush) => {
                         if !buffer.is_empty() {
-                            flush_buffer(&storage, &mut buffer)?;
+                            flush_buffer(&storage, &mut buffer, bench.as_ref())?;
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            flush_buffer(&storage, &mut buffer)?;
+                            flush_buffer(&storage, &mut buffer, bench.as_ref())?;
                         }
                         break;
                     }
@@ -65,7 +67,7 @@ pub async fn run_db_writer(
                 }
             }, if interval.is_some() => {
                 if !buffer.is_empty() {
-                    flush_buffer(&storage, &mut buffer)?;
+                    flush_buffer(&storage, &mut buffer, bench.as_ref())?;
                 }
             }
         }
@@ -74,8 +76,17 @@ pub async fn run_db_writer(
     Ok(())
 }
 
-fn flush_buffer(storage: &Storage, buffer: &mut Vec<BlockBundle>) -> Result<()> {
+fn flush_buffer(
+    storage: &Storage,
+    buffer: &mut Vec<BlockBundle>,
+    bench: Option<&Arc<IngestBenchStats>>,
+) -> Result<()> {
+    let blocks = buffer.len() as u64;
+    let started = Instant::now();
     storage.write_block_bundle_batch(buffer)?;
+    if let Some(bench) = bench {
+        bench.record_db_write(blocks, started.elapsed());
+    }
     buffer.clear();
     Ok(())
 }

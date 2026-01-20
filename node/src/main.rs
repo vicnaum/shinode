@@ -23,6 +23,7 @@ use p2p::PeerPool;
 use sync::{
     BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus,
 };
+use sync::historical::IngestBenchStats;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -101,6 +102,102 @@ async fn main() -> Result<()> {
         );
         sync::historical::run_benchmark_probe(&config, session.pool, range, head_at_startup)
             .await?;
+        return Ok(());
+    }
+
+    if matches!(config.benchmark, BenchmarkMode::Ingest) {
+        info!(
+            chain_id = config.chain_id,
+            data_dir = %config.data_dir.display(),
+            "starting stateless history node (benchmark ingest)"
+        );
+        if !matches!(config.head_source, cli::HeadSource::P2p) {
+            return Err(eyre::eyre!("benchmark ingest requires --head-source p2p"));
+        }
+
+        let storage = Arc::new(storage::Storage::open(&config)?);
+
+        info!("starting p2p network");
+        let session = p2p::connect_mainnet_peers().await?;
+        info!(peers = session.pool.len(), "p2p peers connected");
+        let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
+        let head_at_startup = source.head().await?;
+        let range = compute_target_range(
+            config.start_block,
+            config.end_block,
+            head_at_startup,
+            config.rollback_window,
+        );
+        let total_len = range_len(&range);
+
+        let progress_stats = if std::io::stderr().is_terminal() {
+            Some(Arc::new(SyncProgressStats::default()))
+        } else {
+            None
+        };
+
+        let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
+            let bar = ProgressBar::new(total_len);
+            bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+            let style = ProgressStyle::with_template(
+                "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
+            )
+            .expect("progress style");
+            bar.set_style(style.progress_chars("█▉░"));
+            bar.set_message(format_progress_message(
+                SyncStatus::LookingForPeers,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                "--",
+            ));
+            if let Some(stats) = progress_stats.as_ref() {
+                stats.set_peers(session.pool.len() as u64, session.pool.len() as u64);
+                spawn_progress_updater(
+                    bar.clone(),
+                    Arc::clone(stats),
+                    total_len,
+                    Arc::clone(&session.pool),
+                );
+            }
+            Some(Arc::new(IngestProgress::new(bar, total_len)))
+        } else {
+            None
+        };
+
+        let bench = Arc::new(IngestBenchStats::new(total_len));
+        let progress_ref = progress
+            .as_ref()
+            .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
+        let outcome = sync::historical::run_ingest_pipeline(
+            Arc::clone(&storage),
+            Arc::clone(&session.pool),
+            &config,
+            range.clone(),
+            head_at_startup,
+            progress_ref,
+            progress_stats.clone(),
+            Some(Arc::clone(&bench)),
+        )
+        .await?;
+
+        let logs_total = match outcome {
+            sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
+            sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+        };
+        let summary = bench.summary(
+            *range.start(),
+            *range.end(),
+            head_at_startup,
+            config.rollback_window > 0,
+            session.pool.len() as u64,
+            logs_total,
+        );
+        let summary_json = serde_json::to_string_pretty(&summary)?;
+        println!("{summary_json}");
         return Ok(());
     }
 
@@ -201,6 +298,7 @@ async fn main() -> Result<()> {
                 head_at_startup,
                 progress_ref,
                 progress_stats.clone(),
+                None,
             )
             .await?;
             let elapsed = ingest_started.elapsed();

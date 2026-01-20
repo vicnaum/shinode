@@ -94,12 +94,23 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Graceful shutdown + safe flushing
 - [x] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
 - [x] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
+- [x] Ingest benchmark mode with per-stage timing (fetch/process/db)
+- [x] Defer sender recovery by storing signature + signing hash
 - Verified: `cargo test --manifest-path node/Cargo.toml` (graceful shutdown behavior)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (ingest metrics logging helpers)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (RPC limit CLI config)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (verbosity + progress UI)
 
-### v0.1.5 Live sync + reorg resilience
+### v0.1.5 Historical sync speedup
+- [ ] Define **historical head** = `head - rollback_window`
+- [ ] Chunked range planner for historical blocks (default 32)
+- [ ] Concurrent chunk fetch with bounded in-flight requests
+- [ ] Buffer out-of-order chunks and **write in block order**
+- [ ] Atomic per-chunk MDBX writes + checkpoint updates
+- [ ] Safe boundary switch to slow path near the reorg window
+- [ ] Progress bar: harness-style status line (peers/queue/inflight/speed/eta)
+
+### v0.1.6 Live sync + reorg resilience
 - [ ] **Follow mode**: loop until head, then keep up with new heads
 - [ ] **Live reorg handling**: detect reorgs while following and roll back checkpoints
 

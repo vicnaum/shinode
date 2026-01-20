@@ -9,7 +9,7 @@ subset. It does not execute transactions or keep state.
 What works:
 - P2P range backfill from `start_block..head` (single run).
 - MDBX persistence of headers, tx hashes, receipts, logs, log indexes, tx metadata
-  (no calldata), withdrawals, and block size.
+  (no calldata; signature + signing hash stored for sender recovery), withdrawals, and block size.
 - RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`,
   `eth_getLogs`, with request limits.
 - Graceful shutdown, restart-safe checkpoints, and basic ingest stats.
@@ -72,6 +72,9 @@ Benchmark/probe:
     - `--start-block` sets the start (default 0).
     - `--end-block` limits the end.
     - If `--end-block` is not set, the end is the head at startup (with rollback window applied).
+- `--benchmark ingest`: full ingest benchmark (fetch + process + DB writes).
+  - No RPC server; exits after finishing the configured range.
+  - Prints a per-stage timing summary (fetch/process/db) as JSON.
 
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).

@@ -8,7 +8,7 @@ use crate::cli::{
     DEFAULT_FAST_SYNC_CHUNK_SIZE, DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
     DEFAULT_FAST_SYNC_MAX_INFLIGHT, DEFAULT_DB_WRITE_BATCH_BLOCKS,
 };
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, Signature, U256};
 use eyre::{eyre, Result, WrapErr};
 use reth_db::{
     mdbx::{init_db_for, DatabaseArguments, DatabaseEnv},
@@ -123,10 +123,15 @@ pub struct StoredTxHashes {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTransaction {
     pub hash: B256,
-    pub from: Address,
+    #[serde(default)]
+    pub from: Option<Address>,
     pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
+    #[serde(default)]
+    pub signature: Option<Signature>,
+    #[serde(default)]
+    pub signing_hash: Option<B256>,
 }
 
 #[allow(dead_code)]
@@ -1225,17 +1230,21 @@ mod tests {
 
         let tx0 = StoredTransaction {
             hash: B256::from([0x11u8; 32]),
-            from: Address::from([0x01u8; 20]),
+            from: Some(Address::from([0x01u8; 20])),
             to: Some(Address::from([0x02u8; 20])),
             value: U256::from(42),
             nonce: 7,
+            signature: None,
+            signing_hash: None,
         };
         let tx1 = StoredTransaction {
             hash: B256::from([0x22u8; 32]),
-            from: Address::from([0x03u8; 20]),
+            from: Some(Address::from([0x03u8; 20])),
             to: None,
             value: U256::from(7),
             nonce: 9,
+            signature: None,
+            signing_hash: None,
         };
         storage
             .write_block_transactions(1, StoredTransactions { txs: vec![tx0.clone()] })
@@ -1352,10 +1361,12 @@ mod tests {
             transactions: StoredTransactions {
                 txs: vec![StoredTransaction {
                     hash: tx_hash0,
-                    from: Address::from([0x0au8; 20]),
+                    from: Some(Address::from([0x0au8; 20])),
                     to: Some(Address::from([0x0bu8; 20])),
                     value: U256::from(1),
                     nonce: 0,
+                    signature: None,
+                    signing_hash: None,
                 }],
             },
             withdrawals: StoredWithdrawals { withdrawals: None },
@@ -1375,10 +1386,12 @@ mod tests {
             transactions: StoredTransactions {
                 txs: vec![StoredTransaction {
                     hash: tx_hash1,
-                    from: Address::from([0x0cu8; 20]),
+                    from: Some(Address::from([0x0cu8; 20])),
                     to: None,
                     value: U256::from(2),
                     nonce: 1,
+                    signature: None,
+                    signing_hash: None,
                 }],
             },
             withdrawals: StoredWithdrawals { withdrawals: None },

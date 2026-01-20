@@ -28,6 +28,7 @@ use db_writer::{DbWriteConfig, DbWriterMessage, run_db_writer};
 use process::process_ingest;
 use scheduler::{PeerWorkScheduler, SchedulerConfig};
 use sink::run_probe_sink;
+pub use stats::IngestBenchStats;
 use stats::ProbeStats;
 use types::{BenchmarkConfig, ProbeRecord, FetchMode};
 use crate::storage::Storage;
@@ -455,6 +456,7 @@ pub async fn run_ingest_pipeline(
     head_at_startup: u64,
     progress: Option<Arc<dyn ProgressReporter>>,
     stats: Option<Arc<SyncProgressStats>>,
+    bench: Option<Arc<IngestBenchStats>>,
 ) -> Result<IngestPipelineOutcome> {
     let total = range_len(&range);
     if total == 0 {
@@ -505,6 +507,7 @@ pub async fn run_ingest_pipeline(
         let logs_total = Arc::clone(&logs_total);
         let progress = progress.clone();
         let stats = stats.clone();
+        let bench = bench.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let next = {
@@ -514,7 +517,8 @@ pub async fn run_ingest_pipeline(
                 let Some(payload) = next else {
                     break;
                 };
-                let result = process_ingest(payload);
+                let bench_ref = bench.as_ref().map(Arc::as_ref);
+                let result = process_ingest(payload, bench_ref);
                 match result {
                     Ok((bundle, log_count)) => {
                         logs_total.fetch_add(log_count, Ordering::SeqCst);
@@ -529,6 +533,9 @@ pub async fn run_ingest_pipeline(
                         }
                     }
                     Err(err) => {
+                        if let Some(bench) = bench.as_ref() {
+                            bench.record_process_failure();
+                        }
                         tracing::warn!(error = %err, "ingest processing failed");
                     }
                 }
@@ -546,6 +553,7 @@ pub async fn run_ingest_pipeline(
         Arc::clone(&storage),
         processed_blocks_rx,
         db_config,
+        bench.clone(),
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
@@ -596,14 +604,20 @@ pub async fn run_ingest_pipeline(
         let fetched_tx = fetched_blocks_tx.clone();
         let ready_tx = ready_tx.clone();
         let stats = stats.clone();
+        let bench = bench.clone();
 
         fetch_tasks.spawn(async move {
             let _permit = permit;
+            let fetch_started = Instant::now();
             let result = fetch_ingest_batch(&peer, &batch.blocks).await;
+            let fetch_elapsed = fetch_started.elapsed();
             match result {
                 Ok(payloads) => {
                     scheduler.record_peer_success(peer.peer_id).await;
                     let _ = scheduler.mark_completed(&batch.blocks).await;
+                    if let Some(bench) = bench.as_ref() {
+                        bench.record_fetch_success(payloads.len() as u64, fetch_elapsed);
+                    }
                     for payload in payloads {
                         if fetched_tx.send(payload).await.is_err() {
                             break;
@@ -612,6 +626,10 @@ pub async fn run_ingest_pipeline(
                 }
                 Err(err) => {
                     scheduler.record_peer_failure(peer.peer_id).await;
+                    if let Some(bench) = bench.as_ref() {
+                        bench.record_fetch_failure(batch.blocks.len() as u64, fetch_elapsed);
+                        bench.record_peer_failure();
+                    }
                     match batch.mode {
                         FetchMode::Normal => {
                             let _ = scheduler.requeue_failed(&batch.blocks).await;
@@ -646,6 +664,7 @@ pub async fn run_ingest_pipeline(
         stats.set_status(SyncStatus::Finalizing);
     }
     let _ = db_flush_tx.send(DbWriterMessage::Flush).await;
+    drop(db_flush_tx);
     let db_result = db_handle.await.map_err(|err| eyre!(err))?;
     db_result?;
 

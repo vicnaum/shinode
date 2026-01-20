@@ -217,7 +217,15 @@ Recommendation:
   2. fetch body (or at least tx hashes)
   3. fetch receipts
   4. derive logs with tx hashes + indices
-  5. persist atomically (idempotent)
+  5. persist atomically (idempotent), storing tx signature + signing hash for deferred sender recovery
+
+### Historical fast sync (v0.1.5)
+- For blocks older than the reorg window, use a fast backfill mode:
+  - split the historical range into fixed-size chunks (default 32)
+  - fetch chunks concurrently across peers with bounded in-flight requests
+  - buffer out-of-order chunks and write in block order
+  - persist each chunk in a single MDBX transaction
+- For blocks inside the reorg window, use the existing safe sequential path.
 
 ### Follow (live)
 - Listen for peer sessions and head updates (peer status head, announcements).
@@ -324,12 +332,32 @@ Test gate (must pass):
 Deliverables:
 - structured logs/metrics (lag to head, throughput, reorg count)
 - stable config file format (optional)
+- ingest benchmark mode with per-stage timing (fetch/process/db)
 
 Verification:
 - unattended run for N hours with stable memory and bounded queues
 
 Test gate (must pass):
 - (Manual) N-hour soak run: bounded memory/queues and continued forward progress
+
+### v0.1.5 Historical sync speedup
+Deliverables:
+- historical fast sync mode (chunked + concurrent downloads + ordered writes)
+- bounded in-flight concurrency and buffering
+- per-chunk atomic MDBX commits + checkpoints
+- safe boundary switch to the slow path near the reorg window
+
+Verification:
+- ingest a large historical range and report throughput vs baseline
+
+Test gate (must pass):
+- chunk planner tests (range → chunks)
+- storage batch write tests (single tx per chunk)
+
+### v0.1.6 Live sync + reorg resilience
+Deliverables:
+- follow mode (keep up with new heads)
+- live reorg handling with rollback window
 
 ## Open questions (for you)
 These don’t block writing code, but they affect the “default” product contract:

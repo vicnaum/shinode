@@ -47,6 +47,8 @@ pub enum BenchmarkMode {
     Disabled,
     /// Harness-like probe mode (headers + receipts only, no DB, no RPC).
     Probe,
+    /// Full ingest benchmark (full processing + DB writes, exits after range).
+    Ingest,
 }
 
 /// Stateless history node configuration.

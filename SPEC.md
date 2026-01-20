@@ -4,12 +4,14 @@ This repo currently contains a working **receipt availability harness** (see App
 
 ## Current status (v0.1.4)
 - Range backfill (single run) using P2P headers/bodies/receipts.
-- MDBX persistence for headers, tx hashes, tx metadata (no calldata), receipts,
-  logs, log indexes, withdrawals, and block size.
+- MDBX persistence for headers, tx hashes, tx metadata (no calldata; signature +
+  signing hash stored for sender recovery), receipts, logs, log indexes, withdrawals,
+  and block size.
 - Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
   `eth_getBlockByNumber`, `eth_getLogs`).
 - `eth_getBlockByNumber` returns full block shape; `totalDifficulty` is mocked to `0x0`.
 - Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
+- Benchmark modes: probe (headers/receipts only) and ingest (full pipeline timing).
 - Not yet: follow mode, live reorg handling, extra RPC methods, metrics export.
 
 ## Goals
@@ -77,6 +79,15 @@ High-level components (mirrors reth’s separation of concerns):
    - indexes to make `eth_getLogs` fast
    - rollback (delete/mark) semantics for reorgs
 5. **RPC**: a minimal JSON-RPC server with safe defaults (localhost bind by default, query limits) and only the namespaces we support.
+
+## Historical fast sync (v0.1.5)
+For blocks **older than the reorg window**, we use a fast backfill mode:
+- split the historical range into fixed-size chunks (default 32)
+- fetch chunks concurrently across peers with bounded in-flight requests
+- buffer out-of-order chunks and write in block order
+- persist each chunk in a single MDBX transaction
+
+For blocks **inside the reorg window**, use the existing safe sequential path.
 
 ## References
 - Reth knowledge base index: `spec/reth_kb/INDEX.md`

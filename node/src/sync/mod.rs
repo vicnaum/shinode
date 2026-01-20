@@ -15,7 +15,7 @@ use alloy_rlp::encode;
 use eyre::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reth_ethereum_primitives::{Block, BlockBody, Receipt};
-use reth_primitives_traits::{Header, SealedHeader, SignerRecoverable};
+use reth_primitives_traits::{Header, SealedHeader};
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::RangeInclusive,
@@ -665,19 +665,21 @@ where
 
         let mut stored_transactions = Vec::with_capacity(body.transactions.len());
         for tx in &body.transactions {
-            let from = tx
-                .recover_signer_unchecked()
-                .map_err(|err| eyre::eyre!("failed to recover signer: {err}"))?;
+            let value = tx.value();
+            let signature = tx.signature().clone();
+            let signing_hash = tx.signature_hash();
             let to = match tx.kind() {
                 TxKind::Call(address) => Some(address),
                 TxKind::Create => None,
             };
             stored_transactions.push(StoredTransaction {
                 hash: *tx.hash(),
-                from,
+                from: None,
                 to,
-                value: tx.value(),
+                value,
                 nonce: tx.nonce(),
+                signature: Some(signature),
+                signing_hash: Some(signing_hash),
             });
         }
 
