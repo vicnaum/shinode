@@ -10,7 +10,8 @@ mod types;
 
 use crate::cli::NodeConfig;
 use crate::p2p::PeerPool;
-use crate::sync::{ProgressReporter, SyncProgressStats, SyncStatus, BlockPayload};
+use crate::sync::{BlockPayload, ProgressReporter, SyncProgressStats, SyncStatus};
+use alloy_rlp::Encodable;
 use eyre::{eyre, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reth_network_api::PeerId;
@@ -29,7 +30,7 @@ use process::process_ingest;
 use scheduler::{PeerWorkScheduler, SchedulerConfig};
 use sink::run_probe_sink;
 pub use stats::IngestBenchStats;
-use stats::ProbeStats;
+use stats::{FetchByteTotals, ProbeStats};
 use types::{BenchmarkConfig, ProbeRecord, FetchMode};
 use crate::storage::Storage;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -617,6 +618,11 @@ pub async fn run_ingest_pipeline(
                     let _ = scheduler.mark_completed(&batch.blocks).await;
                     if let Some(bench) = bench.as_ref() {
                         bench.record_fetch_success(payloads.len() as u64, fetch_elapsed);
+                        let mut bytes = FetchByteTotals::default();
+                        for payload in &payloads {
+                            bytes.add(fetch_payload_bytes(payload));
+                        }
+                        bench.record_fetch_bytes(bytes);
                     }
                     for payload in payloads {
                         if fetched_tx.send(payload).await.is_err() {
@@ -679,6 +685,23 @@ fn range_len(range: &RangeInclusive<u64>) -> u64 {
         end - start + 1
     } else {
         0
+    }
+}
+
+fn fetch_payload_bytes(payload: &BlockPayload) -> FetchByteTotals {
+    let headers = payload.header.length() as u64;
+    let bodies = payload.body.length() as u64;
+    let receipts = payload.receipts.length() as u64;
+    let logs = payload
+        .receipts
+        .iter()
+        .map(|receipt| receipt.logs.length() as u64)
+        .sum();
+    FetchByteTotals {
+        headers,
+        bodies,
+        receipts,
+        logs,
     }
 }
 

@@ -4,7 +4,7 @@ use crate::{
     chain::{ChainError, ChainTracker, ChainUpdate, HeadTracker, HeaderStub},
     metrics::range_len,
     storage::{
-        BlockBundle, ReceiptBundle, Storage, StoredBlockSize, StoredLog, StoredLogs, StoredReceipts,
+    BlockBundle, ReceiptBundle, Storage, StoredBlockSize, StoredLogs, StoredReceipts,
         StoredTransaction, StoredTransactions, StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
     },
 };
@@ -702,7 +702,6 @@ where
 
         let stored_header = header.clone();
 
-        let mut block_logs = Vec::new();
         let mut derived_logs = Vec::new();
         for (tx_index, (tx_hash, receipt)) in tx_hashes
             .iter()
@@ -712,7 +711,7 @@ where
             for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
                 let Log { address, data } = log;
                 let (topics, data) = data.split();
-                let stored_log = StoredLog {
+                derived_logs.push(DerivedLog {
                     address,
                     topics,
                     data,
@@ -722,19 +721,7 @@ where
                     transaction_index: tx_index as u64,
                     log_index: log_index as u64,
                     removed: false,
-                };
-                derived_logs.push(DerivedLog {
-                    address: stored_log.address,
-                    topics: stored_log.topics.clone(),
-                    data: stored_log.data.clone(),
-                    block_number: stored_log.block_number,
-                    block_hash: stored_log.block_hash,
-                    transaction_hash: stored_log.transaction_hash,
-                    transaction_index: stored_log.transaction_index,
-                    log_index: stored_log.log_index,
-                    removed: stored_log.removed,
                 });
-                block_logs.push(stored_log);
             }
         }
 
@@ -750,7 +737,7 @@ where
             withdrawals: stored_withdrawals,
             size: StoredBlockSize { size: block_size },
             receipts: StoredReceipts { receipts },
-            logs: StoredLogs { logs: block_logs },
+            logs: StoredLogs { logs: Vec::new() },
         };
 
         Ok(PayloadResult::Bundle {
@@ -1470,15 +1457,7 @@ mod tests {
                 .flat_map(|receipt| receipt.logs.iter().map(|log| log.as_ref())),
         );
         assert_eq!(stored_header.logs_bloom, expected_bloom);
-        assert_eq!(
-            storage
-                .block_logs(0)
-                .expect("logs")
-                .expect("logs exist")
-                .logs
-                .len(),
-            2
-        );
+        assert!(storage.block_logs(0).expect("logs").is_none());
         assert_eq!(storage.last_indexed_block().unwrap(), Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -2,7 +2,7 @@
 
 use crate::storage::{
     BlockBundle, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransaction, StoredTransactions,
-    StoredTxHashes, StoredWithdrawal, StoredWithdrawals, StoredLog,
+    StoredTxHashes, StoredWithdrawal, StoredWithdrawals,
 };
 use crate::sync::{BlockPayload};
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
@@ -109,7 +109,7 @@ pub fn process_ingest(
     let total_start = Instant::now();
 
     let header_hash_start = Instant::now();
-    let header_hash = SealedHeader::seal_slow(header.clone()).hash();
+    let _header_hash = SealedHeader::seal_slow(header.clone()).hash();
     let header_hash_us = header_hash_start.elapsed().as_micros() as u64;
 
     let tx_hashes_start = Instant::now();
@@ -176,31 +176,11 @@ pub fn process_ingest(
     let stored_header = header.clone();
 
     let logs_start = Instant::now();
-    let mut block_logs = Vec::new();
-    for (tx_index, (tx_hash, receipt)) in tx_hashes
-        .iter()
-        .zip(receipts.iter())
-        .enumerate()
-    {
-        for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
-            let alloy_primitives::Log { address, data } = log;
-            let (topics, data) = data.split();
-            let stored_log = StoredLog {
-                address,
-                topics,
-                data,
-                block_number: header.number,
-                block_hash: header_hash,
-                transaction_hash: *tx_hash,
-                transaction_index: tx_index as u64,
-                log_index: log_index as u64,
-                removed: false,
-            };
-            block_logs.push(stored_log);
-        }
+    let mut log_count = 0u64;
+    for receipt in receipts.iter() {
+        log_count = log_count.saturating_add(receipt.logs.len() as u64);
     }
     let logs_build_us = logs_start.elapsed().as_micros() as u64;
-    let log_count = block_logs.len() as u64;
 
     let bundle = BlockBundle {
         number: header.number,
@@ -212,7 +192,7 @@ pub fn process_ingest(
         withdrawals: stored_withdrawals,
         size: StoredBlockSize { size: block_size },
         receipts: StoredReceipts { receipts },
-        logs: StoredLogs { logs: block_logs },
+        logs: StoredLogs { logs: Vec::new() },
     };
 
     if let Some(bench) = bench {

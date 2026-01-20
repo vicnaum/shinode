@@ -18,8 +18,8 @@ use jsonrpsee::{
 use reth_primitives_traits::SealedHeader;
 use serde::Serialize;
 use serde_json::Value;
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
-use tracing::info;
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct RpcConfig {
@@ -300,19 +300,67 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 return Err(invalid_params("block range exceeds max_blocks_per_filter"));
             }
 
-            let mut out = Vec::new();
-            for (_, stored) in ctx
+            let headers = ctx
                 .storage
-                .block_logs_range(from_block..=to_block)
-                .map_err(internal_error)?
-            {
-                for log in stored.logs {
-                    if log_matches(&log, address_filter.as_deref(), topics_filter.as_deref()) {
-                        out.push(format_log(&log));
-                        if ctx.config.max_logs_per_response != 0
-                            && out.len() > ctx.config.max_logs_per_response as usize
+                .block_headers_range(from_block..=to_block)
+                .map_err(internal_error)?;
+            let tx_hashes = ctx
+                .storage
+                .block_tx_hashes_range(from_block..=to_block)
+                .map_err(internal_error)?;
+            let receipts = ctx
+                .storage
+                .block_receipts_range(from_block..=to_block)
+                .map_err(internal_error)?;
+            let headers_by_number: HashMap<u64, _> = headers.into_iter().collect();
+            let tx_hashes_by_number: HashMap<u64, _> = tx_hashes.into_iter().collect();
+
+            let mut out = Vec::new();
+            for (block_number, stored) in receipts {
+                let Some(header) = headers_by_number.get(&block_number) else {
+                    continue;
+                };
+                let Some(tx_hashes) = tx_hashes_by_number.get(&block_number) else {
+                    continue;
+                };
+                if stored.receipts.len() != tx_hashes.hashes.len() {
+                    warn!(
+                        block_number,
+                        receipts = stored.receipts.len(),
+                        tx_hashes = tx_hashes.hashes.len(),
+                        "receipt/tx hash count mismatch while deriving logs"
+                    );
+                    continue;
+                }
+                let block_hash = SealedHeader::seal_slow(header.clone()).hash();
+                for (tx_index, (receipt, tx_hash)) in stored
+                    .receipts
+                    .iter()
+                    .zip(tx_hashes.hashes.iter())
+                    .enumerate()
+                {
+                    for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
+                        let alloy_primitives::Log { address, data } = log;
+                        let (topics, data) = data.split();
+                        let stored_log = StoredLog {
+                            address,
+                            topics,
+                            data,
+                            block_number,
+                            block_hash,
+                            transaction_hash: *tx_hash,
+                            transaction_index: tx_index as u64,
+                            log_index: log_index as u64,
+                            removed: false,
+                        };
+                        if log_matches(&stored_log, address_filter.as_deref(), topics_filter.as_deref())
                         {
-                            return Err(invalid_params("response exceeds max_logs_per_response"));
+                            out.push(format_log(&stored_log));
+                            if ctx.config.max_logs_per_response != 0
+                                && out.len() > ctx.config.max_logs_per_response as usize
+                            {
+                                return Err(invalid_params("response exceeds max_logs_per_response"));
+                            }
                         }
                     }
                 }
@@ -551,6 +599,7 @@ mod tests {
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
+    use reth_ethereum_primitives::{Receipt, TxType};
     use reth_primitives_traits::Header;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -602,6 +651,15 @@ mod tests {
         let mut header = Header::default();
         header.number = number;
         header
+    }
+
+    fn receipt_with_logs(logs: Vec<alloy_primitives::Log>) -> Receipt {
+        Receipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 0,
+            logs,
+        }
     }
 
     async fn start_test_server(
@@ -897,23 +955,24 @@ mod tests {
         let storage = Storage::open(&config).expect("storage");
 
         let topic0 = B256::from([0x11u8; 32]);
-        let log = StoredLog {
-            address: Address::ZERO,
-            topics: vec![topic0],
-            block_number: 5,
-            block_hash: B256::ZERO,
-            transaction_hash: B256::from([0x33u8; 32]),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-            data: alloy_primitives::Bytes::from(vec![0x01]),
-        };
+        let header = header_with_number(5);
+        let tx_hash = B256::from([0x33u8; 32]);
+        let log = alloy_primitives::Log::new_unchecked(
+            Address::ZERO,
+            vec![topic0],
+            alloy_primitives::Bytes::from(vec![0x01]),
+        );
         storage
-            .write_block_logs(5, crate::storage::StoredLogs { logs: vec![log.clone()] })
-            .expect("write logs");
+            .write_block_header(5, header)
+            .expect("write header");
         storage
-            .write_log_indexes(&[log.clone()])
-            .expect("write log indexes");
+            .write_block_tx_hashes(5, crate::storage::StoredTxHashes { hashes: vec![tx_hash] })
+            .expect("write tx hashes");
+        storage
+            .write_block_receipts(5, crate::storage::StoredReceipts {
+                receipts: vec![receipt_with_logs(vec![log.clone()])],
+            })
+            .expect("write receipts");
         storage
             .set_last_indexed_block(5)
             .expect("set last indexed");
@@ -985,23 +1044,24 @@ mod tests {
         let storage = Storage::open(&config).expect("storage");
 
         let topic0 = B256::from([0x42u8; 32]);
-        let log = StoredLog {
-            address: Address::from([0x11u8; 20]),
-            topics: vec![topic0],
-            block_number: 1,
-            block_hash: B256::ZERO,
-            transaction_hash: B256::from([0x33u8; 32]),
-            transaction_index: 0,
-            log_index: 0,
-            removed: false,
-            data: alloy_primitives::Bytes::from(vec![0x01]),
-        };
+        let header = header_with_number(1);
+        let tx_hash = B256::from([0x33u8; 32]);
+        let log = alloy_primitives::Log::new_unchecked(
+            Address::from([0x11u8; 20]),
+            vec![topic0],
+            alloy_primitives::Bytes::from(vec![0x01]),
+        );
         storage
-            .write_block_logs(1, crate::storage::StoredLogs { logs: vec![log.clone()] })
-            .expect("write logs");
+            .write_block_header(1, header)
+            .expect("write header");
         storage
-            .write_log_indexes(&[log.clone()])
-            .expect("write log indexes");
+            .write_block_tx_hashes(1, crate::storage::StoredTxHashes { hashes: vec![tx_hash] })
+            .expect("write tx hashes");
+        storage
+            .write_block_receipts(1, crate::storage::StoredReceipts {
+                receipts: vec![receipt_with_logs(vec![log.clone()])],
+            })
+            .expect("write receipts");
         storage
             .set_last_indexed_block(1)
             .expect("set last indexed");

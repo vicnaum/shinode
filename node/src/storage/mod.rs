@@ -690,7 +690,6 @@ impl Storage {
             tx.put::<tables::BlockWithdrawals>(bundle.number, bundle.withdrawals.clone())?;
             tx.put::<tables::BlockSizes>(bundle.number, bundle.size)?;
             tx.put::<tables::BlockReceipts>(bundle.number, bundle.receipts.clone())?;
-            tx.put::<tables::BlockLogs>(bundle.number, bundle.logs.clone())?;
         }
 
         let last_number = bundles
@@ -1523,15 +1522,7 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(
-            storage
-                .block_logs(1)
-                .expect("log lookup")
-                .expect("logs exist")
-                .logs
-                .len(),
-            1
-        );
+        assert!(storage.block_logs(1).expect("log lookup").is_none());
         let addr_index = storage
             .log_index_by_address_range(Address::from([0x01u8; 20]), 0..=0)
             .expect("address index lookup");

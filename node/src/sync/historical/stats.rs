@@ -237,6 +237,10 @@ pub struct IngestBenchStats {
     fetch_batches: AtomicU64,
     fetch_failures: AtomicU64,
     fetch_total_us: AtomicU64,
+    fetch_bytes_headers: AtomicU64,
+    fetch_bytes_bodies: AtomicU64,
+    fetch_bytes_receipts: AtomicU64,
+    fetch_bytes_logs: AtomicU64,
     peer_failures: AtomicU64,
     process_blocks: AtomicU64,
     process_failures: AtomicU64,
@@ -250,6 +254,13 @@ pub struct IngestBenchStats {
     db_write_blocks: AtomicU64,
     db_write_batches: AtomicU64,
     db_write_total_us: AtomicU64,
+    db_bytes_headers: AtomicU64,
+    db_bytes_tx_hashes: AtomicU64,
+    db_bytes_transactions: AtomicU64,
+    db_bytes_withdrawals: AtomicU64,
+    db_bytes_sizes: AtomicU64,
+    db_bytes_receipts: AtomicU64,
+    db_bytes_logs: AtomicU64,
 }
 
 impl IngestBenchStats {
@@ -262,6 +273,10 @@ impl IngestBenchStats {
             fetch_batches: AtomicU64::new(0),
             fetch_failures: AtomicU64::new(0),
             fetch_total_us: AtomicU64::new(0),
+            fetch_bytes_headers: AtomicU64::new(0),
+            fetch_bytes_bodies: AtomicU64::new(0),
+            fetch_bytes_receipts: AtomicU64::new(0),
+            fetch_bytes_logs: AtomicU64::new(0),
             peer_failures: AtomicU64::new(0),
             process_blocks: AtomicU64::new(0),
             process_failures: AtomicU64::new(0),
@@ -275,6 +290,13 @@ impl IngestBenchStats {
             db_write_blocks: AtomicU64::new(0),
             db_write_batches: AtomicU64::new(0),
             db_write_total_us: AtomicU64::new(0),
+            db_bytes_headers: AtomicU64::new(0),
+            db_bytes_tx_hashes: AtomicU64::new(0),
+            db_bytes_transactions: AtomicU64::new(0),
+            db_bytes_withdrawals: AtomicU64::new(0),
+            db_bytes_sizes: AtomicU64::new(0),
+            db_bytes_receipts: AtomicU64::new(0),
+            db_bytes_logs: AtomicU64::new(0),
         }
     }
 
@@ -290,6 +312,17 @@ impl IngestBenchStats {
         self.fetch_failures.fetch_add(1, Ordering::SeqCst);
         self.fetch_total_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    pub fn record_fetch_bytes(&self, bytes: FetchByteTotals) {
+        self.fetch_bytes_headers
+            .fetch_add(bytes.headers, Ordering::SeqCst);
+        self.fetch_bytes_bodies
+            .fetch_add(bytes.bodies, Ordering::SeqCst);
+        self.fetch_bytes_receipts
+            .fetch_add(bytes.receipts, Ordering::SeqCst);
+        self.fetch_bytes_logs
+            .fetch_add(bytes.logs, Ordering::SeqCst);
     }
 
     pub fn record_process(&self, timing: ProcessTiming) {
@@ -325,6 +358,23 @@ impl IngestBenchStats {
             .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
     }
 
+    pub fn record_db_write_bytes(&self, bytes: DbWriteByteTotals) {
+        self.db_bytes_headers
+            .fetch_add(bytes.headers, Ordering::SeqCst);
+        self.db_bytes_tx_hashes
+            .fetch_add(bytes.tx_hashes, Ordering::SeqCst);
+        self.db_bytes_transactions
+            .fetch_add(bytes.transactions, Ordering::SeqCst);
+        self.db_bytes_withdrawals
+            .fetch_add(bytes.withdrawals, Ordering::SeqCst);
+        self.db_bytes_sizes
+            .fetch_add(bytes.sizes, Ordering::SeqCst);
+        self.db_bytes_receipts
+            .fetch_add(bytes.receipts, Ordering::SeqCst);
+        self.db_bytes_logs
+            .fetch_add(bytes.logs, Ordering::SeqCst);
+    }
+
     pub fn summary(
         &self,
         range_start: u64,
@@ -340,6 +390,10 @@ impl IngestBenchStats {
         let fetch_batches = self.fetch_batches.load(Ordering::SeqCst);
         let fetch_failures = self.fetch_failures.load(Ordering::SeqCst);
         let fetch_total_us = self.fetch_total_us.load(Ordering::SeqCst);
+        let fetch_bytes_headers = self.fetch_bytes_headers.load(Ordering::SeqCst);
+        let fetch_bytes_bodies = self.fetch_bytes_bodies.load(Ordering::SeqCst);
+        let fetch_bytes_receipts = self.fetch_bytes_receipts.load(Ordering::SeqCst);
+        let fetch_bytes_logs = self.fetch_bytes_logs.load(Ordering::SeqCst);
         let peer_failures = self.peer_failures.load(Ordering::SeqCst);
         let process_blocks = self.process_blocks.load(Ordering::SeqCst);
         let process_failures = self.process_failures.load(Ordering::SeqCst);
@@ -347,6 +401,24 @@ impl IngestBenchStats {
         let db_write_blocks = self.db_write_blocks.load(Ordering::SeqCst);
         let db_write_batches = self.db_write_batches.load(Ordering::SeqCst);
         let db_write_total_us = self.db_write_total_us.load(Ordering::SeqCst);
+        let db_bytes_headers = self.db_bytes_headers.load(Ordering::SeqCst);
+        let db_bytes_tx_hashes = self.db_bytes_tx_hashes.load(Ordering::SeqCst);
+        let db_bytes_transactions = self.db_bytes_transactions.load(Ordering::SeqCst);
+        let db_bytes_withdrawals = self.db_bytes_withdrawals.load(Ordering::SeqCst);
+        let db_bytes_sizes = self.db_bytes_sizes.load(Ordering::SeqCst);
+        let db_bytes_receipts = self.db_bytes_receipts.load(Ordering::SeqCst);
+        let db_bytes_logs = self.db_bytes_logs.load(Ordering::SeqCst);
+
+        let fetch_bytes_total = fetch_bytes_headers
+            .saturating_add(fetch_bytes_bodies)
+            .saturating_add(fetch_bytes_receipts);
+        let db_bytes_total = db_bytes_headers
+            .saturating_add(db_bytes_tx_hashes)
+            .saturating_add(db_bytes_transactions)
+            .saturating_add(db_bytes_withdrawals)
+            .saturating_add(db_bytes_sizes)
+            .saturating_add(db_bytes_receipts)
+            .saturating_add(db_bytes_logs);
 
         let blocks_completed = if db_write_blocks > 0 {
             db_write_blocks
@@ -404,6 +476,13 @@ impl IngestBenchStats {
                 failures: fetch_failures,
                 avg_us_per_block: avg_us(fetch_total_us, fetch_blocks),
                 avg_us_per_batch: avg_us(fetch_total_us, fetch_batches),
+                bytes_total: fetch_bytes_total,
+                bytes_headers: fetch_bytes_headers,
+                bytes_bodies: fetch_bytes_bodies,
+                bytes_receipts: fetch_bytes_receipts,
+                bytes_logs: fetch_bytes_logs,
+                avg_bytes_per_block: avg_u64(fetch_bytes_total, fetch_blocks),
+                avg_bytes_per_batch: avg_u64(fetch_bytes_total, fetch_batches),
             },
             process: IngestProcessSummary {
                 total_us: process_total_us,
@@ -419,6 +498,16 @@ impl IngestBenchStats {
                 blocks: db_write_blocks,
                 avg_us_per_block: avg_us(db_write_total_us, db_write_blocks),
                 avg_us_per_batch: avg_us(db_write_total_us, db_write_batches),
+                bytes_total: db_bytes_total,
+                bytes_headers: db_bytes_headers,
+                bytes_tx_hashes: db_bytes_tx_hashes,
+                bytes_transactions: db_bytes_transactions,
+                bytes_withdrawals: db_bytes_withdrawals,
+                bytes_sizes: db_bytes_sizes,
+                bytes_receipts: db_bytes_receipts,
+                bytes_logs: db_bytes_logs,
+                avg_bytes_per_block: avg_u64(db_bytes_total, db_write_blocks),
+                avg_bytes_per_batch: avg_u64(db_bytes_total, db_write_batches),
             },
             peers: PeerSummary {
                 peers_used,
@@ -468,6 +557,13 @@ pub struct IngestFetchSummary {
     pub failures: u64,
     pub avg_us_per_block: u64,
     pub avg_us_per_batch: u64,
+    pub bytes_total: u64,
+    pub bytes_headers: u64,
+    pub bytes_bodies: u64,
+    pub bytes_receipts: u64,
+    pub bytes_logs: u64,
+    pub avg_bytes_per_block: u64,
+    pub avg_bytes_per_batch: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -497,6 +593,16 @@ pub struct IngestDbWriteSummary {
     pub blocks: u64,
     pub avg_us_per_block: u64,
     pub avg_us_per_batch: u64,
+    pub bytes_total: u64,
+    pub bytes_headers: u64,
+    pub bytes_tx_hashes: u64,
+    pub bytes_transactions: u64,
+    pub bytes_withdrawals: u64,
+    pub bytes_sizes: u64,
+    pub bytes_receipts: u64,
+    pub bytes_logs: u64,
+    pub avg_bytes_per_block: u64,
+    pub avg_bytes_per_batch: u64,
 }
 
 fn avg_us(total_us: u64, count: u64) -> u64 {
@@ -504,5 +610,53 @@ fn avg_us(total_us: u64, count: u64) -> u64 {
         0
     } else {
         total_us / count
+    }
+}
+
+fn avg_u64(total: u64, count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        total / count
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchByteTotals {
+    pub headers: u64,
+    pub bodies: u64,
+    pub receipts: u64,
+    pub logs: u64,
+}
+
+impl FetchByteTotals {
+    pub fn add(&mut self, other: FetchByteTotals) {
+        self.headers = self.headers.saturating_add(other.headers);
+        self.bodies = self.bodies.saturating_add(other.bodies);
+        self.receipts = self.receipts.saturating_add(other.receipts);
+        self.logs = self.logs.saturating_add(other.logs);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbWriteByteTotals {
+    pub headers: u64,
+    pub tx_hashes: u64,
+    pub transactions: u64,
+    pub withdrawals: u64,
+    pub sizes: u64,
+    pub receipts: u64,
+    pub logs: u64,
+}
+
+impl DbWriteByteTotals {
+    pub fn add(&mut self, other: DbWriteByteTotals) {
+        self.headers = self.headers.saturating_add(other.headers);
+        self.tx_hashes = self.tx_hashes.saturating_add(other.tx_hashes);
+        self.transactions = self.transactions.saturating_add(other.transactions);
+        self.withdrawals = self.withdrawals.saturating_add(other.withdrawals);
+        self.sizes = self.sizes.saturating_add(other.sizes);
+        self.receipts = self.receipts.saturating_add(other.receipts);
+        self.logs = self.logs.saturating_add(other.logs);
     }
 }
