@@ -76,8 +76,9 @@ This section is the concrete “contract” we implement for v0.1. It is intenti
 - **Params**: `[filter: { fromBlock?, toBlock?, blockHash?, address?, topics? }]`
 - **Supported in v0.1**:
   - range queries via `fromBlock` + `toBlock` (hex quantities or `"latest"`)
+  - `blockHash`: **not supported** in v0.1 (range queries only)
   - `address`: single value or array
-  - `topics`: standard topic filter shape (topic0-3), including `null` wildcards
+  - `topics`: **topic0 only** (event signature). Supports `null` wildcards and OR-lists for topic0 (e.g. `["0x…"]` or `[["0x…","0x…"]]`).
 - **Result (minimum fields guaranteed for each log)**:
   - `address`, `topics`, `data`
   - `blockNumber`, `blockHash`
@@ -87,19 +88,11 @@ This section is the concrete “contract” we implement for v0.1. It is intenti
 - **Ordering**:
   - logs are sorted ascending by `(blockNumber, transactionIndex, logIndex)` (rindexer assumes `logs.last()` corresponds to the highest block)
 - **Limits**:
-  - enforce a configurable `max_blocks_per_filter` and `max_logs_per_response` (reth-style defaults)
-  - **On limit violation**: return JSON-RPC **invalid params** (`-32602`) with a deterministic message (reth-style)
-    - block range too wide: `query exceeds max block range {max_blocks_per_filter}`
-    - too many logs: `query exceeds max results {max_logs_per_response}, retry with the range {from_block}-{to_block}`
-      - `to_block` should be the **last successfully processed block** (so the client can retry the suggested smaller range)
-    - reference: reth’s `eth_getLogs` implementation (`reth/crates/rpc/rpc/src/eth/filter.rs`) uses these messages and maps them to `-32602`
-  - **rindexer retry behavior**: rindexer will shrink the requested range on *any* `eth_getLogs` error, but it shrinks faster if the error `message` or `data` contains provider-style hints. rindexer currently recognizes (case-insensitive):
-    - `this block range should work: [0xFROM, 0xTO]`
-    - `try with this block range [0xFROM, 0xTO]`
-    - `block range is too wide`
-    - `block range too large`
-    - `limited to a N`
-    - `response is too big` / `error decoding response body`
+  - enforce a configurable `max_blocks_per_filter` and `max_logs_per_response`
+  - **On limit violation**: return JSON-RPC **invalid params** (`-32602`) with:
+    - block range too wide: `block range exceeds max_blocks_per_filter`
+    - too many logs: `response exceeds max_logs_per_response`
+  - **rindexer retry behavior**: rindexer will shrink the requested range on *any* `eth_getLogs` error.
 
 Optional / deferred (v0.2+):
 - **Ponder baseline compatibility adds**:
@@ -147,7 +140,7 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
      - checkpoint: “last fully indexed block”
 
 4. **Storage**
-   - Recommended baseline: MDBX (reth-style) with explicit schema/versioning.
+   - Baseline: append-only static-file storage (NippyJar) with explicit schema/versioning.
    - Must support:
      - idempotent writes
      - range queries for logs
@@ -159,7 +152,7 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
 
 ### Suggested crate/module layout (in this repo)
 - `harness/` (keep as a separate tool)
-- `node/` (new): the v0.1 service binary + internal modules:
+- `node/`: the v0.1 service binary + internal modules:
   - `p2p/`
   - `sync/`
   - `chain/`
@@ -221,10 +214,10 @@ Recommendation:
 
 ### Historical fast sync (v0.1.5)
 - For blocks older than the reorg window, use a fast backfill mode:
-  - split the historical range into fixed-size chunks (default 32)
+  - split the historical range into fixed-size chunks (default 16)
   - fetch chunks concurrently across peers with bounded in-flight requests
   - buffer out-of-order chunks and write in block order
-  - persist each chunk in a single MDBX transaction
+  - persist each chunk in a single static-file append batch
 - For blocks inside the reorg window, use the existing safe sequential path.
 
 ### Follow (live)
@@ -344,7 +337,7 @@ Test gate (must pass):
 Deliverables:
 - historical fast sync mode (chunked + concurrent downloads + ordered writes)
 - bounded in-flight concurrency and buffering
-- per-chunk atomic MDBX commits + checkpoints
+- per-chunk atomic static-file append batches + checkpoints
 - safe boundary switch to the slow path near the reorg window
 
 Verification:
@@ -352,7 +345,7 @@ Verification:
 
 Test gate (must pass):
 - chunk planner tests (range → chunks)
-- storage batch write tests (single tx per chunk)
+- storage batch write tests (single append batch per chunk)
 
 ### v0.1.6 Live sync + reorg resilience
 Deliverables:

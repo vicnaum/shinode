@@ -713,9 +713,10 @@ fn spawn_progress_updater(
                     let left_pad = padding / 2;
                     let right_pad = padding - left_pad;
                     
-                    // ANSI: white text (97) on green background (42), then reset (0)
+                    // ANSI: force truecolor white text on truecolor green background, then reset.
+                    // (Some terminals/themes remap ANSI "white" to a dark color; truecolor avoids that.)
                     let bar = format!(
-                        "\x1b[97;42m{:>width_l$}{}{:<width_r$}\x1b[0m",
+                        "\x1b[38;2;255;255;255;48;2;0;128;0m{:>width_l$}{}{:<width_r$}\x1b[0m",
                         "", content, "",
                         width_l = left_pad,
                         width_r = right_pad,

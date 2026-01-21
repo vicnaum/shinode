@@ -1,9 +1,10 @@
 # Stateless History Node SPEC
 
-This repo currently contains a working **receipt availability harness** (see Appendix A). The next product is a **stateless history node**: a long-running service that ingests history artifacts from the Ethereum Execution Layer (EL) P2P network and serves an indexer-compatible RPC subset.
+This repo contains a working **receipt availability harness** (see Appendix A) and a **stateless history node**: a long-running service that ingests history artifacts from the Ethereum Execution Layer (EL) P2P network and serves an indexer-compatible RPC subset.
 
-## Current status (v0.1.4)
-- Range backfill (single run) using P2P headers/bodies/receipts.
+## Current status (v0.1)
+- Range backfill and continuous follow mode using P2P headers/bodies/receipts.
+- Live reorg handling within a configurable rollback window (v0.1 default: delete-on-rollback).
 - Static-file persistence (NippyJar) for headers, tx hashes, tx metadata (no calldata;
   signature + signing hash stored for sender recovery), receipts, and block size.
 - Storage refactor: MDBX replaced by NippyJar static files.
@@ -14,7 +15,7 @@ This repo currently contains a working **receipt availability harness** (see App
 - Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
 - DB stats CLI for on-disk static-file sizes.
 - Benchmark modes: probe (headers/receipts only) and ingest (full pipeline timing).
-- Not yet: follow mode, live reorg handling, extra RPC methods, metrics export.
+- Not yet: extra RPC methods, metrics export, stronger head/finalization signals (safe/finalized).
 
 ## Goals
 - **Ship a usable v0.1 MVP quickly**: backfill → follow head → persist → serve RPC.
@@ -84,7 +85,7 @@ High-level components (mirrors reth’s separation of concerns):
 
 ## Historical fast sync (v0.1.5)
 For blocks **older than the reorg window**, we use a fast backfill mode:
-- split the historical range into fixed-size chunks (default 32)
+- split the historical range into fixed-size chunks (default 16)
 - fetch chunks concurrently across peers with bounded in-flight requests
 - buffer out-of-order chunks and write in block order
 - persist each chunk in a single static-file append batch

@@ -10,6 +10,7 @@ pub const DEFAULT_RPC_MAX_CONNECTIONS: u32 = 100;
 pub const DEFAULT_RPC_MAX_BATCH_REQUESTS: u32 = 100;
 pub const DEFAULT_RPC_MAX_BLOCKS_PER_FILTER: u64 = 10_000;
 pub const DEFAULT_RPC_MAX_LOGS_PER_RESPONSE: u64 = 100_000;
+pub const DEFAULT_START_BLOCK: u64 = 10_000_000;
 pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 16;
 pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 15;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 2048;
@@ -90,7 +91,7 @@ pub struct NodeConfig {
     #[arg(long, default_value = "127.0.0.1:8545")]
     pub rpc_bind: SocketAddr,
     /// First block to backfill.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_START_BLOCK)]
     pub start_block: u64,
     /// Optional final block to stop at (range-limited sync).
     #[arg(long)]
@@ -188,7 +189,7 @@ mod tests {
         assert_eq!(config.chain_id, 1);
         assert_eq!(config.data_dir, PathBuf::from("data"));
         assert_eq!(config.rpc_bind, "127.0.0.1:8545".parse().unwrap());
-        assert_eq!(config.start_block, 0);
+        assert_eq!(config.start_block, DEFAULT_START_BLOCK);
         assert_eq!(config.end_block, None);
         assert_eq!(config.rollback_window, 64);
         assert_eq!(config.retention_mode, RetentionMode::Full);

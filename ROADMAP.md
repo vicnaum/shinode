@@ -63,7 +63,6 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Storage refactor: replace MDBX with NippyJar static files
 - [x] Write path: append headers + tx hashes + receipts + tx metadata during ingest
 - [x] Read path: fetch stored blocks/receipts by number/range (for RPC)
-- [ ] Indexes for fast `eth_getLogs` (address/topic0) — deferred to post-sync indexing
 - [x] Reorg rollback: tail-prune static segments past common ancestor
 - Verified: `cargo test --manifest-path node/Cargo.toml` (storage writes + reads)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (range reads for headers/receipts)
@@ -76,12 +75,6 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - [x] `eth_getBlockByNumber` (must support `"latest"`; must include `timestamp`, `number`, `hash`, `logsBloom`)
   - [x] `eth_getLogs` (must include `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`, `logIndex`)
 - Verified: `cargo test --manifest-path node/Cargo.toml` (RPC block number + block + logs)
-- [ ] **Ponder compatibility (later; NOT in v0.1) requires more than rindexer**:
-  - `eth_getBlockByHash` (reorg traversal via `parentHash`)
-  - `eth_call` (multicall3 + factory/read-contract flows; requires state, so not supported by a fully-stateless node unless proxied or executed via a stateless execution approach like RESS)
-  - optional WS: `eth_subscribe` (`newHeads`) with polling fallback
-  - optional receipts: `eth_getBlockReceipts` / `eth_getTransactionReceipt`
-  - optional call traces: `debug_traceBlockByNumber` / `debug_traceBlockByHash`
 - [x] Adopt reth-style query limits (`max_blocks_per_filter`, `max_logs_per_response`) and return a clear error when exceeded
 - [x] Security defaults: bind **localhost by default**, configurable host/port, request/response limits, basic rate limiting
 - Verified: `cargo test --manifest-path node/Cargo.toml` (RPC limits + server config)
@@ -101,28 +94,30 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ### v0.1.5 Historical sync speedup
 - [x] Define **historical head** = `head - rollback_window`
-- [x] Chunked range planner for historical blocks (default 32)
+- [x] Chunked range planner for historical blocks (default 16)
 - [x] Concurrent chunk fetch with bounded in-flight requests
 - [x] Buffer out-of-order chunks and **write in block order**
 - [x] Atomic per-chunk static-file appends + checkpoint updates
-- [ ] Safe boundary switch to slow path near the reorg window
 - [x] Progress bar: harness-style status line (peers/queue/inflight/speed/eta)
-- [ ] Post-sync log index build (address/topic0) to restore fast `eth_getLogs`
 
 ### v0.1.6 Live sync + reorg resilience
 - [x] **Follow mode**: loop until head, then keep up with new heads
 - [x] **Live reorg handling**: detect reorgs while following and roll back checkpoints
-- [ ] **Additional head sources**: RPC-consensus (reth-style) + beacon light client for `safe`/`finalized`
-- [ ] **Deep reorg recovery**: optional auto-rebootstrap (policy B)
 
 ### Deferred RPC extras (post v0.1)
+- [ ] **Ponder compatibility** requires more than rindexer:
+  - `eth_getBlockByHash` (reorg traversal via `parentHash`)
+  - `eth_call` (multicall3 / read-contract flows; requires state, so not supported by a fully-stateless node unless proxied or executed via a stateless execution approach like RESS)
+  - optional WS: `eth_subscribe` (`newHeads`) with polling fallback
+  - optional receipts: `eth_getBlockReceipts` / `eth_getTransactionReceipt`
+  - optional call traces: `debug_traceBlockByNumber` / `debug_traceBlockByHash`
 - [ ] `net_version`, `web3_clientVersion`, tx/receipt endpoints, WS subscriptions
 
 ### v0.1 release criteria (definition of “usable MVP”)
-- [ ] Fresh start: backfills from configured start block to “head”
-- [ ] Steady-state: continues indexing new blocks and survives reorgs within configured window
-- [ ] Restart safe: resumes without corrupting data or duplicating logs
-- [ ] Indexer can run against it using the supported RPC subset
+- [x] Fresh start: backfills from configured start block to “head”
+- [x] Steady-state: continues indexing new blocks and survives reorgs within configured window
+- [x] Restart safe: resumes without corrupting data or duplicating logs
+- [x] Indexer can run against it using the supported RPC subset
   - Minimum: Uniswap indexing workload (logs + block timestamps)
 
 ---
@@ -133,12 +128,14 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
   - Observed: 10 peers → 1150 b/s, 20 peers → 800 b/s, 50 peers → 500 b/s
 - [ ] Peer scoring/backoff beyond simple rotation (timeouts, slow peers, disconnect reasons)
 - [ ] Backpressure + memory caps for queues
+- [ ] Safe boundary switch to slow path near the reorg window
+- [ ] Deep reorg recovery: optional auto-rebootstrap (policy B)
 - [ ] Tests: sync loop + reorg handling + retry/escalation
 - [ ] Metrics export (Prometheus/OTel)
 - [ ] Optional correctness hardening:
   - receipts root validation (header `receiptsRoot`)
   - multi-peer cross-check for headers/receipts
-  - stronger head source (beacon API / CL integration) if P2P-only head proves flaky
+  - stronger head source (RPC-consensus / beacon API / CL integration) if P2P-only head proves flaky
   - tombstone / “removed logs” handling for reorgs (eth_getLogs consistency)
 
 ---
@@ -146,6 +143,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 ## 🚀 Later (Optimization): Performance & storage efficiency (v0.3+)
 - [ ] Bloom-based short-circuiting (use stored `logsBloom` to skip blocks fast when scanning)
 - [ ] Stronger log indexing (topic1-3, composite indexes, partitioning)
+- [ ] Post-sync `eth_getLogs` index build (address/topic0) for fast range scans
 - [ ] Compression tuning (zstd) and additional cold storage formats
 - [ ] Pipeline improvements: overlap headers/receipts/bodies fetching
 - [ ] (Optional) Multi-peer “scatter/gather” fetching: headers from one peer, bodies/receipts from others (more complexity, potentially higher throughput)
