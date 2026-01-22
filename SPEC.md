@@ -2,7 +2,7 @@
 
 This repo contains a working **receipt availability harness** (see Appendix A) and a **stateless history node**: a long-running service that ingests history artifacts from the Ethereum Execution Layer (EL) P2P network and serves an indexer-compatible RPC subset.
 
-## Current status (v0.1)
+## Current status (v0.2)
 - Range backfill and continuous follow mode using P2P headers/bodies/receipts.
 - Live reorg handling within a configurable rollback window (v0.1 default: delete-on-rollback).
 - Sharded static-file persistence (Storage v2): per-`--shard-size` shard directories with
@@ -14,6 +14,9 @@ This repo contains a working **receipt availability harness** (see Appendix A) a
 - Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
 - DB stats CLI for on-disk static-file sizes.
 - Benchmark modes: probe (headers/receipts only) and ingest (full pipeline timing).
+- Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
+- Fast-sync WAL batching (out-of-order) + benchmark events for compaction/sealing timings.
+- Peer pool warmup: head probes performed asynchronously (avoid blocking peer session watcher).
 - Not yet: extra RPC methods, metrics export, stronger head/finalization signals (safe/finalized).
 
 ## Goals

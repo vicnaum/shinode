@@ -134,9 +134,13 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ## ✅ Next (Functional): Reliability for long-running operation (v0.2)
 - [x] Persist peer cache (warm start; `peers.json` with TTL + cap)
+- [x] Benchmark peer warmup gate: `--benchmark-min-peers` (default: 5)
+- [x] Peer pool warmup: avoid blocking the peer event loop on head probes
 - [ ] **Adaptive concurrency control** (avoid throughput dropping when peers increase)
   - Observed: 10 peers → 1150 b/s, 20 peers → 800 b/s, 50 peers → 500 b/s
 - [ ] Peer scoring/backoff beyond simple rotation (timeouts, slow peers, disconnect reasons)
+- [x] Fast-sync WAL batch writes (out-of-order) + reduced syscall overhead
+- [x] Benchmark events: compaction + sealing duration instrumentation
 - [x] Backpressure + memory caps for queues (bounded lookahead + max buffered blocks)
 - [x] Safe boundary switch to slow path near the reorg window (historical head = head - rollback_window)
 - [ ] Deep reorg recovery: optional auto-rebootstrap (policy B)

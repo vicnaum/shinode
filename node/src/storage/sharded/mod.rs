@@ -19,12 +19,12 @@ use reth_nippy_jar::{NippyJar, NippyJarCursor, NippyJarWriter, CONFIG_FILE_EXTEN
 use reth_primitives_traits::{serde_bincode_compat::SerdeBincodeCompat, Header};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use wal::{append_record, read_records, WalRecord};
+use wal::{append_record, append_records, read_records, WalRecord};
 
 const SCHEMA_VERSION: u64 = 2;
 const META_FILE_NAME: &str = "meta.json";
@@ -434,6 +434,81 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    pub fn write_block_bundles_wal(&self, bundles: &[BlockBundle]) -> Result<Vec<u64>> {
+        if bundles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut per_shard: HashMap<u64, Vec<WalRecord>> = HashMap::new();
+        for bundle in bundles {
+            let shard_start = shard_start(bundle.number, self.shard_size());
+            let record = WalBundleRecord {
+                number: bundle.number,
+                header: encode_bincode_compat_value(&bundle.header)?,
+                tx_hashes: encode_bincode_value(&bundle.tx_hashes)?,
+                tx_meta: encode_bincode_value(&bundle.transactions)?,
+                receipts: encode_bincode_compat_value(&bundle.receipts)?,
+                size: encode_u64_value(bundle.size.size),
+            };
+            let payload = encode_bincode_value(&record)?;
+            per_shard
+                .entry(shard_start)
+                .or_default()
+                .push(WalRecord {
+                    block_number: bundle.number,
+                    payload,
+                });
+        }
+
+        let mut written_blocks = Vec::new();
+        for (shard_start, mut records) in per_shard {
+            let shard = self.get_or_create_shard(shard_start)?;
+            let mut state = shard.lock().expect("shard lock");
+            let mut to_append: Vec<WalRecord> = Vec::new();
+            let mut seen_offsets: HashSet<usize> = HashSet::new();
+
+            for record in records.drain(..) {
+                let offset = (record.block_number - shard_start) as usize;
+                if state.bitset.is_set(offset) || !seen_offsets.insert(offset) {
+                    continue;
+                }
+                to_append.push(record);
+            }
+
+            if to_append.is_empty() {
+                continue;
+            }
+
+            append_records(&wal_path(&state.dir), &to_append)?;
+
+            let mut max_written: Option<u64> = None;
+            let mut meta_completed = false;
+            for record in &to_append {
+                let offset = (record.block_number - shard_start) as usize;
+                if state.bitset.set(offset) {
+                    state.meta.present_count = state.meta.present_count.saturating_add(1);
+                    state.meta.complete =
+                        state.meta.present_count as u64 >= state.meta.shard_size;
+                    state.meta.sorted = false;
+                    state.meta.sealed = false;
+                    state.meta.content_hash = None;
+                    if state.meta.complete {
+                        meta_completed = true;
+                    }
+                    written_blocks.push(record.block_number);
+                    max_written = Some(max_written.unwrap_or(record.block_number).max(record.block_number));
+                }
+            }
+
+            if meta_completed {
+                persist_shard_meta(&state.dir, &state.meta)?;
+            }
+            if let Some(max_written) = max_written {
+                self.bump_max_present(max_written)?;
+            }
+        }
+        Ok(written_blocks)
     }
 
     pub fn write_block_bundle_wal(&self, bundle: &BlockBundle) -> Result<bool> {
@@ -1356,6 +1431,7 @@ mod tests {
             benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
             benchmark_trace: false,
             benchmark_events: false,
+            benchmark_min_peers: None,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,

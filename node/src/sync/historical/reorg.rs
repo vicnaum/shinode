@@ -173,6 +173,7 @@ mod tests {
             benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
             benchmark_trace: false,
             benchmark_events: false,
+            benchmark_min_peers: None,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,

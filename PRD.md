@@ -1,5 +1,12 @@
 # PRD: Stateless History Node (v0.1 MVP)
 
+## Status update (v0.2)
+The v0.1 product contract is implemented. v0.2 focuses on reliability/performance hardening:
+- Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
+- Peer pool warmup: head probes performed asynchronously (avoid blocking peer session watcher).
+- Fast-sync WAL batching (out-of-order) to reduce per-block WAL syscall overhead.
+- Benchmark events include compaction + sealing duration instrumentation for attribution.
+
 ## Context
 We already have a working **receipt availability harness** (`harness/`) that uses Reth as a library to do devp2p discovery, dialing, `eth` handshake, and `GetBlockHeaders`/`GetReceipts*` probing. The next product is a **long-running stateless history node**: it ingests history artifacts and serves an indexer-compatible RPC subset.
 

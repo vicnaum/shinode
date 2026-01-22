@@ -35,6 +35,36 @@ pub fn append_record(path: &Path, block_number: u64, payload: &[u8]) -> Result<(
     Ok(())
 }
 
+pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).wrap_err("failed to create wal dir")?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .wrap_err("failed to open staging.wal")?;
+
+    for record in records {
+        let mut hasher = Hasher::new();
+        hasher.update(&record.block_number.to_le_bytes());
+        let len = record.payload.len() as u32;
+        hasher.update(&len.to_le_bytes());
+        hasher.update(&record.payload);
+        let crc = hasher.finalize();
+
+        file.write_all(&record.block_number.to_le_bytes())?;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(&record.payload)?;
+        file.write_all(&crc.to_le_bytes())?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
 pub fn read_records(path: &Path) -> Result<Vec<WalRecord>> {
     if !path.exists() {
         return Ok(Vec::new());

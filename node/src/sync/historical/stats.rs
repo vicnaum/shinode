@@ -883,6 +883,21 @@ pub enum BenchEvent {
         bytes_total: u64,
         duration_ms: u64,
     },
+    CompactionStart {
+        shard_start: u64,
+    },
+    CompactionEnd {
+        shard_start: u64,
+        duration_ms: u64,
+    },
+    CompactAllDirtyStart,
+    CompactAllDirtyEnd {
+        duration_ms: u64,
+    },
+    SealCompletedStart,
+    SealCompletedEnd {
+        duration_ms: u64,
+    },
     PeerConnected {
         peer_id: String,
     },

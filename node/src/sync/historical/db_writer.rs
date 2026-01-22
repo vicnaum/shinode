@@ -13,6 +13,146 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+
+async fn flush_fast_sync_buffer(
+    storage: &Arc<Storage>,
+    buffer: &mut Vec<BlockBundle>,
+    bench: Option<&Arc<IngestBenchStats>>,
+    events: Option<&Arc<BenchEventLogger>>,
+    remaining_per_shard: Option<&Arc<Mutex<HashMap<u64, usize>>>>,
+    compactions: &mut Vec<JoinHandle<Result<()>>>,
+    semaphore: &Arc<Semaphore>,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+
+    let bytes = if bench.is_some() || events.is_some() {
+        Some(db_bytes_for_bundles(buffer)?)
+    } else {
+        None
+    };
+    if let Some(events) = events.as_ref() {
+        let bytes_total = bytes
+            .as_ref()
+            .map(|totals| {
+                totals
+                    .headers
+                    .saturating_add(totals.tx_hashes)
+                    .saturating_add(totals.transactions)
+                    .saturating_add(totals.withdrawals)
+                    .saturating_add(totals.sizes)
+                    .saturating_add(totals.receipts)
+                    .saturating_add(totals.logs)
+            })
+            .unwrap_or(0);
+        events.record(BenchEvent::DbFlushStart {
+            blocks: buffer.len() as u64,
+            bytes_total,
+        });
+    }
+
+    let started = Instant::now();
+    let written_blocks = storage.write_block_bundles_wal(buffer)?;
+    if let Some(bench) = bench.as_ref() {
+        bench.record_db_write(buffer.len() as u64, started.elapsed());
+        if let Some(bytes) = bytes.as_ref() {
+            bench.record_db_write_bytes(*bytes);
+        }
+    }
+    if let Some(events) = events.as_ref() {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let bytes_total = bytes
+            .as_ref()
+            .map(|totals| {
+                totals
+                    .headers
+                    .saturating_add(totals.tx_hashes)
+                    .saturating_add(totals.transactions)
+                    .saturating_add(totals.withdrawals)
+                    .saturating_add(totals.sizes)
+                    .saturating_add(totals.receipts)
+                    .saturating_add(totals.logs)
+            })
+            .unwrap_or(0);
+        events.record(BenchEvent::DbFlushEnd {
+            blocks: buffer.len() as u64,
+            bytes_total,
+            duration_ms: elapsed_ms,
+        });
+    }
+
+    if let Some(remaining) = remaining_per_shard.as_ref() {
+        let mut shards_to_compact = Vec::new();
+        let mut guard = remaining.lock().await;
+        for number in written_blocks {
+            let shard_start = (number / storage.shard_size()) * storage.shard_size();
+            if let Some(count) = guard.get_mut(&shard_start) {
+                if *count > 0 {
+                    *count -= 1;
+                    if *count == 0 {
+                        shards_to_compact.push(shard_start);
+                    }
+                }
+            }
+        }
+        drop(guard);
+
+        for shard_start in shards_to_compact {
+            let storage = Arc::clone(storage);
+            let semaphore = Arc::clone(semaphore);
+            let events = events.cloned();
+            compactions.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await?;
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::CompactionStart { shard_start });
+                }
+                let started = Instant::now();
+                let result = storage.compact_shard(shard_start);
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::CompactionEnd {
+                        shard_start,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+                result
+            }));
+        }
+    }
+
+    buffer.clear();
+    Ok(())
+}
+
+fn compact_and_seal(
+    storage: &Storage,
+    events: Option<&Arc<BenchEventLogger>>,
+) -> Result<()> {
+    if let Some(events) = events.as_ref() {
+        events.record(BenchEvent::CompactAllDirtyStart);
+    }
+    let started = Instant::now();
+    storage.compact_all_dirty()?;
+    if let Some(events) = events.as_ref() {
+        events.record(BenchEvent::CompactAllDirtyEnd {
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+    }
+
+    if let Some(events) = events.as_ref() {
+        events.record(BenchEvent::SealCompletedStart);
+    }
+    let started = Instant::now();
+    storage.seal_completed_shards()?;
+    if let Some(events) = events.as_ref() {
+        events.record(BenchEvent::SealCompletedEnd {
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DbWriteConfig {
@@ -55,6 +195,7 @@ pub async fn run_db_writer(
     let mut interval = config.flush_interval.map(tokio::time::interval);
     let semaphore = Arc::new(Semaphore::new(2));
     let mut compactions = Vec::new();
+    let mut buffer: Vec<BlockBundle> = Vec::new();
 
     tracing::debug!(
         mode = ?mode,
@@ -67,103 +208,120 @@ pub async fn run_db_writer(
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(DbWriterMessage::Block(block)) => {
-                        let bytes = if bench.is_some() || events.is_some() {
-                            Some(db_bytes_for_bundles(&[block.clone()])?)
+                        if mode == DbWriteMode::FastSync {
+                            buffer.push(block);
+                            if buffer.len() >= config.batch_blocks {
+                                flush_fast_sync_buffer(
+                                    &storage,
+                                    &mut buffer,
+                                    bench.as_ref(),
+                                    events.as_ref(),
+                                    remaining_per_shard.as_ref(),
+                                    &mut compactions,
+                                    &semaphore,
+                                )
+                                .await?;
+                            }
                         } else {
-                            None
-                        };
-                        if let Some(events) = events.as_ref() {
-                            let bytes_total = bytes
-                                .as_ref()
-                                .map(|totals| {
-                                    totals
-                                        .headers
-                                        .saturating_add(totals.tx_hashes)
-                                        .saturating_add(totals.transactions)
-                                        .saturating_add(totals.withdrawals)
-                                        .saturating_add(totals.sizes)
-                                        .saturating_add(totals.receipts)
-                                        .saturating_add(totals.logs)
-                                })
-                                .unwrap_or(0);
-                            events.record(BenchEvent::DbFlushStart {
-                                blocks: 1,
-                                bytes_total,
-                            });
-                        }
-                        let started = Instant::now();
-                        let wrote = match mode {
-                            DbWriteMode::FastSync => storage.write_block_bundle_wal(&block)?,
-                            DbWriteMode::Follow => {
-                                storage.write_block_bundle_follow(&block)?;
-                                true
+                            let bytes = if bench.is_some() || events.is_some() {
+                                Some(db_bytes_for_bundles(&[block.clone()])?)
+                            } else {
+                                None
+                            };
+                            if let Some(events) = events.as_ref() {
+                                let bytes_total = bytes
+                                    .as_ref()
+                                    .map(|totals| {
+                                        totals
+                                            .headers
+                                            .saturating_add(totals.tx_hashes)
+                                            .saturating_add(totals.transactions)
+                                            .saturating_add(totals.withdrawals)
+                                            .saturating_add(totals.sizes)
+                                            .saturating_add(totals.receipts)
+                                            .saturating_add(totals.logs)
+                                    })
+                                    .unwrap_or(0);
+                                events.record(BenchEvent::DbFlushStart {
+                                    blocks: 1,
+                                    bytes_total,
+                                });
                             }
-                        };
-                        if let Some(bench) = bench.as_ref() {
-                            bench.record_db_write(1, started.elapsed());
-                            if let Some(bytes) = bytes.as_ref() {
-                                bench.record_db_write_bytes(*bytes);
-                            }
-                        }
-                        if let Some(events) = events.as_ref() {
-                            let elapsed_ms = started.elapsed().as_millis() as u64;
-                            let bytes_total = bytes
-                                .as_ref()
-                                .map(|totals| {
-                                    totals
-                                        .headers
-                                        .saturating_add(totals.tx_hashes)
-                                        .saturating_add(totals.transactions)
-                                        .saturating_add(totals.withdrawals)
-                                        .saturating_add(totals.sizes)
-                                        .saturating_add(totals.receipts)
-                                        .saturating_add(totals.logs)
-                                })
-                                .unwrap_or(0);
-                            events.record(BenchEvent::DbFlushEnd {
-                                blocks: 1,
-                                bytes_total,
-                                duration_ms: elapsed_ms,
-                            });
-                        }
-
-                        if mode == DbWriteMode::FastSync && wrote {
-                            if let Some(remaining) = remaining_per_shard.as_ref() {
-                                let shard_start = (block.number / storage.shard_size()) * storage.shard_size();
-                                let mut guard = remaining.lock().await;
-                                if let Some(count) = guard.get_mut(&shard_start) {
-                                    if *count > 0 {
-                                        *count -= 1;
-                                        if *count == 0 {
-                                            let storage = Arc::clone(&storage);
-                                            let semaphore = Arc::clone(&semaphore);
-                                            compactions.push(tokio::spawn(async move {
-                                                let _permit = semaphore.acquire_owned().await?;
-                                                storage.compact_shard(shard_start)
-                                            }));
-                                        }
-                                    }
+                            let started = Instant::now();
+                            storage.write_block_bundle_follow(&block)?;
+                            if let Some(bench) = bench.as_ref() {
+                                bench.record_db_write(1, started.elapsed());
+                                if let Some(bytes) = bytes.as_ref() {
+                                    bench.record_db_write_bytes(*bytes);
                                 }
+                            }
+                            if let Some(events) = events.as_ref() {
+                                let elapsed_ms = started.elapsed().as_millis() as u64;
+                                let bytes_total = bytes
+                                    .as_ref()
+                                    .map(|totals| {
+                                        totals
+                                            .headers
+                                            .saturating_add(totals.tx_hashes)
+                                            .saturating_add(totals.transactions)
+                                            .saturating_add(totals.withdrawals)
+                                            .saturating_add(totals.sizes)
+                                            .saturating_add(totals.receipts)
+                                            .saturating_add(totals.logs)
+                                    })
+                                    .unwrap_or(0);
+                                events.record(BenchEvent::DbFlushEnd {
+                                    blocks: 1,
+                                    bytes_total,
+                                    duration_ms: elapsed_ms,
+                                });
                             }
                         }
                     }
                     Some(DbWriterMessage::Flush) => {
                         if mode == DbWriteMode::FastSync {
-                            storage.compact_all_dirty()?;
-                            storage.seal_completed_shards()?;
+                            flush_fast_sync_buffer(
+                                &storage,
+                                &mut buffer,
+                                bench.as_ref(),
+                                events.as_ref(),
+                                remaining_per_shard.as_ref(),
+                                &mut compactions,
+                                &semaphore,
+                            )
+                            .await?;
+                            compact_and_seal(&storage, events.as_ref())?;
                         }
                     }
                     Some(DbWriterMessage::Finalize) => {
                         if mode == DbWriteMode::FastSync {
-                            storage.compact_all_dirty()?;
-                            storage.seal_completed_shards()?;
+                            flush_fast_sync_buffer(
+                                &storage,
+                                &mut buffer,
+                                bench.as_ref(),
+                                events.as_ref(),
+                                remaining_per_shard.as_ref(),
+                                &mut compactions,
+                                &semaphore,
+                            )
+                            .await?;
+                            compact_and_seal(&storage, events.as_ref())?;
                         }
                         break;
                     }
                     None => {
                         if mode == DbWriteMode::FastSync {
-                            storage.compact_all_dirty()?;
-                            storage.seal_completed_shards()?;
+                            flush_fast_sync_buffer(
+                                &storage,
+                                &mut buffer,
+                                bench.as_ref(),
+                                events.as_ref(),
+                                remaining_per_shard.as_ref(),
+                                &mut compactions,
+                                &semaphore,
+                            )
+                            .await?;
+                            compact_and_seal(&storage, events.as_ref())?;
                         }
                         break;
                     }
@@ -175,8 +333,17 @@ pub async fn run_db_writer(
                 }
             }, if interval.is_some() => {
                 if mode == DbWriteMode::FastSync {
-                    storage.compact_all_dirty()?;
-                    storage.seal_completed_shards()?;
+                    flush_fast_sync_buffer(
+                        &storage,
+                        &mut buffer,
+                        bench.as_ref(),
+                        events.as_ref(),
+                        remaining_per_shard.as_ref(),
+                        &mut compactions,
+                        &semaphore,
+                    )
+                    .await?;
+                    compact_and_seal(&storage, events.as_ref())?;
                 }
             }
         }
@@ -265,6 +432,7 @@ mod tests {
             benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
             benchmark_trace: false,
             benchmark_events: false,
+            benchmark_min_peers: None,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,

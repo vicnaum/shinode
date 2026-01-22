@@ -4,7 +4,7 @@ A minimal, stateless Ethereum history indexer that backfills headers, receipts,
 and logs from the EL P2P network and serves a small, indexer-friendly RPC
 subset. It does not execute transactions or keep state.
 
-## Status (v0.1)
+## Status (v0.2)
 
 What works:
 - P2P range backfill from `start_block..head` and continuous follow mode (keeps indexing new heads).
@@ -17,6 +17,8 @@ What works:
 - Graceful shutdown, restart-safe checkpoints, and basic ingest stats.
 - Peer health tracking (bans/quality scoring), bounded per-batch timeouts, and partial response handling.
 - Verbosity flags and progress bars (TTY only).
+- Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
+- Fast-sync WAL batching (out-of-order) + benchmark events for compaction/sealing timings.
 
 What does not yet:
 - Additional RPC methods (`eth_getBlockByHash`, receipts endpoints, WS).
@@ -98,6 +100,7 @@ Benchmark/probe:
     - `--benchmark-name <string>`: label used in output filenames.
     - `--benchmark-trace`: Chrome trace (`.trace.json`) for timeline inspection.
     - `--benchmark-events`: JSONL event log (`.events.jsonl`) for post-analysis (capped; default: 10,000,000 events).
+    - `--benchmark-min-peers <u64>`: wait for at least N connected peers before starting the benchmark (default: 5).
 
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).
@@ -114,7 +117,7 @@ Ingest tuning:
 - `--fast-sync-batch-timeout-ms <u64>`: per-batch timeout (default: 5000).
 - `--fast-sync-max-buffered-blocks <u64>`: max buffered blocks (default: 2048).
 - `--fast-sync-max-lookahead-blocks <u64>`: max blocks ahead of the DB writer low watermark to assign (default: 50_000; `0` = unlimited).
-- `--db-write-batch-blocks <u64>`: batch size for static-file writes (default: 512).
+- `--db-write-batch-blocks <u64>`: batch size for fast-sync WAL writes in ingest mode (default: 512). Follow mode remains per-block.
 - `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
 
 DB stats:

@@ -137,6 +137,11 @@ pub struct NodeConfig {
     /// Emit a JSONL event log during benchmark runs.
     #[arg(long, default_value_t = false)]
     pub benchmark_events: bool,
+    /// Minimum peers to wait for before starting benchmark ingest/probe.
+    ///
+    /// If unset, benchmark runs will default to 5 peers. Non-benchmark runs ignore this.
+    #[arg(long)]
+    pub benchmark_min_peers: Option<u64>,
     /// Optional command.
     #[command(subcommand)]
     #[serde(skip)]
@@ -234,6 +239,7 @@ mod tests {
         assert_eq!(config.benchmark_output_dir, PathBuf::from(DEFAULT_BENCHMARK_OUTPUT_DIR));
         assert!(!config.benchmark_trace);
         assert!(!config.benchmark_events);
+        assert_eq!(config.benchmark_min_peers, None);
         assert!(config.command.is_none());
         assert_eq!(config.rpc_max_request_body_bytes, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES);
         assert_eq!(config.rpc_max_response_body_bytes, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES);

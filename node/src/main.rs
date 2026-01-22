@@ -39,6 +39,8 @@ use tracing_subscriber::Layer;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 
+const DEFAULT_BENCHMARK_MIN_PEERS: u64 = 5;
+
 async fn apply_cached_peer_limits(
     storage: &storage::Storage,
     peer_health: &PeerHealthTracker,
@@ -307,6 +309,28 @@ fn benchmark_mode_str(mode: BenchmarkMode) -> &'static str {
     }
 }
 
+async fn wait_for_benchmark_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
+    if min_peers == 0 {
+        return;
+    }
+    let mut last_log = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
+    loop {
+        let peers = pool.len();
+        if peers >= min_peers {
+            return;
+        }
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            info!(
+                peers,
+                min_peers,
+                "waiting for benchmark peer warmup"
+            );
+            last_log = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 fn benchmark_base_name(
     benchmark_name: &str,
     timestamp: &str,
@@ -549,6 +573,13 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = env::args().collect();
     let data_dir_specified = arg_present(&argv, "--data-dir");
     let is_benchmark = matches!(config.benchmark, BenchmarkMode::Probe | BenchmarkMode::Ingest);
+    let benchmark_min_peers = if is_benchmark {
+        config
+            .benchmark_min_peers
+            .unwrap_or(DEFAULT_BENCHMARK_MIN_PEERS)
+    } else {
+        0
+    };
     let chunk_max = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -628,6 +659,8 @@ async fn main() -> Result<()> {
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(peer_cache).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
+        wait_for_benchmark_min_peers(&session.pool, benchmark_min_peers as usize).await;
+        info!(peers = session.pool.len(), "benchmark peer warmup complete");
         let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
         let head_at_startup = source.head().await?;
         let range = compute_target_range(
@@ -690,6 +723,8 @@ async fn main() -> Result<()> {
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
+        wait_for_benchmark_min_peers(&session.pool, benchmark_min_peers as usize).await;
+        info!(peers = session.pool.len(), "benchmark peer warmup complete");
         let head_at_startup = wait_for_peer_head(
             &session.pool,
             config.start_block,

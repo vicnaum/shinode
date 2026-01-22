@@ -41,6 +41,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// Identifier for a peer in the selection pool.
@@ -295,6 +296,13 @@ impl PeerPool {
         peers.push(peer);
     }
 
+    fn update_peer_head(&self, peer_id: PeerId, head_number: u64) {
+        let mut peers = self.peers.write().expect("peer pool lock");
+        if let Some(peer) = peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
+            peer.head_number = head_number;
+        }
+    }
+
     fn remove_peer(&self, peer_id: PeerId) {
         let mut peers = self.peers.write().expect("peer pool lock");
         peers.retain(|peer| peer.peer_id != peer_id);
@@ -340,31 +348,41 @@ fn spawn_peer_watcher(
 ) {
     tokio::spawn(async move {
         let mut events = handle.event_listener();
+        let head_probe_semaphore = Arc::new(Semaphore::new(24));
         while let Some(event) = events.next().await {
             match event {
                 NetworkEvent::ActivePeerSession { info, messages } => {
                     if info.status.genesis != MAINNET.genesis_hash() {
                         continue;
                     }
-                    let head_number =
-                        match request_head_number(info.peer_id, info.status.blockhash, &messages)
-                            .await
-                        {
-                            Ok(head_number) => head_number,
+                    let peer_id = info.peer_id;
+                    let head_hash = info.status.blockhash;
+                    let messages_for_peer = messages.clone();
+                    let messages_for_probe = messages.clone();
+                    pool.add_peer(NetworkPeer {
+                        peer_id,
+                        eth_version: info.version,
+                        messages: messages_for_peer,
+                        head_number: 0,
+                    });
+                    let pool_for_probe = Arc::clone(&pool);
+                    let head_probe_semaphore = Arc::clone(&head_probe_semaphore);
+                    tokio::spawn(async move {
+                        let Ok(_permit) = head_probe_semaphore.acquire_owned().await else {
+                            return;
+                        };
+                        match request_head_number(peer_id, head_hash, &messages_for_probe).await {
+                            Ok(head_number) => {
+                                pool_for_probe.update_peer_head(peer_id, head_number);
+                            }
                             Err(err) => {
                                 tracing::debug!(
-                                    peer_id = ?info.peer_id,
+                                    peer_id = ?peer_id,
                                     error = %err,
                                     "failed to probe peer head; keeping peer with unknown head"
                                 );
-                                0
                             }
-                        };
-                    pool.add_peer(NetworkPeer {
-                        peer_id: info.peer_id,
-                        eth_version: info.version,
-                        messages,
-                        head_number,
+                        }
                     });
                     if let Some(peer_cache) = peer_cache.as_ref() {
                         let peer = StoredPeer {
