@@ -1,9 +1,7 @@
 ./rindexer/
 ./reth/
 target/
-data/
-data-p2p-test/
-data-p2p-test2/
-data-p2p-test3/
+data*/
 .DS_Store
 harness/output/
+/repomix*.*
