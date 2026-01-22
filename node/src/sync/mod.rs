@@ -47,6 +47,29 @@ impl SyncStatus {
     }
 }
 
+pub fn format_eta_seconds(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "--".to_string();
+    }
+    let mut remaining = seconds.round().max(0.0) as u64;
+    let days = remaining / 86_400;
+    remaining %= 86_400;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let mins = remaining / 60;
+    let secs = remaining % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SyncProgressStats {
     processed: std::sync::atomic::AtomicU64,

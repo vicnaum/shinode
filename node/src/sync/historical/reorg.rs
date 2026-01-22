@@ -130,6 +130,7 @@ mod tests {
     use reth_network_api::{PeerId, PeerRequest, PeerRequestSender};
     use reth_primitives_traits::{Header, SealedHeader};
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
@@ -157,6 +158,7 @@ mod tests {
         NodeConfig {
             chain_id: 1,
             data_dir: dir,
+            peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("rpc bind"),
             start_block: 0,
             end_block: None,
@@ -166,6 +168,10 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Disabled,
+            benchmark_name: None,
+            benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
+            benchmark_trace: false,
+            benchmark_events: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,
@@ -174,6 +180,7 @@ mod tests {
             rpc_max_blocks_per_filter: 0,
             rpc_max_logs_per_response: 0,
             fast_sync_chunk_size: 16,
+            fast_sync_chunk_max: None,
             fast_sync_max_inflight: 2,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,

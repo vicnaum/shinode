@@ -67,6 +67,7 @@ kill -USR1 <pid>
 Core:
 - `--chain-id <u64>`: chain id for RPC (default: 1 as the only supported is ETH Mainnet).
 - `--data-dir <path>`: base data directory (default: `data`).
+- `--peer-cache-dir <path>`: directory for persisted peer cache (shared across runs).
 - `--rpc-bind <ip:port>`: RPC bind (default: `127.0.0.1:8545`).
 - `--start-block <u64>`: first block to backfill (default: 10_000_000 - right before Uniswap V2 was deployed on ETH Mainnet).
 - `--end-block <u64>`: optional final block to stop at.
@@ -90,6 +91,11 @@ Benchmark/probe:
 - `--benchmark ingest`: full ingest benchmark (fetch + process + DB writes).
   - No RPC server; exits after finishing the configured range.
   - Prints a per-stage timing summary (fetch/process/db) as JSON.
+  - Writes a summary JSON file to `--benchmark-output-dir` (default: `benchmarks`).
+  - Optional artifacts:
+    - `--benchmark-name <string>`: label used in output filenames.
+    - `--benchmark-trace`: Chrome trace (`.trace.json`) for timeline inspection.
+    - `--benchmark-events`: JSONL event log (`.events.jsonl`) for post-analysis.
 
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).
@@ -100,7 +106,8 @@ RPC safety limits:
 - `--rpc-max-logs-per-response <u64>` (default: 100000; `0` = unlimited).
 
 Ingest tuning:
-- `--fast-sync-chunk-size <u64>`: blocks per peer batch (default: 16).
+- `--fast-sync-chunk-size <u64>`: initial blocks per peer batch (default: 16).
+- `--fast-sync-chunk-max <u64>`: hard cap for per-peer AIMD batch size (defaults to `4x --fast-sync-chunk-size`).
 - `--fast-sync-max-inflight <u32>`: max concurrent peer batches (default: 15).
 - `--fast-sync-batch-timeout-ms <u64>`: per-batch timeout (default: 5000).
 - `--fast-sync-max-buffered-blocks <u64>`: max buffered blocks (default: 2048).
@@ -111,12 +118,44 @@ DB stats:
 - `stateless-history-node db stats --data-dir <path>`: print static-file storage sizes.
 - `stateless-history-node db stats --data-dir <path> --json`: JSON output for tooling.
 
+## Profiling
+
+CPU sampling (Linux):
+
+```bash
+samply record -- \
+  cargo run --manifest-path node/Cargo.toml --release -- \
+  --benchmark ingest --start-block 10_000_000 --end-block 10_010_000
+```
+
+CPU sampling (macOS):
+
+- Use Instruments → Time Profiler.
+- Target the `stateless-history-node` process launched via:
+
+```bash
+cargo run --manifest-path node/Cargo.toml --release -- \
+  --benchmark ingest --start-block 10_000_000 --end-block 10_010_000
+```
+
+Benchmark timeline artifacts:
+
+- Add `--benchmark-trace` to emit a Chrome trace file alongside the summary JSON.
+
+Notes:
+
+- Jemalloc, tracing_samply, and tokio-console integrations are planned but not wired yet.
+
 ## Configuration and storage
 
 Storage is under `data_dir`:
 - `meta.json`: schema version, chain id, start block, checkpoints.
-- `peers.json`: cached peers (TTL + cap applied on load).
 - `static/`: NippyJar segments (`headers`, `tx_hashes`, `tx_meta`, `receipts`, `block_sizes`).
+
+Peer cache (shared across runs):
+
+- `peers.json`: cached peers (TTL + cap applied on load) stored under `--peer-cache-dir`.
+- Default is `~/.stateless-history-node/peers.json` unless `--peer-cache-dir` is set.
 
 The config is validated on startup. If you change storage-affecting settings
 (retention, head source, reorg strategy, start block), use a new `data_dir`.

@@ -9,23 +9,77 @@ use cli::{compute_target_range, BenchmarkMode, NodeConfig};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use metrics::range_len;
+use serde::Serialize;
 use std::{
     collections::VecDeque,
+    env,
+    fs,
     io::IsTerminal,
-    path::Path,
+    path::{Path, PathBuf},
+    process,
+    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use p2p::PeerPool;
+use p2p::{PeerPool, p2p_limits};
+use reth_network_api::PeerId;
 use sync::{
     BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus,
 };
-use sync::historical::{IngestBenchStats, PeerHealthTracker, ProbeStats};
+use sync::historical::{BenchEventLogger, IngestBenchStats, PeerHealthTracker, ProbeStats};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
+
+async fn apply_cached_peer_limits(
+    storage: &storage::Storage,
+    peer_health: &PeerHealthTracker,
+) {
+    let peers = storage.peer_cache_snapshot();
+    for peer in peers {
+        let Some(limit) = peer.aimd_batch_limit else {
+            continue;
+        };
+        let Ok(peer_id) = PeerId::from_str(&peer.peer_id) else {
+            continue;
+        };
+        peer_health.set_batch_limit(peer_id, limit).await;
+    }
+}
+
+async fn persist_peer_limits(storage: &storage::Storage, peer_health: &PeerHealthTracker) {
+    let snapshot = peer_health.snapshot().await;
+    let limits: Vec<(String, u64)> = snapshot
+        .into_iter()
+        .map(|entry| (entry.peer_id.to_string(), entry.batch_limit as u64))
+        .collect();
+    storage.update_peer_batch_limits(&limits);
+}
+
+async fn flush_peer_cache_with_limits(
+    session: &p2p::NetworkSession,
+    storage: &storage::Storage,
+    peer_health: Option<&PeerHealthTracker>,
+) {
+    if let Err(err) = session.flush_peer_cache() {
+        warn!(error = %err, "failed to flush peer cache");
+        return;
+    }
+    if let Some(peer_health) = peer_health {
+        persist_peer_limits(storage, peer_health).await;
+        if let Err(err) = storage.flush_peer_cache() {
+            warn!(error = %err, "failed to flush peer cache with limits");
+        }
+    }
+}
 
 impl sync::ProgressReporter for ProgressBar {
     fn set_length(&self, len: u64) {
@@ -69,10 +123,482 @@ impl sync::ProgressReporter for IngestProgress {
         self.bar.inc(delta);
     }
 }
+
+#[derive(Debug, Serialize)]
+struct BenchmarkRunReport {
+    meta: BenchmarkMeta,
+    argv: Vec<String>,
+    config: NodeConfig,
+    derived: BenchmarkDerived,
+    results: sync::historical::IngestBenchSummary,
+    peer_health_all: Vec<PeerHealthSummary>,
+    peer_health_top: Vec<PeerHealthSummary>,
+    peer_health_worst: Vec<PeerHealthSummary>,
+    events: Option<BenchmarkEventsSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkMeta {
+    timestamp_utc: String,
+    run_id: String,
+    benchmark_name: String,
+    benchmark_mode: String,
+    build: BuildInfo,
+    env: EnvInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildInfo {
+    profile: String,
+    debug_assertions: bool,
+    features: Vec<String>,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EnvInfo {
+    os: String,
+    arch: String,
+    cpu_count: usize,
+    pid: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkDerived {
+    range_start: u64,
+    range_end: u64,
+    head_at_startup: u64,
+    safe_head: u64,
+    rollback_window_applied: bool,
+    worker_count: usize,
+    p2p_limits: P2pLimitsSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct P2pLimitsSummary {
+    max_outbound: usize,
+    max_concurrent_dials: usize,
+    peer_refill_interval_ms: u64,
+    request_timeout_ms: u64,
+    max_headers_per_request: usize,
+    peer_cache_ttl_days: u64,
+    peer_cache_max: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PeerHealthSummary {
+    peer_id: String,
+    is_banned: bool,
+    ban_remaining_ms: Option<u64>,
+    consecutive_failures: u32,
+    consecutive_partials: u32,
+    successes: u64,
+    failures: u64,
+    partials: u64,
+    assignments: u64,
+    assigned_blocks: u64,
+    inflight_blocks: u64,
+    batch_limit: u64,
+    batch_limit_max: u64,
+    batch_limit_avg: Option<f64>,
+    last_assigned_age_ms: Option<u64>,
+    last_success_age_ms: Option<u64>,
+    last_failure_age_ms: Option<u64>,
+    last_partial_age_ms: Option<u64>,
+    quality_score: f64,
+    quality_samples: u64,
+    last_error: Option<String>,
+    last_error_age_ms: Option<u64>,
+    last_error_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkEventsSummary {
+    total_events: usize,
+    dropped_events: u64,
+    path: String,
+}
+
+#[derive(Debug)]
+struct BenchmarkRunContext {
+    timestamp_utc: String,
+    run_id: String,
+    benchmark_name: String,
+    output_dir: PathBuf,
+    argv: Vec<String>,
+    trace_tmp_path: Option<PathBuf>,
+}
+
+fn bench_timestamp_utc(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        year, month, day, hour, min, sec
+    )
+}
+
+fn civil_from_days(days: i64) -> (i32, i32, i32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as i32, d as i32)
+}
+
+fn sanitize_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn arg_present(args: &[String], flag: &str) -> bool {
+    let flag_eq = format!("{flag}=");
+    args.iter().any(|arg| arg == flag || arg.starts_with(&flag_eq))
+}
+
+fn default_peer_cache_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".stateless-history-node"))
+}
+
+fn build_info() -> BuildInfo {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let features = Vec::new();
+    BuildInfo {
+        profile: profile.to_string(),
+        debug_assertions: cfg!(debug_assertions),
+        features,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn env_info() -> EnvInfo {
+    EnvInfo {
+        os: env::consts::OS.to_string(),
+        arch: env::consts::ARCH.to_string(),
+        cpu_count: std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1),
+        pid: process::id(),
+    }
+}
+
+fn benchmark_mode_str(mode: BenchmarkMode) -> &'static str {
+    match mode {
+        BenchmarkMode::Disabled => "disabled",
+        BenchmarkMode::Probe => "probe",
+        BenchmarkMode::Ingest => "ingest",
+    }
+}
+
+fn benchmark_base_name(
+    benchmark_name: &str,
+    timestamp: &str,
+    range: &std::ops::RangeInclusive<u64>,
+    config: &NodeConfig,
+    build: &BuildInfo,
+) -> String {
+    let base = sanitize_label(benchmark_name);
+    let profile = sanitize_label(&build.profile);
+    let alloc = if build.features.iter().any(|feat| feat == "jemalloc") {
+        "jemalloc"
+    } else {
+        "system"
+    };
+    let chunk_max = config
+        .fast_sync_chunk_max
+        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4));
+    let chunk_max_suffix = if chunk_max != config.fast_sync_chunk_size {
+        format!("__chunkmax{chunk_max}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{base}__{timestamp}__range-{}-{}__chunk{}{}__inflight{}__timeout{}__profile-{profile}__alloc-{alloc}",
+        range.start(),
+        range.end(),
+        config.fast_sync_chunk_size,
+        chunk_max_suffix,
+        config.fast_sync_max_inflight,
+        config.fast_sync_batch_timeout_ms
+    )
+}
+
+fn write_benchmark_report(
+    output_dir: &Path,
+    base_name: &str,
+    report: &BenchmarkRunReport,
+) -> Result<PathBuf> {
+    fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{base_name}.json"));
+    let file = fs::File::create(&path)?;
+    serde_json::to_writer_pretty(file, report)?;
+    Ok(path)
+}
+
+async fn emit_benchmark_artifacts(
+    bench_context: &BenchmarkRunContext,
+    config: &NodeConfig,
+    range: &std::ops::RangeInclusive<u64>,
+    head_at_startup: u64,
+    peer_health: &PeerHealthTracker,
+    summary: sync::historical::IngestBenchSummary,
+    events: Option<&BenchEventLogger>,
+    chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
+) -> Result<()> {
+    let build = build_info();
+    let env = env_info();
+    let base_name = benchmark_base_name(
+        &bench_context.benchmark_name,
+        &bench_context.timestamp_utc,
+        range,
+        config,
+        &build,
+    );
+    let limits = p2p_limits();
+    let derived = BenchmarkDerived {
+        range_start: *range.start(),
+        range_end: *range.end(),
+        head_at_startup,
+        safe_head: head_at_startup.saturating_sub(config.rollback_window),
+        rollback_window_applied: config.rollback_window > 0,
+        worker_count: std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4)
+            .max(1),
+        p2p_limits: P2pLimitsSummary {
+            max_outbound: limits.max_outbound,
+            max_concurrent_dials: limits.max_concurrent_dials,
+            peer_refill_interval_ms: limits.peer_refill_interval_ms,
+            request_timeout_ms: limits.request_timeout_ms,
+            max_headers_per_request: limits.max_headers_per_request,
+            peer_cache_ttl_days: limits.peer_cache_ttl_days,
+            peer_cache_max: limits.peer_cache_max,
+        },
+    };
+
+    let mut snapshot = peer_health.snapshot().await;
+    let peer_health_all: Vec<PeerHealthSummary> = snapshot
+        .iter()
+        .filter(|dump| dump.quality_samples > 0)
+        .map(|dump| PeerHealthSummary {
+            peer_id: format!("{:?}", dump.peer_id),
+            is_banned: dump.is_banned,
+            ban_remaining_ms: dump.ban_remaining_ms,
+            consecutive_failures: dump.consecutive_failures,
+            consecutive_partials: dump.consecutive_partials,
+            successes: dump.successes,
+            failures: dump.failures,
+            partials: dump.partials,
+            assignments: dump.assignments,
+            assigned_blocks: dump.assigned_blocks,
+            inflight_blocks: dump.inflight_blocks,
+            batch_limit: dump.batch_limit as u64,
+            batch_limit_max: dump.batch_limit_max as u64,
+            batch_limit_avg: dump.batch_limit_avg,
+            last_assigned_age_ms: dump.last_assigned_age_ms,
+            last_success_age_ms: dump.last_success_age_ms,
+            last_failure_age_ms: dump.last_failure_age_ms,
+            last_partial_age_ms: dump.last_partial_age_ms,
+            quality_score: dump.quality_score,
+            quality_samples: dump.quality_samples,
+            last_error: dump.last_error.clone(),
+            last_error_age_ms: dump.last_error_age_ms,
+            last_error_count: dump.last_error_count,
+        })
+        .collect();
+
+    let top: Vec<PeerHealthSummary> = snapshot
+        .iter()
+        .filter(|dump| dump.quality_samples > 0)
+        .take(10)
+        .map(|dump| PeerHealthSummary {
+            peer_id: format!("{:?}", dump.peer_id),
+            is_banned: dump.is_banned,
+            ban_remaining_ms: dump.ban_remaining_ms,
+            consecutive_failures: dump.consecutive_failures,
+            consecutive_partials: dump.consecutive_partials,
+            successes: dump.successes,
+            failures: dump.failures,
+            partials: dump.partials,
+            assignments: dump.assignments,
+            assigned_blocks: dump.assigned_blocks,
+            inflight_blocks: dump.inflight_blocks,
+            batch_limit: dump.batch_limit as u64,
+            batch_limit_max: dump.batch_limit_max as u64,
+            batch_limit_avg: dump.batch_limit_avg,
+            last_assigned_age_ms: dump.last_assigned_age_ms,
+            last_success_age_ms: dump.last_success_age_ms,
+            last_failure_age_ms: dump.last_failure_age_ms,
+            last_partial_age_ms: dump.last_partial_age_ms,
+            quality_score: dump.quality_score,
+            quality_samples: dump.quality_samples,
+            last_error: dump.last_error.clone(),
+            last_error_age_ms: dump.last_error_age_ms,
+            last_error_count: dump.last_error_count,
+        })
+        .collect();
+
+    snapshot.sort_by(|a, b| {
+        a.quality_score
+            .partial_cmp(&b.quality_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let worst: Vec<PeerHealthSummary> = snapshot
+        .iter()
+        .filter(|dump| dump.quality_samples > 0)
+        .take(10)
+        .map(|dump| PeerHealthSummary {
+            peer_id: format!("{:?}", dump.peer_id),
+            is_banned: dump.is_banned,
+            ban_remaining_ms: dump.ban_remaining_ms,
+            consecutive_failures: dump.consecutive_failures,
+            consecutive_partials: dump.consecutive_partials,
+            successes: dump.successes,
+            failures: dump.failures,
+            partials: dump.partials,
+            assignments: dump.assignments,
+            assigned_blocks: dump.assigned_blocks,
+            inflight_blocks: dump.inflight_blocks,
+            batch_limit: dump.batch_limit as u64,
+            batch_limit_max: dump.batch_limit_max as u64,
+            batch_limit_avg: dump.batch_limit_avg,
+            last_assigned_age_ms: dump.last_assigned_age_ms,
+            last_success_age_ms: dump.last_success_age_ms,
+            last_failure_age_ms: dump.last_failure_age_ms,
+            last_partial_age_ms: dump.last_partial_age_ms,
+            quality_score: dump.quality_score,
+            quality_samples: dump.quality_samples,
+            last_error: dump.last_error.clone(),
+            last_error_age_ms: dump.last_error_age_ms,
+            last_error_count: dump.last_error_count,
+        })
+        .collect();
+
+    let events_summary = if let Some(logger) = events {
+        let path = bench_context
+            .output_dir
+            .join(format!("{base_name}.events.jsonl"));
+        let total_events = logger.dump_jsonl(&path)?;
+        Some(BenchmarkEventsSummary {
+            total_events,
+            dropped_events: logger.dropped_events(),
+            path: path.display().to_string(),
+        })
+    } else {
+        None
+    };
+
+    let report = BenchmarkRunReport {
+        meta: BenchmarkMeta {
+            timestamp_utc: bench_context.timestamp_utc.clone(),
+            run_id: bench_context.run_id.clone(),
+            benchmark_name: bench_context.benchmark_name.clone(),
+            benchmark_mode: benchmark_mode_str(config.benchmark).to_string(),
+            build,
+            env,
+        },
+        argv: bench_context.argv.clone(),
+        config: config.clone(),
+        derived,
+        results: summary,
+        peer_health_all,
+        peer_health_top: top,
+        peer_health_worst: worst,
+        events: events_summary,
+    };
+    let report_path = write_benchmark_report(&bench_context.output_dir, &base_name, &report)?;
+    info!(path = %report_path.display(), "benchmark summary written");
+
+    if let Some(tmp_path) = bench_context.trace_tmp_path.as_ref() {
+        let final_path = bench_context
+            .output_dir
+            .join(format!("{base_name}.trace.json"));
+        drop(chrome_guard.take());
+        match fs::rename(tmp_path, &final_path) {
+            Ok(()) => {
+                info!(path = %final_path.display(), "benchmark trace written");
+            }
+            Err(err) => {
+                warn!(error = %err, tmp = %tmp_path.display(), "failed to rename trace output");
+            }
+        }
+    }
+
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = NodeConfig::from_args();
-    init_tracing(config.verbosity);
+    let mut config = NodeConfig::from_args();
+    let argv: Vec<String> = env::args().collect();
+    let data_dir_specified = arg_present(&argv, "--data-dir");
+    let is_benchmark = matches!(config.benchmark, BenchmarkMode::Probe | BenchmarkMode::Ingest);
+    let chunk_max = config
+        .fast_sync_chunk_max
+        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .max(1);
+    if chunk_max < config.fast_sync_chunk_size.max(1) {
+        warn!(
+            initial = config.fast_sync_chunk_size,
+            max = chunk_max,
+            "fast-sync-chunk-max is below fast-sync-chunk-size; clamping initial to max"
+        );
+        config.fast_sync_chunk_size = chunk_max;
+    }
+    config.fast_sync_chunk_max = Some(chunk_max);
+    let bench_context = if is_benchmark {
+        let timestamp_utc = bench_timestamp_utc(SystemTime::now());
+        let run_id = format!("{}-{}", timestamp_utc, process::id());
+        let benchmark_name = config
+            .benchmark_name
+            .clone()
+            .unwrap_or_else(|| format!("{}-bench", benchmark_mode_str(config.benchmark)));
+        let output_dir = config.benchmark_output_dir.clone();
+        let trace_tmp_path = if config.benchmark_trace {
+            Some(output_dir.join(format!("trace__{}__tmp.json", timestamp_utc)))
+        } else {
+            None
+        };
+        fs::create_dir_all(&output_dir)?;
+        Some(BenchmarkRunContext {
+            timestamp_utc,
+            run_id,
+            benchmark_name,
+            output_dir,
+            argv,
+            trace_tmp_path,
+        })
+    } else {
+        None
+    };
+    if is_benchmark && !data_dir_specified {
+        if let Some(ctx) = &bench_context {
+            config.data_dir = ctx.output_dir.join("data").join(&ctx.run_id);
+        }
+    }
+    if config.peer_cache_dir.is_none() {
+        config.peer_cache_dir = default_peer_cache_dir();
+    }
+    let mut chrome_guard = init_tracing(
+        config.verbosity,
+        bench_context.as_ref().and_then(|ctx| ctx.trace_tmp_path.clone()),
+    );
 
     if let Some(command) = &config.command {
         match command {
@@ -172,6 +698,7 @@ async fn main() -> Result<()> {
             head_at_startup,
             config.rollback_window,
         );
+        let bench_context = bench_context.as_ref().expect("benchmark context");
         let total_len = range_len(&range);
 
         let progress_stats = if std::io::stderr().is_terminal() {
@@ -179,7 +706,17 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let peer_health = sync::historical::build_peer_health_tracker(&config);
+        let peer_health_local = sync::historical::build_peer_health_tracker(&config);
+        apply_cached_peer_limits(&storage, &peer_health_local).await;
+        #[cfg(unix)]
+        spawn_usr1_state_logger(
+            progress_stats.clone(),
+            Some(Arc::clone(&session.pool)),
+            Some(Arc::clone(&peer_health_local)),
+        );
+        let events = config
+            .benchmark_events
+            .then(|| Arc::new(BenchEventLogger::new()));
 
         let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
             let bar = ProgressBar::new(total_len);
@@ -207,7 +744,7 @@ async fn main() -> Result<()> {
                     Arc::clone(stats),
                     total_len,
                     Arc::clone(&session.pool),
-                    Some(Arc::clone(&peer_health)),
+                    Some(Arc::clone(&peer_health_local)),
                 );
             }
             Some(Arc::new(IngestProgress::new(bar, total_len)))
@@ -229,7 +766,8 @@ async fn main() -> Result<()> {
             progress_stats.clone(),
             Some(Arc::clone(&bench)),
             None,
-            peer_health,
+            Arc::clone(&peer_health_local),
+            events.clone(),
         );
         tokio::pin!(ingest_future);
         let outcome = tokio::select! {
@@ -253,9 +791,21 @@ async fn main() -> Result<()> {
                 );
                 let summary_json = serde_json::to_string_pretty(&summary)?;
                 println!("{summary_json}");
-                if let Err(err) = session.flush_peer_cache() {
-                    warn!(error = %err, "failed to flush peer cache");
+                if let Err(err) = emit_benchmark_artifacts(
+                    bench_context,
+                    &config,
+                    &range,
+                    head_at_startup,
+                    &peer_health_local,
+                    summary,
+                    events.as_deref(),
+                    &mut chrome_guard,
+                )
+                .await
+                {
+                    warn!(error = %err, "failed to write benchmark artifacts");
                 }
+                flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
                 return Ok(());
             }
         };
@@ -282,9 +832,21 @@ async fn main() -> Result<()> {
         );
         let summary_json = serde_json::to_string_pretty(&summary)?;
         println!("{summary_json}");
-        if let Err(err) = session.flush_peer_cache() {
-            warn!(error = %err, "failed to flush peer cache");
+        if let Err(err) = emit_benchmark_artifacts(
+            bench_context,
+            &config,
+            &range,
+            head_at_startup,
+            &peer_health_local,
+            summary,
+            events.as_deref(),
+            &mut chrome_guard,
+        )
+        .await
+        {
+            warn!(error = %err, "failed to write benchmark artifacts");
         }
+        flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
         return Ok(());
     }
 
@@ -309,6 +871,7 @@ async fn main() -> Result<()> {
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
 
     let mut _network_session = None;
+    let mut peer_health: Option<Arc<PeerHealthTracker>> = None;
     let mut follow_error: Option<eyre::Report> = None;
     let mut progress: Option<Arc<IngestProgress>> = None;
     if matches!(config.head_source, cli::HeadSource::P2p) {
@@ -332,7 +895,15 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let peer_health = sync::historical::build_peer_health_tracker(&config);
+        let peer_health_local = sync::historical::build_peer_health_tracker(&config);
+        apply_cached_peer_limits(&storage, &peer_health_local).await;
+        peer_health = Some(Arc::clone(&peer_health_local));
+        #[cfg(unix)]
+        spawn_usr1_state_logger(
+            progress_stats.clone(),
+            Some(Arc::clone(&session.pool)),
+            Some(Arc::clone(&peer_health_local)),
+        );
 
         progress = if std::io::stderr().is_terminal() {
             let bar = ProgressBar::new(total_len);
@@ -360,7 +931,7 @@ async fn main() -> Result<()> {
                     Arc::clone(stats),
                     total_len,
                     Arc::clone(&session.pool),
-                    Some(Arc::clone(&peer_health)),
+                    Some(Arc::clone(&peer_health_local)),
                 );
             }
             Some(Arc::new(IngestProgress::new(bar, total_len)))
@@ -377,7 +948,7 @@ async fn main() -> Result<()> {
             &config,
             progress_ref,
             progress_stats.clone(),
-            peer_health,
+            peer_health_local,
         );
 
         _network_session = Some(session);
@@ -405,9 +976,12 @@ async fn main() -> Result<()> {
     }
     rpc_handle.stopped().await;
     if let Some(session) = _network_session.as_ref() {
-        if let Err(err) = session.flush_peer_cache() {
-            warn!(error = %err, "failed to flush peer cache");
-        }
+        flush_peer_cache_with_limits(
+            session,
+            &storage,
+            peer_health.as_ref().map(|health| health.as_ref()),
+        )
+        .await;
     }
     drop(_network_session);
     drop(storage);
@@ -420,7 +994,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing(verbosity: u8) {
+fn init_tracing(
+    verbosity: u8,
+    chrome_trace_path: Option<PathBuf>,
+) -> Option<tracing_chrome::FlushGuard> {
     let filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
         Err(_) => {
@@ -433,10 +1010,107 @@ fn init_tracing(verbosity: u8) {
             EnvFilter::new(format!("{global},stateless_history_node={local}"))
         }
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
-        .init();
+        .with_filter(filter);
+
+    let mut chrome_guard = None;
+    if let Some(path) = chrome_trace_path {
+        let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(path)
+            .include_args(true)
+            .build();
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(chrome_layer.with_filter(LevelFilter::TRACE))
+            .init();
+        chrome_guard = Some(guard);
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .init();
+    }
+    chrome_guard
+}
+
+#[cfg(unix)]
+fn spawn_usr1_state_logger(
+    stats: Option<Arc<SyncProgressStats>>,
+    peer_pool: Option<Arc<PeerPool>>,
+    peer_health: Option<Arc<PeerHealthTracker>>,
+) {
+    tokio::spawn(async move {
+        let mut stream = match signal(SignalKind::user_defined1()) {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!(error = %err, "failed to install SIGUSR1 handler");
+                return;
+            }
+        };
+        while stream.recv().await.is_some() {
+            if let Some(stats) = stats.as_ref() {
+                let snapshot = stats.snapshot();
+                info!(
+                    status = snapshot.status.as_str(),
+                    processed = snapshot.processed,
+                    queue = snapshot.queue,
+                    inflight = snapshot.inflight,
+                    failed = snapshot.failed,
+                    peers_active = snapshot.peers_active,
+                    peers_total = snapshot.peers_total,
+                    head_block = snapshot.head_block,
+                    head_seen = snapshot.head_seen,
+                    "SIGUSR1: state dump"
+                );
+            } else {
+                info!("SIGUSR1: state dump (no progress stats available)");
+            }
+
+            if let (Some(pool), Some(health)) = (peer_pool.as_ref(), peer_health.as_ref()) {
+                let peers = pool.snapshot();
+                let peer_ids: Vec<_> = peers.iter().map(|p| p.peer_id).collect();
+                let banned = health.count_banned_peers(&peer_ids).await;
+                info!(
+                    connected = peers.len(),
+                    banned,
+                    available = peers.len().saturating_sub(banned as usize),
+                    "SIGUSR1: peer pool"
+                );
+
+                let dump = health.snapshot().await;
+                let total = dump.len();
+                let banned_total = dump.iter().filter(|p| p.is_banned).count();
+                let top = dump.iter().take(3).collect::<Vec<_>>();
+                let worst = dump.iter().rev().take(3).collect::<Vec<_>>();
+                info!(total, banned_total, "SIGUSR1: peer health snapshot");
+                for entry in top {
+                    info!(
+                        peer_id = ?entry.peer_id,
+                        score = entry.quality_score,
+                        samples = entry.quality_samples,
+                        batch_limit = entry.batch_limit,
+                        inflight_blocks = entry.inflight_blocks,
+                        is_banned = entry.is_banned,
+                        ban_remaining_ms = entry.ban_remaining_ms,
+                        "SIGUSR1: peer health (top)"
+                    );
+                }
+                for entry in worst {
+                    info!(
+                        peer_id = ?entry.peer_id,
+                        score = entry.quality_score,
+                        samples = entry.quality_samples,
+                        batch_limit = entry.batch_limit,
+                        inflight_blocks = entry.inflight_blocks,
+                        is_banned = entry.is_banned,
+                        ban_remaining_ms = entry.ban_remaining_ms,
+                        last_error = entry.last_error.as_deref().unwrap_or(""),
+                        "SIGUSR1: peer health (worst)"
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn select_start_from(start_block: u64, last_indexed: Option<u64>) -> u64 {
@@ -640,7 +1314,7 @@ fn spawn_progress_updater(
                 };
                 let remaining = total_len.saturating_sub(processed) as f64;
                 let eta = if speed > 0.0 {
-                    format!("{:.0}s", remaining / speed)
+                    sync::format_eta_seconds(remaining / speed)
                 } else {
                     "--".to_string()
                 };

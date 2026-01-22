@@ -17,13 +17,13 @@ use alloy_rlp::Encodable;
 use eyre::{eyre, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reth_network_api::PeerId;
-use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Duration};
+use tracing::Instrument;
 
 use fetch::{fetch_ingest_batch, fetch_probe_batch, FetchIngestOutcome, FetchProbeOutcome};
 use db_writer::{DbWriteConfig, DbWriterMessage, run_db_writer};
@@ -31,20 +31,45 @@ use process::process_ingest;
 use scheduler::{PeerHealthConfig, PeerWorkScheduler, SchedulerConfig};
 pub(crate) use scheduler::PeerHealthTracker;
 use sink::run_probe_sink;
-pub use stats::{IngestBenchStats, ProbeStats};
+pub use stats::{BenchEventLogger, IngestBenchStats, IngestBenchSummary, ProbeStats};
 pub use follow::run_follow_loop;
-use stats::FetchByteTotals;
+use stats::{BenchEvent, FetchByteTotals};
 use types::{BenchmarkConfig, ProbeRecord, FetchMode};
 use crate::storage::Storage;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-const WARMUP_SECS: u64 = 3;
 static PEER_FEEDER_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
+async fn pick_best_ready_peer_index(
+    peers: &[crate::p2p::NetworkPeer],
+    peer_health: &PeerHealthTracker,
+) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_samples = 0u64;
+    for (idx, peer) in peers.iter().enumerate() {
+        let quality = peer_health.quality(peer.peer_id).await;
+        if quality.score > best_score
+            || (quality.score == best_score && quality.samples > best_samples)
+        {
+            best_idx = idx;
+            best_score = quality.score;
+            best_samples = quality.samples;
+        }
+    }
+    best_idx
+}
+
 pub(crate) fn build_peer_health_tracker(config: &NodeConfig) -> Arc<PeerHealthTracker> {
+    let max_blocks = config
+        .fast_sync_chunk_max
+        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .max(1) as usize;
+    let initial_blocks = (config.fast_sync_chunk_size.max(1) as usize).min(max_blocks);
     let scheduler_config = SchedulerConfig {
-        blocks_per_assignment: config.fast_sync_chunk_size.max(1) as usize,
+        blocks_per_assignment: max_blocks,
+        initial_blocks_per_assignment: initial_blocks,
         ..SchedulerConfig::default()
     };
     Arc::new(PeerHealthTracker::new(
@@ -68,11 +93,18 @@ pub async fn run_benchmark_probe(
     }
 
     let blocks: Vec<u64> = range.clone().collect();
+    let max_blocks = config
+        .fast_sync_chunk_max
+        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .max(1) as usize;
+    let initial_blocks = benchmark.blocks_per_assignment.max(1).min(max_blocks);
     let scheduler_config = SchedulerConfig {
-        blocks_per_assignment: benchmark.blocks_per_assignment,
+        blocks_per_assignment: max_blocks,
+        initial_blocks_per_assignment: initial_blocks,
         ..SchedulerConfig::default()
     };
     let peer_health = build_peer_health_tracker(config);
+    let peer_health_for_select = Arc::clone(&peer_health);
     let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
         scheduler_config,
         blocks,
@@ -110,21 +142,39 @@ pub async fn run_benchmark_probe(
         config.fast_sync_max_inflight.max(1) as usize,
     ));
     let mut fetch_tasks: JoinSet<()> = JoinSet::new();
-    let mut warmed_up = false;
-    while let Some(peer) = ready_rx.recv().await {
-        if !warmed_up {
-            if WARMUP_SECS > 0 {
-                sleep(Duration::from_secs(WARMUP_SECS)).await;
+    let mut ready_peers: Vec<crate::p2p::NetworkPeer> = Vec::new();
+    let mut ready_set: HashSet<PeerId> = HashSet::new();
+    loop {
+        while let Ok(peer) = ready_rx.try_recv() {
+            if ready_set.insert(peer.peer_id) {
+                ready_peers.push(peer);
             }
-            warmed_up = true;
+        }
+        if ready_peers.is_empty() {
+            let Some(peer) = ready_rx.recv().await else {
+                break;
+            };
+            if ready_set.insert(peer.peer_id) {
+                ready_peers.push(peer);
+            }
+            continue;
         }
         while fetch_tasks.try_join_next().is_some() {}
         if scheduler.is_done().await {
             break;
         }
         let active_peers = pool.len();
+        let best_idx =
+            pick_best_ready_peer_index(&ready_peers, peer_health_for_select.as_ref()).await;
+        let peer = ready_peers.swap_remove(best_idx);
+        ready_set.remove(&peer.peer_id);
+        let head_cap = if peer.head_number == 0 {
+            *range.end()
+        } else {
+            peer.head_number
+        };
         let batch = scheduler
-            .next_batch_for_peer(peer.peer_id, peer.head_number, active_peers)
+            .next_batch_for_peer(peer.peer_id, head_cap, active_peers)
             .await;
         if batch.blocks.is_empty() {
             let ready_tx = ready_tx.clone();
@@ -372,7 +422,7 @@ fn spawn_probe_progress_bar(
                         };
                         let remaining = total.saturating_sub(processed) as f64;
                         let eta = if speed > 0.0 {
-                            format!("{:.0}s", remaining / speed)
+                            crate::sync::format_eta_seconds(remaining / speed)
                         } else {
                             "--".to_string()
                         };
@@ -443,7 +493,7 @@ fn spawn_probe_progress_bar(
                                     0.0
                                 };
                             let esc_eta = if esc_speed > 0.0 {
-                                format!("{:.0}s", remaining as f64 / esc_speed)
+                                crate::sync::format_eta_seconds(remaining as f64 / esc_speed)
                             } else {
                                 "--".to_string()
                             };
@@ -490,6 +540,7 @@ pub async fn run_ingest_pipeline(
     bench: Option<Arc<IngestBenchStats>>,
     head_cap_override: Option<u64>,
     peer_health: Arc<PeerHealthTracker>,
+    events: Option<Arc<BenchEventLogger>>,
 ) -> Result<IngestPipelineOutcome> {
     let total = range_len(&range);
     if total == 0 {
@@ -515,8 +566,14 @@ pub async fn run_ingest_pipeline(
     }
 
     let blocks: Vec<u64> = range.clone().collect();
+    let max_blocks = config
+        .fast_sync_chunk_max
+        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .max(1) as usize;
+    let initial_blocks = (config.fast_sync_chunk_size.max(1) as usize).min(max_blocks);
     let mut scheduler_config = SchedulerConfig {
-        blocks_per_assignment: config.fast_sync_chunk_size.max(1) as usize,
+        blocks_per_assignment: max_blocks,
+        initial_blocks_per_assignment: initial_blocks,
         ..SchedulerConfig::default()
     };
     // In follow mode, missing blocks are typically due to propagation lag near the tip.
@@ -549,6 +606,7 @@ pub async fn run_ingest_pipeline(
         let progress = progress.clone();
         let stats = stats.clone();
         let bench = bench.clone();
+        let events = events.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let next = {
@@ -558,10 +616,24 @@ pub async fn run_ingest_pipeline(
                 let Some(payload) = next else {
                     break;
                 };
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::ProcessStart {
+                        block: payload.header.number,
+                    });
+                }
+                let process_started = Instant::now();
                 let bench_ref = bench.as_ref().map(Arc::as_ref);
-                let result = process_ingest(payload, bench_ref);
+                let span = tracing::trace_span!("process_block", block = payload.header.number);
+                let result = span.in_scope(|| process_ingest(payload, bench_ref));
                 match result {
                     Ok((bundle, log_count)) => {
+                        if let Some(events) = events.as_ref() {
+                            events.record(BenchEvent::ProcessEnd {
+                                block: bundle.number,
+                                duration_us: process_started.elapsed().as_micros() as u64,
+                                logs: log_count,
+                            });
+                        }
                         logs_total.fetch_add(log_count, Ordering::SeqCst);
                         if let Some(progress) = progress.as_ref() {
                             progress.inc(1);
@@ -599,11 +671,67 @@ pub async fn run_ingest_pipeline(
         processed_blocks_rx,
         db_config,
         bench.clone(),
+        events.clone(),
         *range.start(),
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let peer_events_handle = if let Some(events) = events.clone() {
+        let pool = Arc::clone(&pool);
+        let peer_health = Arc::clone(&peer_health);
+        let mut shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            let mut known_peers: HashSet<PeerId> = HashSet::new();
+            let mut banned_state: HashMap<PeerId, bool> = HashMap::new();
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                let snapshot = pool.snapshot();
+                let current: HashSet<PeerId> =
+                    snapshot.iter().map(|peer| peer.peer_id).collect();
+                for added in current.difference(&known_peers) {
+                    events.record(BenchEvent::PeerConnected {
+                        peer_id: format!("{:?}", added),
+                    });
+                }
+                for removed in known_peers.difference(&current) {
+                    events.record(BenchEvent::PeerDisconnected {
+                        peer_id: format!("{:?}", removed),
+                    });
+                }
+                known_peers = current;
+
+                let health_snapshot = peer_health.snapshot().await;
+                for dump in &health_snapshot {
+                    let was_banned = banned_state.get(&dump.peer_id).copied().unwrap_or(false);
+                    if dump.is_banned && !was_banned {
+                        events.record(BenchEvent::PeerBanned {
+                            peer_id: format!("{:?}", dump.peer_id),
+                            reason: "health",
+                        });
+                    } else if !dump.is_banned && was_banned {
+                        events.record(BenchEvent::PeerUnbanned {
+                            peer_id: format!("{:?}", dump.peer_id),
+                        });
+                    }
+                    banned_state.insert(dump.peer_id, dump.is_banned);
+                }
+
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let peer_feeder_handle = spawn_peer_feeder(
         Arc::clone(&pool),
         ready_tx.clone(),
@@ -617,26 +745,50 @@ pub async fn run_ingest_pipeline(
         Duration::from_millis(config.fast_sync_batch_timeout_ms.max(1));
 
     let mut fetch_tasks: JoinSet<()> = JoinSet::new();
-    while let Some(peer) = ready_rx.recv().await {
+    let mut ready_peers: Vec<crate::p2p::NetworkPeer> = Vec::new();
+    let mut ready_set: HashSet<PeerId> = HashSet::new();
+    loop {
+        while let Ok(peer) = ready_rx.try_recv() {
+            if ready_set.insert(peer.peer_id) {
+                ready_peers.push(peer);
+            }
+        }
+        if ready_peers.is_empty() {
+            let Some(peer) = ready_rx.recv().await else {
+                break;
+            };
+            if ready_set.insert(peer.peer_id) {
+                ready_peers.push(peer);
+            }
+            continue;
+        }
         while fetch_tasks.try_join_next().is_some() {}
         if scheduler.is_done().await {
             break;
         }
 
+        let active_peers = pool.len();
         let permit = match fetch_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                let ready_tx = ready_tx.clone();
-                tokio::spawn(async move {
-                    sleep(Duration::from_millis(50)).await;
-                    let _ = ready_tx.send(peer);
-                });
+                sleep(Duration::from_millis(10)).await;
                 continue;
             }
         };
 
-        let active_peers = pool.len();
-        let head_cap = head_cap_override.unwrap_or(peer.head_number);
+        let best_idx = pick_best_ready_peer_index(&ready_peers, peer_health.as_ref()).await;
+        let peer = ready_peers.swap_remove(best_idx);
+        ready_set.remove(&peer.peer_id);
+        let head_cap = match head_cap_override {
+            Some(cap) => cap,
+            None => {
+                if peer.head_number == 0 {
+                    *range.end()
+                } else {
+                    peer.head_number
+                }
+            }
+        };
         let batch = scheduler
             .next_batch_for_peer(peer.peer_id, head_cap, active_peers)
             .await;
@@ -650,6 +802,24 @@ pub async fn run_ingest_pipeline(
             continue;
         }
 
+        let batch_limit = peer_health.batch_limit(peer.peer_id).await as u64;
+        if let Some(events) = events.as_ref() {
+            let range_start = batch.blocks.first().copied().unwrap_or(0);
+            let range_end = batch.blocks.last().copied().unwrap_or(range_start);
+            let mode = match batch.mode {
+                FetchMode::Normal => "normal",
+                FetchMode::Escalation => "escalation",
+            };
+            events.record(BenchEvent::BatchAssigned {
+                peer_id: format!("{:?}", peer.peer_id),
+                range_start,
+                range_end,
+                blocks: batch.blocks.len() as u64,
+                batch_limit,
+                mode,
+            });
+        }
+
         peer_health
             .record_assignment(peer.peer_id, batch.blocks.len())
             .await;
@@ -660,7 +830,9 @@ pub async fn run_ingest_pipeline(
         let ready_tx = ready_tx.clone();
         let stats = stats.clone();
         let bench = bench.clone();
+        let events = events.clone();
         let assigned_blocks = batch.blocks.len();
+        let batch_limit = batch_limit;
         let fetch_timeout = fetch_timeout;
         let active_fetch_tasks = Arc::clone(&active_fetch_tasks);
 
@@ -691,8 +863,27 @@ pub async fn run_ingest_pipeline(
                 stats: stats.clone(),
             };
             let fetch_started = Instant::now();
-            let result =
-                match timeout(fetch_timeout, fetch_ingest_batch(&peer, &batch.blocks)).await {
+            if let Some(events) = events.as_ref() {
+                let range_start = batch.blocks.first().copied().unwrap_or(0);
+                let range_end = batch.blocks.last().copied().unwrap_or(range_start);
+                events.record(BenchEvent::FetchStart {
+                    peer_id: format!("{:?}", peer.peer_id),
+                    range_start,
+                    range_end,
+                    blocks: assigned_blocks as u64,
+                    batch_limit,
+                });
+            }
+            let span = tracing::trace_span!(
+                "fetch_batch",
+                peer_id = ?peer.peer_id,
+                range_start = batch.blocks.first().copied().unwrap_or(0),
+                range_end = batch.blocks.last().copied().unwrap_or(0),
+                blocks = assigned_blocks,
+                batch_limit = batch_limit
+            );
+            let fetch_future = fetch_ingest_batch(&peer, &batch.blocks).instrument(span);
+            let result = match timeout(fetch_timeout, fetch_future).await {
                     Ok(result) => result,
                     Err(_) => {
                         tracing::debug!(
@@ -703,6 +894,18 @@ pub async fn run_ingest_pipeline(
                             timeout_ms = fetch_timeout.as_millis() as u64,
                             "ingest batch timed out"
                         );
+                        if let Some(events) = events.as_ref() {
+                            let range_start = batch.blocks.first().copied().unwrap_or(0);
+                            let range_end = batch.blocks.last().copied().unwrap_or(range_start);
+                            events.record(BenchEvent::FetchTimeout {
+                                peer_id: format!("{:?}", peer.peer_id),
+                                range_start,
+                                range_end,
+                                blocks: assigned_blocks as u64,
+                                batch_limit,
+                                timeout_ms: fetch_timeout.as_millis() as u64,
+                            });
+                        }
                         Err(eyre!(
                             "ingest batch to {:?} timed out after {:?}",
                             peer.peer_id,
@@ -716,7 +919,27 @@ pub async fn run_ingest_pipeline(
                     let FetchIngestOutcome {
                         payloads,
                         missing_blocks,
+                        fetch_stats,
                     } = outcome;
+                    if let Some(events) = events.as_ref() {
+                        let range_start = batch.blocks.first().copied().unwrap_or(0);
+                        let range_end = batch.blocks.last().copied().unwrap_or(range_start);
+                        events.record(BenchEvent::FetchEnd {
+                            peer_id: format!("{:?}", peer.peer_id),
+                            range_start,
+                            range_end,
+                            blocks: assigned_blocks as u64,
+                            batch_limit,
+                            duration_ms: fetch_elapsed.as_millis() as u64,
+                            missing_blocks: missing_blocks.len() as u64,
+                            headers_ms: fetch_stats.headers_ms,
+                            bodies_ms: fetch_stats.bodies_ms,
+                            receipts_ms: fetch_stats.receipts_ms,
+                            headers_requests: fetch_stats.headers_requests,
+                            bodies_requests: fetch_stats.bodies_requests,
+                            receipts_requests: fetch_stats.receipts_requests,
+                        });
+                    }
                     let completed: Vec<u64> = payloads
                         .iter()
                         .map(|payload| payload.header.number)
@@ -738,6 +961,16 @@ pub async fn run_ingest_pipeline(
                                 bytes.add(fetch_payload_bytes(payload));
                             }
                             bench.record_fetch_bytes(bytes);
+                        }
+                        if fetch_stats.headers_requests > 0 {
+                            bench.record_fetch_stage_stats(
+                                fetch_stats.headers_ms,
+                                fetch_stats.bodies_ms,
+                                fetch_stats.receipts_ms,
+                                fetch_stats.headers_requests,
+                                fetch_stats.bodies_requests,
+                                fetch_stats.receipts_requests,
+                            );
                         }
                     }
 
@@ -827,20 +1060,53 @@ pub async fn run_ingest_pipeline(
     }
 
     while fetch_tasks.join_next().await.is_some() {}
+    let finalize_started = Instant::now();
     if let Some(stats) = stats.as_ref() {
         // Fetching is done; remaining work is local processing/DB flush.
         stats.set_status(SyncStatus::Finalizing);
+        let snapshot = stats.snapshot();
+        tracing::info!(
+            processed = snapshot.processed,
+            queue = snapshot.queue,
+            inflight = snapshot.inflight,
+            failed = snapshot.failed,
+            peers_active = snapshot.peers_active,
+            peers_total = snapshot.peers_total,
+            "finalizing: fetch complete, draining workers and flushing DB"
+        );
+    } else {
+        tracing::info!("finalizing: fetch complete, draining workers and flushing DB");
     }
     let _ = shutdown_tx.send(true);
+    tracing::info!("finalizing: stopping peer feeder");
     let _ = peer_feeder_handle.await;
+    if let Some(handle) = peer_events_handle {
+        let _ = handle.await;
+    }
     drop(fetched_blocks_tx);
+    tracing::info!(workers = processor_handles.len(), "finalizing: draining processor workers");
+    let processors_started = Instant::now();
     for handle in processor_handles {
         let _ = handle.await;
     }
+    tracing::info!(
+        elapsed_ms = processors_started.elapsed().as_millis() as u64,
+        "finalizing: processor workers drained"
+    );
+    tracing::info!("finalizing: flushing DB writer");
+    let db_flush_started = Instant::now();
     let _ = db_flush_tx.send(DbWriterMessage::Flush).await;
     drop(db_flush_tx);
     let db_result = db_handle.await.map_err(|err| eyre!(err))?;
     db_result?;
+    tracing::info!(
+        elapsed_ms = db_flush_started.elapsed().as_millis() as u64,
+        "finalizing: DB writer flushed"
+    );
+    tracing::info!(
+        elapsed_ms = finalize_started.elapsed().as_millis() as u64,
+        "finalizing: complete"
+    );
 
     let logs = logs_total.load(Ordering::SeqCst);
     Ok(IngestPipelineOutcome::RangeApplied { range, logs })
@@ -900,6 +1166,7 @@ mod tests {
         NodeConfig {
             chain_id: 1,
             data_dir,
+            peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
             end_block: None,
@@ -909,6 +1176,10 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Probe,
+            benchmark_name: None,
+            benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
+            benchmark_trace: false,
+            benchmark_events: false,
             command: None,
             rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
             rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
@@ -917,6 +1188,7 @@ mod tests {
             rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
             rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
             fast_sync_chunk_size: DEFAULT_FAST_SYNC_CHUNK_SIZE,
+            fast_sync_chunk_max: None,
             fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
             fast_sync_batch_timeout_ms: DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,

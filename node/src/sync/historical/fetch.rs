@@ -21,6 +21,7 @@ pub struct FetchProbeOutcome {
 pub struct FetchIngestOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
+    pub fetch_stats: crate::p2p::FetchStageStats,
 }
 
 /// Fetch headers + receipts for a consecutive batch of blocks.
@@ -104,6 +105,7 @@ pub async fn fetch_ingest_batch(
         return Ok(FetchIngestOutcome {
             payloads: Vec::new(),
             missing_blocks: Vec::new(),
+            fetch_stats: crate::p2p::FetchStageStats::default(),
         });
     }
     ensure_consecutive(blocks)?;
@@ -112,10 +114,12 @@ pub async fn fetch_ingest_batch(
     let PayloadFetchOutcome {
         payloads,
         missing_blocks,
+        fetch_stats,
     } = fetch_payloads_for_peer(peer, start..=end).await?;
     Ok(FetchIngestOutcome {
         payloads,
         missing_blocks,
+        fetch_stats,
     })
 }
 

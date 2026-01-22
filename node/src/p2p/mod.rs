@@ -82,6 +82,7 @@ impl PeerSelector for RoundRobinPeerSelector {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const MIN_PEER_START: usize = 1;
 const PEER_DISCOVERY_TIMEOUT: Option<Duration> = None;
+const PEER_START_WARMUP_SECS: u64 = 2;
 const MAX_OUTBOUND: usize = 400;
 const MAX_CONCURRENT_DIALS: usize = 100;
 const PEER_REFILL_INTERVAL_MS: u64 = 500;
@@ -89,6 +90,29 @@ const MAX_HEADERS_PER_REQUEST: usize = 1024;
 const PEER_CACHE_TTL_DAYS: u64 = 7;
 const PEER_CACHE_MAX: usize = 5000;
 static HEAD_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct P2pLimits {
+    pub max_outbound: usize,
+    pub max_concurrent_dials: usize,
+    pub peer_refill_interval_ms: u64,
+    pub request_timeout_ms: u64,
+    pub max_headers_per_request: usize,
+    pub peer_cache_ttl_days: u64,
+    pub peer_cache_max: usize,
+}
+
+pub(crate) fn p2p_limits() -> P2pLimits {
+    P2pLimits {
+        max_outbound: MAX_OUTBOUND,
+        max_concurrent_dials: MAX_CONCURRENT_DIALS,
+        peer_refill_interval_ms: PEER_REFILL_INTERVAL_MS,
+        request_timeout_ms: REQUEST_TIMEOUT.as_millis() as u64,
+        max_headers_per_request: MAX_HEADERS_PER_REQUEST,
+        peer_cache_ttl_days: PEER_CACHE_TTL_DAYS,
+        peer_cache_max: PEER_CACHE_MAX,
+    }
+}
 
 #[derive(Debug)]
 struct PeerCacheBuffer {
@@ -186,12 +210,20 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
         Arc::clone(&pool),
         peer_cache.as_ref().map(|cache| Arc::clone(&cache.buffer)),
     );
+    let warmup_started = Instant::now();
     let _connected = wait_for_peer_pool(
         Arc::clone(&pool),
         MIN_PEER_START,
         PEER_DISCOVERY_TIMEOUT,
     )
     .await?;
+    if PEER_START_WARMUP_SECS > 0 {
+        let min = Duration::from_secs(PEER_START_WARMUP_SECS);
+        let elapsed = warmup_started.elapsed();
+        if elapsed < min {
+            sleep(min - elapsed).await;
+        }
+    }
     Ok(NetworkSession {
         _handle: handle,
         pool,
@@ -319,7 +351,14 @@ fn spawn_peer_watcher(
                             .await
                         {
                             Ok(head_number) => head_number,
-                            Err(_) => continue,
+                            Err(err) => {
+                                tracing::debug!(
+                                    peer_id = ?info.peer_id,
+                                    error = %err,
+                                    "failed to probe peer head; keeping peer with unknown head"
+                                );
+                                0
+                            }
                         };
                     pool.add_peer(NetworkPeer {
                         peer_id: info.peer_id,
@@ -333,6 +372,7 @@ fn spawn_peer_watcher(
                             tcp_addr: info.remote_addr,
                             udp_addr: None,
                             last_seen_ms: now_ms(),
+                            aimd_batch_limit: None,
                         };
                         peer_cache.upsert(peer);
                     }
@@ -362,6 +402,7 @@ fn spawn_peer_discovery_watcher(
                     tcp_addr: addr.tcp(),
                     udp_addr: addr.udp(),
                     last_seen_ms: now_ms(),
+                    aimd_batch_limit: None,
                 };
                 peer_cache.upsert(peer);
             }
@@ -532,20 +573,54 @@ impl std::fmt::Display for HeaderCountMismatch {
 
 impl std::error::Error for HeaderCountMismatch {}
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FetchStageStats {
+    pub headers_ms: u64,
+    pub bodies_ms: u64,
+    pub receipts_ms: u64,
+    pub headers_requests: u64,
+    pub bodies_requests: u64,
+    pub receipts_requests: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct HeadersChunkedResponse {
+    pub headers: Vec<Header>,
+    pub requests: u64,
+}
+
+#[cfg(test)]
 pub(crate) async fn request_headers_chunked(
     peer: &NetworkPeer,
     start_block: u64,
     count: usize,
 ) -> Result<Vec<Header>> {
+    Ok(
+        request_headers_chunked_with_stats(peer, start_block, count)
+            .await?
+            .headers,
+    )
+}
+
+pub(crate) async fn request_headers_chunked_with_stats(
+    peer: &NetworkPeer,
+    start_block: u64,
+    count: usize,
+) -> Result<HeadersChunkedResponse> {
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(HeadersChunkedResponse {
+            headers: Vec::new(),
+            requests: 0,
+        });
     }
     let mut headers = Vec::with_capacity(count);
     let mut current = start_block;
     let mut remaining = count;
+    let mut requests = 0u64;
     while remaining > 0 {
         let batch = remaining.min(MAX_HEADERS_PER_REQUEST);
         let mut batch_headers = request_headers_batch(peer, current, batch).await?;
+        requests = requests.saturating_add(1);
         if batch_headers.is_empty() {
             break;
         }
@@ -557,7 +632,7 @@ pub(crate) async fn request_headers_chunked(
         current = current.saturating_add(batch as u64);
         remaining = remaining.saturating_sub(batch);
     }
-    Ok(headers)
+    Ok(HeadersChunkedResponse { headers, requests })
 }
 
 pub(crate) async fn request_headers_chunked_strict(
@@ -592,6 +667,7 @@ pub(crate) async fn request_headers_chunked_strict(
 pub(crate) struct PayloadFetchOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
+    pub fetch_stats: FetchStageStats,
 }
 
 pub(crate) async fn fetch_payloads_for_peer(
@@ -601,8 +677,11 @@ pub(crate) async fn fetch_payloads_for_peer(
     let start = *range.start();
     let end = *range.end();
     let count = (end - start + 1) as usize;
-
-    let headers = request_headers_chunked(peer, start, count).await?;
+    let headers_start = Instant::now();
+    let headers_response = request_headers_chunked_with_stats(peer, start, count).await?;
+    let headers_ms = headers_start.elapsed().as_millis() as u64;
+    let headers_requests = headers_response.requests;
+    let headers = headers_response.headers;
 
     let mut headers_by_number = HashMap::new();
     for header in headers {
@@ -623,6 +702,11 @@ pub(crate) async fn fetch_payloads_for_peer(
         return Ok(PayloadFetchOutcome {
             payloads: Vec::new(),
             missing_blocks,
+            fetch_stats: FetchStageStats {
+                headers_ms,
+                headers_requests,
+                ..FetchStageStats::default()
+            },
         });
     }
 
@@ -632,10 +716,21 @@ pub(crate) async fn fetch_payloads_for_peer(
         hashes.push(hash);
     }
 
-    let (mut bodies, mut receipts) = tokio::try_join!(
-        request_bodies_chunked_partial(peer, &hashes),
-        request_receipts_chunked_partial(peer, &hashes)
-    )?;
+    let bodies_fut = async {
+        let started = Instant::now();
+        let resp = request_bodies_chunked_partial_with_stats(peer, &hashes).await?;
+        Ok::<_, eyre::Report>((resp, started.elapsed().as_millis() as u64))
+    };
+    let receipts_fut = async {
+        let started = Instant::now();
+        let resp = request_receipts_chunked_partial_with_stats(peer, &hashes).await?;
+        Ok::<_, eyre::Report>((resp, started.elapsed().as_millis() as u64))
+    };
+    let ((bodies, bodies_ms), (receipts, receipts_ms)) = tokio::try_join!(bodies_fut, receipts_fut)?;
+    let bodies_requests = bodies.requests;
+    let receipts_requests = receipts.requests;
+    let mut bodies = bodies.results;
+    let mut receipts = receipts.results;
 
     let mut payloads = Vec::with_capacity(ordered_headers.len());
     for (idx, header) in ordered_headers.into_iter().enumerate() {
@@ -664,6 +759,14 @@ pub(crate) async fn fetch_payloads_for_peer(
     Ok(PayloadFetchOutcome {
         payloads,
         missing_blocks,
+        fetch_stats: FetchStageStats {
+            headers_ms,
+            bodies_ms,
+            receipts_ms,
+            headers_requests,
+            bodies_requests,
+            receipts_requests,
+        },
     })
 }
 
@@ -728,20 +831,41 @@ async fn request_bodies(
     Ok(bodies.0)
 }
 
+#[derive(Debug)]
+pub(crate) struct ChunkedResponse<T> {
+    pub results: Vec<Option<T>>,
+    pub requests: u64,
+}
+
+#[cfg(test)]
 async fn request_bodies_chunked_partial(
     peer: &NetworkPeer,
     hashes: &[B256],
 ) -> Result<Vec<Option<reth_ethereum_primitives::BlockBody>>> {
+    Ok(request_bodies_chunked_partial_with_stats(peer, hashes)
+        .await?
+        .results)
+}
+
+async fn request_bodies_chunked_partial_with_stats(
+    peer: &NetworkPeer,
+    hashes: &[B256],
+) -> Result<ChunkedResponse<reth_ethereum_primitives::BlockBody>> {
     if hashes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ChunkedResponse {
+            results: Vec::new(),
+            requests: 0,
+        });
     }
 
     let mut results: Vec<Option<reth_ethereum_primitives::BlockBody>> = vec![None; hashes.len()];
     let mut cursor = 0usize;
+    let mut requests = 0u64;
     while cursor < hashes.len() {
         let slice = &hashes[cursor..];
         let requested = slice.len();
         let bodies = request_bodies(peer, slice).await?;
+        requests = requests.saturating_add(1);
         if bodies.is_empty() {
             break;
         }
@@ -762,7 +886,7 @@ async fn request_bodies_chunked_partial(
         }
     }
 
-    Ok(results)
+    Ok(ChunkedResponse { results, requests })
 }
 
 pub(crate) async fn request_receipts(
@@ -828,20 +952,36 @@ async fn request_receipt_counts70(peer: &NetworkPeer, hashes: &[B256]) -> Result
     Ok(receipts.receipts.iter().map(|block| block.len()).collect())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn request_receipts_chunked_partial(
     peer: &NetworkPeer,
     hashes: &[B256],
 ) -> Result<Vec<Option<Vec<Receipt>>>> {
+    Ok(request_receipts_chunked_partial_with_stats(peer, hashes)
+        .await?
+        .results)
+}
+
+async fn request_receipts_chunked_partial_with_stats(
+    peer: &NetworkPeer,
+    hashes: &[B256],
+) -> Result<ChunkedResponse<Vec<Receipt>>> {
     if hashes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ChunkedResponse {
+            results: Vec::new(),
+            requests: 0,
+        });
     }
 
     let mut results: Vec<Option<Vec<Receipt>>> = vec![None; hashes.len()];
     let mut cursor = 0usize;
+    let mut requests = 0u64;
     while cursor < hashes.len() {
         let slice = &hashes[cursor..];
         let requested = slice.len();
         let receipts = request_receipts(peer, slice).await?;
+        requests = requests.saturating_add(1);
         if receipts.is_empty() {
             break;
         }
@@ -862,7 +1002,7 @@ async fn request_receipts_chunked_partial(
         }
     }
 
-    Ok(results)
+    Ok(ChunkedResponse { results, requests })
 }
 
 async fn request_receipts_legacy(

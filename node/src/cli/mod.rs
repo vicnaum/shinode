@@ -16,6 +16,7 @@ pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 15;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 2048;
 pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
+pub const DEFAULT_BENCHMARK_OUTPUT_DIR: &str = "benchmarks";
 
 /// Retention mode for stored history.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +88,11 @@ pub struct NodeConfig {
     /// Base data directory for node storage.
     #[arg(long, default_value = "data")]
     pub data_dir: PathBuf,
+    /// Optional directory for persisted peer cache (shared across runs).
+    ///
+    /// If unset, defaults to the data directory unless overridden by the binary.
+    #[arg(long)]
+    pub peer_cache_dir: Option<PathBuf>,
     /// JSON-RPC bind address.
     #[arg(long, default_value = "127.0.0.1:8545")]
     pub rpc_bind: SocketAddr,
@@ -114,6 +120,18 @@ pub struct NodeConfig {
     /// Benchmark mode (probe only, exits after range).
     #[arg(long, value_enum, default_value_t = BenchmarkMode::Disabled)]
     pub benchmark: BenchmarkMode,
+    /// Optional benchmark run name (used in output filenames).
+    #[arg(long)]
+    pub benchmark_name: Option<String>,
+    /// Benchmark output directory (summary JSON, traces, events).
+    #[arg(long, default_value = DEFAULT_BENCHMARK_OUTPUT_DIR)]
+    pub benchmark_output_dir: PathBuf,
+    /// Emit a Chrome trace during benchmark runs.
+    #[arg(long, default_value_t = false)]
+    pub benchmark_trace: bool,
+    /// Emit a JSONL event log during benchmark runs.
+    #[arg(long, default_value_t = false)]
+    pub benchmark_events: bool,
     /// Optional command.
     #[command(subcommand)]
     #[serde(skip)]
@@ -136,9 +154,14 @@ pub struct NodeConfig {
     /// Max logs per eth_getLogs response (0 = unlimited).
     #[arg(long, default_value_t = DEFAULT_RPC_MAX_LOGS_PER_RESPONSE)]
     pub rpc_max_logs_per_response: u64,
-    /// Fast sync chunk size (historical backfill only).
+    /// Initial fast sync chunk size (historical backfill only).
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_CHUNK_SIZE)]
     pub fast_sync_chunk_size: u64,
+    /// Optional hard cap for fast sync chunk size (AIMD upper bound).
+    ///
+    /// If unset, defaults to `4x --fast-sync-chunk-size`.
+    #[arg(long)]
+    pub fast_sync_chunk_max: Option<u64>,
     /// Max in-flight chunk requests for fast sync.
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_INFLIGHT)]
     pub fast_sync_max_inflight: u32,
@@ -188,6 +211,7 @@ mod tests {
 
         assert_eq!(config.chain_id, 1);
         assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.peer_cache_dir, None);
         assert_eq!(config.rpc_bind, "127.0.0.1:8545".parse().unwrap());
         assert_eq!(config.start_block, DEFAULT_START_BLOCK);
         assert_eq!(config.end_block, None);
@@ -197,6 +221,10 @@ mod tests {
         assert_eq!(config.reorg_strategy, ReorgStrategy::Delete);
         assert_eq!(config.verbosity, 0);
         assert_eq!(config.benchmark, BenchmarkMode::Disabled);
+        assert_eq!(config.benchmark_name, None);
+        assert_eq!(config.benchmark_output_dir, PathBuf::from(DEFAULT_BENCHMARK_OUTPUT_DIR));
+        assert!(!config.benchmark_trace);
+        assert!(!config.benchmark_events);
         assert!(config.command.is_none());
         assert_eq!(config.rpc_max_request_body_bytes, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES);
         assert_eq!(config.rpc_max_response_body_bytes, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES);
@@ -205,6 +233,7 @@ mod tests {
         assert_eq!(config.rpc_max_blocks_per_filter, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER);
         assert_eq!(config.rpc_max_logs_per_response, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE);
         assert_eq!(config.fast_sync_chunk_size, DEFAULT_FAST_SYNC_CHUNK_SIZE);
+        assert_eq!(config.fast_sync_chunk_max, None);
         assert_eq!(config.fast_sync_max_inflight, DEFAULT_FAST_SYNC_MAX_INFLIGHT);
         assert_eq!(
             config.fast_sync_batch_timeout_ms,

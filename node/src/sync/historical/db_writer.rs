@@ -1,7 +1,7 @@
 //! Batched DB writer for ingest mode.
 
 use crate::storage::{BlockBundle, Storage};
-use crate::sync::historical::stats::{DbWriteByteTotals, IngestBenchStats};
+use crate::sync::historical::stats::{BenchEvent, BenchEventLogger, DbWriteByteTotals, IngestBenchStats};
 use eyre::Result;
 use reth_primitives_traits::serde_bincode_compat::SerdeBincodeCompat;
 use serde::Serialize;
@@ -36,6 +36,7 @@ pub async fn run_db_writer(
     mut rx: mpsc::Receiver<DbWriterMessage>,
     config: DbWriteConfig,
     bench: Option<Arc<IngestBenchStats>>,
+    events: Option<Arc<BenchEventLogger>>,
     start_block: u64,
 ) -> Result<()> {
     let mut buffer: Vec<BlockBundle> = Vec::with_capacity(config.batch_blocks);
@@ -45,6 +46,11 @@ pub async fn run_db_writer(
         .map(|block| block.saturating_add(1))
         .unwrap_or(start_block)
         .max(start_block);
+    tracing::debug!(
+        expected_next,
+        batch_blocks = config.batch_blocks,
+        "db writer started"
+    );
 
     loop {
         tokio::select! {
@@ -57,27 +63,43 @@ pub async fn run_db_writer(
                                 &storage,
                                 &mut buffer,
                                 bench.as_ref(),
+                                events.as_ref(),
                                 &mut expected_next,
+                                config.batch_blocks,
                             )?;
                         }
                     }
                     Some(DbWriterMessage::Flush) => {
+                        tracing::info!(
+                            buffered_blocks = buffer.len(),
+                            expected_next,
+                            "db writer flush requested"
+                        );
                         if !buffer.is_empty() {
                             flush_buffer(
                                 &storage,
                                 &mut buffer,
                                 bench.as_ref(),
+                                events.as_ref(),
                                 &mut expected_next,
+                                config.batch_blocks,
                             )?;
                         }
                     }
                     None => {
+                        tracing::info!(
+                            buffered_blocks = buffer.len(),
+                            expected_next,
+                            "db writer channel closed; final flush"
+                        );
                         if !buffer.is_empty() {
                             flush_buffer(
                                 &storage,
                                 &mut buffer,
                                 bench.as_ref(),
+                                events.as_ref(),
                                 &mut expected_next,
+                                config.batch_blocks,
                             )?;
                         }
                         break;
@@ -94,7 +116,9 @@ pub async fn run_db_writer(
                         &storage,
                         &mut buffer,
                         bench.as_ref(),
+                        events.as_ref(),
                         &mut expected_next,
+                        config.batch_blocks,
                     )?;
                 }
             }
@@ -108,40 +132,132 @@ fn flush_buffer(
     storage: &Storage,
     buffer: &mut Vec<BlockBundle>,
     bench: Option<&Arc<IngestBenchStats>>,
+    events: Option<&Arc<BenchEventLogger>>,
     expected_next: &mut u64,
+    max_write_blocks: usize,
 ) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
     }
 
     buffer.sort_by_key(|bundle| bundle.number);
-    let mut idx = 0;
+    let mut idx = 0usize;
     while idx < buffer.len() && buffer[idx].number < *expected_next {
         idx += 1;
     }
-    let start_idx = idx;
-    let mut expected = *expected_next;
-    while idx < buffer.len() && buffer[idx].number == expected {
-        expected = expected.saturating_add(1);
-        idx += 1;
+    if idx > 0 {
+        buffer.drain(..idx);
+    }
+    if buffer.is_empty() {
+        return Ok(());
     }
 
-    if idx > start_idx {
-        let written = &buffer[start_idx..idx];
+    let mut expected = *expected_next;
+    let mut contiguous = 0usize;
+    while contiguous < buffer.len() && buffer[contiguous].number == expected {
+        expected = expected.saturating_add(1);
+        contiguous += 1;
+    }
+    if contiguous == 0 {
+        tracing::debug!(
+            expected_next = *expected_next,
+            buffer_len = buffer.len(),
+            first = buffer.first().map(|b| b.number),
+            "db flush: no contiguous prefix ready"
+        );
+        return Ok(());
+    }
+
+    let chunk = max_write_blocks.max(1);
+    let last_contiguous = buffer[contiguous.saturating_sub(1)].number;
+    tracing::info!(
+        expected_next = *expected_next,
+        buffer_len = buffer.len(),
+        contiguous_blocks = contiguous,
+        range_start = buffer[0].number,
+        range_end = last_contiguous,
+        chunk_blocks = chunk,
+        "db flush: flushing contiguous blocks"
+    );
+    let mut cursor = 0usize;
+    while cursor < contiguous {
+        let end = (cursor + chunk).min(contiguous);
+        let written = &buffer[cursor..end];
         let blocks = written.len() as u64;
+        let write_start = written.first().map(|b| b.number).unwrap_or(0);
+        let write_end = written.last().map(|b| b.number).unwrap_or(write_start);
+        let bytes = if bench.is_some() || events.is_some() {
+            Some(db_bytes_for_bundles(written)?)
+        } else {
+            None
+        };
+        tracing::debug!(
+            start = write_start,
+            end = write_end,
+            blocks,
+            "db flush: writing block bundle batch"
+        );
+        if let Some(events) = events {
+            let bytes_total = bytes
+                .as_ref()
+                .map(|totals| {
+                    totals
+                        .headers
+                        .saturating_add(totals.tx_hashes)
+                        .saturating_add(totals.transactions)
+                        .saturating_add(totals.withdrawals)
+                        .saturating_add(totals.sizes)
+                        .saturating_add(totals.receipts)
+                        .saturating_add(totals.logs)
+                })
+                .unwrap_or(0);
+            events.record(BenchEvent::DbFlushStart {
+                blocks,
+                bytes_total,
+            });
+        }
+        let _span = tracing::trace_span!("db_flush", blocks = blocks).entered();
         let started = Instant::now();
         storage.write_block_bundle_batch(written)?;
+        tracing::debug!(
+            start = write_start,
+            end = write_end,
+            blocks,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "db flush: wrote block bundle batch"
+        );
         if let Some(bench) = bench {
             bench.record_db_write(blocks, started.elapsed());
-            let bytes = db_bytes_for_bundles(written)?;
-            bench.record_db_write_bytes(bytes);
+            if let Some(bytes) = bytes.as_ref() {
+                bench.record_db_write_bytes(*bytes);
+            }
         }
-        *expected_next = expected;
+        if let Some(events) = events {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let bytes_total = bytes
+                .as_ref()
+                .map(|totals| {
+                    totals
+                        .headers
+                        .saturating_add(totals.tx_hashes)
+                        .saturating_add(totals.transactions)
+                        .saturating_add(totals.withdrawals)
+                        .saturating_add(totals.sizes)
+                        .saturating_add(totals.receipts)
+                        .saturating_add(totals.logs)
+                })
+                .unwrap_or(0);
+            events.record(BenchEvent::DbFlushEnd {
+                blocks,
+                bytes_total,
+                duration_ms: elapsed_ms,
+            });
+        }
+        cursor = end;
     }
 
-    let remaining: Vec<_> = buffer.drain(idx..).collect();
-    buffer.clear();
-    buffer.extend(remaining);
+    *expected_next = expected;
+    buffer.drain(..contiguous);
     Ok(())
 }
 
@@ -183,6 +299,7 @@ mod tests {
     };
     use alloy_primitives::{Address, B256, U256};
     use reth_ethereum_primitives::Receipt;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -205,6 +322,7 @@ mod tests {
         NodeConfig {
             chain_id: 1,
             data_dir,
+            peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
             end_block: None,
@@ -214,6 +332,10 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: crate::cli::BenchmarkMode::Disabled,
+            benchmark_name: None,
+            benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
+            benchmark_trace: false,
+            benchmark_events: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,
@@ -222,6 +344,7 @@ mod tests {
             rpc_max_blocks_per_filter: 0,
             rpc_max_logs_per_response: 0,
             fast_sync_chunk_size: 16,
+            fast_sync_chunk_max: None,
             fast_sync_max_inflight: 2,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
@@ -268,7 +391,7 @@ mod tests {
 
         let mut buffer = vec![bundle_with_number(2), bundle_with_number(0)];
         let mut expected_next = 0;
-        flush_buffer(&storage, &mut buffer, None, &mut expected_next)
+        flush_buffer(&storage, &mut buffer, None, None, &mut expected_next, 1)
             .expect("flush buffer");
 
         assert!(storage.block_header(0).expect("header 0").is_some());
@@ -279,7 +402,7 @@ mod tests {
         assert_eq!(buffer[0].number, 2);
 
         buffer.push(bundle_with_number(1));
-        flush_buffer(&storage, &mut buffer, None, &mut expected_next)
+        flush_buffer(&storage, &mut buffer, None, None, &mut expected_next, 1)
             .expect("flush buffer 2");
 
         assert!(storage.block_header(1).expect("header 1").is_some());

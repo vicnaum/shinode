@@ -234,6 +234,7 @@ pub async fn run_follow_loop(
             None,
             Some(target_head),
             Arc::clone(&peer_health),
+            None,
         )
         .await?;
         let elapsed = ingest_started.elapsed();

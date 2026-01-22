@@ -2,6 +2,8 @@
 
 use crate::storage::StorageDiskStats;
 use serde::Serialize;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -211,6 +213,21 @@ fn percentile_pair(values: &Mutex<Vec<u64>>) -> (Option<u64>, Option<u64>) {
     (p50, p95)
 }
 
+fn percentile_triplet(values: &Mutex<Vec<u64>>) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut data = match values.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => Vec::new(),
+    };
+    if data.is_empty() {
+        return (None, None, None);
+    }
+    data.sort_unstable();
+    let p50 = percentile(&data, 0.50);
+    let p95 = percentile(&data, 0.95);
+    let p99 = percentile(&data, 0.99);
+    (p50, p95, p99)
+}
+
 fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
     if sorted.is_empty() {
         return None;
@@ -218,6 +235,16 @@ fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
     let clamped = p.clamp(0.0, 1.0);
     let idx = ((sorted.len() - 1) as f64 * clamped).round() as usize;
     sorted.get(idx).copied()
+}
+
+const SAMPLE_LIMIT: usize = 100_000;
+
+fn push_sample(samples: &Mutex<Vec<u64>>, value: u64) {
+    if let Ok(mut guard) = samples.lock() {
+        if guard.len() < SAMPLE_LIMIT {
+            guard.push(value);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -244,6 +271,9 @@ pub struct IngestBenchStats {
     fetch_bytes_bodies: AtomicU64,
     fetch_bytes_receipts: AtomicU64,
     fetch_bytes_logs: AtomicU64,
+    fetch_headers_requests: AtomicU64,
+    fetch_bodies_requests: AtomicU64,
+    fetch_receipts_requests: AtomicU64,
     peer_failures: AtomicU64,
     process_blocks: AtomicU64,
     process_failures: AtomicU64,
@@ -254,9 +284,11 @@ pub struct IngestBenchStats {
     process_withdrawals_us: AtomicU64,
     process_block_size_us: AtomicU64,
     process_logs_build_us: AtomicU64,
+    process_total_samples_us: Mutex<Vec<u64>>,
     db_write_blocks: AtomicU64,
     db_write_batches: AtomicU64,
     db_write_total_us: AtomicU64,
+    db_write_ms_samples: Mutex<Vec<u64>>,
     db_bytes_headers: AtomicU64,
     db_bytes_tx_hashes: AtomicU64,
     db_bytes_transactions: AtomicU64,
@@ -265,6 +297,9 @@ pub struct IngestBenchStats {
     db_bytes_receipts: AtomicU64,
     db_bytes_logs: AtomicU64,
     logs_total: AtomicU64,
+    fetch_headers_ms: Mutex<Vec<u64>>,
+    fetch_bodies_ms: Mutex<Vec<u64>>,
+    fetch_receipts_ms: Mutex<Vec<u64>>,
 }
 
 impl IngestBenchStats {
@@ -281,6 +316,9 @@ impl IngestBenchStats {
             fetch_bytes_bodies: AtomicU64::new(0),
             fetch_bytes_receipts: AtomicU64::new(0),
             fetch_bytes_logs: AtomicU64::new(0),
+            fetch_headers_requests: AtomicU64::new(0),
+            fetch_bodies_requests: AtomicU64::new(0),
+            fetch_receipts_requests: AtomicU64::new(0),
             peer_failures: AtomicU64::new(0),
             process_blocks: AtomicU64::new(0),
             process_failures: AtomicU64::new(0),
@@ -291,9 +329,11 @@ impl IngestBenchStats {
             process_withdrawals_us: AtomicU64::new(0),
             process_block_size_us: AtomicU64::new(0),
             process_logs_build_us: AtomicU64::new(0),
+            process_total_samples_us: Mutex::new(Vec::new()),
             db_write_blocks: AtomicU64::new(0),
             db_write_batches: AtomicU64::new(0),
             db_write_total_us: AtomicU64::new(0),
+            db_write_ms_samples: Mutex::new(Vec::new()),
             db_bytes_headers: AtomicU64::new(0),
             db_bytes_tx_hashes: AtomicU64::new(0),
             db_bytes_transactions: AtomicU64::new(0),
@@ -302,6 +342,9 @@ impl IngestBenchStats {
             db_bytes_receipts: AtomicU64::new(0),
             db_bytes_logs: AtomicU64::new(0),
             logs_total: AtomicU64::new(0),
+            fetch_headers_ms: Mutex::new(Vec::new()),
+            fetch_bodies_ms: Mutex::new(Vec::new()),
+            fetch_receipts_ms: Mutex::new(Vec::new()),
         }
     }
 
@@ -330,10 +373,37 @@ impl IngestBenchStats {
             .fetch_add(bytes.logs, Ordering::SeqCst);
     }
 
+    pub fn record_fetch_stage_stats(
+        &self,
+        headers_ms: u64,
+        bodies_ms: u64,
+        receipts_ms: u64,
+        headers_requests: u64,
+        bodies_requests: u64,
+        receipts_requests: u64,
+    ) {
+        if headers_ms > 0 {
+            push_sample(&self.fetch_headers_ms, headers_ms);
+        }
+        if bodies_ms > 0 {
+            push_sample(&self.fetch_bodies_ms, bodies_ms);
+        }
+        if receipts_ms > 0 {
+            push_sample(&self.fetch_receipts_ms, receipts_ms);
+        }
+        self.fetch_headers_requests
+            .fetch_add(headers_requests, Ordering::SeqCst);
+        self.fetch_bodies_requests
+            .fetch_add(bodies_requests, Ordering::SeqCst);
+        self.fetch_receipts_requests
+            .fetch_add(receipts_requests, Ordering::SeqCst);
+    }
+
     pub fn record_process(&self, timing: ProcessTiming) {
         self.process_blocks.fetch_add(1, Ordering::SeqCst);
         self.process_total_us
             .fetch_add(timing.total_us, Ordering::SeqCst);
+        push_sample(&self.process_total_samples_us, timing.total_us);
         self.process_header_hash_us
             .fetch_add(timing.header_hash_us, Ordering::SeqCst);
         self.process_tx_hashes_us
@@ -361,6 +431,7 @@ impl IngestBenchStats {
         self.db_write_batches.fetch_add(1, Ordering::SeqCst);
         self.db_write_total_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
+        push_sample(&self.db_write_ms_samples, elapsed.as_millis() as u64);
     }
 
     pub fn record_db_write_bytes(&self, bytes: DbWriteByteTotals) {
@@ -408,6 +479,9 @@ impl IngestBenchStats {
         let fetch_bytes_bodies = self.fetch_bytes_bodies.load(Ordering::SeqCst);
         let fetch_bytes_receipts = self.fetch_bytes_receipts.load(Ordering::SeqCst);
         let fetch_bytes_logs = self.fetch_bytes_logs.load(Ordering::SeqCst);
+        let fetch_headers_requests = self.fetch_headers_requests.load(Ordering::SeqCst);
+        let fetch_bodies_requests = self.fetch_bodies_requests.load(Ordering::SeqCst);
+        let fetch_receipts_requests = self.fetch_receipts_requests.load(Ordering::SeqCst);
         let peer_failures = self.peer_failures.load(Ordering::SeqCst);
         let process_blocks = self.process_blocks.load(Ordering::SeqCst);
         let process_failures = self.process_failures.load(Ordering::SeqCst);
@@ -422,6 +496,17 @@ impl IngestBenchStats {
         let db_bytes_sizes = self.db_bytes_sizes.load(Ordering::SeqCst);
         let db_bytes_receipts = self.db_bytes_receipts.load(Ordering::SeqCst);
         let db_bytes_logs = self.db_bytes_logs.load(Ordering::SeqCst);
+
+        let (headers_ms_p50, headers_ms_p95, headers_ms_p99) =
+            percentile_triplet(&self.fetch_headers_ms);
+        let (bodies_ms_p50, bodies_ms_p95, bodies_ms_p99) =
+            percentile_triplet(&self.fetch_bodies_ms);
+        let (receipts_ms_p50, receipts_ms_p95, receipts_ms_p99) =
+            percentile_triplet(&self.fetch_receipts_ms);
+        let (process_total_us_p50, process_total_us_p95, process_total_us_p99) =
+            percentile_triplet(&self.process_total_samples_us);
+        let (db_flush_ms_p50, db_flush_ms_p95, db_flush_ms_p99) =
+            percentile_triplet(&self.db_write_ms_samples);
 
         let fetch_bytes_total = fetch_bytes_headers
             .saturating_add(fetch_bytes_bodies)
@@ -448,6 +533,13 @@ impl IngestBenchStats {
             0.0
         };
         let fetch_mib_per_sec = fetch_bytes_per_sec / (1024.0 * 1024.0);
+        let db_seconds = db_write_total_us as f64 / 1_000_000.0;
+        let db_bytes_per_sec = if db_seconds > 0.0 {
+            db_bytes_total as f64 / db_seconds
+        } else {
+            0.0
+        };
+        let db_mib_per_sec = db_bytes_per_sec / (1024.0 * 1024.0);
 
         let process_breakdown = ProcessBreakdownSummary {
             header_hash_us: self.process_header_hash_us.load(Ordering::SeqCst),
@@ -506,12 +598,27 @@ impl IngestBenchStats {
                 avg_bytes_per_batch: avg_u64(fetch_bytes_total, fetch_batches),
                 download_bytes_per_sec_avg: fetch_bytes_per_sec,
                 download_mib_per_sec_avg: fetch_mib_per_sec,
+                headers_requests: fetch_headers_requests,
+                bodies_requests: fetch_bodies_requests,
+                receipts_requests: fetch_receipts_requests,
+                headers_ms_p50,
+                headers_ms_p95,
+                headers_ms_p99,
+                bodies_ms_p50,
+                bodies_ms_p95,
+                bodies_ms_p99,
+                receipts_ms_p50,
+                receipts_ms_p95,
+                receipts_ms_p99,
             },
             process: IngestProcessSummary {
                 total_us: process_total_us,
                 blocks: process_blocks,
                 failures: process_failures,
                 avg_us_per_block: avg_us(process_total_us, process_blocks),
+                total_us_p50: process_total_us_p50,
+                total_us_p95: process_total_us_p95,
+                total_us_p99: process_total_us_p99,
                 breakdown_us: process_breakdown,
                 breakdown_avg_us: process_breakdown_avg,
             },
@@ -531,6 +638,11 @@ impl IngestBenchStats {
                 bytes_logs: db_bytes_logs,
                 avg_bytes_per_block: avg_u64(db_bytes_total, db_write_blocks),
                 avg_bytes_per_batch: avg_u64(db_bytes_total, db_write_batches),
+                flush_ms_p50: db_flush_ms_p50,
+                flush_ms_p95: db_flush_ms_p95,
+                flush_ms_p99: db_flush_ms_p99,
+                write_bytes_per_sec_avg: db_bytes_per_sec,
+                write_mib_per_sec_avg: db_mib_per_sec,
             },
             storage: storage_stats,
             peers: PeerSummary {
@@ -591,6 +703,18 @@ pub struct IngestFetchSummary {
     pub avg_bytes_per_batch: u64,
     pub download_bytes_per_sec_avg: f64,
     pub download_mib_per_sec_avg: f64,
+    pub headers_requests: u64,
+    pub bodies_requests: u64,
+    pub receipts_requests: u64,
+    pub headers_ms_p50: Option<u64>,
+    pub headers_ms_p95: Option<u64>,
+    pub headers_ms_p99: Option<u64>,
+    pub bodies_ms_p50: Option<u64>,
+    pub bodies_ms_p95: Option<u64>,
+    pub bodies_ms_p99: Option<u64>,
+    pub receipts_ms_p50: Option<u64>,
+    pub receipts_ms_p95: Option<u64>,
+    pub receipts_ms_p99: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -599,6 +723,9 @@ pub struct IngestProcessSummary {
     pub blocks: u64,
     pub failures: u64,
     pub avg_us_per_block: u64,
+    pub total_us_p50: Option<u64>,
+    pub total_us_p95: Option<u64>,
+    pub total_us_p99: Option<u64>,
     pub breakdown_us: ProcessBreakdownSummary,
     pub breakdown_avg_us: ProcessBreakdownSummary,
 }
@@ -630,6 +757,11 @@ pub struct IngestDbWriteSummary {
     pub bytes_logs: u64,
     pub avg_bytes_per_block: u64,
     pub avg_bytes_per_batch: u64,
+    pub flush_ms_p50: Option<u64>,
+    pub flush_ms_p95: Option<u64>,
+    pub flush_ms_p99: Option<u64>,
+    pub write_bytes_per_sec_avg: f64,
+    pub write_mib_per_sec_avg: f64,
 }
 
 fn avg_us(total_us: u64, count: u64) -> u64 {
@@ -686,5 +818,139 @@ impl DbWriteByteTotals {
         self.sizes = self.sizes.saturating_add(other.sizes);
         self.receipts = self.receipts.saturating_add(other.receipts);
         self.logs = self.logs.saturating_add(other.logs);
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum BenchEvent {
+    BatchAssigned {
+        peer_id: String,
+        range_start: u64,
+        range_end: u64,
+        blocks: u64,
+        batch_limit: u64,
+        mode: &'static str,
+    },
+    FetchStart {
+        peer_id: String,
+        range_start: u64,
+        range_end: u64,
+        blocks: u64,
+        batch_limit: u64,
+    },
+    FetchEnd {
+        peer_id: String,
+        range_start: u64,
+        range_end: u64,
+        blocks: u64,
+        batch_limit: u64,
+        duration_ms: u64,
+        missing_blocks: u64,
+        headers_ms: u64,
+        bodies_ms: u64,
+        receipts_ms: u64,
+        headers_requests: u64,
+        bodies_requests: u64,
+        receipts_requests: u64,
+    },
+    FetchTimeout {
+        peer_id: String,
+        range_start: u64,
+        range_end: u64,
+        blocks: u64,
+        batch_limit: u64,
+        timeout_ms: u64,
+    },
+    ProcessStart {
+        block: u64,
+    },
+    ProcessEnd {
+        block: u64,
+        duration_us: u64,
+        logs: u64,
+    },
+    DbFlushStart {
+        blocks: u64,
+        bytes_total: u64,
+    },
+    DbFlushEnd {
+        blocks: u64,
+        bytes_total: u64,
+        duration_ms: u64,
+    },
+    PeerConnected {
+        peer_id: String,
+    },
+    PeerDisconnected {
+        peer_id: String,
+    },
+    PeerBanned {
+        peer_id: String,
+        reason: &'static str,
+    },
+    PeerUnbanned {
+        peer_id: String,
+    },
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct BenchEventRecord {
+    pub t_ms: u64,
+    #[serde(flatten)]
+    pub event: BenchEvent,
+}
+
+#[derive(Debug)]
+pub struct BenchEventLogger {
+    started_at: Instant,
+    events: Mutex<Vec<BenchEventRecord>>,
+    dropped_events: AtomicU64,
+    max_events: usize,
+}
+
+impl BenchEventLogger {
+    pub fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            events: Mutex::new(Vec::new()),
+            dropped_events: AtomicU64::new(0),
+            max_events: SAMPLE_LIMIT,
+        }
+    }
+
+    pub fn record(&self, event: BenchEvent) {
+        let record = BenchEventRecord {
+            t_ms: self.started_at.elapsed().as_millis() as u64,
+            event,
+        };
+        if let Ok(mut guard) = self.events.lock() {
+            if guard.len() < self.max_events {
+                guard.push(record);
+            } else {
+                self.dropped_events.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub fn dump_jsonl(&self, path: &Path) -> eyre::Result<usize> {
+        let records = match self.events.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::File::create(path)?;
+        for record in &records {
+            serde_json::to_writer(&mut file, record)?;
+            use std::io::Write;
+            file.write_all(b"\n")?;
+        }
+        Ok(records.len())
+    }
+
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::SeqCst)
     }
 }

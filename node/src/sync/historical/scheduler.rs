@@ -14,7 +14,10 @@ use crate::sync::historical::types::{FetchBatch, FetchMode};
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
+    /// Hard cap for blocks assigned in a single peer batch.
     pub blocks_per_assignment: usize,
+    /// Initial blocks per peer batch (before AIMD adjusts).
+    pub initial_blocks_per_assignment: usize,
     pub max_attempts_per_block: u32,
     pub peer_failure_threshold: u32,
     pub peer_ban_duration: Duration,
@@ -24,6 +27,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             blocks_per_assignment: 32,
+            initial_blocks_per_assignment: 32,
             max_attempts_per_block: 3,
             peer_failure_threshold: 5,
             peer_ban_duration: Duration::from_secs(120),
@@ -35,8 +39,16 @@ impl Default for SchedulerConfig {
 pub(crate) struct PeerHealthConfig {
     peer_failure_threshold: u32,
     peer_ban_duration: Duration,
+    #[allow(dead_code)]
     partial_threshold_multiplier: u32,
+    #[allow(dead_code)]
     partial_ban_duration: Duration,
+    aimd_increase_after: u32,
+    aimd_partial_decrease: f64,
+    aimd_failure_decrease: f64,
+    aimd_min_batch: usize,
+    aimd_initial_batch: usize,
+    aimd_max_batch: usize,
     quality_partial_weight: f64,
     quality_min_samples: u64,
     quality_defer_threshold: f64,
@@ -44,11 +56,22 @@ pub(crate) struct PeerHealthConfig {
 
 impl PeerHealthConfig {
     pub(crate) fn from_scheduler_config(config: &SchedulerConfig) -> Self {
+        let max_batch = config.blocks_per_assignment.max(1);
+        let initial_batch = config
+            .initial_blocks_per_assignment
+            .max(1)
+            .min(max_batch);
         Self {
             peer_failure_threshold: config.peer_failure_threshold,
             peer_ban_duration: config.peer_ban_duration,
             partial_threshold_multiplier: 3,
             partial_ban_duration: Duration::from_secs(30),
+            aimd_increase_after: 5,
+            aimd_partial_decrease: 0.7,
+            aimd_failure_decrease: 0.5,
+            aimd_min_batch: 1,
+            aimd_initial_batch: initial_batch,
+            aimd_max_batch: max_batch,
             quality_partial_weight: 0.5,
             quality_min_samples: 5,
             quality_defer_threshold: 0.6,
@@ -64,6 +87,8 @@ struct PeerHealth {
     successes: u64,
     failures: u64,
     partials: u64,
+    assignments: u64,
+    assigned_blocks: u64,
     inflight_blocks: u64,
     last_assigned_at: Option<Instant>,
     last_success_at: Option<Instant>,
@@ -72,6 +97,11 @@ struct PeerHealth {
     last_error: Option<String>,
     last_error_at: Option<Instant>,
     last_error_count: u64,
+    batch_limit: usize,
+    batch_limit_max: usize,
+    batch_limit_sum: u64,
+    batch_limit_samples: u64,
+    success_streak: u32,
 }
 
 impl PeerHealth {
@@ -110,11 +140,16 @@ pub(crate) struct PeerHealthDump {
     pub successes: u64,
     pub failures: u64,
     pub partials: u64,
+    pub assignments: u64,
+    pub assigned_blocks: u64,
     pub inflight_blocks: u64,
     #[allow(dead_code)]
     pub last_assigned_age_ms: Option<u64>,
     pub quality_score: f64,
     pub quality_samples: u64,
+    pub batch_limit: usize,
+    pub batch_limit_max: usize,
+    pub batch_limit_avg: Option<f64>,
     #[allow(dead_code)]
     pub last_success_age_ms: Option<u64>,
     #[allow(dead_code)]
@@ -133,6 +168,23 @@ pub(crate) struct PeerHealthTracker {
 }
 
 impl PeerHealthTracker {
+    fn ensure_batch_limit(&self, entry: &mut PeerHealth) {
+        if entry.batch_limit == 0 {
+            entry.batch_limit = self.config.aimd_initial_batch.max(1);
+        }
+        if entry.batch_limit_max == 0 {
+            entry.batch_limit_max = entry.batch_limit;
+        } else if entry.batch_limit > entry.batch_limit_max {
+            entry.batch_limit_max = entry.batch_limit;
+        }
+    }
+
+    fn clamp_batch_limit(&self, value: usize) -> usize {
+        value
+            .max(self.config.aimd_min_batch)
+            .min(self.config.aimd_max_batch.max(1))
+    }
+
     pub(crate) fn new(config: PeerHealthConfig) -> Self {
         Self {
             config,
@@ -143,41 +195,42 @@ impl PeerHealthTracker {
     pub(crate) async fn record_success(&self, peer_id: PeerId) {
         let mut health = self.health.lock().await;
         let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
         entry.successes = entry.successes.saturating_add(1);
         entry.consecutive_failures = 0;
         entry.consecutive_partials = 0;
         entry.banned_until = None;
         entry.last_success_at = Some(Instant::now());
+        entry.success_streak = entry.success_streak.saturating_add(1);
+        if entry.success_streak >= self.config.aimd_increase_after {
+            entry.batch_limit = self.clamp_batch_limit(entry.batch_limit.saturating_add(1));
+            entry.success_streak = 0;
+        }
+        entry.batch_limit_max = entry.batch_limit_max.max(entry.batch_limit);
     }
 
     pub(crate) async fn record_partial(&self, peer_id: PeerId) {
         let mut health = self.health.lock().await;
         let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
         entry.partials = entry.partials.saturating_add(1);
         entry.consecutive_partials = entry.consecutive_partials.saturating_add(1);
         entry.last_partial_at = Some(Instant::now());
-        let partial_threshold = self
-            .config
-            .peer_failure_threshold
-            .saturating_mul(self.config.partial_threshold_multiplier);
-        if entry.consecutive_partials >= partial_threshold {
-            entry.banned_until = Some(Instant::now() + self.config.partial_ban_duration);
-            entry.consecutive_partials = 0;
-            tracing::debug!(
-                peer_id = ?peer_id,
-                ban_seconds = self.config.partial_ban_duration.as_secs(),
-                partials = entry.partials,
-                "peer temporarily banned after partial responses"
-            );
-        }
+        entry.success_streak = 0;
+        let reduced = (entry.batch_limit as f64 * self.config.aimd_partial_decrease).floor() as usize;
+        entry.batch_limit = self.clamp_batch_limit(reduced);
     }
 
     pub(crate) async fn record_failure(&self, peer_id: PeerId) {
         let mut health = self.health.lock().await;
         let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
         entry.failures = entry.failures.saturating_add(1);
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_failure_at = Some(Instant::now());
+        entry.success_streak = 0;
+        let reduced = (entry.batch_limit as f64 * self.config.aimd_failure_decrease).floor() as usize;
+        entry.batch_limit = self.clamp_batch_limit(reduced);
         if entry.consecutive_failures >= self.config.peer_failure_threshold {
             entry.banned_until = Some(Instant::now() + self.config.peer_ban_duration);
             tracing::debug!(
@@ -215,6 +268,14 @@ impl PeerHealthTracker {
         }
         let mut health = self.health.lock().await;
         let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
+        entry.assignments = entry.assignments.saturating_add(1);
+        entry.assigned_blocks = entry.assigned_blocks.saturating_add(blocks as u64);
+        let clamped = self.clamp_batch_limit(entry.batch_limit);
+        entry.batch_limit = clamped;
+        entry.batch_limit_sum = entry.batch_limit_sum.saturating_add(clamped as u64);
+        entry.batch_limit_samples = entry.batch_limit_samples.saturating_add(1);
+        entry.batch_limit_max = entry.batch_limit_max.max(clamped);
         entry.inflight_blocks = entry.inflight_blocks.saturating_add(blocks as u64);
         entry.last_assigned_at = Some(Instant::now());
     }
@@ -225,7 +286,22 @@ impl PeerHealthTracker {
         }
         let mut health = self.health.lock().await;
         let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
         entry.inflight_blocks = entry.inflight_blocks.saturating_sub(blocks as u64);
+    }
+
+    pub(crate) async fn batch_limit(&self, peer_id: PeerId) -> usize {
+        let mut health = self.health.lock().await;
+        let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
+        self.clamp_batch_limit(entry.batch_limit)
+    }
+
+    pub(crate) async fn set_batch_limit(&self, peer_id: PeerId, limit: u64) {
+        let mut health = self.health.lock().await;
+        let entry = health.entry(peer_id).or_default();
+        entry.batch_limit = self.clamp_batch_limit(limit as usize);
+        entry.batch_limit_max = entry.batch_limit_max.max(entry.batch_limit);
     }
 
     pub(crate) async fn count_banned_peers(&self, peer_ids: &[PeerId]) -> u64 {
@@ -274,12 +350,23 @@ impl PeerHealthTracker {
                 successes: entry.successes,
                 failures: entry.failures,
                 partials: entry.partials,
+                assignments: entry.assignments,
+                assigned_blocks: entry.assigned_blocks,
                 inflight_blocks: entry.inflight_blocks,
                 last_assigned_age_ms: entry
                     .last_assigned_at
                     .map(|t| now.duration_since(t).as_millis() as u64),
                 quality_score,
                 quality_samples: total,
+                batch_limit: entry.batch_limit.max(self.config.aimd_min_batch),
+                batch_limit_max: entry
+                    .batch_limit_max
+                    .max(entry.batch_limit.max(self.config.aimd_min_batch)),
+                batch_limit_avg: if entry.batch_limit_samples > 0 {
+                    Some(entry.batch_limit_sum as f64 / entry.batch_limit_samples as f64)
+                } else {
+                    None
+                },
                 last_success_age_ms: entry
                     .last_success_at
                     .map(|t| now.duration_since(t).as_millis() as u64),
@@ -327,7 +414,8 @@ impl PeerHealthTracker {
     }
 
     pub(crate) async fn should_defer_peer(&self, peer_id: PeerId, active_peers: usize) -> bool {
-        if active_peers <= 1 {
+        // If we only have a couple of peers, keep using them even if they're not great.
+        if active_peers <= 3 {
             return false;
         }
         let quality = self.quality(peer_id).await;
@@ -485,7 +573,8 @@ impl PeerWorkScheduler {
             };
         }
 
-        let normal = self.pop_next_batch_for_head(peer_head).await;
+        let max_blocks = self.peer_health.batch_limit(peer_id).await;
+        let normal = self.pop_next_batch_for_head(peer_head, max_blocks).await;
         if !normal.is_empty() {
             return FetchBatch {
                 blocks: normal,
@@ -501,15 +590,18 @@ impl PeerWorkScheduler {
         }
     }
 
-    async fn pop_next_batch_for_head(&self, peer_head: u64) -> Vec<u64> {
+    async fn pop_next_batch_for_head(&self, peer_head: u64, max_blocks: usize) -> Vec<u64> {
         let mut pending = self.pending.lock().await;
         let mut queued = self.queued.lock().await;
         let mut in_flight = self.in_flight.lock().await;
 
-        let mut batch = Vec::with_capacity(self.config.blocks_per_assignment);
+        let limit = max_blocks
+            .max(1)
+            .min(self.config.blocks_per_assignment.max(1));
+        let mut batch = Vec::with_capacity(limit);
         let mut last: Option<u64> = None;
 
-        while batch.len() < self.config.blocks_per_assignment {
+        while batch.len() < limit {
             let Some(Reverse(next)) = pending.peek().copied() else {
                 break;
             };

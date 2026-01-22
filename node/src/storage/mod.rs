@@ -148,6 +148,8 @@ pub struct StoredPeer {
     pub tcp_addr: SocketAddr,
     pub udp_addr: Option<SocketAddr>,
     pub last_seen_ms: u64,
+    #[serde(default)]
+    pub aimd_batch_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +484,7 @@ impl SegmentWriter {
 
 pub struct Storage {
     data_dir: PathBuf,
+    peer_cache_dir: PathBuf,
     meta: Mutex<MetaState>,
     segments: SegmentStore,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
@@ -506,6 +509,11 @@ struct SegmentStore {
 impl Storage {
     pub fn open(config: &NodeConfig) -> Result<Self> {
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
+        let peer_cache_dir = config
+            .peer_cache_dir
+            .clone()
+            .unwrap_or_else(|| config.data_dir.clone());
+        fs::create_dir_all(&peer_cache_dir).wrap_err("failed to create peer cache dir")?;
         let meta_path = meta_path(&config.data_dir);
         let meta = if meta_path.exists() {
             load_meta(&meta_path)?
@@ -551,9 +559,10 @@ impl Storage {
             sizes: SegmentWriter::open(static_dir.join("block_sizes"), start_block, SegmentCompression::None)?,
         };
 
-        let peer_cache = load_peer_cache(&config.data_dir)?;
+        let peer_cache = load_peer_cache(&peer_cache_dir)?;
         Ok(Self {
             data_dir: config.data_dir.clone(),
+            peer_cache_dir,
             meta: Mutex::new(meta),
             segments,
             peer_cache: Mutex::new(peer_cache),
@@ -794,8 +803,13 @@ impl Storage {
         Ok(Vec::new())
     }
 
-    pub fn upsert_peer(&self, peer: StoredPeer) -> Result<()> {
+    pub fn upsert_peer(&self, mut peer: StoredPeer) -> Result<()> {
         let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        if let Some(existing) = cache.get(&peer.peer_id) {
+            if peer.aimd_batch_limit.is_none() {
+                peer.aimd_batch_limit = existing.aimd_batch_limit;
+            }
+        }
         cache.insert(peer.peer_id.clone(), peer);
         Ok(())
     }
@@ -803,7 +817,7 @@ impl Storage {
     pub fn flush_peer_cache(&self) -> Result<()> {
         let cache = self.peer_cache.lock().expect("peer cache lock");
         let peers: Vec<StoredPeer> = cache.values().cloned().collect();
-        persist_peer_cache(&self.data_dir, &peers)
+        persist_peer_cache(&self.peer_cache_dir, &peers)
     }
 
     pub fn load_peers(&self, expire_before_ms: u64, max_peers: usize) -> Result<PeerCacheLoad> {
@@ -830,7 +844,7 @@ impl Storage {
             cache.insert(peer.peer_id.clone(), peer.clone());
         }
         drop(cache);
-        persist_peer_cache(&self.data_dir, &peers)?;
+        persist_peer_cache(&self.peer_cache_dir, &peers)?;
         Ok(PeerCacheLoad {
             peers,
             total,
@@ -838,6 +852,20 @@ impl Storage {
             corrupted,
             capped,
         })
+    }
+
+    pub fn peer_cache_snapshot(&self) -> Vec<StoredPeer> {
+        let cache = self.peer_cache.lock().expect("peer cache lock");
+        cache.values().cloned().collect()
+    }
+
+    pub fn update_peer_batch_limits(&self, limits: &[(String, u64)]) {
+        let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        for (peer_id, limit) in limits {
+            if let Some(peer) = cache.get_mut(peer_id) {
+                peer.aimd_batch_limit = Some(*limit);
+            }
+        }
     }
 }
 
@@ -1023,6 +1051,7 @@ mod tests {
         NodeConfig {
             chain_id: 1,
             data_dir,
+            peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
             end_block: None,
@@ -1032,6 +1061,10 @@ mod tests {
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
             benchmark: BenchmarkMode::Disabled,
+            benchmark_name: None,
+            benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
+            benchmark_trace: false,
+            benchmark_events: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,
@@ -1040,6 +1073,7 @@ mod tests {
             rpc_max_blocks_per_filter: 0,
             rpc_max_logs_per_response: 0,
             fast_sync_chunk_size: 16,
+            fast_sync_chunk_max: None,
             fast_sync_max_inflight: 2,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
@@ -1443,24 +1477,28 @@ mod tests {
             tcp_addr: "127.0.0.1:30303".parse().expect("valid addr"),
             udp_addr: None,
             last_seen_ms: now_ms.saturating_sub(day_ms.saturating_mul(8)),
+            aimd_batch_limit: None,
         };
         let recent1 = StoredPeer {
             peer_id: "peer-recent-1".to_string(),
             tcp_addr: "127.0.0.2:30303".parse().expect("valid addr"),
             udp_addr: Some("127.0.0.2:30303".parse().expect("valid addr")),
             last_seen_ms: now_ms.saturating_sub(day_ms.saturating_mul(2)),
+            aimd_batch_limit: None,
         };
         let recent2 = StoredPeer {
             peer_id: "peer-recent-2".to_string(),
             tcp_addr: "127.0.0.3:30303".parse().expect("valid addr"),
             udp_addr: None,
             last_seen_ms: now_ms.saturating_sub(day_ms),
+            aimd_batch_limit: None,
         };
         let recent3 = StoredPeer {
             peer_id: "peer-recent-3".to_string(),
             tcp_addr: "127.0.0.4:30303".parse().expect("valid addr"),
             udp_addr: None,
             last_seen_ms: now_ms,
+            aimd_batch_limit: None,
         };
 
         storage.upsert_peer(expired).expect("insert expired");
