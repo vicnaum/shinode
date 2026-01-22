@@ -3,7 +3,10 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -18,6 +21,8 @@ pub struct SchedulerConfig {
     pub blocks_per_assignment: usize,
     /// Initial blocks per peer batch (before AIMD adjusts).
     pub initial_blocks_per_assignment: usize,
+    /// Max blocks ahead of the DB writer low watermark to assign (0 = unlimited).
+    pub max_lookahead_blocks: u64,
     pub max_attempts_per_block: u32,
     pub peer_failure_threshold: u32,
     pub peer_ban_duration: Duration,
@@ -28,6 +33,7 @@ impl Default for SchedulerConfig {
         Self {
             blocks_per_assignment: 32,
             initial_blocks_per_assignment: 32,
+            max_lookahead_blocks: 0,
             max_attempts_per_block: 3,
             peer_failure_threshold: 5,
             peer_ban_duration: Duration::from_secs(120),
@@ -446,6 +452,7 @@ pub struct PeerWorkScheduler {
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
     escalation: Mutex<EscalationState>,
+    low_watermark: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -456,7 +463,8 @@ mod tests {
         let blocks = (start..=end).collect::<Vec<_>>();
         let peer_health =
             Arc::new(PeerHealthTracker::new(PeerHealthConfig::from_scheduler_config(&config)));
-        PeerWorkScheduler::new_with_health(config, blocks, peer_health)
+        let low_watermark = Arc::new(AtomicU64::new(start));
+        PeerWorkScheduler::new_with_health(config, blocks, peer_health, low_watermark)
     }
 
     #[tokio::test]
@@ -537,6 +545,7 @@ impl PeerWorkScheduler {
         config: SchedulerConfig,
         blocks: Vec<u64>,
         peer_health: Arc<PeerHealthTracker>,
+        low_watermark: Arc<AtomicU64>,
     ) -> Self {
         let queued: HashSet<u64> = blocks.iter().copied().collect();
         let pending = blocks.into_iter().map(Reverse).collect::<BinaryHeap<_>>();
@@ -550,6 +559,7 @@ impl PeerWorkScheduler {
             attempts: Mutex::new(HashMap::new()),
             peer_health,
             escalation: Mutex::new(EscalationState::default()),
+            low_watermark,
         }
     }
 
@@ -606,6 +616,13 @@ impl PeerWorkScheduler {
                 break;
             };
 
+            let lookahead = self.config.max_lookahead_blocks;
+            if lookahead > 0 {
+                let watermark = self.low_watermark.load(Ordering::Relaxed);
+                if next > watermark.saturating_add(lookahead) {
+                    break;
+                }
+            }
             if next > peer_head {
                 break;
             }

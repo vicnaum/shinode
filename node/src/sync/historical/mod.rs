@@ -93,6 +93,8 @@ pub async fn run_benchmark_probe(
     }
 
     let blocks: Vec<u64> = range.clone().collect();
+    let start_block = *range.start();
+    let low_watermark = Arc::new(AtomicU64::new(start_block));
     let max_blocks = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -109,6 +111,7 @@ pub async fn run_benchmark_probe(
         scheduler_config,
         blocks,
         peer_health,
+        low_watermark,
     ));
 
     let buffer_cap = config
@@ -566,6 +569,13 @@ pub async fn run_ingest_pipeline(
     }
 
     let blocks: Vec<u64> = range.clone().collect();
+    let start_block = *range.start();
+    let initial_watermark = storage
+        .last_indexed_block()?
+        .map(|block| block.saturating_add(1))
+        .unwrap_or(start_block)
+        .max(start_block);
+    let low_watermark = Arc::new(AtomicU64::new(initial_watermark));
     let max_blocks = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -574,6 +584,7 @@ pub async fn run_ingest_pipeline(
     let mut scheduler_config = SchedulerConfig {
         blocks_per_assignment: max_blocks,
         initial_blocks_per_assignment: initial_blocks,
+        max_lookahead_blocks: config.fast_sync_max_lookahead_blocks,
         ..SchedulerConfig::default()
     };
     // In follow mode, missing blocks are typically due to propagation lag near the tip.
@@ -585,6 +596,7 @@ pub async fn run_ingest_pipeline(
         scheduler_config,
         blocks,
         Arc::clone(&peer_health),
+        Arc::clone(&low_watermark),
     ));
 
     let (fetched_blocks_tx, fetched_blocks_rx) = mpsc::channel::<BlockPayload>(2048);
@@ -672,7 +684,8 @@ pub async fn run_ingest_pipeline(
         db_config,
         bench.clone(),
         events.clone(),
-        *range.start(),
+        start_block,
+        Arc::clone(&low_watermark),
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
@@ -921,9 +934,21 @@ pub async fn run_ingest_pipeline(
                         missing_blocks,
                         fetch_stats,
                     } = outcome;
+                    let bytes = if bench.is_some() || events.is_some() {
+                        let mut bytes = FetchByteTotals::default();
+                        for payload in &payloads {
+                            bytes.add(fetch_payload_bytes(payload));
+                        }
+                        Some(bytes)
+                    } else {
+                        None
+                    };
                     if let Some(events) = events.as_ref() {
                         let range_start = batch.blocks.first().copied().unwrap_or(0);
                         let range_end = batch.blocks.last().copied().unwrap_or(range_start);
+                        let bytes_headers = bytes.map(|b| b.headers).unwrap_or(0);
+                        let bytes_bodies = bytes.map(|b| b.bodies).unwrap_or(0);
+                        let bytes_receipts = bytes.map(|b| b.receipts).unwrap_or(0);
                         events.record(BenchEvent::FetchEnd {
                             peer_id: format!("{:?}", peer.peer_id),
                             range_start,
@@ -932,6 +957,9 @@ pub async fn run_ingest_pipeline(
                             batch_limit,
                             duration_ms: fetch_elapsed.as_millis() as u64,
                             missing_blocks: missing_blocks.len() as u64,
+                            bytes_headers,
+                            bytes_bodies,
+                            bytes_receipts,
                             headers_ms: fetch_stats.headers_ms,
                             bodies_ms: fetch_stats.bodies_ms,
                             receipts_ms: fetch_stats.receipts_ms,
@@ -956,11 +984,9 @@ pub async fn run_ingest_pipeline(
                     if let Some(bench) = bench.as_ref() {
                         if !payloads.is_empty() {
                             bench.record_fetch_success(payloads.len() as u64, fetch_elapsed);
-                            let mut bytes = FetchByteTotals::default();
-                            for payload in &payloads {
-                                bytes.add(fetch_payload_bytes(payload));
+                            if let Some(bytes) = bytes {
+                                bench.record_fetch_bytes(bytes);
                             }
-                            bench.record_fetch_bytes(bytes);
                         }
                         if fetch_stats.headers_requests > 0 {
                             bench.record_fetch_stage_stats(
@@ -1192,6 +1218,7 @@ mod tests {
             fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
             fast_sync_batch_timeout_ms: DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
             db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
             db_write_flush_interval_ms: None,
         }

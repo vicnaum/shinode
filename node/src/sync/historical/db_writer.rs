@@ -5,7 +5,10 @@ use crate::sync::historical::stats::{BenchEvent, BenchEventLogger, DbWriteByteTo
 use eyre::Result;
 use reth_primitives_traits::serde_bincode_compat::SerdeBincodeCompat;
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -38,6 +41,7 @@ pub async fn run_db_writer(
     bench: Option<Arc<IngestBenchStats>>,
     events: Option<Arc<BenchEventLogger>>,
     start_block: u64,
+    low_watermark: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut buffer: Vec<BlockBundle> = Vec::with_capacity(config.batch_blocks);
     let mut interval = config.flush_interval.map(tokio::time::interval);
@@ -46,6 +50,7 @@ pub async fn run_db_writer(
         .map(|block| block.saturating_add(1))
         .unwrap_or(start_block)
         .max(start_block);
+    low_watermark.store(expected_next, Ordering::Relaxed);
     tracing::debug!(
         expected_next,
         batch_blocks = config.batch_blocks,
@@ -67,6 +72,7 @@ pub async fn run_db_writer(
                                 &mut expected_next,
                                 config.batch_blocks,
                             )?;
+                            low_watermark.store(expected_next, Ordering::Relaxed);
                         }
                     }
                     Some(DbWriterMessage::Flush) => {
@@ -84,6 +90,7 @@ pub async fn run_db_writer(
                                 &mut expected_next,
                                 config.batch_blocks,
                             )?;
+                            low_watermark.store(expected_next, Ordering::Relaxed);
                         }
                     }
                     None => {
@@ -101,6 +108,7 @@ pub async fn run_db_writer(
                                 &mut expected_next,
                                 config.batch_blocks,
                             )?;
+                            low_watermark.store(expected_next, Ordering::Relaxed);
                         }
                         break;
                     }
@@ -120,6 +128,7 @@ pub async fn run_db_writer(
                         &mut expected_next,
                         config.batch_blocks,
                     )?;
+                    low_watermark.store(expected_next, Ordering::Relaxed);
                 }
             }
         }
@@ -348,6 +357,7 @@ mod tests {
             fast_sync_max_inflight: 2,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
+            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,
         }

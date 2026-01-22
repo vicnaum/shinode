@@ -95,7 +95,7 @@ Benchmark/probe:
   - Optional artifacts:
     - `--benchmark-name <string>`: label used in output filenames.
     - `--benchmark-trace`: Chrome trace (`.trace.json`) for timeline inspection.
-    - `--benchmark-events`: JSONL event log (`.events.jsonl`) for post-analysis.
+    - `--benchmark-events`: JSONL event log (`.events.jsonl`) for post-analysis (capped; default: 10,000,000 events).
 
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).
@@ -111,6 +111,7 @@ Ingest tuning:
 - `--fast-sync-max-inflight <u32>`: max concurrent peer batches (default: 15).
 - `--fast-sync-batch-timeout-ms <u64>`: per-batch timeout (default: 5000).
 - `--fast-sync-max-buffered-blocks <u64>`: max buffered blocks (default: 2048).
+- `--fast-sync-max-lookahead-blocks <u64>`: max blocks ahead of the DB writer low watermark to assign (default: 2048; `0` = unlimited).
 - `--db-write-batch-blocks <u64>`: batch size for static-file writes (default: 512).
 - `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
 
@@ -179,4 +180,7 @@ All other methods are unimplemented and return `-32601`.
 
 - `node/`: stateless history node implementation.
 - `harness/`: receipt availability harness (see `harness/README.md`).
-- `spec/`, `SPEC.md`, `ROADMAP.md`: scope, non-goals, and progress.
+- `SPEC.md`: current system spec (“what exists / doesn’t exist”).
+- `PRD.md`: v0.1 product contract (RPC semantics + constraints).
+- `ROADMAP.md`: milestones and what’s next.
+- `spec/`: supporting docs (worklogs, reth knowledge base, research transcripts).

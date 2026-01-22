@@ -238,6 +238,7 @@ fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 }
 
 const SAMPLE_LIMIT: usize = 100_000;
+const EVENT_LOG_LIMIT: usize = 10_000_000;
 
 fn push_sample(samples: &Mutex<Vec<u64>>, value: u64) {
     if let Ok(mut guard) = samples.lock() {
@@ -847,6 +848,9 @@ pub enum BenchEvent {
         batch_limit: u64,
         duration_ms: u64,
         missing_blocks: u64,
+        bytes_headers: u64,
+        bytes_bodies: u64,
+        bytes_receipts: u64,
         headers_ms: u64,
         bodies_ms: u64,
         receipts_ms: u64,
@@ -915,7 +919,7 @@ impl BenchEventLogger {
             started_at: Instant::now(),
             events: Mutex::new(Vec::new()),
             dropped_events: AtomicU64::new(0),
-            max_events: SAMPLE_LIMIT,
+            max_events: EVENT_LOG_LIMIT,
         }
     }
 
@@ -935,16 +939,16 @@ impl BenchEventLogger {
 
     pub fn dump_jsonl(&self, path: &Path) -> eyre::Result<usize> {
         let records = match self.events.lock() {
-            Ok(guard) => guard.clone(),
+            Ok(mut guard) => std::mem::take(&mut *guard),
             Err(_) => Vec::new(),
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::File::create(path)?;
+        let mut file = std::io::BufWriter::new(fs::File::create(path)?);
+        use std::io::Write;
         for record in &records {
             serde_json::to_writer(&mut file, record)?;
-            use std::io::Write;
             file.write_all(b"\n")?;
         }
         Ok(records.len())

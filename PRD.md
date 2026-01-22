@@ -6,7 +6,7 @@ We already have a working **receipt availability harness** (`harness/`) that use
 References:
 - Project goals: `spec/main_idea.md`
 - Verified Reth knowledge: `spec/reth_kb/INDEX.md` (especially Q015/Q016/Q021/Q022/Q034/Q039)
-- Reth crate responsibility map: `reth/crates/**/AGENTS.md`
+- Reth crate responsibility map: `spec/reth_kb/agents-export/reth/crates/**/AGENTS.md` (committed snapshot)
 
 ## Product goal
 Ship **v0.1** as soon as possible:
@@ -154,8 +154,7 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
 - `harness/` (keep as a separate tool)
 - `node/`: the v0.1 service binary + internal modules:
   - `p2p/`
-  - `sync/`
-  - `chain/`
+  - `sync/` (includes chain tracking + reorg handling today)
   - `storage/`
   - `rpc/`
   - `cli/`
@@ -260,7 +259,7 @@ Recommendation:
     - topic/address filter semantics used by indexers (address as single or array; topic wildcards)
     - limit errors as `-32602` with deterministic reth-style messages (see RPC contract section)
 - Where possible, reuse/refer to reth’s `eth_getLogs` compatibility vectors as test inputs:
-  - `reth/crates/rpc/rpc-e2e-tests/testdata/rpc-compat/eth_getLogs/`
+  - `reth/crates/rpc/rpc-e2e-tests/testdata/rpc-compat/eth_getLogs/` (if you have a local `reth/` checkout)
 - Acceptance test (manual or automated later): run `rindexer` against the node for a small range and confirm end-to-end indexing works.
 
 ## Milestone plan (mapped to ROADMAP.md)

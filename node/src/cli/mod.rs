@@ -14,6 +14,7 @@ pub const DEFAULT_START_BLOCK: u64 = 10_000_000;
 pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 16;
 pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 15;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 2048;
+pub const DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS: u64 = 2048;
 pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 pub const DEFAULT_BENCHMARK_OUTPUT_DIR: &str = "benchmarks";
@@ -173,6 +174,9 @@ pub struct NodeConfig {
     /// Max buffered blocks (across completed chunks) for fast sync.
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS)]
     pub fast_sync_max_buffered_blocks: u64,
+    /// Max blocks ahead of the DB writer low watermark to assign (0 = unlimited).
+    #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS)]
+    pub fast_sync_max_lookahead_blocks: u64,
     /// DB writer batch size for ingest mode.
     #[arg(long, default_value_t = DEFAULT_DB_WRITE_BATCH_BLOCKS)]
     pub db_write_batch_blocks: u64,
@@ -242,6 +246,10 @@ mod tests {
         assert_eq!(
             config.fast_sync_max_buffered_blocks,
             DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS
+        );
+        assert_eq!(
+            config.fast_sync_max_lookahead_blocks,
+            DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS
         );
         assert_eq!(config.db_write_batch_blocks, DEFAULT_DB_WRITE_BATCH_BLOCKS);
         assert_eq!(config.db_write_flush_interval_ms, None);

@@ -635,6 +635,7 @@ mod tests {
             fast_sync_max_inflight: crate::cli::DEFAULT_FAST_SYNC_MAX_INFLIGHT,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
             db_write_batch_blocks: crate::cli::DEFAULT_DB_WRITE_BATCH_BLOCKS,
             db_write_flush_interval_ms: None,
         }

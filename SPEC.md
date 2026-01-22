@@ -22,7 +22,7 @@ This repo contains a working **receipt availability harness** (see Appendix A) a
 - **Stay stateless**: no EVM execution, no state trie/database, no archive-state growth.
 - **Future-proof architecture from day 1**: clear boundaries, stable storage contract, minimal rewrites.
 - **Reuse Reth components and patterns** wherever feasible:
-  - Networking (`reth/crates/net/**`)
+  - Networking (see `spec/reth_kb/agents-export/reth/crates/net/` for per-crate `AGENTS.md`)
   - Proven download/concurrency patterns (see `spec/reth_kb` Q034/Q035)
   - Storage primitives (static-file patterns) and safety knobs
   - RPC safety defaults and query limits (see `spec/reth_kb` Q021/Q022/Q023)
@@ -94,7 +94,7 @@ For blocks **inside the reorg window**, use the existing safe sequential path.
 
 ## References
 - Reth knowledge base index: `spec/reth_kb/INDEX.md`
-- Reth “what lives where” map: `reth/crates/**/AGENTS.md`
+- Reth “what lives where” map: `spec/reth_kb/agents-export/reth/crates/**/AGENTS.md`
 
 ---
 
