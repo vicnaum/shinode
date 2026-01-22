@@ -26,7 +26,7 @@ use tokio::time::{sleep, timeout, Duration};
 use tracing::Instrument;
 
 use fetch::{fetch_ingest_batch, fetch_probe_batch, FetchIngestOutcome, FetchProbeOutcome};
-use db_writer::{DbWriteConfig, DbWriterMessage, run_db_writer};
+use db_writer::{DbWriteConfig, DbWriteMode, DbWriterMessage, run_db_writer};
 use process::process_ingest;
 use scheduler::{PeerHealthConfig, PeerWorkScheduler, SchedulerConfig};
 pub(crate) use scheduler::PeerHealthTracker;
@@ -545,7 +545,8 @@ pub async fn run_ingest_pipeline(
     peer_health: Arc<PeerHealthTracker>,
     events: Option<Arc<BenchEventLogger>>,
 ) -> Result<IngestPipelineOutcome> {
-    let total = range_len(&range);
+    let blocks = storage.missing_blocks_in_range(range.clone())?;
+    let total = blocks.len() as u64;
     if total == 0 {
         if let Some(stats) = stats {
             stats.set_status(SyncStatus::UpToDate);
@@ -568,14 +569,8 @@ pub async fn run_ingest_pipeline(
         stats.set_inflight(0);
     }
 
-    let blocks: Vec<u64> = range.clone().collect();
     let start_block = *range.start();
-    let initial_watermark = storage
-        .last_indexed_block()?
-        .map(|block| block.saturating_add(1))
-        .unwrap_or(start_block)
-        .max(start_block);
-    let low_watermark = Arc::new(AtomicU64::new(initial_watermark));
+    let low_watermark = Arc::new(AtomicU64::new(start_block));
     let max_blocks = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -594,7 +589,7 @@ pub async fn run_ingest_pipeline(
     }
     let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
         scheduler_config,
-        blocks,
+        blocks.clone(),
         Arc::clone(&peer_health),
         Arc::clone(&low_watermark),
     ));
@@ -678,14 +673,30 @@ pub async fn run_ingest_pipeline(
         config.db_write_batch_blocks,
         None,
     );
+    let db_mode = if head_cap_override.is_some() {
+        DbWriteMode::Follow
+    } else {
+        DbWriteMode::FastSync
+    };
+    let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
+        let mut remaining: HashMap<u64, usize> = HashMap::new();
+        let shard_size = storage.shard_size();
+        for block in &blocks {
+            let shard_start = (block / shard_size) * shard_size;
+            *remaining.entry(shard_start).or_insert(0) += 1;
+        }
+        Some(Arc::new(tokio::sync::Mutex::new(remaining)))
+    } else {
+        None
+    };
     let db_handle = tokio::spawn(run_db_writer(
         Arc::clone(&storage),
         processed_blocks_rx,
         db_config,
         bench.clone(),
         events.clone(),
-        start_block,
-        Arc::clone(&low_watermark),
+        db_mode,
+        remaining_per_shard,
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
@@ -1121,7 +1132,7 @@ pub async fn run_ingest_pipeline(
     );
     tracing::info!("finalizing: flushing DB writer");
     let db_flush_started = Instant::now();
-    let _ = db_flush_tx.send(DbWriterMessage::Flush).await;
+    let _ = db_flush_tx.send(DbWriterMessage::Finalize).await;
     drop(db_flush_tx);
     let db_result = db_handle.await.map_err(|err| eyre!(err))?;
     db_result?;
@@ -1195,6 +1206,7 @@ mod tests {
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
+            shard_size: crate::cli::DEFAULT_SHARD_SIZE,
             end_block: None,
             rollback_window: 0,
             retention_mode: RetentionMode::Full,

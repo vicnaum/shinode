@@ -1512,6 +1512,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5904,6 +5913,7 @@ dependencies = [
  "bincode",
  "bytes",
  "clap",
+ "crc32fast",
  "eyre",
  "futures",
  "indicatif",
@@ -5919,6 +5929,7 @@ dependencies = [
  "reth-primitives-traits",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-chrome",

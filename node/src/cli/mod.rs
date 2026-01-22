@@ -14,9 +14,10 @@ pub const DEFAULT_START_BLOCK: u64 = 10_000_000;
 pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 16;
 pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 15;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 2048;
-pub const DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS: u64 = 2048;
+pub const DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS: u64 = 50_000;
 pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
+pub const DEFAULT_SHARD_SIZE: u64 = 10_000;
 pub const DEFAULT_BENCHMARK_OUTPUT_DIR: &str = "benchmarks";
 
 /// Retention mode for stored history.
@@ -100,6 +101,9 @@ pub struct NodeConfig {
     /// First block to backfill.
     #[arg(long, default_value_t = DEFAULT_START_BLOCK)]
     pub start_block: u64,
+    /// Shard size (blocks per shard) for storage v2.
+    #[arg(long, default_value_t = DEFAULT_SHARD_SIZE)]
+    pub shard_size: u64,
     /// Optional final block to stop at (range-limited sync).
     #[arg(long)]
     pub end_block: Option<u64>,
@@ -218,6 +222,7 @@ mod tests {
         assert_eq!(config.peer_cache_dir, None);
         assert_eq!(config.rpc_bind, "127.0.0.1:8545".parse().unwrap());
         assert_eq!(config.start_block, DEFAULT_START_BLOCK);
+        assert_eq!(config.shard_size, DEFAULT_SHARD_SIZE);
         assert_eq!(config.end_block, None);
         assert_eq!(config.rollback_window, 64);
         assert_eq!(config.retention_mode, RetentionMode::Full);

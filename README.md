@@ -9,9 +9,8 @@ subset. It does not execute transactions or keep state.
 What works:
 - P2P range backfill from `start_block..head` and continuous follow mode (keeps indexing new heads).
 - Live reorg handling within `--rollback-window` (delete-on-rollback).
-- Static-file persistence (NippyJar) of headers, tx hashes, receipts, tx metadata
-  (no calldata; signature + signing hash stored for sender recovery), and block size.
-- Storage backend refactor: MDBX replaced by NippyJar static files to minimize footprint.
+- Sharded static-file persistence (Storage v2): per-`--shard-size` shard directories with
+  per-shard presence bitsets + WAL staging + compaction into canonical sorted segments.
 - Logs are derived on-demand from receipts; withdrawals are not stored.
 - RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`,
   `eth_getLogs`, with request limits.
@@ -70,6 +69,7 @@ Core:
 - `--peer-cache-dir <path>`: directory for persisted peer cache (shared across runs).
 - `--rpc-bind <ip:port>`: RPC bind (default: `127.0.0.1:8545`).
 - `--start-block <u64>`: first block to backfill (default: 10_000_000 - right before Uniswap V2 was deployed on ETH Mainnet).
+- `--shard-size <u64>`: blocks per shard for Storage v2 (default: 10_000).
 - `--end-block <u64>`: optional final block to stop at.
 - `--rollback-window <u64>`: max rollback depth (default: 64).
 - `--retention-mode <full>`: retention policy (default: `full`).
@@ -84,12 +84,14 @@ Benchmark/probe:
 - `--benchmark probe`: harness-like probe mode (headers + receipts only).
   - No DB writes, no chain tracking, no RPC server.
   - Exits after finishing the configured range.
+  - If `--start-block` is above the peer-reported safe head, waits for more peers/head updates.
   - Range selection uses the same flags as normal sync:
     - `--start-block` sets the start (default 0).
     - `--end-block` limits the end.
     - If `--end-block` is not set, the end is the head at startup (with rollback window applied).
 - `--benchmark ingest`: full ingest benchmark (fetch + process + DB writes).
   - No RPC server; exits after finishing the configured range.
+  - If `--start-block` is above the peer-reported safe head, waits for more peers/head updates.
   - Prints a per-stage timing summary (fetch/process/db) as JSON.
   - Writes a summary JSON file to `--benchmark-output-dir` (default: `benchmarks`).
   - Optional artifacts:
@@ -111,7 +113,7 @@ Ingest tuning:
 - `--fast-sync-max-inflight <u32>`: max concurrent peer batches (default: 15).
 - `--fast-sync-batch-timeout-ms <u64>`: per-batch timeout (default: 5000).
 - `--fast-sync-max-buffered-blocks <u64>`: max buffered blocks (default: 2048).
-- `--fast-sync-max-lookahead-blocks <u64>`: max blocks ahead of the DB writer low watermark to assign (default: 2048; `0` = unlimited).
+- `--fast-sync-max-lookahead-blocks <u64>`: max blocks ahead of the DB writer low watermark to assign (default: 50_000; `0` = unlimited).
 - `--db-write-batch-blocks <u64>`: batch size for static-file writes (default: 512).
 - `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
 
@@ -150,8 +152,11 @@ Notes:
 ## Configuration and storage
 
 Storage is under `data_dir`:
-- `meta.json`: schema version, chain id, start block, checkpoints.
-- `static/`: NippyJar segments (`headers`, `tx_hashes`, `tx_meta`, `receipts`, `block_sizes`).
+- `meta.json`: schema version, chain id, storage key, shard size, checkpoints.
+- `static/shards/<shard_start>/`:
+  - `shard.json`, `present.bitset`
+  - `state/staging.wal` (during fast-sync / out-of-order ingestion)
+  - `sorted/` shard segments (`headers`, `tx_hashes`, `tx_meta`, `receipts`, `block_sizes`)
 
 Peer cache (shared across runs):
 
@@ -159,7 +164,7 @@ Peer cache (shared across runs):
 - Default is `~/.stateless-history-node/peers.json` unless `--peer-cache-dir` is set.
 
 The config is validated on startup. If you change storage-affecting settings
-(retention, head source, reorg strategy, start block), use a new `data_dir`.
+(retention, head source, reorg strategy, shard size), use a new `data_dir`.
 Runtime-only settings (verbosity, RPC limits) can be changed freely.
 
 ## RPC support

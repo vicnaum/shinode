@@ -17,7 +17,7 @@ use jsonrpsee::{
 };
 use reth_primitives_traits::SealedHeader;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 use tracing::{info, warn};
 
@@ -285,6 +285,12 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 return Err(invalid_params("block range exceeds max_blocks_per_filter"));
             }
 
+            for block in from_block..=to_block {
+                if !ctx.storage.has_block(block).map_err(internal_error)? {
+                    return Err(missing_block_error(block));
+                }
+            }
+
             let headers = ctx
                 .storage
                 .block_headers_range(from_block..=to_block)
@@ -380,6 +386,14 @@ fn invalid_params(message: &str) -> ErrorObjectOwned {
 
 fn internal_error(err: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32000, "internal error", Some(err.to_string()))
+}
+
+fn missing_block_error(block: u64) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        -32001,
+        "missing block in requested range",
+        Some(json!({ "missing_block": format!("0x{:x}", block) })),
+    )
 }
 
 #[derive(Debug)]
@@ -584,6 +598,7 @@ mod tests {
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
+    use crate::storage::BlockBundle;
     use reth_ethereum_primitives::{Receipt, TxType};
     use reth_primitives_traits::Header;
     use std::path::PathBuf;
@@ -612,6 +627,7 @@ mod tests {
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
             start_block: 0,
+            shard_size: crate::cli::DEFAULT_SHARD_SIZE,
             end_block: None,
             rollback_window: 64,
             retention_mode: RetentionMode::Full,
@@ -645,6 +661,31 @@ mod tests {
         let mut header = Header::default();
         header.number = number;
         header
+    }
+
+    fn write_bundle(storage: &Storage, bundle: BlockBundle) {
+        storage
+            .write_block_bundle_follow(&bundle)
+            .expect("write bundle");
+    }
+
+    fn bundle_with_number(
+        number: u64,
+        header: Header,
+        tx_hashes: Vec<B256>,
+        receipts: Vec<reth_ethereum_primitives::Receipt>,
+        size: u64,
+    ) -> BlockBundle {
+        BlockBundle {
+            number,
+            header,
+            tx_hashes: crate::storage::StoredTxHashes { hashes: tx_hashes },
+            transactions: crate::storage::StoredTransactions { txs: Vec::new() },
+            withdrawals: crate::storage::StoredWithdrawals { withdrawals: None },
+            size: crate::storage::StoredBlockSize { size },
+            receipts: crate::storage::StoredReceipts { receipts },
+            logs: crate::storage::StoredLogs { logs: Vec::new() },
+        }
     }
 
     fn receipt_with_logs(logs: Vec<alloy_primitives::Log>) -> Receipt {
@@ -804,23 +845,16 @@ mod tests {
 
         let mut header = header_with_number(7);
         header.timestamp = 1000;
-        storage
-            .write_block_header(7, header.clone())
-            .expect("write header");
-        storage
-            .write_block_tx_hashes(
+        write_bundle(
+            &storage,
+            bundle_with_number(
                 7,
-                crate::storage::StoredTxHashes {
-                    hashes: vec![B256::from([0x11u8; 32]), B256::from([0x22u8; 32])],
-                },
-            )
-            .expect("write tx hashes");
-        storage
-            .write_block_size(7, crate::storage::StoredBlockSize { size: 123 })
-            .expect("write size");
-        storage
-            .set_last_indexed_block(7)
-            .expect("set last indexed");
+                header.clone(),
+                vec![B256::from([0x11u8; 32]), B256::from([0x22u8; 32])],
+                Vec::new(),
+                123,
+            ),
+        );
 
         let (addr, handle) =
             start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
@@ -856,12 +890,10 @@ mod tests {
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
-        storage
-            .write_block_header(1, header_with_number(1))
-            .expect("write header");
-        storage
-            .set_last_indexed_block(1)
-            .expect("set last indexed");
+        write_bundle(
+            &storage,
+            bundle_with_number(1, header_with_number(1), Vec::new(), Vec::new(), 0),
+        );
 
         let (addr, handle) =
             start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
@@ -893,12 +925,10 @@ mod tests {
 
         let mut header = header_with_number(9);
         header.withdrawals_root = Some(B256::from([0x55u8; 32]));
-        storage
-            .write_block_header(9, header.clone())
-            .expect("write header");
-        storage
-            .set_last_indexed_block(9)
-            .expect("set last indexed");
+        write_bundle(
+            &storage,
+            bundle_with_number(9, header.clone(), Vec::new(), Vec::new(), 0),
+        );
 
         let (addr, handle) =
             start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
@@ -935,20 +965,16 @@ mod tests {
             vec![topic0],
             alloy_primitives::Bytes::from(vec![0x01]),
         );
-        storage
-            .write_block_header(5, header)
-            .expect("write header");
-        storage
-            .write_block_tx_hashes(5, crate::storage::StoredTxHashes { hashes: vec![tx_hash] })
-            .expect("write tx hashes");
-        storage
-            .write_block_receipts(5, crate::storage::StoredReceipts {
-                receipts: vec![receipt_with_logs(vec![log.clone()])],
-            })
-            .expect("write receipts");
-        storage
-            .set_last_indexed_block(5)
-            .expect("set last indexed");
+        write_bundle(
+            &storage,
+            bundle_with_number(
+                5,
+                header,
+                vec![tx_hash],
+                vec![receipt_with_logs(vec![log.clone()])],
+                0,
+            ),
+        );
 
         let (addr, handle) =
             start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
@@ -1009,6 +1035,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eth_get_logs_errors_on_missing_block() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+        let storage = Storage::open(&config).expect("storage");
+
+        let header = header_with_number(1);
+        write_bundle(&storage, bundle_with_number(1, header, Vec::new(), Vec::new(), 0));
+
+        let (addr, handle) =
+            start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
+        let client = HttpClientBuilder::default()
+            .build(&format!("http://{addr}"))
+            .expect("client");
+
+        let filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock": "0x1",
+        });
+
+        let err = client
+            .request::<Vec<Value>, _>("eth_getLogs", rpc_params![filter])
+            .await
+            .expect_err("missing block should error");
+        match err {
+            jsonrpsee::core::ClientError::Call(err_obj) => {
+                assert_eq!(err_obj.code(), -32001);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        handle.stop().expect("stop server");
+        handle.stopped().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn eth_get_logs_allows_unlimited_limits() {
         let dir = temp_dir();
         let mut config = base_config(dir.clone());
@@ -1024,20 +1086,16 @@ mod tests {
             vec![topic0],
             alloy_primitives::Bytes::from(vec![0x01]),
         );
-        storage
-            .write_block_header(1, header)
-            .expect("write header");
-        storage
-            .write_block_tx_hashes(1, crate::storage::StoredTxHashes { hashes: vec![tx_hash] })
-            .expect("write tx hashes");
-        storage
-            .write_block_receipts(1, crate::storage::StoredReceipts {
-                receipts: vec![receipt_with_logs(vec![log.clone()])],
-            })
-            .expect("write receipts");
-        storage
-            .set_last_indexed_block(1)
-            .expect("set last indexed");
+        write_bundle(
+            &storage,
+            bundle_with_number(
+                1,
+                header,
+                vec![tx_hash],
+                vec![receipt_with_logs(vec![log.clone()])],
+                0,
+            ),
+        );
 
         let (addr, handle) =
             start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;
@@ -1046,8 +1104,8 @@ mod tests {
             .expect("client");
 
         let filter = serde_json::json!({
-            "fromBlock": "0x0",
-            "toBlock": "0x100",
+            "fromBlock": "0x1",
+            "toBlock": "0x1",
         });
         let result: Vec<Value> = client
             .request("eth_getLogs", rpc_params![filter])

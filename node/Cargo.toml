@@ -23,6 +23,8 @@ reth-network-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9c
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["secp256k1", "serde-bincode-compat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+crc32fast = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

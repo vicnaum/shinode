@@ -1,0 +1,1030 @@
+user:
+<agent_transcripts_context>
+      The user has given you a pointer to a file containing an agent transcript. Here's how you should read it:
+
+1. **Message format**: Messages alternate between "user:" and "assistant:" sections. User prompts are enclosed in <user_query> tags.
+2. **Tool calls**: Tool calls appear as "[Tool call] toolName" followed by arguments, and results as "[Tool result] toolName" with the output.
+3. **Thinking blocks**: If present, "[Thinking]" markers indicate the model's reasoning process.
+4. **Context**: The transcript shows the full conversation history including any code changes, file reads, and terminal commands that were executed. The file is too big to read at once, so search through it and read it in chunks.
+</agent_transcripts_context>
+
+### What happened in `ingest_100k_v3` (why the “no contiguous prefix” came back)
+
+This run **deadlocked early** because the **first missing gap blocks were moved into the scheduler’s `failed` set**, and with the new **lookahead backpressure** they were **never retried**.
+
+### Evidence from the run artifacts
+
+- **DB writer got stuck at the first gap and never advanced**
+  - Summary: `blocks_written = 16` while `blocks_processed = 2062`
+  - Final DB writer state (from terminal + summary): `expected_next = 24183468`, `buffered_blocks ~= 2046`, `first = 24183471`
+  - That means blocks **24183468..24183470** never arrived to the DB writer, so it couldn’t flush anything beyond the first 16.
+
+- **Those gap blocks were repeatedly assigned to a peer that returned *empty responses***
+  - In `ingest_100k_v3...events.jsonl` (very early, t=5–223ms), peer `0x026236...` was assigned ranges starting at **24183468** and repeatedly returned:
+    - `missing_blocks == blocks` (e.g. 16/16, 8/8, 4/4, 2/2, 1/1)
+    - `bytes_headers/bodies/receipts == 0`
+    - `headers_requests=1` and `bodies_requests=0`, `receipts_requests=0`
+  - This is an **empty header response** pattern (peer doesn’t have/serve those blocks), not a “random missing receipts” case.
+
+- **The peer was marked as failures and banned**
+  - Because the response was empty (`completed.is_empty()`), the ingest loop treats it as a **peer failure** (not partial), so it quickly hit the ban threshold.
+  - You can see `{"event":"peer_banned","peer_id":"0x026236...","reason":"health"}` at ~1s.
+
+- **The blocking blocks got “burned” into `failed`**
+  - Every empty response runs `scheduler.requeue_failed(&missing_blocks)` which increments the per-block attempt counter; with `max_attempts_per_block = 3`, those early blocks can become **permanently failed quickly**.
+
+### Why it became a hard stall (new interaction)
+
+Your bounded lookahead does what it’s supposed to do: it kept the DB writer buffer bounded (it topped out around **2046**, basically the **2048 lookahead**).
+
+But: **escalation currently only starts when `pending` is empty**. With lookahead enabled, `pending` is *never drained to empty* (scheduler stops assigning once it hits the lookahead window). So once the gap blocks enter `failed`, the system ends up in:
+
+- DB writer watermark stuck at 24183468
+- pending still huge (blocks beyond watermark+lookahead)
+- normal scheduling returns empty (backpressure)
+- escalation never starts (pending not empty)
+- the failed gap blocks never get retried ⇒ **deadlock**
+
+### Counts (for this stalled run)
+
+- In the `ingest_100k_v3...trace.json` there are **1,535** occurrences of `db flush: no contiguous prefix ready`.
+- That’s consistent with “writer stuck + buffer fills near the lookahead cap”, not the unbounded backlog from the original issue.
+
+### Bottom line
+
+This run didn’t regress “randomly”; it hit a **specific failure mode**:
+- **empty peer responses** early on **burned** the first gap blocks into `failed`
+- bounded lookahead then prevented draining `pending` to trigger escalation
+- so the gap blocks were never retried, and the DB writer stayed stuck forever
+
+If you want, I can propose a minimal fix that preserves bounded lookahead but **starts escalation when we’re backpressured by lookahead** (or when `low_watermark` is in `failed`), so this can’t deadlock again.
+
+user:
+<user_query>
+Yes, let's brainstorm on the best fix, while trying not to break anything else
+</user_query>
+
+assistant:
+[Thinking] **Brainstorming fixes and trade-offs**
+
+I’m tasked with brainstorming effective, minimal fixes without disrupting other parts of the system. Since this is more about planning and discussion, I won’t delve into code modifications just yet. I’ll propose various alternatives and their trade-offs, while asking clarifying questions as needed. I need to respect the instructions to do only what’s required, which means I’ll focus on brainstorming strategies regarding the discovered deadlock related to the scheduler and pending heap.
+**Analyzing escalation issues**
+
+I’m observing that escalation never activates, which means blocks in the failed set aren’t retried. There's also the problem that requeuing failed blocks increments attempts and, after reaching maximum attempts, they get moved to failed without being put back in pending, preventing progress for the DB writer. Ideally, without lookahead, the scheduler would pop pending blocks until empty, but this could lead to excessive buffering. We need to ensure that missing blocks are retried rather than permanently failing them, especially during historical ingestion. Allowing marking as failed with escalation attempts from peers could be an option.
+**Revising escalation conditions**
+
+I’m realizing that while we were able to retrieve blocks eventually, the escalation conditions need to change. My goals include keeping backpressure to prevent unbounded buffering, ensuring that gap blocks are retried or escalated even when pending isn’t empty, and avoiding network spamming. Code changes should be minimal to avoid affecting the follow mode.
+
+I also need to consider that a problematic peer returned an empty header response for block range due to potentially being at an unknown head, showing missing blocks and bytes as zero. This is likely a header response error, indicating that `fetch_ingest_batch` made a header request and received no headers. The code treats this as a completed request but records a peer failure due to the missing blocks.
+**Analyzing peer assignment and attempts**
+
+I'm noticing that if this peer continues to be assigned, the attempts could quickly exceed the threshold, moving blocks into the failed set. The scheduler's pending blocks are maintained as a min-heap, so the lowest block, 24183468, will stay until it’s assigned and put into in_flight. If a fetch returns empty, requeue_failed checks the count for each block. If the count exceeds max_attempts, those blocks no longer get requeued and are added to the failed set. After several failed attempts, the next minimum block becomes 24183471, which exceeds the watermark. Without lookahead backpressure, that could lead to the scheduler assigning it to peers, causing issues with the DB writer's buffering.
+**Addressing escalation during backpressure**
+
+I see that with a lookahead of 2048, the scheduler assigns blocks starting from the watermark but still manages to process blocks within this limit. The DB writer is stuck, processing only up to a certain extent. If the scheduler's pending has blocks beyond the lookahead, it can't escalate, leading to a deadlock where failed blocks aren't retried. It seems we should allow escalation to proceed during lookahead backpressure even if pending isn't empty, focusing on blocks near the watermark. 
+
+One straightforward solution could be to modify the escalation logic to kick in if we hit a normal batch empty due to lookahead backpressure while there are failed blocks available. This way, we can keep trying to retrieve those blocks without letting them fall through the cracks.
+**Refining escalation logic**
+
+I’m realizing that the pop_next_batch can return empty for various reasons—not just lookahead. To specifically detect lookahead-related emptiness, I can modify pop_next_batch to return an enum that indicates whether we’re blocked by lookahead. Alternatively, I could mirror this check in maybe_start_escalation using pending.peek as a quick reference. 
+
+It’s crucial to ensure we’re not holding onto multiple locks simultaneously to avoid deadlocks. I’ll implement logic that checks if escalation should start only if there are failed blocks available. However, I need to be cautious about potentially mishandling new failures while keeping the `escalation.active` flag. Keeping this flag active might prevent adding new failed blocks later, which seems problematic. 
+
+It appears the solution lies in confirming any new failed blocks get queued even if the escalation is active. I'll keep refining to ensure blocks are retried properly without introducing unnecessary complexity or deadlock risks.
+**Adjusting escalation strategy**
+
+I’m realizing that when escalation is active, new failed blocks may just sit in the failed set without being retried. Currently, `maybe_start_escalation` checks if escalation is already active and returns early, which means no new blocks get added. This seems to suggest that escalation should only kick in when normal operation is fully paused. 
+
+However, if we start escalation while still processing outstanding tasks, and those tasks fail, we could end up leaving failed blocks unhandled. I think I need to adjust my logic to ensure newly failed blocks are added to the escalation queue even if escalation is already active, especially when we’re blocked by lookahead. 
+
+So, perhaps I can remove the check for `escalation.active` and ensure that all current failed blocks are processed. We can leverage existing checks to prevent duplicates and incorporate any blocks that failed during escalation. Plus, I have to ensure we don’t begin escalation too early, but my proposed changes already align with launching it when the normal mode is empty or when we are blocked by lookahead. 
+
+This would indeed allow any missed blocks to be retried immediately, preventing them from stalling out completely. Also, I think it’s worth considering how to handle empty responses from peers differently so that we don’t mistakenly think a block has permanently failed when it could just be a peer issue.
+**Exploring escalation adjustments**
+
+I've realized that block attempts currently increment regardless, and after three attempts, they go to failed status, which might be too low. Rather than letting blocks accumulate attempts, I wonder if we could schedule escalation immediately for blocks that receive empty responses. 
+
+Alternatively, keeping failed blocks in pending but marking them high-priority could also work. However, this could lead to repeated attempts. A simpler option might be to adjust the escalation trigger to include lookahead-blocked cases and allow adding new failed blocks to the escalation queue, even when it's already active.
+
+This way, we can ensure that new failures are not ignored while simultaneously maintaining fairness in the process. There seem to be potential issues related to peer availability and network stability, which could contribute to backpressure. I think proposing fixes focused on treating failed blocks as always eligible for scheduling, possibly through a separate queue, could help effectively address the deadlock concerns and improve overall efficiency. Let's explore alternatives!
+**Considering escalation options**
+
+I’m reflecting on how blocks currently get removed from the queued list and moved to in-flight. If the normal task list isn't empty, we can simply return to normal mode. If it is empty, that's when we consider escalation. Currently, escalation only triggers when pending is empty, which presents a challenge, especially with lookahead scenarios. 
+
+For potential improvements, I see a few options: 
+
+Option A: We could modify the escalation trigger logic to consider a lookahead-blocked state as equivalent to pending being empty. 
+
+Alternatively, Option B could prioritize missing blocks close to the watermark, even when normal tasks still exist. 
+
+Considering fairness and starvations is crucial, as is simplifying the approach while addressing these concerns. Option A seems to be the minimal change we need while still allowing for necessary flexibility in handling failed blocks. I want to ensure that any proposed fix also accounts for previous successful runs and doesn’t disrupt the current system.
+**Exploring escalation strategies**
+
+I’m considering how to improve the escalation process. Currently, we can only escalate when pending is empty, but if there’s a lookahead issue, it might be necessary to change this. 
+
+For a possible solution, I see a few strategies. One is to start escalation when pending is empty or when there are blocks near the watermark that are missing. Additionally, I could ensure failed blocks are sorted when added to the escalation queue to prioritize those closest to recovery. 
+
+It seems important to address these adjustments carefully, particularly to prevent deadlock situations while keeping the system robust and efficient.
+**Refining peer block handling**
+
+I'm examining ways to improve how we handle peer blocks, especially for missing critical blocks that may lead to bottlenecks. One idea is to set a high `max_attempts_per_block` for critical blocks, keeping them in pending status for retries in normal mode, but there are concerns. 
+
+Another approach is to treat blocks with empty headers as peer failures without incrementing their attempt counts. This might prevent blocks from being marked as failed due to one unreliable peer. Overall, I think balancing attempts per block and ensuring robust handling of peer communications is key.
+**Improving block escalation handling**
+
+When in lookahead-blocked mode, I need to treat escalation as active and ensure all failed blocks up to watermark and lookahead are included in the escalation queue. We could discuss adding a debugging stat for tracking progress. 
+
+In ingest mode, I might consider setting `max_attempts_per_block` very high to avoid marking blocks as permanently failed. There's a potential flaw where blocks could drop out of the queue after all peers have been tried without resolution, leading to unresolved blocks. It's crucial to refine the escalation process to ensure no blocks are lost while still managing their attempts effectively.
+**Brainstorming escalation improvements**
+
+In v3, only 2 of the 5 peers were active, and it seems if we tried a block on all peers once without success, we might give up too soon. New peers might join, but the scheduler may not retry, potentially leading to an incorrect finish. 
+
+I think we should always include failed blocks in the escalation queue and treat them as eligible for retries. Instead of dropping unresolved blocks after trying active peers, it would be better to requeue them after some delay. This way, future peers can have a chance to attempt the blocks. 
+
+Also, we should consider how channel capacity interacts with backpressure. It seems the DB writer buffer can grow, causing stalls, especially when lookahead is active. To mitigate this, we could start escalation when lookahead triggers backpressure, ensuring that missing blocks are continuously scheduled.
+
+Lastly, we should validate our efforts by rerunning tests and checking for any failed blocks during the stall. These decisions should help streamline the process and enhance the overall system efficiency.
+**Proposing escalation improvements**
+
+Given the user's rules, if there are several good solutions, I should present options and ask for their input afterward. I’ll recap the failure mode briefly, and then provide a clear list of options. 
+
+Option A proposes enabling escalation when lookahead is blocked. Option B suggests avoiding marking blocks as failed during lookahead, while Option C focuses on retrying critical blocks near the watermark. 
+
+I recommend Option A as the minimal fix, coupled with a plan to run tests and check counts. While the user might prefer not to mark blocks as permanently failed, it’s crucial we avoid stalls. I’ll ensure our suggestions are concise yet detailed enough to facilitate meaningful discussion.
+**Addressing escalation and peer issues**
+
+In the v3 run, a problematic peer returned missing blocks, but only some entered the failed set. I need to propose a fix: start escalation when scheduling is empty or lookahead-blocked. This involves checking if the pending queue has far ahead blocks. 
+
+We could introduce a helper function to determine if lookahead is blocked and, when calling `maybe_start_escalation`, collect and sort failed blocks. An additional improvement could be ensuring new failed blocks are queued even during active escalation. 
+
+We should also consider treating empty responses as failures to prevent blocks from being marked as failed prematurely, which might lead to infinite loops with peers. Additionally, setting `max_attempts_per_block` higher than the `peer_failure_threshold` could help avoid this issue in the future.
+**Proposing fixes for deadlock issues**
+
+I need to suggest some adjustments regarding handling empty responses and attempts. For instance, we could treat empty responses as failures without incrementing the per-block attempt count. However, I want to avoid altering the default configuration too much. Looking at the v3 run, I observed many debug messages due to buffer management issues during the flush operation, which can lead to deadlocks.
+
+To address this, I can propose several options: 
+
+1. Start escalation when backpressure occurs.
+2. Keep blocks pending in ingest mode and avoid moving them to failed status.
+3. Adjust counting rules for empty responses.
+4. Introduce a "gap queue" for certain blocks.
+
+I’d recommend Option 1 for its minimal required code changes, and if the user prefers it, I’ll implement a patch along with a unit test to replicate the v3 scenario.
+### Recap: why `v3` deadlocked (the “new” failure mode)
+With `max_lookahead_blocks=2048`, once we’ve fetched/processed up to \(low\_watermark + 2048\), **normal scheduling intentionally returns empty**.
+
+In `v3`, the *blocking* blocks (24183468–24183470) got pushed into the scheduler’s **`failed` set** (because a peer kept returning *empty* header responses and `max_attempts_per_block=3`), and then:
+
+- **DB watermark never advanced** (writer stuck at `expected_next=24183468`)
+- pending still contained far-ahead blocks (so `pending_len>0`)
+- **escalation never started** because `maybe_start_escalation()` currently requires `pending_len == 0`
+
+So bounded lookahead did its job (bounded buffer), but it exposed a scheduler invariant: “escalation only when pending empty” no longer holds.
+
+---
+
+### Best “minimal-risk” fix (recommended)
+**Start escalation when we are “lookahead-blocked”, not only when `pending` is empty.**
+
+Concretely:
+- Treat the state **`pending.peek() > low_watermark + max_lookahead_blocks`** as “no normal work left in the allowed window”.
+- If that’s true *and* `failed` is non-empty, start/continue escalation even though `pending` isn’t empty.
+
+This is the smallest change that directly addresses the deadlock without changing fetch logic, DB writer logic, or the meaning of lookahead.
+
+**Two important details to make it robust:**
+- **Keep feeding new failed blocks into the escalation queue** even if escalation is already “active” (because with lookahead, new failures can happen while pending is still non-empty).
+- **Prefer the lowest failed blocks first** (sort by block number) so we repair the exact gap the DB writer needs.
+
+**Why this won’t break other behavior**
+- When the DB writer is simply “slow” (watermark advancing, but we hit lookahead), `failed` is usually empty → escalation does nothing, and we just backpressure as intended.
+- When a real gap exists (failed blocks near the watermark), escalation kicks in and tries to fill it, unblocking the writer.
+
+---
+
+### Other viable fixes (bigger behavior changes)
+These are valid, but riskier / more invasive:
+
+#### Option B — never move blocks to `failed` in ingest mode
+Set `max_attempts_per_block = u32::MAX` for ingest (like follow mode) so the gap blocks never leave `pending`.
+- **Pros:** eliminates this deadlock class entirely.
+- **Cons:** can spin forever on a truly-unavailable block; you lose the “escalation path” semantics; changes existing failure model.
+
+#### Option C — don’t count “empty responses” toward per-block attempts
+If a peer returns `completed.is_empty()`, treat it as a peer problem only: requeue blocks without incrementing per-block attempts.
+- **Pros:** prevents a single bad peer from “burning” a block into `failed`.
+- **Cons:** if *all* peers return empty, you can spin indefinitely unless you add other stop conditions.
+
+#### Option D — always escalate the watermark block if it’s failed
+Special-case: if `failed.contains(low_watermark)` then schedule that block even if normal work exists.
+- **Pros:** very targeted.
+- **Cons:** still needs careful integration with the lookahead/backpressure path; can become a pile of special cases over time.
+
+---
+
+### My recommendation
+Implement **Option A** (escalate when lookahead-blocked) + “keep adding newly failed blocks” + “sort lowest-first”.
+
+If you agree, I’ll implement it with a small unit test that reproduces the v3 situation:
+- pending has items (far ahead)
+- lookahead-blocked is true
+- failed contains watermark block(s)
+- `next_batch_for_peer()` returns an escalation block instead of stalling forever
+
+user:
+<user_query>
+Ok, here's what I think:
+1) I agree with your recommendation on minimal risk fix, cause the current approach is certainly not working properly
+2) We should definitely not count “empty responses” toward per-block attempts (but only if batch > 1, cause if the batch is 1 block and response is empty - it might mean that block is really hard to obtain)
+3) Failed blocks (but I'd say rather: rare blocks) should be escalated and what escalation means is - try to fetch it via as much nodes as possible, not only fire shoot a single node all the time
+4) Option B is nice, but yeah, it can spin forever, but here's an idea I want to propose to you - make failed blocks queue just a parallel queue - that you always try to execute it in parallel with ordinary queue - so neither should wait for the other - just do them both!
+5) What's "watermark"?
+6) Why do we even have a limit of "max_lookahead_blocks"?
+7) Can you explain our whole block fetching process in detail?
+
+Let's brainstorm this
+</user_query>
+
+assistant:
+[Thinking] **Explaining block fetching process**
+
+I’m detailing the block fetching process. It starts by the scheduler selecting the next consecutive blocks from the pending heap and assigning them to peers. The fetch tasks then request headers, bodies, and receipts, sending this data to processing. The processing turns the block into a BlockBundle, which is sent to the DB writer channel. 
+
+There are new modifications proposed, like not counting empty responses towards per-block attempts if the batch size is greater than one, to prevent issues with bad peers.
+**Assessing block fetching strategy**
+
+In this scenario, even if a block is rare, it might eventually be fetchable, so we want to keep retrying across multiple peers. I’m considering attempt counters keyed per block, focusing on "hard" failures like timeouts. There's a suggestion that if the batch size is greater than one, an empty response indicates the peer likely can't serve that range, so we should penalize the peer but not the blocks. For a single block batch, an empty response could mean it's genuinely hard to obtain, which complicates the situation. Escalation should involve multiple nodes rather than just one.
+**Analyzing escalation queue mechanics**
+
+Right now, our escalation queue is designed to choose a block and ensure it’s only attempted once per peer in each round. However, only one block is returned per peer. It seems possible for multiple peers to fetch the same block concurrently. The current escalation setup only assigns a block to one peer at a time, ensuring it hasn’t already been attempted by that peer. 
+
+I need to check `pop_escalation_for_peer` to see if the same block can indeed be assigned to multiple peers based on its logic.
+**Examining concurrent block assignments**
+
+I’m thinking that, actually, blocks could be assigned to multiple peers concurrently since for each peer, if a block remains in the queue, it could be given to another peer. However, once a block is popped from the queue, it's removed and the assignment only goes to one peer at a time. After a failure, `requeue_escalation_block` might push it back for another attempt later. 
+
+This means it’s currently set up sequentially, and I'm realizing that having the same rare block assigned to multiple peers at once could help reduce wait times. Yet, I need to think about the network costs involved in fetching the same block from different peers, as it could duplicate work. Starting with a small level of concurrency might be a good approach.
+**Evaluating block ingestion adjustments**
+
+Right now, missing blocks count as failures, which seems fine. I’m considering changing how we count attempts per block rather than per peer. Currently, our round-robin setup could lead to repeated failures if the same block is sent back to the same peer quickly.
+
+There’s a proposal to have a parallel queue for failed blocks and execute it alongside the ordinary queue, which could simplify the handling of rare blocks. I think we might want to implement a few steps: allowing escalation during lookahead blocks, adjusting attempt counting for empty responses, and enhancing concurrency with multiple attempts on rare blocks. This could lead to a meaningful improvement overall.
+### First: answers to your questions (5–7)
+
+### 5) What’s “watermark”?
+In our code it’s the shared `low_watermark: AtomicU64`.
+
+- **Meaning:** the **next block number the DB writer needs** in order to keep committing contiguously.
+- In DB-writer terms it’s exactly `expected_next`.
+- So if `low_watermark = 24183468`, the writer is waiting for block **24183468** (and then 69, 70, …).
+
+It’s the “commit cursor”.
+
+---
+
+### 6) Why have `max_lookahead_blocks` at all?
+Because the DB writer **cannot commit out of order**. Without a limit, the fetch+process pipeline can run far ahead and dump lots of future blocks into the DB writer buffer while a single low block is missing → **unbounded memory growth + huge backlog flushes** (your original issue).
+
+`max_lookahead_blocks` is a **bounded prefetch window**:
+
+- it allows concurrency (we can be ahead a bit),
+- but caps memory/backlog,
+- and forces the system to focus on filling gaps near the commit cursor.
+
+Tradeoff:
+- **Higher lookahead:** more prefetch/throughput potential, higher memory/backlog risk.
+- **Lower lookahead:** less memory, but you’re more sensitive to missing blocks (need good gap handling).
+
+---
+
+### 7) Whole block fetching process (current design)
+Here’s the pipeline end-to-end for ingest:
+
+1) **Scheduler init**
+   - Builds a list of target blocks (range).
+   - Stores them in a **min-heap** `pending` (so we prefer lower blocks).
+   - Maintains sets: `queued`, `in_flight`, `completed`, `failed`.
+
+2) **Peer feeder**
+   - Collects ready peers and picks “best” peer by health score.
+
+3) **Assign a batch**
+   - `next_batch_for_peer(peer_id, peer_head, active_peers)`:
+     - tries **normal**: pop consecutive blocks from `pending` that are ≤ peer head and consecutive.
+     - if normal empty, it may fall back to **escalation** (currently flawed, we’ll fix).
+
+4) **Fetch task**
+   - Calls `fetch_ingest_batch(peer, blocks)` with a timeout.
+   - Returns:
+     - `payloads` (block header + body + receipts),
+     - `missing_blocks` (subset it couldn’t fetch),
+     - timing stats.
+
+5) **Process stage (CPU)**
+   - Worker pool converts `BlockPayload → BlockBundle` (what we store).
+
+6) **DB writer**
+   - Receives `BlockBundle`s out-of-order.
+   - Sorts buffer and **only writes contiguous prefix starting at `expected_next`**.
+   - If missing the next needed block → logs `db flush: no contiguous prefix ready` and keeps buffering.
+
+7) **Watermark + backpressure**
+   - DB writer updates `low_watermark = expected_next`.
+   - Scheduler uses it: if `pending.peek() > low_watermark + max_lookahead_blocks`, it returns no normal work (backpressure).
+
+---
+
+## Now: brainstorming fixes (based on your points 1–4)
+
+Your diagnosis is right: the bounded lookahead fix was good, but it revealed a **new deadlock** when the *blocking block* gets moved to `failed` and escalation doesn’t kick in.
+
+### The minimal-risk fix (I still recommend it, aligned with your #1)
+**Escalation must run whenever we are “lookahead-blocked”, not only when `pending` is empty.**
+
+That means:
+- If normal scheduling is blocked because we’re beyond the lookahead window, then “normal work” is effectively unavailable, even though `pending` isn’t empty.
+- In that state, if there are failed/rare blocks near the watermark, we must attempt them.
+
+This is the smallest change that preserves your intended “bounded memory” behavior.
+
+---
+
+### Your #2: don’t count empty responses toward per-block attempts (with nuance)
+I agree with the spirit, and I’d refine it slightly:
+
+- **If the response is empty and the batch had >1 blocks**:
+  - It’s almost always a **peer capability** problem (“this peer can’t serve this range”), not a “these blocks are inherently failing”.
+  - So: **penalize/ban peer**, but **do not increment per-block attempts**.
+  - Requeue blocks normally.
+
+- **If batch == 1 and response is empty**:
+  - This is ambiguous: could be peer can’t serve, or block is genuinely rare.
+  - Here I’d still avoid immediately “failing permanently”, but we *do* want to increase urgency:
+    - either increment a “rarity” counter,
+    - or move it into a “rare” queue that triggers escalation/fanout.
+
+So yes: your conditional on batch size makes sense, but I’d still avoid “permanent failed” as the immediate outcome even for batch==1. Better: treat it as “rare” and escalate.
+
+---
+
+### Your #3: escalation should try many nodes, not one-at-a-time
+100% agree. Today escalation is effectively **single-flight** per block (one peer tries, then requeue, then another).
+
+What “try as many nodes as possible” can mean in a safe way:
+- For a rare block, allow **N concurrent attempts** (fanout), e.g. `N = min(active_peers, 3)` or configurable.
+- Ensure we don’t ask the **same peer twice** for the same rare block until others have tried.
+- As soon as any peer succeeds, stop scheduling it.
+
+This dramatically reduces “time stuck on a rare gap” while still bounding wasted work.
+
+---
+
+### Your #4: make failed/rare blocks a parallel queue (always running)
+This is a good framing. The safest implementation is “parallel but bounded”:
+
+- Keep the normal queue for throughput.
+- Keep a **rare queue** for gap-filling.
+- Use **two budgets** (or weights) out of the same inflight capacity:
+  - e.g. 90% normal, 10% rare (or “at least 1 slot for rare when rare exists”).
+- This prevents the system from either:
+  - starving rare blocks (deadlock risk), or
+  - starving normal blocks (throughput collapse).
+
+This also plays nicely with lookahead:
+- when lookahead-blocked → allocate more/most budget to rare queue until watermark moves.
+
+---
+
+## Proposed “best combined solution” (low risk, high payoff)
+If we want the smallest change that fixes v3 *and* aligns with your improvements:
+
+1) **Escalation triggers when lookahead-blocked** (fix deadlock).
+2) **Empty response with batch>1 does NOT increment per-block attempts** (prevents burning early blocks into `failed` because of a bad peer).
+3) **Escalation becomes fanout-capable** (try rare blocks across multiple peers quickly).
+4) Optional: evolve “failed” terminology to “rare” internally (conceptually clearer; behavior stays same).
+
+---
+
+## One clarification question (to choose the least risky behavior)
+When a block remains unavailable for a long time, what do you want the node to do?
+
+- **Option 1 (strict):** keep retrying forever (never skip), but keep bounded memory and show “stuck on rare block”.
+- **Option 2 (liveness-first):** after X minutes / Y attempts, mark it permanently missing and allow progress (but storage becomes gappy, which breaks contiguous write semantics unless we change storage model).
+
+Given your architecture so far, I assume **Option 1**—but I want to confirm because it changes how we treat “rare forever” situations.
+
+If you confirm Option 1, I can draft a very concrete patch plan for the scheduler changes (no big refactors) that addresses v3 and adds the “empty response doesn’t burn blocks” rule.
+
+user:
+<user_query>
+100% agree with your brainstorming - valuable insights there - you should not forget these! And I agree with all 4 points (even the 4 that you marked optional - we should do) proposed in the best combined solution.
+
+But before any further actions and before choosing solutions, let's also consider the following:
+
+1) If the network is our main bottleneck - I don't think we need to stop fetching future blocks, even if we cannot process/flush them. Fetching must never stop - memory on modern systems is big enough to fetch 100k of blocks on 32GB of ram. I think 2048 max lookahead is too small for anything. It should be at least 10x bigger so we can have time to find any missing blocks that prevent us from db flushing - especially at the beginning of the run, when we don't have enough peers. Maybe we should limit it by the memory amount somehow instead of it being a constant? Cause I don't want to have a situation, when we hit some limit, and network has to wait for something, while we have peers available, and bandwidth available - cause again: network is our main bottleneck rn.
+2) Btw is our DB writer consequtive? Is there a way to not make it like that? Can we add blocks back to history? What if I synced 1M blocks first, but then I decided I want to sync more and sync one more million back in history - is that possible with the current DB architecture? Cause that might be the real usecase we would want to implement soon. As one of the hacks - maybe we can fill in empty block in place of a missing one, and then fill it up with data when we actually have the real block? But I would prefer to know a real reason behind this design and if that is preventable?
+</user_query>
+
+assistant:
+[Thinking] **Considering architecture decisions**
+
+I need to respond as an AI assistant regarding the user's architecture decisions. They want to brainstorm solutions based on four points they plan to implement. They’re raising some additional considerations about the network being the main bottleneck and whether we should continue fetching future blocks without stopping. They also have questions about the database writer’s requirements and syncing earlier history after a certain number of blocks. It’s crucial that I answer these comprehensively.
+**Evaluating fetch strategy**
+
+I’m considering how `max_lookahead` is enforced by the scheduler, which prevents fetch tasks from being assigned too far ahead. This could cause network idling if the lookahead window fills with processed blocks. If the network is a bottleneck, maybe we should keep downloading, but that risks high memory usage and processing stalls. The user mentions 32GB memory suffices for 100k blocks, but we need to explore the implications of out-of-order writes versus contiguous DB writes, especially considering NippyJar's append-only storage.
+**Exploring storage strategies**
+
+I’m considering a different approach where I could store per-block bundles using a key-value store, which seems to have shifted from MDBX to static files. I think NippyJar segments depend on contiguous numbering for efficient offset calculations and range queries. There's also a concern about syncing earlier history when there's already a later range synced. If the start block defaults to a high number, I wonder about the implications of changing it and the necessity for a new data directory if settings change.
+**Considering segment storage**
+
+I'm pondering the idea of storing segments with offsets and how `last_indexed_block` and `start_block` in metadata suggest a contiguous range. This is common for static-file segment storage, where each segment holds rows for a specific range. They also store offsets to manage variable sizes for random access. The question arises about using placeholders for missing blocks to maintain contiguity, which is tricky since placeholders need to match the size of the actual data to prevent shifting offsets. Exploring ideas like a patch file or a mutable overlay store could be beneficial.
+**Proposing lookahead improvements**
+
+The user initially requested minimal changes but now wants a larger lookahead. I could suggest a dynamic approach based on memory, calculating a maximum lookahead using the average block size and available memory. However, there are challenges, such as needing to manage channel capacities and addressing the sorting inefficiencies of the DB writer. I think we can propose increasing the default lookahead to around 20k but ensure safeguards are in place to prevent overloading the system. Plus, we should explain why maintaining contiguous storage is vital for effective querying and rollback.
+**Exploring block syncing strategies**
+
+I’m considering hacks like maintaining a separate overlay store for missing blocks or allowing out-of-order writes by using an offset table. NippyJar might enable random access, but updating the offset table could be tricky. The user seeks the ability to sync more history, highlighting the need for a segment-based design with metadata for multiple segments. 
+
+I can propose two directions: A) maintaining contiguous storage while optimizing gap-filling or B) shifting to a multi-segment approach to allow for progress despite missing blocks. We also need to address network bottlenecks and CPU overhead when increasing lookahead for efficiency.
+**Enhancing DB writer for lookahead**
+
+To improve large lookahead, I think it’d be best to adjust our DB writer. Instead of using Vec for buffering, I could switch to a BTreeMap or a HashMap with a BinaryHeap. This way, we can insert blocks more efficiently without needing to sort everything each time, which could really enhance performance.
+
+I'll propose a dynamic lookahead strategy, where we can increase it when gaps are detected. We could also store extra data temporarily on disk to manage memory better. Also, if we want to backfill older history, we might need to set up multi-segment storage and manage segment boundaries carefully.
+**Proposing a dynamic sync strategy**
+
+To support syncing more blocks, I think treating the dataset as multiple segments makes sense, allowing for arbitrary ranges. As we backfill earlier segments, `last_indexed_block` won't suffice; instead, I might need a "covered ranges" set. 
+
+Regarding gaps, it’s tricky; while we can't fill them completely, we could use "gap markers" for reads. I should also focus on the user’s modifications and keep in mind that we’re brainstorming. 
+
+Doing some rough calculations shows that increasing lookahead could lead to a CPU bottleneck, so it might be better to switch from Vec to BTreeMap for efficiency. Keeping the lookahead dynamic could balance memory and CPU usage while minimizing gaps.
+**Exploring lookahead strategies**
+
+I think keeping the lookahead moderate might be a good approach, but the user wants to increase it. In my analysis, the count of "no contiguous prefix" dropped significantly, which is a positive sign. While higher lookahead could improve performance in rare cases, it raises concerns about memory usage. 
+
+For syncing back in history, we might consider an incremental approach: initially keeping the contiguous writer while enhancing escalation and gradually raising the lookahead to 20k. Ultimately, we need to adapt to peer limitations and ensure efficient fetching strategies.
+**Detailing storage and fetching concerns**
+
+The user is looking for a detailed brainstorming session rather than just minimal responses, so I'll make sure to cover all relevant points without going overboard. They've also made changes to `mod.rs`, which might be worth mentioning, but it's not crucial—what’s important is their inquiry about lookahead and storage.
+
+Currently, backfilling more requires a new data directory due to storage metadata tied to the start block. I can confirm this with the README. Additionally, the DB writer is consecutive by design, but a different backend could change that. The idea of using placeholders for missing blocks could be complex due to variable-length encoding, but I’ll provide alternatives for maintaining progress. It seems crucial to keep fetching without deadlock, especially when gaps hinder flushing. We could propose a dynamic system with a high lookahead and parallel queues to manage rare blocks, but I need to be careful about memory use.
+**Crafting a Concise Response**
+
+Now that I'm in agent mode, I want to ensure my response is clear and structured, keeping things concise. 
+
+I’ll highlight key insights like how lookahead impacts not just memory but also CPU use since the DB writer sorts every time. Increasing lookahead may necessitate enlarging the mpsc channel size of 2048 to prevent blocking.
+
+I should also mention how Ethereum peers might not always serve deep history, leading to empty header responses, which means the network is not necessarily the bottleneck.
+
+For options on lookahead, I could suggest increasing it, making it dynamic, or memory-based. I’ll clarify that the storage design with NippyJar segments is append-only, allowing compact storage but restricting mutation.
+
+Regarding future requirements for backfilling, I’ll propose the idea of multi-range segments or overlays. My recommendation will involve fixing the scheduler and the empty-response rule while considering increasing the lookahead default to something like 20k. Lastly, I could propose a "soft backpressure" approach to balance normal assignments and rare queues. I'll frame all of this with caution to suggest incremental changes to avoid breaking anything.
+### On (1): “network is bottleneck → fetching must never stop”
+I agree **in principle**, but two practical constraints mean “fetch forever” needs guardrails:
+
+- **It’s not just RAM**: the current DB writer does `buffer.sort_by_key(...)` every time `buffer.len() >= db_write_batch_blocks` (512). If it’s stuck on a gap and you keep feeding it, it ends up **re-sorting an ever-growing buffer on every incoming block** → this can turn into a **CPU bottleneck** (and then *that* backpressures the whole pipeline).
+- **There are hard internal queues too**: fetch → process uses an mpsc channel (capacity 2048 today). If processors/DB-writer can’t keep up, fetch tasks will block on `send()` anyway, so “network never stops” won’t hold unless we also address downstream throughput.
+
+So I think the right target is:
+
+- **Keep the network saturated when it’s healthy**, *but* don’t allow unbounded buffering that can collapse CPU or force OOM in worst cases.
+
+That said: **2048 lookahead is probably too conservative** for sustained backfills if we want to hide rare-gap latency.
+
+Two better approaches than “constant 2048”:
+- **Raise the default significantly** (e.g. 20k–50k) *once escalation/fanout is correct* so we rarely hit the cap anyway.
+- **Make lookahead “soft” + budgeted**: reserve some inflight budget for “rare/gap filling”, and allow the rest to keep fetching ahead up to a **memory/CPU-informed cap** (not necessarily a fixed block count).
+
+### On (2): “DB writer is consecutive — can we avoid that?”
+Yes: today it’s effectively **append/contiguous** by design.
+
+Why:
+- Storage is static-file (NippyJar) segment style. It’s optimized for **compactness + fast sequential/range reads** and simple checkpointing (`last_indexed_block`).
+- If you allow gaps or out-of-order commits, you need either:
+  - a mutable key-value store (MDBX/RocksDB), **or**
+  - a more complex “multi-segment + index” design that can represent holes and out-of-order writes.
+
+So: **it is preventable**, but it’s a bigger storage architecture decision, not just a DB-writer tweak.
+
+### On “can I sync 1M, then later sync 1M more *backwards*?”
+With the **current storage contract**: effectively **no** (at least not in the same `data_dir` without redesign). The project docs already hint at this: start-block is treated as storage-affecting.
+
+To support that “extend backwards” use case, we’d likely need one of:
+
+- **Multi-range storage**: keep multiple contiguous segments (each with `[start,end]`) and maintain a “covered ranges” index. Backfilling older history would create a new earlier segment. Reads merge across segments.
+- **Overlay store**: keep static files as the “base”, and store late/patch blocks in a small KV overlay; reads consult overlay first. Periodically compact into static files.
+
+### On the “placeholder empty block then fill later” idea
+In static-file formats with **variable-length payloads** (receipts/txs), true in-place replacement is not feasible without either:
+- reserving worst-case space (wasteful/unbounded), or
+- adding an overlay/patch mechanism (which is basically “overlay store” above).
+
+So placeholders are possible only if we accept “placeholder + overlay” complexity.
+
+---
+
+## How these new considerations affect the scheduler fixes we discussed
+They *strengthen* the case for the combined solution, but also suggest two extra tweaks:
+
+1) **Fix deadlock**: escalation must run when “normal work is unavailable” (including lookahead-blocked), not only when `pending` is empty.  
+2) **Empty response handling**: don’t let empty responses burn blocks into “failed/rare” (your batch>1 rule is good).  
+3) **Escalation fanout**: “rare blocks” should be attempted across multiple peers concurrently.  
+4) **Parallel queues**: always run “rare/gap fill” in parallel with normal queue using a budget (prevents starvation).  
+5) **Revisit lookahead** once the above is correct:
+   - raise it substantially, **or**
+   - make it adaptive (based on estimated buffered bytes and/or DB-writer cost), instead of a small constant.
+
+### One key takeaway
+If we increase lookahead 10×–50×, we should also consider changing the DB-writer buffering structure (e.g., ordered map/set rather than repeated full-buffer sort), otherwise big lookahead can *create* a CPU bottleneck even if RAM is fine.
+
+If you confirm you want the system to **never “skip” a block** (strict correctness; retry forever but remain bounded), I can propose a concrete design for:
+- parallel “rare queue” + fanout attempts,
+- empty-response attempt accounting,
+- and a higher/adaptive lookahead that keeps network busy without risking CPU spiral.
+
+user:
+<user_query>
+```
+Two better approaches than “constant 2048”:
+Raise the default significantly (e.g. 20k–50k) once escalation/fanout is correct so we rarely hit the cap anyway.
+Make lookahead “soft” + budgeted: reserve some inflight budget for “rare/gap filling”, and allow the rest to keep fetching ahead up to a memory/CPU-informed cap (not necessarily a fixed block count).
+```
+Agreed. Let's raise the default to 50k
+
+--
+
+On the DB - we can store data in 50k blocks subfolders, it's not too big and not too small - for 30M blocks chain it's only 600 folders - which is completely fine. We might also make it configurable (say we can have 10k subfolders so they're smaller etc). And when someone, say, downloads blocks 125000 to 145000 - we place that in the `100000` subfolder (which should have all blocks from 100000 to 149999). And when later someone wishes to replenish their db and download range 60000 to 125000 - then he would but blocks 60000-99999 into `50000` subfolder, and 100000 to 124999 would go to the `100000` subfolder - it should use the existing files to consolidate (sort or whatever) the two ranges. Of course if the folders are 10k this would be even simpler and faster to reorganize and fill up if something is missing. What do you think?
+
+Do we also have blocks availability map somewhere? Which blocks we have available in the db and which we don't? Or we should parse the whole db to know that?
+
+--
+
+I'm talking about the db structure because I feel it's related to our current problem - if we have 10k folders - that means we don't need a much bigger lookahead - cause we can then always reach the next subfolder and start flushing db there, while previous one is still waiting for it's blocks. Moreover - with 10k subfolders maybe we don't even need to write sequentially - it should be easy to resort the smaller db files after all blocks are done. Does this make sense?
+
+--
+
+What do you think about the above ideas? Let's brainstorm these too - maybe they will be helpful for our problems and to optimize our workflow. Answer the questions and give me your opinion.
+</user_query>
+
+assistant:
+[Thinking] **Analyzing storage design**
+
+I’m aiming to provide a concise answer about raising defaults to 50k and its pros and cons while estimating memory needs. I’ll also look into a folder-based design that interacts with contiguous writing. Understanding the current storage implementation is essential, especially how static files like headers and hashes are organized. I need to check how storage writes and reads works, particularly with nippy-jar segments. We could consider implementing per-range segments, which would be a significant redesign that’s conceptually feasible!
+**Considering retrieval queries**
+
+I need to consider retrieval queries like `eth_getLogs` and `eth_getBlockByNumber`. It's important to support random block reads and range log filtering, and having per-range directories might help with non-contiguous commits. This way, if one shard has missing blocks, it won't stall the entire database. However, I’d need a coverage map to track blocks and handle gaps, keeping in mind that receipts and logs can vary in length. Rewriting may be necessary, but if shards are limited in size, it's manageable! I'll analyze the current DB writer in node/src/storage and read that implementation closely.
+**Analyzing the storage system**
+
+I’ve read some tests, but I need to dive deeper into the core implementation. I plan to use Grep to locate the `write_block_bundle_batch` definition so I can analyze it quickly. Additionally, I need to check on the availability map, which seems to include a `meta.json` file that stores `last_indexed_block` and `head_seen`. There seems to be logic in place for skipping missing rows when reading, which suggests that static files might tolerate missing blocks. I’ll also explore the possibility of sharding by block ranges to improve flushing efficiency.
+**Revising DB structure**
+
+I need to think about changing the database structure to use subfolders, similar to partitioning by block ranges. This relates to the concept of range segments or chunk directories. If each folder contains 10k blocks, missing blocks in one folder shouldn’t block writing in later ones, but only if out-of-order writes are supported. The design suggests that while we may have gaps within a shard, we could write out-of-order and merge later, similar to an LSM or shard-level compaction. It's a more extensive change than just a scheduler fix!
+**Proposing a path forward**
+
+We can propose a step-by-step approach to improve performance. First, we need to fix the scheduler to avoid deadlocks. Next, it might be beneficial to raise the lookahead default to 50k, but we need to consider the impact on memory since fetching 100k blocks could consume significant space (around 27.9 GB). We should focus on processing blocks without storing full payloads and consider using smaller files or out-of-order writes. Finally, let’s clarify the availability map and ensure it tracks which blocks are present in the DB.
+**Exploring database improvements**
+
+I’m thinking about how to optimize our implementation. We could suggest a memory-based adaptive approach by computing approximate bytes per block from recent fetch statistics while maintaining a limit by bytes instead of blocks. Raising the default to 50k looks good, but we also need to consider sharding the DB by block ranges for out-of-order writes.  
+
+With sharded segments, we’d need a coverage map to track available blocks, possibly stored as `ranges.json`. Additionally, we should ensure the scheduler supports independent shards to ease the contiguous constraint. We must balance these changes with memory capacity and current configuration.
+**Analyzing memory and performance**
+
+I'm considering how raising the lookahead could impact memory utilization. If we increase it to 50k while retaining the 2048 channel capacity, we might not efficiently fill that lookahead. The DB writer buffer grew to 2046, but the processed blocks let me realize it could exceed 2048 if we continued processing.
+
+Also, when we think about designing a more efficient DB writer buffer structure, perhaps using `BTreeMap` and `VecDeque` could enhance performance. Creating subfolders for segments is possible, but we’d need to ensure the structure supports efficient reading and writing without excessive complexity.
+**Exploring sharded storage options**
+
+In sharded storage, I can see that allowing gaps or "holes" is feasible, as we can fill those gaps later without losing the ability to do so. This out-of-order storage could be beneficial. However, for RPC, having an availability map is crucial to identify which blocks are present.
+
+It seems we don't have such a map yet, but we could maintain it within the scheduler as metadata, although how we handle writes in the storage system, particularly with respect to out-of-order writes and updating `last_indexed_block`, remains unclear. I'll need to look deeper into the storage implementation for `write_block_bundle_batch`.
+[Tool call] Grep
+  pattern: fn write_block_bundle_batch
+  path: /Users/vicnaum/github/stateless-history-node/node/src/storage
+[Tool call] Grep
+  pattern: last_indexed_block
+  path: /Users/vicnaum/github/stateless-history-node/node/src/storage
+[Tool call] Grep
+  pattern: NippyJar|nippy
+  path: /Users/vicnaum/github/stateless-history-node/node/src/storage
+[Tool call] Read
+  path: /Users/vicnaum/github/stateless-history-node/benchmarks/data/20260122T102313Z-69705/meta.json
+
+[Tool result] Grep
+
+[Tool result] Grep
+
+[Tool result] Grep
+
+[Tool result] Read
+
+assistant:
+[Tool call] Read
+  path: /Users/vicnaum/github/stateless-history-node/node/src/storage/mod.rs
+  offset: 640
+  limit: 140
+
+[Tool result] Read
+
+assistant:
+[Thinking] **Inspecting storage logic**
+
+I'm considering this idea of organizing subfolders in segments of 50k blocks, essentially multi-jar segments. Each jar would hold 50k blocks, and I'd need to write contiguously within that jar. If I start writing at 125000 without filling the earlier blocks, I might run into issues trying to append later.
+
+I think I need to check the `append_rows` logic for segments to see if it allows skipping, as it seems it could be expecting the next value to match. I'll take a look at the Segment struct, especially around where `append_rows` is defined.
+[Tool call] Grep
+  pattern: fn append_rows\(
+  path: /Users/vicnaum/github/stateless-history-node/node/src/storage/mod.rs
+
+[Tool result] Grep
+
+assistant:
+[Tool call] Read
+  path: /Users/vicnaum/github/stateless-history-node/node/src/storage/mod.rs
+  offset: 240
+  limit: 120
+
+[Tool result] Read
+
+assistant:
+[Thinking] **Understanding data handling in storage**
+
+Alright, I’m exploring how `append_rows` works, allowing for gaps in storage by inserting empty rows as placeholders. This means it can fill segments when there are missing blocks. It’s interesting that the current DB writer requires a contiguous prefix for writing, but because `append_rows` can handle gaps, there might be an opportunity to let the DB writer go beyond the missing rows by filling in those gaps with empty data. That's a helpful insight!
+**Examining placeholder limitations**
+
+I'm considering how holes in storage are represented as empty rows, but there's a catch: `append_rows` doesn’t allow writing earlier than `next_block`, which means I can't fill those holes later. Once I reserve those empty bytes, they're permanent since there's no update method. So, placeholders can’t be patched. To support later filling, I’d need an update ability or to rebuild segments. It's interesting that they anticipated gaps but treat empty bytes as None and skip them. This makes the idea of filling later unfeasible, unless they suggest rewriting segments.
+**Exploring storage design possibilities**
+
+I'm thinking about how we could potentially manage storage by using subfolders to rebuild smaller segments. However, creating placeholders for missing blocks would lead to a permanent loss of those blocks in the current design. The idea behind a contiguous writer is to prevent gaps and ensure that the `last_indexed_block` remains a contiguous prefix. While storage segments allow gap filling, maybe we could use that for backfilling older ranges. But since `append_rows` only inserts empty rows, it won't help with retroactive filling. If we see the missing blocks as permanently absent, we could skip them, but that's not what the user wants. So, no skipping!
+**Evaluating sync scenarios**
+
+In considering their scenario of syncing ranges from 125k to 145k and then 60k to 125k, I realize that if I want to write at 125k first, I'd open a segment potentially starting from 0. If I call `append_rows` with 125k as the starting block, I would end up creating a massive gap of 125k empty rows, which feels wasteful. 
+
+However, if I start at 100k and write 125k, it creates a smaller 25k gap, but it's still a placeholder that I can't fill later unless I rebuild the segment. Using their proposed subfolder segmentation of 50k seems like a smarter solution since it limits the gap size. This way, I could start at 100k and fill up to 125k while managing those empty rows better. But still, there’s no filling for those holes later on unless we rebuild.
+**Assessing storage strategies**
+
+Right now, we rely on contiguous writing, but this has limitations for handling holes. If we use subfolders of 10k, we could avoid writing sequentially, as smaller segments can be compacted later. However, this delays persistence, raising risks of losing progress. To support this idea, we’d need mechanisms for per-shard compaction, coverage maps, and potentially a significant code change for routing.
+
+NippyJar segments allow for gap fill with empty rows, but they can’t patch later. Sharding helps reduce the impact of gaps since we can work on other shards while fixing one. So, the immediate suggestion is to enhance scheduler functionality and lookahead settings, while considering long-term shard-based designs. This aligns with existing practices, like Reth’s segment files structured by range.
+**Assessing writing segments and performance**
+
+Segments can read `None` for empty rows, but we generally avoid writing empties. When analyzing performance, I need to note the network's bottleneck impacts, where the DB writes at 400MiB/s, while downloads are just 8.7MiB/s. This can limit throughput when raising lookahead, although it may help conceal gaps and reduce stalls.
+
+However, increasing lookahead can lead to fetching and processing large amounts of data that might strain memory. Lastly, the "fast_sync_max_buffered_blocks" setting isn't currently used for sizing channels. 
+
+In terms of the proposed folder and shard structure, we need to consider feasibility and necessary adjustments to address gaps effectively.
+### Raising `max_lookahead_blocks` default to **50k**
+I’m on board **once escalation/fanout is correct** (so we don’t deadlock like `v3`).
+
+Two practical notes though:
+
+- **Memory math is real**: your own 100k runs averaged ~\(278kB\)/block fetched. A 50k lookahead is ~\(13–14GB\) of *raw payload bytes* worth of data “in flight” (and our in-memory structs are usually larger than their serialized form). It can fit in 32GB, but it’s not “free”.
+- **CPU trap in the current DB writer**: today it repeatedly sorts a growing buffer. With lookahead=50k, if we ever hit a gap, we risk turning the DB writer into a CPU hotspot just from managing that big buffer (even if network is the main bottleneck).
+
+So: **50k is a sensible default**, but we should pair it with (at least) a more efficient buffering structure in the DB writer (e.g. `BTreeMap`/ordered map keyed by block number, not “sort the whole vec repeatedly”).
+
+---
+
+### Is our DB writer consecutive? Can we make it not consecutive?
+**Yes, it is consecutive today by design**, and it’s not accidental:
+
+- `Storage::write_block_bundle_batch()` explicitly rejects non-contiguous batches.
+- Under the hood, each segment is a `NippyJar` and only supports **append** (plus prune).  
+  It *can* append “gaps” by inserting empty rows, but **it cannot patch those rows later**.
+
+So we currently have 3 important properties:
+- **Append-only**
+- **Contiguous batches required**
+- **No “fill later”** without rewriting files
+
+That means:
+- Your “write placeholders then fill later” isn’t supported in-place (we’d need either rewrite/compaction or an overlay).
+
+Also: syncing 125k–145k first, then later 60k–125k in the *same storage* is **not supported cleanly** with the current “single contiguous segment per column” model.
+
+---
+
+### Your “50k (or 10k) subfolder per block-range” idea
+This is essentially: **range-sharded static storage**. It’s a good and common pattern.
+
+What it would buy us:
+- A missing block would only stall **its shard** (e.g. the 100k–149,999 folder), not the entire DB.
+- Backfilling older history becomes natural: you create/fill older shards without touching newer ones.
+- Rebuilding/compacting becomes bounded by shard size.
+
+What it requires (important):
+- We must choose how shards get filled when ranges arrive out-of-order:
+  - **Rewrite shard on “merge”** (simple, but rewriting a 50k shard can be many GB)
+  - **Store multiple “runs” per shard + compact later** (more complex, but avoids rewriting on every incremental fill)
+  - **Overlay KV per shard** (complex, but great for patching rare holes)
+
+Shard size tradeoff:
+- **50k**: fewer folders (30M blocks → ~600 shards), but merges/rewrites are heavier.
+- **10k**: more folders (~3000 shards), but merges are much cheaper and “holes” are smaller blast-radius.
+
+So yes, your logic (“with 10k folders we can tolerate less lookahead / easier resort”) makes sense — because you’re moving the system from “global contiguity” to “local contiguity/compaction”.
+
+---
+
+### Do we have a “block availability map” today?
+**Not really.** Today we mostly assume availability is:
+- a contiguous prefix `start_block..=last_indexed_block` (tracked in `meta.json`)
+
+With shard storage (or any non-contiguous model), we absolutely want an explicit map:
+- per-shard **bitset** (10k bits = 1.25KB) or “present ranges”
+- persisted to disk so we don’t have to scan the whole DB at startup
+
+This also becomes useful for scheduling (“what’s missing?”) and RPC (“do we have this block?”).
+
+---
+
+### How this ties back to the current gap problem
+- **Short-term fix (scheduler):** we still need “rare/gap queue + fanout + don’t burn blocks on empty batch>1” to prevent deadlocks.
+- **Medium-term (lookahead):** raise default to **50k**, but don’t keep the DB-writer “sort huge vec repeatedly” approach.
+- **Long-term (storage):** your shard/subfolder design would *structurally* reduce the impact of gaps and unlock backfilling older ranges cleanly.
+
+If you want, I can propose a staged roadmap that gets us:
+1) scheduler robustness (no deadlocks, fanout, parallel rare queue),
+2) lookahead default 50k + DB-writer buffer structure change,
+3) shard storage + availability map (bigger project, but very aligned with your workflow goals).
+
+user:
+<user_query>
+I think I want to move to 10k blocks shards + per-shard bitset (and some kind of "complete" indicator), so you don't have to verify the whole bitset to know the shard if fully complete. These shards will also help with p2p syncing between Stateless History Nodes (so you can deliver a full compressed shard instead of block-per-block - for faster syncs).
+
+Let's plan this refactor - think about how we will do it, and the questions we still have.
+After that we can think how can we rework our queueing/fetching/escalating system to support new sharding scheme - cause this would simplify things a lot.
+</user_query>
+
+assistant:
+[Thinking] **Planning storage architecture**
+
+I think it’s time to switch to plan mode to outline our approach. However, I've noted that plan mode isn't currently active, so I’ll proceed with calling SwitchMode. My plan includes designing a new storage architecture with shards of 10k blocks, incorporating various segments plus indicators for availability and completion. I'm considering how to handle transitions for reading, writing, and syncing between nodes, including compressed shards and integrity verification. There’s a lot to strategize, but this is the right direction!
+**Analyzing current storage module**
+
+I need to analyze the existing storage module, which currently uses a static directory structure with segments like `static/headers` and includes `.conf` and `.off` files using reth_nippy_jar. My idea is to reorganize this into subdirectories, such as `static/shards/<shard_start>/headers`. However, I must consider that the NippyJar header includes start_block, which we'll use for shard starting points. It'll be important to create mappings from block numbers to shard starts while keeping everything aligned properly within 10k boundaries. This will streamline packaging and organization!
+**Storing block metadata efficiently**
+
+I realize we can still store the `start_block` for metadata, even though shards might start earlier. We could also track `storage_min_block` and `storage_max_block` for coverage. It's important to note that in our new model, we'll allow for partial shards where a bitset indicates present blocks, and a completion indicator confirms full data verification. Since data may arrive out of order, we’ll need a writer that can insert a row for a specific block index within a shard. NippyJar allows append-only, so I’m considering options like writing individual files or using a run system for ordered merging despite potential overhead.
+**Exploring data writing strategies**
+
+Rewriting could be cumbersome, particularly with receipts, but maybe for 10k blocks, it’s manageable at around 1-2 GB. An alternative is using an overlay approach with a small key-value database, like SQLite, for handling out-of-order blocks within a shard until completed, then compacting that into NippyJar, though that adds complexity. I could also consider treating each block separately with NippyJar, but that seems inefficient. Since the aim is to deliver full compressed shards, designing each shard as a set of NippyJars with an index file might be best. For writes, I prefer sequential writing but accept out-of-order for practicality.
+**Designing for out-of-order writes**
+
+I’m considering maintaining an in-memory map buffer for each shard, allowing contiguous sequences to be flushed to the NippyJar writer. This requires blocks to be written in increasing order within each shard. It’s feasible since missing blocks don't block writing to other shards, but I still can’t write to a shard with missing earlier blocks. I need to think about using placeholders or a staging area for out-of-order writes since the NippyJar's append-only nature creates challenges with filling gaps later. This requires designing a flexible structure that handles these complexities!
+**Planning shard structure and metadata**
+
+I’m thinking about storing blocks like 125000-145000 in a temporary key-value store or using separate NippyJar runs, merging them when older blocks arrive. Alternatively, I could structure each shard as a directory of multiple contiguous NippyJar runs, allowing for an organized read path. I’ll set the shard size to 10k blocks, as the user prefers that. The directory structure might be `static/shards/<start>/headers`, and the metadata can include each shard's details. Lastly, I’ll need to update the Storage APIs to accommodate reading across shards and adapting the write methods to fit this new design!
+**Exploring storage gaps**
+
+I need to look into the `storage_gap_fill_skips_missing_rows` test, as those tests might indicate reading gaps. The `read_row` function returns None for empty row bytes, which could mean that if there's a gap, it skips over those missing rows. I should check out `read_range_compat` since that might affect the bitset. Also, since this is an append-only structure, we can't fill in missing rows later. Let’s see how the read path handles these empty rows.
+**Considering data pruning strategy**
+
+I'm thinking about a scenario where if we write from 125000 to 145000 and leave a gap from 100000 to 124999, we could prune down to 99999 later and then rewrite the full shard. But wait—pruning only works from the end, so attempting to prune down to 99999 would remove all the rows and reset. Maybe, if I restructure the way we store runs as separate jar files starting at their own blocks, we could then merge them later. I also need to look into how `Segment` handles reading and writing.
+**Considering staging store implementation**
+
+I’m thinking about implementing a staging store with separate NippyJar files for each contiguous run. We can write batches to a "run" file for that shard, appending contiguous blocks as needed. This seems to require only minimal new dependencies since we already rely on reth_nippy_jar. 
+
+However, reading from multiple run files complicates things. We can use a `Shard` abstraction to find the correct row in a run. Although NippyJar reads sequentially, accessing row by number within its index seems feasible. For multiple runs, we’ll need a manifest to track ranges and perform a binary search on the run list.
+**Addressing run overlaps and completeness**
+
+I’m considering how to handle overlaps when managing runs. Should I choose the latest run or a fully complete one? To keep it simple, I'll aim to avoid overlaps. If writing a new run, it shouldn't overlap with existing ones. However, ingestion might create overlaps, especially when retrying blocks. 
+
+I could manage duplicate data with a bitset for each shard, updated upon successful storage. The "complete indicator" as a boolean could also track the `present_count` to check if it matches the shard size. I need to account for duplicates not incrementing present_count; otherwise, it might drift.
+**Planning for p2p sharing and sharding**
+
+For peer-to-peer sharing, I want to ensure that a shard is complete before packaging it. This means I'll need to maintain a complete flag. I'm also pondering whether we have a "block availability map." Currently, the metadata includes `last_indexed_block` and `start_block`, which suffice for contiguous storage prefixes. However, with sharding and hole support, an explicit map seems necessary.
+
+The user is looking to plan a refactor, and I realize there are still questions to address. I should consider all these aspects carefully!
+**Planning storage phases**
+
+I'm drafting a plan with several phases. First, I want to define our goals and invariants for the project. For instance, we need to support partial shards and have the ability to backfill older ranges, resume work, and deliver complete shards while preserving existing RPC and reader semantics.
+
+Next, for Phase 1, I’m thinking about the new storage layout and metadata. A possible new directory structure could be `storage_v2` with relevant metadata updates like `shard_size` and `coverage`. Plus, each shard will include a `shard.meta.json` file with specific attributes. For data storage, I’m considering how to structure files with runs and segments efficiently.
+**Evaluating NippyJar structure**
+
+I'm considering how NippyJar supports multiple columns, but it looks like they might be using a single column jar for each segment type. For our runs, it seems like we need to maintain separate jars per segment just like we do now. I'm thinking it might be better to have one jar per segment in each shard with the capability to rewrite or compact them. However, NippyJar doesn’t support mid-insertion, so it looks like we’ll have to keep multiple run jars and merge them into one canonical jar per segment during compaction.
+**Evaluating scheduler modifications**
+
+I'm considering some updates for sharding. Instead of relying on a global prefix and watermark, I think we could focus on each shard's completion and gaps. This way, the scheduler can assign blocks out of global order but still favor older shards for efficiency.
+
+I also want to introduce a rare queue for each shard or block. However, the user prefers to prioritize a storage refactor first. I need to adjust stats, as current summaries expect blocks written to equal blocks processed, which might change.
+**Considering shard locking and memory**
+
+I'm thinking we need locking per shard. For memory, it could make sense to store a bitset as `Vec<u8>` loaded at startup for all shards. For 30M blocks, that’s around 3.75MB, which sounds okay. If we store a per-shard bitset file, maybe memory mapping is an option.
+
+Regarding the “complete indicator,” I could store `present_count`, `complete` boolean, and perhaps also `complete_at` timestamp and `compacted` boolean. The user wants to raise the default to 50k, but they seem to want to focus on sharding first, so that might be a future task.
+**Planning implementation steps**
+
+I need to remember that we shouldn't implement the changes just yet since the user asked for planning and brainstorming. They proposed splitting the database into subfolders (shards), and that sounds like a significant refactor, so we should definitely plan it out first. It’s probably best not to create new todos unless explicitly requested. Since they haven’t asked to implement anything yet, we might hold off on TodoWrite. I think I should call SwitchMode to move into planning mode.
+[Tool call] SwitchMode
+  target_mode_id: plan
+  explanation: This is a large storage + scheduler architecture refactor with multiple viable designs/tradeoffs (shard layout, compaction strategy, RPC semantics, migration), so switching to Plan mode will help us design it carefully before touching code.
+
+[Tool result] SwitchMode
+
+assistant:
+[Thinking] **Planning for Sharding**
+
+Alright, the user wants to move to 10k block shards with a per-shard bitset and a complete indicator. This will help with P2P syncing between nodes by delivering a fully compressed shard. I’m considering how to plan the refactor and what questions we still have.
+
+I need to propose a technical design plan that includes aspects like storage layout, metadata structures, API changes, and more. We also need to address whether we have a blocks availability map, and even though the user rejected the plan mode, I can still provide this in a clear and plain message.
+**Proposing Shard Goals and Layout**
+
+I want to outline the goals and non-goals for our sharding proposal. The goals include supporting sparse historical coverage, allowing for arbitrary ranges and backfilling, and having each shard cover a fixed interval of 10,000 blocks. Each shard will feature its local presence bitset and flags for counting and completion.
+
+The proposed shard file layout will include a manifest with version details and shard information, a presence bitset file, and a directory for run files. It’s important to maintain our existing ingest pipeline while acknowledging that we can iterate on performance later.
+**Outlining Run Structure and Write Algorithm**
+
+I’m considering Option A for our run structure, which involves having each run contain 5 segment files: headers, tx_hashes, tx_meta, receipts, and block_sizes, along with their respective .conf and .off files. Each run file starts at run_start and allows for arbitrary writing ranges without needing to begin at shard_start.
+
+Once a shard is complete, we can compact the runs into canonical segment files within the shard directory and delete the original runs. This process is similar to LSM compaction. For the write algorithm, we’ll group contiguous blocks produced by the ingest pipeline by shard.
+**Defining Run Flushing and Concurrency Management**
+
+For each shard, I’m planning to flush contiguous sequences as one run. The run_start will be the first block, and the run_end will be the last block. I’ll write the BlockBundle data into the segment NippyJar files associated with that run and update the presence bitset for each block written, along with the present_count and complete flag.
+
+To handle duplicates, I’ll check the bitset first and skip writing if the block is already present, which will help reduce storage. For overlapping runs, if blocks are already noted in the bitset, those won’t be written again. Lastly, I’ll maintain a lock per shard to prevent concurrent run creation and bitset updates.
+**Developing Read Algorithm and Global Metadata**
+
+I’m outlining the read algorithm and global metadata changes for our sharding approach. For reading a block number, I’ll determine the shard_start and load the shard manifest and bitset. If necessary, I’ll read from the compacted canonical segment for efficiency. For range queries, I'll iterate over overlapping shards and gather present blocks.
+
+The availability map will utilize a presence bitset for completeness, with metadata changes to a new schema including `schema_version` and `coverage` details. Additionally, I’ll establish a migration plan for schema changes and consider how to compact shards when complete, ensuring ease for P2P sync by packaging compacted directories.
+**Planning Scheduler Rework and Storage Model**
+
+I like the idea of reorganizing the scheduler. Instead of a per-block pending heap, I’ll propose scheduling missing blocks per shard, potentially using BFS or a shard queue. The rare queue will fill gaps by choosing missing bits, allowing for out-of-order writes into different shards.
+
+For blocks availability maps, we’ll affirm that currently, there isn’t an explicit map, but we can scan static segments. I'll outline task phases and open questions about storage models, shard alignment, and automatic compaction. We’ll also consider raising the default lookahead to 50k as an intermediate step. Overall, I plan to create a two-layer design and emphasize that our existing segments are already append-only, ensuring we don't break functionality during this transition.
+**Crafting a Detailed Plan**
+
+I’m outlining a detailed plan with multiple phases for the storage refactor.
+
+In **Phase A**, I'll define the on-disk format and metadata, including a `StorageLayout` enum and adding necessary structures like `ShardId` and `ShardMeta`.
+
+In **Phase B**, I’ll implement read-only support for shards, allowing the opening of storage and reading `eth_blockNumber`, along with building tests.
+
+**Phase C** centers on writing functionality for shards, introducing `ShardWriter` and a compaction function along with updating the ingest pipeline.
+
+Lastly, in **Phase D**, I'll acknowledge the need for a storage rework before updating the scheduler to operate at the shard level, noting that shards also allow for "cold syncing" by shipping shard packages.
+### High-signal take: your 10k-shard + bitset idea is **very** aligned with (a) fixing today’s gap pain structurally, and (b) enabling fast “shard shipping” between nodes.
+
+But to make it work with NippyJar (append-only), we need to be careful about **how we write partial shards**.
+
+---
+
+## Key constraint in current storage (why sharding needs a specific design)
+Right now each segment is a **single append-only NippyJar**; it can *append with gaps* (by writing empty rows), but it **cannot fill those empty rows later**.
+
+So if we try “write 125k–145k into shard 120k first, later fill 120k–124,999”, **we can’t patch it in-place** if we wrote placeholders or advanced the append cursor past it.
+
+That’s why the sharded design needs either:
+- **a mutable overlay**, or
+- **multi-run files + compaction** (LSM style), or
+- rewrite the shard when adding earlier blocks.
+
+For minimal dependencies + shard-packaging friendliness, **multi-run + compaction is the sweet spot**.
+
+---
+
+## Proposed storage design (10k shards) — pragmatic + future-proof
+
+### 1) On-disk layout (per shard)
+Under `data_dir/static/shards/<shard_start>/`:
+
+- **`shard.json`** (small metadata)
+  - `shard_start`, `shard_size=10000`, `present_count`, `complete: bool`
+  - optional: `compacted: bool`, `updated_at`, `format_version`, hashes
+- **`present.bitset`** (binary bitset, 10k bits = 1250 bytes)
+- **`runs/`** (append-only “runs”, created as we ingest out-of-order)
+  - each run represents a contiguous range we obtained, e.g. `[125000..125511]`
+  - each run stores the same segment set we already store today (headers/tx_hashes/tx_meta/receipts/sizes) as NippyJar files
+
+Then:
+- When `present_count == shard_size`, set **`complete=true`**
+- Optionally trigger **compaction**: merge `runs/` into a single canonical set of NippyJars inside the shard dir and delete `runs/`.
+
+This gives you:
+- out-of-order ingestion into a shard (by adding runs)
+- easy packaging for node-to-node sync once compacted (ship the shard directory)
+
+### 2) “Complete indicator” without scanning the bitset
+Exactly as you suggested:
+- maintain `present_count` in `shard.json`
+- update it only when a bit flips from 0→1
+- `complete = (present_count == shard_size)`
+
+No need to scan the bitset on startup.
+
+### 3) “Do we have an availability map?”
+Today: **no**, because the old storage assumes a contiguous prefix and stores only `last_indexed_block`.
+
+With shards:
+- the **bitset is the availability map**
+- globally, we can also maintain a lightweight “shard index” cache in memory, loaded by scanning `static/shards/*/shard.json` (fast).
+
+---
+
+## How this helps the current gap problem
+With sharding:
+- a missing block only stalls **its shard**, not the entire DB
+- we can keep committing other shards/runs while one shard is “rare-gap blocked”
+- and the scheduler can become “shard-aware” and avoid wasting work on blocks already present (bitset)
+
+It doesn’t magically remove “rare blocks”, but it removes the **global contiguity coupling** that caused huge backlog flushes.
+
+---
+
+## Plan for the refactor (incremental, minimize breakage)
+
+### Phase A — Storage format + metadata (no pipeline changes yet)
+- Add **schema versioning** to `meta.json` (e.g. `schema_version: 2`, `shard_size: 10000`)
+- Implement new `ShardedStorage` alongside the existing storage.
+- Implement shard discovery/loading:
+  - locate shards, read `shard.json`, load bitset
+- Define what `Storage::has_block(n)` means in the new world.
+
+**Open questions to decide here**
+- **Shard alignment**: I strongly recommend absolute `floor(n/10000)*10000` (good for sharing shards between nodes).
+- **What does “block is present” mean?** I recommend: “full bundle present” (headers+bodies+receipts-derived artifacts), not “header-only”.
+
+### Phase B — Read path (RPC keeps working)
+- Implement reads through shard routing:
+  - `block_header(n)` → shard → if bit set → read from compacted jar or from runs
+- Range reads iterate shards.
+- Decide semantics for `eth_blockNumber`:
+  - Option 1: “highest contiguous tip we have” (safer)
+  - Option 2: “max present block” (faster but can lie if there are holes)
+
+### Phase C — Write path for ingest (multi-run writer)
+- Replace the single global contiguous DB writer with a **shard writer**:
+  - incoming `BlockBundle` goes to the correct shard
+  - batch into contiguous runs where possible
+  - write a new run file per shard (append-only)
+  - update bitset + present_count
+- Add optional compaction:
+  - when `complete`, merge runs into canonical jars (good for P2P shard shipping)
+
+**Open questions**
+- **Compaction policy**: on-complete immediately vs background vs manual CLI.
+- **Duplicate handling**: skip writing if bit already set (recommended).
+
+### Phase D — Migration strategy
+- Easiest/safest: require a **new `data_dir`** for schema v2.
+- Optional later: a migration tool to split old contiguous segments into shards.
+
+### Phase E — Scheduler refactor (after storage lands)
+Once storage can handle out-of-order by shard:
+- Scheduler becomes **“missing-first by shard”**
+- “failed” becomes “rare” (terminology + behavior)
+- Rare queue runs in parallel and uses fanout attempts
+- Lookahead becomes less critical; we can switch to a **memory/bytes budget** instead of a block-count cap
+
+---
+
+## About raising `max_lookahead_blocks` default to 50k
+Agreed, but I’d treat it as an **intermediate tuning knob** for the current architecture.
+With shards + runs, we’ll likely want to replace “lookahead blocks” with “max buffered bytes” anyway.
+
+---
+
+## Biggest remaining questions (to answer before coding)
+1) **Do we require shard completeness to serve RPC, or can RPC serve partial shards?**  
+2) **Do we want to support “backfill older ranges into existing DB” as a first-class feature immediately?** (your shard plan enables it, but it affects metadata + RPC semantics)
+3) **Compaction timing**: immediate vs background vs manual (this affects performance and disk usage).
+4) **Shard packaging format + integrity** for node-to-node sync (tar.zst? per-file hashes?).
+
+If you answer those 4, I can turn this into a concrete step-by-step implementation sequence (files to add/change, minimal API surface changes, and a testing strategy) before we touch any code.
+
+user:
+<user_query>
+I think we should go with the approach when we append randomly to the shard, and rewriting the shard (sorting it) when we stop adding new blocks to it.
+
+1) During the initial fast sync - maybe let's just write to shards non-sorted, until the shard is marked as fully complete, and then we rewrite the shard in a sorted way when it's fully complete and mark it as done (we can have some shard metadata in the data root folder that would save how many blocks the shard has, it's state - complete/incomplete, sorted/non-sorted - etc, or something like that (you think of proper organization of this). If we just partially fill the shard (like, start from the middle of it, or just fetch a small range in the middle initially) - we might want to trigger sorting even if it's not yet complete. What do you think about this? I think it's simpler than having multi-run files inside, cause the format always stays the same, it's just either unsorted (while fetching, we just append to the end of the shard file) or sorted (after our current run fetched everything he wanted into that particular shard).
+2) We could also reorganize our ingestion queue so the starting queue is always split by shard. Thus once there is no more blocks left to fetch from some shard's queue - we can start that shard sorting process, cause we know we won't be appending anymore to it in this run.
+3) I like the ideas behind shard.json and metadata
+
+Now to your questions:
+Phase A:
+- Yes, Shards should be aligned to floor(n/10000)*10000
+- Block is full bundle (we don't write the block down until full bundle is present)
+Phase B:
+- Max present block, as we don't really have the full history either (we usually don't start from genesis 0)
+Phase C:
+- On compaction - I wrote my opinion/idea above
+- We shouldn't even put the blocks to queue if the bit is present (i.e. prefilter the queue by what we have in shards)
+Phase D:
+- We don't need to migrate - all our data is benchmarks so far - its safe to delete and just use the new schema
+Phase E:
+- All good
+
+Biggest questions answers:
+1) We can share with partial shards as long as the ingestion run is finished and we flushed and have them sorted
+2) Yes, we should, that's the whole point of refactoring for shards
+3) I wrote above on compaction (i.e. we go with sorting after finish fetching shard)
+4) node-to-node shard sync details - let's postpone into roadmap
+
+--
+
+Now, I think it's more or less clear, so you can try to write a corrected detailed plan into some SHARDING_REFACTOR_PLAN spec md file.
+You can also include the details and thoughts for the future ingestion/queueing/fetching refactor, cause sharding will change this.
+
+Make it clear, detailed and specific. Add any questions you still have in the end.
+</user_query>

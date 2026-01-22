@@ -5,9 +5,8 @@ This repo contains a working **receipt availability harness** (see Appendix A) a
 ## Current status (v0.1)
 - Range backfill and continuous follow mode using P2P headers/bodies/receipts.
 - Live reorg handling within a configurable rollback window (v0.1 default: delete-on-rollback).
-- Static-file persistence (NippyJar) for headers, tx hashes, tx metadata (no calldata;
-  signature + signing hash stored for sender recovery), receipts, and block size.
-- Storage refactor: MDBX replaced by NippyJar static files.
+- Sharded static-file persistence (Storage v2): per-`--shard-size` shard directories with
+  per-shard presence bitsets + WAL staging + compaction into canonical sorted segments.
 - Logs are derived on demand; withdrawals are not stored.
 - Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
   `eth_getBlockByNumber`, `eth_getLogs`).
@@ -84,13 +83,15 @@ High-level components (mirrors reth’s separation of concerns):
 5. **RPC**: a minimal JSON-RPC server with safe defaults (localhost bind by default, query limits) and only the namespaces we support.
 
 ## Historical fast sync (v0.1.5)
-For blocks **older than the reorg window**, we use a fast backfill mode:
-- split the historical range into fixed-size chunks (default 16)
-- fetch chunks concurrently across peers with bounded in-flight requests
-- buffer out-of-order chunks and write in block order
-- persist each chunk in a single static-file append batch
+For blocks **older than the reorg window**, we run a fast backfill mode that supports
+**out-of-order ingestion** via Storage v2 shards:
+- schedule missing blocks across the target range (prefiltered by shard presence bitsets)
+- write out-of-order blocks to per-shard `state/staging.wal`
+- compact “done for this run” shards into canonical `sorted/` segments
 
-For blocks **inside the reorg window**, use the existing safe sequential path.
+For blocks **inside the reorg window**, the follow loop keeps the DB consistent via rollback.
+
+Storage format details (schema v2): `spec/worklogs/sharding_refactor/SHARDED_STORAGE_REFACTOR_SPEC.md`.
 
 ## References
 - Reth knowledge base index: `spec/reth_kb/INDEX.md`

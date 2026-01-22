@@ -61,7 +61,8 @@ This section is the concrete “contract” we implement for v0.1. It is intenti
 **2) `eth_blockNumber`**
 - **Params**: `[]`
 - **Result**: hex quantity block number.
-- **Semantics**: returns the **highest canonical block number fully indexed and queryable** by this node. May temporarily decrease within the configured reorg rollback window.
+- **Semantics**: returns the **highest block number present in storage** (`max_present_block`).
+  This may be non-contiguous (holes are possible); clients must handle gaps explicitly (see `eth_getLogs` behavior below).
 
 **3) `eth_getBlockByNumber`**
 - **Params**: `[block: "latest" | hex_quantity, full_transactions: boolean]`
@@ -93,6 +94,11 @@ This section is the concrete “contract” we implement for v0.1. It is intenti
     - block range too wide: `block range exceeds max_blocks_per_filter`
     - too many logs: `response exceeds max_logs_per_response`
   - **rindexer retry behavior**: rindexer will shrink the requested range on *any* `eth_getLogs` error.
+- **Availability semantics (all-or-nothing)**:
+  - If **any** block in `[fromBlock..=toBlock]` is missing in storage, return a JSON-RPC **server error**:
+    - code: `-32001`
+    - message: `missing block in requested range`
+    - data: `{ "missing_block": "0x..." }` (first missing block)
 
 Optional / deferred (v0.2+):
 - **Ponder baseline compatibility adds**:
@@ -140,7 +146,8 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
      - checkpoint: “last fully indexed block”
 
 4. **Storage**
-   - Baseline: append-only static-file storage (NippyJar) with explicit schema/versioning.
+   - Baseline: sharded static-file storage (schema v2) built on per-shard NippyJar segments, with
+     per-shard presence bitsets, staging WAL, and compaction into canonical sorted shards.
    - Must support:
      - idempotent writes
      - range queries for logs

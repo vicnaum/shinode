@@ -104,6 +104,16 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] **Follow mode**: loop until head, then keep up with new heads
 - [x] **Live reorg handling**: detect reorgs while following and roll back checkpoints
 
+### v0.1.7 Sharded storage v2 (DB shards)
+- [x] Storage schema v2: `static/shards/<shard_start>/` with per-shard metadata + presence bitset.
+- [x] Per-shard staging WAL (`state/staging.wal`) + startup replay + bounded-concurrency compaction into canonical `sorted/`.
+- [x] Shard sealing + SHA-256 `content_hash` for future distribution/integrity.
+- [x] Shard-aware db writer and scheduler (out-of-order ingestion without global contiguous backpressure).
+- [x] RPC availability semantics:
+  - `eth_blockNumber` reports `max_present_block`
+  - `eth_getLogs` errors if any block in the range is missing (`-32001`)
+- Verified: `cargo test --manifest-path node/Cargo.toml`
+
 ### Deferred RPC extras (post v0.1)
 - [ ] **Ponder compatibility** requires more than rindexer:
   - `eth_getBlockByHash` (reorg traversal via `parentHash`)

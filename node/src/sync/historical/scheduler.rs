@@ -3,10 +3,7 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicU64, Arc},
     time::{Duration, Instant},
 };
 
@@ -616,13 +613,7 @@ impl PeerWorkScheduler {
                 break;
             };
 
-            let lookahead = self.config.max_lookahead_blocks;
-            if lookahead > 0 {
-                let watermark = self.low_watermark.load(Ordering::Relaxed);
-                if next > watermark.saturating_add(lookahead) {
-                    break;
-                }
-            }
+            // Sharded storage removes contiguous watermark backpressure.
             if next > peer_head {
                 break;
             }

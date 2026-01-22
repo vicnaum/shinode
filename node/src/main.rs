@@ -690,8 +690,13 @@ async fn main() -> Result<()> {
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
-        let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
-        let head_at_startup = source.head().await?;
+        let head_at_startup = wait_for_peer_head(
+            &session.pool,
+            config.start_block,
+            config.end_block,
+            config.rollback_window,
+        )
+        .await;
         let range = compute_target_range(
             config.start_block,
             config.end_block,
@@ -878,10 +883,15 @@ async fn main() -> Result<()> {
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
-        let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
-        let initial_head = source.head().await?;
         let last_indexed = storage.last_indexed_block()?;
         let start_from = select_start_from(config.start_block, last_indexed);
+        let initial_head = wait_for_peer_head(
+            &session.pool,
+            start_from,
+            config.end_block,
+            config.rollback_window,
+        )
+        .await;
         let initial_range = compute_target_range(
             start_from,
             config.end_block,
@@ -992,6 +1002,41 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn wait_for_peer_head(
+    pool: &Arc<PeerPool>,
+    start_block: u64,
+    end_block: Option<u64>,
+    rollback_window: u64,
+) -> u64 {
+    let mut last_log = Instant::now() - Duration::from_secs(10);
+    loop {
+        let peers = pool.snapshot();
+        let best_head = peers
+            .iter()
+            .map(|peer| peer.head_number)
+            .max()
+            .unwrap_or(0);
+        let safe_head = best_head.saturating_sub(rollback_window);
+        let requested_end = end_block.unwrap_or(safe_head);
+        let end = requested_end.min(safe_head);
+        if start_block <= end {
+            return best_head;
+        }
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            info!(
+                peers = peers.len(),
+                best_head,
+                safe_head,
+                start_block,
+                requested_end,
+                "waiting for peer head to reach start block"
+            );
+            last_log = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn init_tracing(

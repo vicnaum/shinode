@@ -161,6 +161,7 @@ mod tests {
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("rpc bind"),
             start_block: 0,
+            shard_size: crate::cli::DEFAULT_SHARD_SIZE,
             end_block: None,
             rollback_window: 64,
             retention_mode: RetentionMode::Full,
@@ -197,6 +198,22 @@ mod tests {
         header
     }
 
+    fn write_bundle(storage: &Storage, header: Header) {
+        let bundle = crate::storage::BlockBundle {
+            number: header.number,
+            header,
+            tx_hashes: crate::storage::StoredTxHashes { hashes: Vec::new() },
+            transactions: crate::storage::StoredTransactions { txs: Vec::new() },
+            withdrawals: crate::storage::StoredWithdrawals { withdrawals: None },
+            size: crate::storage::StoredBlockSize { size: 0 },
+            receipts: crate::storage::StoredReceipts { receipts: Vec::new() },
+            logs: crate::storage::StoredLogs { logs: Vec::new() },
+        };
+        storage
+            .write_block_bundle_follow(&bundle)
+            .expect("write bundle");
+    }
+
     #[test]
     fn ancestor_picks_highest_match() {
         let stored = HashMap::from([(1u64, b(1)), (2, b(2)), (3, b(3))]);
@@ -218,9 +235,7 @@ mod tests {
         let storage = Storage::open(&config).expect("open storage");
 
         let stored_header = header_with_number(10, b(1));
-        storage
-            .write_block_header(10, stored_header.clone())
-            .expect("write header");
+        write_bundle(&storage, stored_header.clone());
         let stored_hash = SealedHeader::seal_slow(stored_header.clone()).hash();
 
         let (tx, mut rx) = mpsc::channel(8);
@@ -268,9 +283,7 @@ mod tests {
         let storage = Storage::open(&config).expect("open storage");
 
         let stored_header = header_with_number(10, b(1));
-        storage
-            .write_block_header(10, stored_header.clone())
-            .expect("write header");
+        write_bundle(&storage, stored_header.clone());
 
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
@@ -317,9 +330,7 @@ mod tests {
         let storage = Storage::open(&config).expect("open storage");
 
         let stored_header = header_with_number(10, b(1));
-        storage
-            .write_block_header(10, stored_header)
-            .expect("write header");
+        write_bundle(&storage, stored_header);
 
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
