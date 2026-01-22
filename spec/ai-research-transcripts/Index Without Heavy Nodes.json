@@ -1,0 +1,427 @@
+{
+  "runSettings": {
+    "temperature": 1.0,
+    "model": "models/gemini-3-flash-preview",
+    "topP": 0.95,
+    "topK": 64,
+    "maxOutputTokens": 65536,
+    "safetySettings": [{
+      "category": "HARM_CATEGORY_HARASSMENT",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_HATE_SPEECH",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+      "threshold": "OFF"
+    }],
+    "enableCodeExecution": false,
+    "enableSearchAsATool": false,
+    "enableBrowseAsATool": false,
+    "enableAutoFunctionResponse": false,
+    "thinkingBudget": -1,
+    "outputResolution": "1K",
+    "thinkingLevel": "THINKING_HIGH"
+  },
+  "systemInstruction": {
+  },
+  "chunkedPrompt": {
+    "chunks": [{
+      "driveDocument": {
+        "id": "1flCngYPCkZ-gTUK-F6-vyZg9izW6th3j"
+      },
+      "role": "user",
+      "tokenCount": 54050
+    }, {
+      "driveDocument": {
+        "id": "1v0sIJPA_GQkRbNSM5oXIzPq0Lo41sk8y"
+      },
+      "role": "user",
+      "tokenCount": 9651
+    }, {
+      "driveDocument": {
+        "id": "1EcPM6Er2ZMOrVRKvi1L68Ct3De6R1FO_"
+      },
+      "role": "user",
+      "tokenCount": 6328
+    }, {
+      "driveDocument": {
+        "id": "1tELew9l511RysKOpXF2WoQri3csIVm2f"
+      },
+      "role": "user",
+      "tokenCount": 4176
+    }, {
+      "driveDocument": {
+        "id": "1cMcgkaR1rxX5ANTaWZE9q9tniYUoJMKT"
+      },
+      "role": "user",
+      "tokenCount": 2302
+    }, {
+      "driveDocument": {
+        "id": "1nZjk81N-lWT0QKgYagZLKYLUi0E_PWpW"
+      },
+      "role": "user",
+      "tokenCount": 2053
+    }, {
+      "driveDocument": {
+        "id": "1__FObwBdUwvhKYmiGNXl8mDBmipbu4cQ"
+      },
+      "role": "user",
+      "tokenCount": 944
+    }, {
+      "text": "I want to index Uniswap v4 events without paying third-party RPC providers by building a stateless history client. “Stateless” here means: no EVM execution, no state trie/database, no archive/full node state growth. The client will only acquire and persist history artifacts needed for event indexing: canonical block headers (timestamp/number/hash/parent), transaction receipts (logs/events), and optionally a minimal extracted tx record (tx hash, from/to, value) rather than raw calldata. Correctness will be “stage-1 pragmatic”: I will accept weaker trust assumptions (e.g., trusting my own upstream sources or peer set) while still optionally validating that fetched receipts match the header’s receiptsRoot.\n\nPhase 1 (Ethereum L1): implement an EL devp2p/ETH history client that peers with Ethereum execution nodes and fetches headers + receipts (and optionally bodies for a short rolling window), storing only what’s required for indexing and re-serving cached data to remain a useful peer.\n\nPhase 2 (OP-based): After this works end-to-end on L1, extend the same principle to OP Stack L2s (Base, later Optimism): run the same style of client against op-geth/op-reth peers to fetch L2 headers + receipts over EL P2P, again without executing transactions or maintaining state. Only if peer history availability proves insufficient would I introduce heavier components (e.g., rollup-node derivation + execution client), but the intended path is P2P receipts ingestion → persistent receipts/log DB → indexer, staying stateless throughout. If needed - we can use our L1 RPC for op-node requirement (and can even filter the data it needs that\u0027s stored in L1 calldata).\n\n--\n\nI have done some research, and wrote a spec for a reth harness that I want to do. I want to to examine this (especially `harness_spec.md`) and try to understand the problem.\n\nThen I\u0027m attaching you reth.tree.txt that contains a folder tree and biggest files of the `reth` repository.\nI want to pick the context that is relevant to my task, and filter out everything else.\n\nPlease make me a list, which folders I should definitely exclude, and which ones I should definitely include.",
+      "role": "user",
+      "tokenCount": 488
+    }, {
+      "text": "**Designing a Client Architecture**\n\nI\u0027m currently focused on the initial phase: building the Ethereum L1 devp2p client. My goal is a stateless history client, meaning no EVM or state database. I plan to use P2P via devp2p/RLPx for data acquisition, specifically headers and receipts, to index Uniswap v4 events.\n\n\n**Outlining Core Components**\n\nI\u0027m now zeroing in on the essential components needed, and, crucially, what to leave out. The plan solidifies around networking—RLPx, Discovery, and wire protocol (`eth/66-70`)—along with core primitives (Headers, Receipts, Hashes, Trie logic) and chain specs (Mainnet, Base). My approach is streamlined; the EVM, execution logic, state DB, sync pipeline, transaction pool, and RPC server logic are all out.\n\n\n**Identifying Essential Dependencies**\n\nI\u0027ve been meticulously sorting the needed crates. On the networking side, I\u0027ll definitely incorporate Discovery (v4 and v5), ECIES for RLPx encryption, and robust peer management. I\u0027m also including core primitives and Mainnet/Base chain specs. Crucially, I\u0027m integrating Trie logic for validation and a minimal node builder with basic configuration options. Heavy components like the EVM and DB are definitely out.\n\n\n**Clarifying Scope Boundaries**\n\nI\u0027m presently refining the architectural scope and identifying specific crates to exclude. I\u0027ve ruled out `crates/stages`, the transaction pool and JSON-RPC, `evm` components, and the optimism and era components. My rationale centers on keeping the design lean, which excludes syncing logic and specialized execution environments. I\u0027m focusing on the \"Reth as a library\" model.\n\n\n",
+      "role": "model",
+      "isThought": true,
+      "parts": [{
+        "text": "**Designing a Client Architecture**\n\nI\u0027m currently focused on the initial phase: building the Ethereum L1 devp2p client. My goal is a stateless history client, meaning no EVM or state database. I plan to use P2P via devp2p/RLPx for data acquisition, specifically headers and receipts, to index Uniswap v4 events.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Outlining Core Components**\n\nI\u0027m now zeroing in on the essential components needed, and, crucially, what to leave out. The plan solidifies around networking—RLPx, Discovery, and wire protocol (`eth/66-70`)—along with core primitives (Headers, Receipts, Hashes, Trie logic) and chain specs (Mainnet, Base). My approach is streamlined; the EVM, execution logic, state DB, sync pipeline, transaction pool, and RPC server logic are all out.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Identifying Essential Dependencies**\n\nI\u0027ve been meticulously sorting the needed crates. On the networking side, I\u0027ll definitely incorporate Discovery (v4 and v5), ECIES for RLPx encryption, and robust peer management. I\u0027m also including core primitives and Mainnet/Base chain specs. Crucially, I\u0027m integrating Trie logic for validation and a minimal node builder with basic configuration options. Heavy components like the EVM and DB are definitely out.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Clarifying Scope Boundaries**\n\nI\u0027m presently refining the architectural scope and identifying specific crates to exclude. I\u0027ve ruled out `crates/stages`, the transaction pool and JSON-RPC, `evm` components, and the optimism and era components. My rationale centers on keeping the design lean, which excludes syncing logic and specialized execution environments. I\u0027m focusing on the \"Reth as a library\" model.\n\n\n",
+        "thought": true
+      }]
+    }, {
+      "text": "This is a sophisticated approach to data indexing. By focusing on **Stateless Receipt Ingestion**, you are essentially building a \"Light Client for History,\" which is the exact architectural gap currently existing between heavy Archive Nodes and centralized RPC providers.\n\nTo build the harness using **Reth as a library (Option 1)**, you need the networking stack, the wire protocol codecs, and the chain definitions, but you can discard the entire execution and storage engine.\n\nBased on the `reth-tree.txt` and `tree-sizes.txt` provided, here is the filtered context list for your task.\n\n---\n\n### ✅ DEFINITELY INCLUDE (The Core Library)\n*These crates provide the RLPx/devp2p stack, the message types, and the chain constants needed to talk to peers.*\n\n**1. Networking \u0026 P2P Stack**\n*   `crates/net/network`: **Highest Priority.** Contains the `NetworkManager` and `NetworkHandle`. This is your primary entry point for managing peer sessions and sending `PeerRequest`s.\n*   `crates/net/eth-wire`: Contains the RLP codecs for the `eth` subprotocol. Necessary for encoding `GetReceipts`.\n*   `crates/net/eth-wire-types`: The actual struct definitions for `Status`, `Receipts`, etc.\n*   `crates/net/discv4` \u0026 `crates/net/discv5`: Necessary for finding peers on Ethereum and Base.\n*   `crates/net/ecies` \u0026 `crates/net/p2p`: Low-level RLPx encryption and framing logic.\n\n**2. Chain Specifications (The \"Rules\")**\n*   `crates/chainspec`: Definitions for Ethereum Mainnet (genesis hashes, fork ids).\n*   `crates/optimism/chainspec`: **Crucial for Phase 2.** Contains the Base and Optimism specific genesis and hardfork logic.\n\n**3. Primitives \u0026 Trie (For Verification)**\n*   `crates/primitives`: Core types (`Header`, `Receipt`, `Log`, `B256`).\n*   `crates/primitives-traits`: Traits that abstractions in the network layer use.\n*   `crates/trie/common`: Necessary logic for MPT (Merkle Patricia Trie) construction to verify `receiptsRoot`.\n\n**4. Node Glue**\n*   `crates/node/builder`: Even for a stateless harness, using the `NodeBuilder` is the easiest way to initialize a clean networking stack without manually wiring 50+ components.\n\n---\n\n### ❌ DEFINITELY EXCLUDE (The \"Heavy\" State Engine)\n*These represent 80% of Reth\u0027s complexity and are entirely related to EVM execution and disk-based state storage, which you are explicitly avoiding.*\n\n**1. Execution \u0026 EVM (Stateless \u003d No EVM)**\n*   `crates/revm`: The EVM implementation. \n*   `crates/ethereum/evm` \u0026 `crates/optimism/evm`: Glue code for executing blocks.\n*   `crates/payload`: Logic for building new blocks/payloads.\n\n**2. Storage \u0026 Database (The \"State\" you don\u0027t want)**\n*   `crates/storage/libmdbx-rs`: The underlying C database.\n*   `crates/storage/db`: Reth\u0027s abstraction over MDBX.\n*   `crates/storage/provider`: The traits and implementations for reading/writing state to disk.\n*   `crates/storage/codecs`: Compact serialization for database rows.\n*   `crates/static-file`: While potentially useful later for caching, it\u0027s not needed for the P2P harness.\n\n**3. Syncing \u0026 Stages**\n*   `crates/stages`: This is the \"Pipeline\" (Headers -\u003e Bodies -\u003e Execution). Since you are doing a custom stateless probe, you don\u0027t want the standard Reth sync stages running.\n*   `crates/etl`: Used for bulk loading data into the DB.\n\n**4. Transaction Pool**\n*   `crates/transaction-pool`: You are indexing history, not watching the mempool (gossip of unconfirmed txs).\n\n**5. RPC Server**\n*   `crates/rpc/*`: All crates in the RPC folder. You are building a *client* that consumes data, not a *server* that provides JSON-RPC to others.\n\n---\n\n### ⚠️ OPTIONAL / CONDITIONAL\n*   `crates/era-downloader`: You mentioned using `era1` as a fallback. This crate contains the logic to parse those files. Keep it if you want to implement the backfill fallback early.\n*   `crates/ress`: (Reth Stateless). This is worth reading as a reference (as it handles witnesses), but you likely won\u0027t import it directly as your goal is receipts-only indexing, not full stateless verification.\n*   `examples/manual-p2p`: **Highly Recommended Reference.** This is a minimal example of how to use Reth\u0027s network stack without the rest of the node. It is very close to what your `harness_spec.md` describes.\n\n---\n\n### Recommended Strategy for your Harness\n1.  **Dependencies:** Start by only importing `reth-network`, `reth-eth-wire`, `reth-chainspec`, and `reth-op-chainspec`.\n2.  **Base Connection:** Use `reth_op_chainspec::BASE_MAINNET` to get the genesis hash.\n3.  **The Probe:** Use `NetworkHandle::send_request` to target a specific `PeerId` with `PeerRequest::GetReceipts`.\n4.  **Verification:** If you implement `receiptsRoot` verification, look at `reth_trie::common::root::receipts_root`.\n\n**Summary of Filtered Context:**\nFocus on `crates/net`, `crates/primitives`, and `crates/chainspec`. Discard `crates/storage`, `crates/revm`, and `crates/rpc`. This reduces your surface area from ~23M tokens to roughly ~2M tokens of relevant logic.",
+      "role": "model",
+      "finishReason": "STOP",
+      "tokenCount": 1321,
+      "parts": [{
+        "text": "This is a sophisticated approach to data indexing. By focusing on **Stateless Receipt Ingestion**, you are"
+      }, {
+        "text": " essentially building a \"Light Client for History,\" which is the exact architectural gap currently existing between heavy Archive Nodes and centralized RPC"
+      }, {
+        "text": " providers.\n\nTo build the harness using **Reth as a library (Option 1)**, you need the networking stack, the"
+      }, {
+        "text": " wire protocol codecs, and the chain definitions, but you can discard the entire execution and storage engine.\n\nBased on the `reth"
+      }, {
+        "text": "-tree.txt` and `tree-sizes.txt` provided, here is the filtered context list for your task"
+      }, {
+        "text": ".\n\n---\n\n### ✅ DEFINITELY INCLUDE (The Core Library)\n*These crates provide the RLPx/"
+      }, {
+        "text": "devp2p stack, the message types, and the chain constants needed to talk to peers.*\n\n**1. Networking"
+      }, {
+        "text": " \u0026 P2P Stack**\n*   `crates/net/network`: **Highest Priority.** Contains the `NetworkManager"
+      }, {
+        "text": "` and `NetworkHandle`. This is your primary entry point for managing peer sessions and sending `PeerRequest`s.\n*"
+      }, {
+        "text": "   `crates/net/eth-wire`: Contains the RLP codecs for the `eth` subprotocol. Necessary"
+      }, {
+        "text": " for encoding `GetReceipts`.\n*   `crates/net/eth-wire-types`: The actual struct definitions for "
+      }, {
+        "text": "`Status`, `Receipts`, etc.\n*   `crates/net/discv4` \u0026 `crates/net"
+      }, {
+        "text": "/discv5`: Necessary for finding peers on Ethereum and Base.\n*   `crates/net/ecies"
+      }, {
+        "text": "` \u0026 `crates/net/p2p`: Low-level RLPx encryption and framing logic.\n\n**2"
+      }, {
+        "text": ". Chain Specifications (The \"Rules\")**\n*   `crates/chainspec`: Definitions for Ethereum Mainnet (genesis hashes"
+      }, {
+        "text": ", fork ids).\n*   `crates/optimism/chainspec`: **Crucial for Phase 2.** Contains"
+      }, {
+        "text": " the Base and Optimism specific genesis and hardfork logic.\n\n**3. Primitives \u0026 Trie (For Verification)**\n*"
+      }, {
+        "text": "   `crates/primitives`: Core types (`Header`, `Receipt`, `Log`, `B256`).\n*"
+      }, {
+        "text": "   `crates/primitives-traits`: Traits that abstractions in the network layer use.\n*   `crates/"
+      }, {
+        "text": "trie/common`: Necessary logic for MPT (Merkle Patricia Trie) construction to verify `receiptsRoot`.\n\n"
+      }, {
+        "text": "**4. Node Glue**\n*   `crates/node/builder`: Even for a stateless harness, using the `Node"
+      }, {
+        "text": "Builder` is the easiest way to initialize a clean networking stack without manually wiring 50+ components.\n\n---\n\n"
+      }, {
+        "text": "### ❌ DEFINITELY EXCLUDE (The \"Heavy\" State Engine)\n*These represent 80%"
+      }, {
+        "text": " of Reth\u0027s complexity and are entirely related to EVM execution and disk-based state storage, which you are explicitly"
+      }, {
+        "text": " avoiding.*\n\n**1. Execution \u0026 EVM (Stateless \u003d No EVM)**\n*   `crates/"
+      }, {
+        "text": "revm`: The EVM implementation. \n*   `crates/ethereum/evm` \u0026 `crates/"
+      }, {
+        "text": "optimism/evm`: Glue code for executing blocks.\n*   `crates/payload`: Logic for building new"
+      }, {
+        "text": " blocks/payloads.\n\n**2. Storage \u0026 Database (The \"State\" you don\u0027t want)**\n*   "
+      }, {
+        "text": "`crates/storage/libmdbx-rs`: The underlying C database.\n*   `crates/storage/db`: Reth"
+      }, {
+        "text": "\u0027s abstraction over MDBX.\n*   `crates/storage/provider`: The traits and implementations for reading"
+      }, {
+        "text": "/writing state to disk.\n*   `crates/storage/codecs`: Compact serialization for database rows.\n"
+      }, {
+        "text": "*   `crates/static-file`: While potentially useful later for caching, it\u0027s not needed for the P"
+      }, {
+        "text": "2P harness.\n\n**3. Syncing \u0026 Stages**\n*   `crates/stages`: This is the \""
+      }, {
+        "text": "Pipeline\" (Headers -\u003e Bodies -\u003e Execution). Since you are doing a custom stateless probe, you don\u0027t want the standard Reth"
+      }, {
+        "text": " sync stages running.\n*   `crates/etl`: Used for bulk loading data into the DB.\n\n**4"
+      }, {
+        "text": ". Transaction Pool**\n*   `crates/transaction-pool`: You are indexing history, not watching the mempool ("
+      }, {
+        "text": "gossip of unconfirmed txs).\n\n**5. RPC Server**\n*   `crates/rpc/*`: All"
+      }, {
+        "text": " crates in the RPC folder. You are building a *client* that consumes data, not a *server* that provides JSON"
+      }, {
+        "text": "-RPC to others.\n\n---\n\n### ⚠️ OPTIONAL / CONDITIONAL\n*   `crates/era-"
+      }, {
+        "text": "downloader`: You mentioned using `era1` as a fallback. This crate contains the logic to parse those files. Keep"
+      }, {
+        "text": " it if you want to implement the backfill fallback early.\n*   `crates/ress`: (Reth Stateless)."
+      }, {
+        "text": " This is worth reading as a reference (as it handles witnesses), but you likely won\u0027t import it directly as your"
+      }, {
+        "text": " goal is receipts-only indexing, not full stateless verification.\n*   `examples/manual-p2p`: **Highly"
+      }, {
+        "text": " Recommended Reference.** This is a minimal example of how to use Reth\u0027s network stack without the rest of the node."
+      }, {
+        "text": " It is very close to what your `harness_spec.md` describes.\n\n---\n\n### Recommended Strategy for your Harness"
+      }, {
+        "text": "\n1.  **Dependencies:** Start by only importing `reth-network`, `reth-eth-wire`, "
+      }, {
+        "text": "`reth-chainspec`, and `reth-op-chainspec`.\n2.  **Base Connection:** Use `reth_op"
+      }, {
+        "text": "_chainspec::BASE_MAINNET` to get the genesis hash.\n3.  **The Probe:** Use "
+      }, {
+        "text": "`NetworkHandle::send_request` to target a specific `PeerId` with `PeerRequest::GetReceipts`.\n"
+      }, {
+        "text": "4.  **Verification:** If you implement `receiptsRoot` verification, look at `reth_trie::"
+      }, {
+        "text": "common::root::receipts_root`.\n\n**Summary of Filtered Context:**\nFocus on `crates/net`,"
+      }, {
+        "text": " `crates/primitives`, and `crates/chainspec`. Discard `crates/storage`, `crates/revm`, and"
+      }, {
+        "text": " `crates/rpc`. This reduces your surface area from ~23M tokens to roughly ~2M tokens of relevant"
+      }, {
+        "text": " logic."
+      }, {
+        "text": "",
+        "thoughtSignature": "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"
+      }]
+    }, {
+      "text": "Please write me a repomix prompt with either ignore, or include (i think they\u0027re overriding each other):\nrepomix --ignore \"dir1,dir2,dir3/subdir1\"",
+      "role": "user",
+      "tokenCount": 44
+    }, {
+      "text": "**Conceptualizing Stateless History**\n\nI\u0027m currently focused on the stateless history client for Uniswap v4. Right now, I\u0027m thinking about breaking this down into phases, starting with ETH L1 and then moving to Base/OP. I\u0027m leveraging the `reth` repository and plan to exclude heavy execution and storage context while including networking, wire, and chainspec context. I am exploring a `repomix` command and `--include` argument.\n\n\n**Considering Include vs. Ignore**\n\nI\u0027ve been wrestling with the `include` and `ignore` approach. I am leaning towards \"ignore\" now, as it offers a safer approach to retaining the general structure while purging irrelevant components. This is especially true given the vast size of the execution, database, and RPC modules I want to exclude. I\u0027ve compiled a definitive list of things to definitely ignore, namely the `crates/storage`, `crates/revm`, `crates/rpc`, and other modules.\n\n\n**Finalizing Inclusion/Exclusion**\n\nI\u0027m now zeroing in on the definitive include/exclude list. It is an iterative process. I\u0027ve firmed up the \"ignore\" approach and have a comprehensive list of modules to exclude from the `repomix` command. This ensures a lean, focused client. Crucially, networking, chain spec, and core primitives are being included. The goal now is to have a functional base layer, stripped of any unneeded weight.\n\n\n**Excluding Resource Intensive Files**\n\nI\u0027m now adding a `repomix` specific behavior to ensure that large JSON files within the `chainspec/res` directories are explicitly ignored, even if their parent directory is nominally included. This is to avoid the size of those large files which is why I\u0027m adding a robust glob pattern. I\u0027ll also bring in `crates/primitives-traits` and `crates/errors`. This requires careful attention as I\u0027ve found that files in the `crates/optimism` directory are often very large.\n\n\n**Specifying Exclusion for Simplicity**\n\nI\u0027m now focusing on the `repomix` command. I\u0027ve specified a comprehensive ignore list to eliminate stateless context modules, including storage, EVM, RPC, and optimistic specific components. This significantly streamlines the client. For a simple P2P example, I\u0027ll recommend including `examples/manual-p2p`.\n\n\n",
+      "role": "model",
+      "isThought": true,
+      "parts": [{
+        "text": "**Conceptualizing Stateless History**\n\nI\u0027m currently focused on the stateless history client for Uniswap v4. Right now, I\u0027m thinking about breaking this down into phases, starting with ETH L1 and then moving to Base/OP. I\u0027m leveraging the `reth` repository and plan to exclude heavy execution and storage context while including networking, wire, and chainspec context. I am exploring a `repomix` command and `--include` argument.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Considering Include vs. Ignore**\n\nI\u0027ve been wrestling with the `include` and `ignore` approach. I am leaning towards \"ignore\" now, as it offers a safer approach to retaining the general structure while purging irrelevant components. This is especially true given the vast size of the execution, database, and RPC modules I want to exclude. I\u0027ve compiled a definitive list of things to definitely ignore, namely the `crates/storage`, `crates/revm`, `crates/rpc`, and other modules.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Finalizing Inclusion/Exclusion**\n\nI\u0027m now zeroing in on the definitive include/exclude list. It is an iterative process. I\u0027ve firmed up the \"ignore\" approach and have a comprehensive list of modules to exclude from the `repomix` command. This ensures a lean, focused client. Crucially, networking, chain spec, and core primitives are being included. The goal now is to have a functional base layer, stripped of any unneeded weight.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Excluding Resource Intensive Files**\n\nI\u0027m now adding a `repomix` specific behavior to ensure that large JSON files within the `chainspec/res` directories are explicitly ignored, even if their parent directory is nominally included. This is to avoid the size of those large files which is why I\u0027m adding a robust glob pattern. I\u0027ll also bring in `crates/primitives-traits` and `crates/errors`. This requires careful attention as I\u0027ve found that files in the `crates/optimism` directory are often very large.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Specifying Exclusion for Simplicity**\n\nI\u0027m now focusing on the `repomix` command. I\u0027ve specified a comprehensive ignore list to eliminate stateless context modules, including storage, EVM, RPC, and optimistic specific components. This significantly streamlines the client. For a simple P2P example, I\u0027ll recommend including `examples/manual-p2p`.\n\n\n",
+        "thought": true
+      }]
+    }, {
+      "text": "To provide the most relevant context for your **Stateless History Client** while avoiding the massive token count of the database, EVM, and JSON genesis files, you should use the `--ignore` flag. \n\nUsing `--ignore` is safer here because it allows `repomix` to find all necessary shared traits and internal dependencies within the `net` and `chainspec` crates that a strict `include` might miss.\n\n### The Repomix Command\n\nRun this from the root of the `reth` repository:\n\n```bash\nrepomix --ignore \"crates/storage/**,crates/revm/**,crates/rpc/**,crates/transaction-pool/**,crates/stages/**,crates/payload/**,crates/optimism/evm/**,crates/optimism/rpc/**,crates/optimism/node/**,crates/optimism/txpool/**,crates/optimism/storage/**,crates/optimism/flashblocks/**,docs/vocs/**,bin/**,examples/**,crates/chainspec/res/**,crates/optimism/chainspec/res/**,crates/era-downloader/tests/res/**,crates/net/eth-wire/testdata/**,testing/**\"\n```\n\n---\n\n### Why this specific list?\n\n1.  **JSON Genesis Bloat (`res/**`):** \n    Your initial report showed that `base.json` and `sepolia_op.json` account for over **10 million tokens**. These are just raw genesis states. Since your harness only needs the **Genesis Hash** (which is a constant in the Rust code), these JSON files are useless context.\n2.  **Execution \u0026 State (`storage`, `revm`, `payload`):** \n    You are explicitly building a **stateless** client. Including the EVM (`revm`) or the database logic (`storage`) will confuse the LLM into suggesting `StateProvider` patterns which require a local database.\n3.  **Standard Sync (`stages`):**\n    Reth\u0027s standard sync pipeline is built around a \"Stage\" architecture (Headers -\u003e Bodies -\u003e Senders -\u003e Execution). You are building a custom P2P probe, so you want to avoid the LLM trying to fit your logic into the `Pipeline` or `Stage` traits.\n4.  **OP-Node \u0026 Sequencer (`optimism/node`, `flashblocks`):**\n    Phase 2 focuses on EL P2P (Execution Layer). Excluding the L2 \"Rollup Node\" and \"Flashblocks\" logic keeps the focus on `op-reth` as an execution-layer peer.\n5.  **Documentation \u0026 Examples:**\n    `docs/vocs` is the website source code (huge token count). Most examples are irrelevant, though you might want to manually look at `examples/manual-p2p` separately as it is a great blueprint.\n\n### Pro-Tip: Adding the `manual-p2p` example back\nIf you want to include the one example that actually helps you, you can append `!examples/manual-p2p/**` to the ignore list (if your shell supports it) or simply run this specific command after the big one to get a smaller context file for the example:\n\n```bash\nrepomix --include \"examples/manual-p2p/**\"\n```",
+      "role": "model",
+      "finishReason": "STOP",
+      "tokenCount": 713,
+      "parts": [{
+        "text": "To provide the most relevant context"
+      }, {
+        "text": " for your **Stateless History Client** while avoiding the massive token count of the database, EVM, and JSON genesis files, you"
+      }, {
+        "text": " should use the `--ignore` flag. \n\nUsing `--ignore` is safer here because it allows `repomix"
+      }, {
+        "text": "` to find all necessary shared traits and internal dependencies within the `net` and `chainspec` crates that a strict `include"
+      }, {
+        "text": "` might miss.\n\n### The Repomix Command\n\nRun this from the root of the `reth` repository:\n\n```bash"
+      }, {
+        "text": "\nrepomix --ignore \"crates/storage/**,crates/revm/**,crates/rpc/**,crates"
+      }, {
+        "text": "/transaction-pool/**,crates/stages/**,crates/payload/**,crates/optimism/evm/**"
+      }, {
+        "text": ",crates/optimism/rpc/**,crates/optimism/node/**,crates/optimism/txpool"
+      }, {
+        "text": "/**,crates/optimism/storage/**,crates/optimism/flashblocks/**,docs/vocs/**"
+      }, {
+        "text": ",bin/**,examples/**,crates/chainspec/res/**,crates/optimism/chainspec/res"
+      }, {
+        "text": "/**,crates/era-downloader/tests/res/**,crates/net/eth-wire/testdata/**"
+      }, {
+        "text": ",testing/**\"\n```\n\n---\n\n### Why this specific list?\n\n1.  **JSON Genesis Bloat ("
+      }, {
+        "text": "`res/**`):** \n    Your initial report showed that `base.json` and `sepolia_"
+      }, {
+        "text": "op.json` account for over **10 million tokens**. These are just raw genesis states. Since your harness only"
+      }, {
+        "text": " needs the **Genesis Hash** (which is a constant in the Rust code), these JSON files are useless context.\n2"
+      }, {
+        "text": ".  **Execution \u0026 State (`storage`, `revm`, `payload`):** \n    You are explicitly"
+      }, {
+        "text": " building a **stateless** client. Including the EVM (`revm`) or the database logic (`storage`) will"
+      }, {
+        "text": " confuse the LLM into suggesting `StateProvider` patterns which require a local database.\n3.  **Standard Sync ("
+      }, {
+        "text": "`stages`):**\n    Reth\u0027s standard sync pipeline is built around a \"Stage\" architecture (Headers -\u003e Bodies -\u003e"
+      }, {
+        "text": " Senders -\u003e Execution). You are building a custom P2P probe, so you want to avoid the LLM trying"
+      }, {
+        "text": " to fit your logic into the `Pipeline` or `Stage` traits.\n4.  **OP-Node \u0026"
+      }, {
+        "text": " Sequencer (`optimism/node`, `flashblocks`):**\n    Phase 2 focuses on EL P2P ("
+      }, {
+        "text": "Execution Layer). Excluding the L2 \"Rollup Node\" and \"Flashblocks\" logic keeps the focus on `op"
+      }, {
+        "text": "-reth` as an execution-layer peer.\n5.  **Documentation \u0026 Examples:**\n    `docs/voc"
+      }, {
+        "text": "s` is the website source code (huge token count). Most examples are irrelevant, though you might want to manually look at `examples"
+      }, {
+        "text": "/manual-p2p` separately as it is a great blueprint.\n\n### Pro-Tip: Adding the `manual-"
+      }, {
+        "text": "p2p` example back\nIf you want to include the one example that actually helps you, you can append "
+      }, {
+        "text": "`!examples/manual-p2p/**` to the ignore list (if your shell supports it) or simply run this"
+      }, {
+        "text": " specific command after the big one to get a smaller context file for the example:\n\n```bash\nrepomix --include"
+      }, {
+        "text": " \"examples/manual-p2p/**\"\n```"
+      }, {
+        "text": "",
+        "thoughtSignature": "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"
+      }]
+    }, {
+      "driveDocument": {
+        "id": "1YbzaCJgES2_3saVkMCxiroexJYiscRep"
+      },
+      "role": "user",
+      "tokenCount": 27901
+    }, {
+      "text": "It\u0027s still 2.3M tokens. We need to somehow make it under 1M. Or maybe split it into different parts which are each below 1M. Any ideas? Btw include overrides ignore in repomix - so it only includes the files mentioned in include and that\u0027s it.",
+      "role": "user",
+      "tokenCount": 66
+    }, {
+      "text": "**Indexing Uniswap Events**\n\nI\u0027m now focused on indexing Uniswap v4 events using a stateless history client, specifically avoiding the EVM and any state database. I\u0027m exploring EL devp2p using headers and receipts to achieve this. The plan is to then extend this to the OP Stack, including Base and Optimism, utilizing EL P2P. Finally, I need to validate the `receiptsRoot` in the header for stateless verification. I also need to reduce the Repomix token.\n\n\n**Analyzing Dependencies \u0026 Size**\n\nI\u0027m now diving into the component sizes, aiming to slim down the system. The `crates/trie` logic at 372k seems excessive given my needs, especially with all of its variations. The Engine API in `crates/engine` at 198k is also irrelevant. Networking is crucial: `network` (202k), `eth-wire` (46k), and `discv5` (20k) are key, and `chain-state` at 37k is also helpful. I\u0027ll focus on getting the \"Connector\" built first.\n\n\n**Prioritizing Chunk Breakdown**\n\nI\u0027ve been re-evaluating the component breakdown to stay under 1M tokens, focusing on splitting into two key areas: networking and wire, and the verification engine comprising the trie and primitives. My assessment centers on the essential crates: `eth-wire-types`, `net/discv4`, `net/discv5`, and `primitives-traits`. I\u0027m paying close attention to the chain specifications and primitives for genesis hashes and header/receipt structures. I need to ensure the `receiptsRoot` verification is handled correctly.\n\n\n**Refining Component Focus**\n\nI\u0027m now prioritizing the \"Networking\" aspect to provide a functional base. I\u0027ll create a master command that aggressively reduces the codebase to stay within the 1M token limit, mainly pruning sub-folders. This involves keeping `crates/net` (excluding tests and benches), and `crates/trie` (only `common` and `trie`). I\u0027ll also retain `crates/chainspec` (without JSONs) and `crates/primitives-traits`. I\u0027ll carefully construct the include glob and will add a logic summary explaining the selections.\n\n\n",
+      "role": "model",
+      "isThought": true,
+      "parts": [{
+        "text": "**Indexing Uniswap Events**\n\nI\u0027m now focused on indexing Uniswap v4 events using a stateless history client, specifically avoiding the EVM and any state database. I\u0027m exploring EL devp2p using headers and receipts to achieve this. The plan is to then extend this to the OP Stack, including Base and Optimism, utilizing EL P2P. Finally, I need to validate the `receiptsRoot` in the header for stateless verification. I also need to reduce the Repomix token.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Analyzing Dependencies \u0026 Size**\n\nI\u0027m now diving into the component sizes, aiming to slim down the system. The `crates/trie` logic at 372k seems excessive given my needs, especially with all of its variations. The Engine API in `crates/engine` at 198k is also irrelevant. Networking is crucial: `network` (202k), `eth-wire` (46k), and `discv5` (20k) are key, and `chain-state` at 37k is also helpful. I\u0027ll focus on getting the \"Connector\" built first.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Prioritizing Chunk Breakdown**\n\nI\u0027ve been re-evaluating the component breakdown to stay under 1M tokens, focusing on splitting into two key areas: networking and wire, and the verification engine comprising the trie and primitives. My assessment centers on the essential crates: `eth-wire-types`, `net/discv4`, `net/discv5`, and `primitives-traits`. I\u0027m paying close attention to the chain specifications and primitives for genesis hashes and header/receipt structures. I need to ensure the `receiptsRoot` verification is handled correctly.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Refining Component Focus**\n\nI\u0027m now prioritizing the \"Networking\" aspect to provide a functional base. I\u0027ll create a master command that aggressively reduces the codebase to stay within the 1M token limit, mainly pruning sub-folders. This involves keeping `crates/net` (excluding tests and benches), and `crates/trie` (only `common` and `trie`). I\u0027ll also retain `crates/chainspec` (without JSONs) and `crates/primitives-traits`. I\u0027ll carefully construct the include glob and will add a logic summary explaining the selections.\n\n\n",
+        "thought": true
+      }]
+    }, {
+      "text": "To get under 1M tokens while maintaining enough context to build your harness, we need to move from **excluding crates** to **selectively including source files** and aggressively **pruning non-essential sub-directories** (tests, benches, and complex trie variations).\n\nHere is a plan to split this into two coherent contexts, each likely under 500k–700k tokens.\n\n### Split 1: The P2P \u0026 Networking Context\n**Focus:** How to find peers, maintain RLPx sessions, and exchange `eth_getReceipts` messages. This is 90% of your harness work.\n\n```bash\nrepomix --include \"Cargo.toml,crates/net/network/src/**,crates/net/eth-wire/src/**,crates/net/eth-wire-types/src/**,crates/net/discv4/src/**,crates/net/discv5/src/**,crates/net/p2p/src/**,crates/net/network-types/src/**,crates/chainspec/src/**,crates/optimism/chainspec/src/**,examples/manual-p2p/src/**\"\n```\n\n**Why this works:**\n*   Includes the **Manual P2P example** (your best blueprint).\n*   Includes `eth-wire` (the protocol codecs).\n*   Includes `chainspec` (genesis hashes for ETH and Base).\n*   **Excluded:** `tests`, `benches`, and `test_utils` (which are huge in the networking crates).\n\n---\n\n### Split 2: The Verification \u0026 Primitives Context\n**Focus:** What do Headers and Receipts look like? How do I recompute the Trie Root to verify the data I just fetched?\n\n```bash\nrepomix --include \"crates/primitives-traits/src/**,crates/ethereum/primitives/src/**,crates/optimism/primitives/src/**,crates/trie/common/src/**,crates/trie/trie/src/**\"\n```\n\n**Why this works:**\n*   **Aggressively Pruned Trie:** It only includes `trie/common` and `trie/trie`. It skips `sparse`, `parallel`, and `sparse-parallel` (the #1 token bloat in your previous list), which are optimizations for full nodes and not needed for a simple receipt root check.\n*   Includes the **Ethereum \u0026 Optimism Primitive definitions** for Receipts and Logs.\n\n---\n\n### Alternative: One \"Master\" Harness Context (Aggressive)\nIf you want **everything in one file** and want to stay under 1M, run this command. It uses precise globs to take only the \"Brain\" of each relevant crate:\n\n```bash\nrepomix --include \"{Cargo.toml,crates/net/network/src/**,crates/net/eth-wire/src/**,crates/net/eth-wire-types/src/**,crates/net/discv5/src/**,crates/chainspec/src/**,crates/optimism/chainspec/src/**,crates/primitives-traits/src/**,crates/ethereum/primitives/src/**,crates/trie/common/src/**,crates/trie/trie/src/**,examples/manual-p2p/src/**}\" --ignore \"**/{tests,benches,test_utils,testdata}/**\"\n```\n\n### Key Logic used for these selections:\n1.  **Skip the \"Sub-Tries\":** `crates/trie/sparse-parallel` alone is 76k tokens. You only need `trie/common` to build a standard Merkle Patricia Trie for verification.\n2.  **No `tests`/`benches`:** In Reth, the test code is often 2x the size of the implementation code.\n3.  **The \"src\" Only Rule:** By targeting `src/**` specifically, we ignore `README.md`, `Makefile`, and other root-level crate files that add up.\n4.  **Optimism Scope:** I included `optimism/chainspec` (Base genesis) and `optimism/primitives` (L2 Receipt types), but skipped the rest of the `optimism/` folder (which includes the sequencer, state, and batcher logic you don\u0027t need).\n\n**Which to run first?** \nI recommend **Split 1**. Once you have the code that successfully connects to a Base peer and receives a `Receipts` RLP message, you will know exactly what types you need to import for **Split 2** (Verification).",
+      "role": "model",
+      "finishReason": "STOP",
+      "tokenCount": 1002,
+      "parts": [{
+        "text": "To get under 1M tokens while maintaining enough context to build your harness, we need to move from **excluding"
+      }, {
+        "text": " crates** to **selectively including source files** and aggressively **pruning non-essential sub-directories** (tests"
+      }, {
+        "text": ", benches, and complex trie variations).\n\nHere is a plan to split this into two coherent contexts, each likely"
+      }, {
+        "text": " under 500k–700k tokens.\n\n### Split 1: The P2P \u0026"
+      }, {
+        "text": " Networking Context\n**Focus:** How to find peers, maintain RLPx sessions, and exchange `eth_getReceipts` messages"
+      }, {
+        "text": ". This is 90% of your harness work.\n\n```bash\nrepomix --include \"Cargo.toml,crates"
+      }, {
+        "text": "/net/network/src/**,crates/net/eth-wire/src/**,crates/net/eth-wire-"
+      }, {
+        "text": "types/src/**,crates/net/discv4/src/**,crates/net/discv5/"
+      }, {
+        "text": "src/**,crates/net/p2p/src/**,crates/net/network-types/src/**,crates/"
+      }, {
+        "text": "chainspec/src/**,crates/optimism/chainspec/src/**,examples/manual-p2p"
+      }, {
+        "text": "/src/**\"\n```\n\n**Why this works:**\n*   Includes the **Manual P2P example** (your best"
+      }, {
+        "text": " blueprint).\n*   Includes `eth-wire` (the protocol codecs).\n*   Includes `chainspec` (genesis"
+      }, {
+        "text": " hashes for ETH and Base).\n*   **Excluded:** `tests`, `benches`, and `test_utils` (which"
+      }, {
+        "text": " are huge in the networking crates).\n\n---\n\n### Split 2: The Verification \u0026 Primitives Context\n**Focus:**"
+      }, {
+        "text": " What do Headers and Receipts look like? How do I recompute the Trie Root to verify the data I just fetched?\n\n```bash"
+      }, {
+        "text": "\nrepomix --include \"crates/primitives-traits/src/**,crates/ethereum/primitives/"
+      }, {
+        "text": "src/**,crates/optimism/primitives/src/**,crates/trie/common/src/**,"
+      }, {
+        "text": "crates/trie/trie/src/**\"\n```\n\n**Why this works:**\n*   **Agg"
+      }, {
+        "text": "ressively Pruned Trie:** It only includes `trie/common` and `trie/trie`. It"
+      }, {
+        "text": " skips `sparse`, `parallel`, and `sparse-parallel` (the #1 token bloat in your previous list), which are"
+      }, {
+        "text": " optimizations for full nodes and not needed for a simple receipt root check.\n*   Includes the **Ethereum \u0026 Optimism Primitive"
+      }, {
+        "text": " definitions** for Receipts and Logs.\n\n---\n\n### Alternative: One \"Master\" Harness Context (Aggressive)\nIf"
+      }, {
+        "text": " you want **everything in one file** and want to stay under 1M, run this command. It uses precise"
+      }, {
+        "text": " globs to take only the \"Brain\" of each relevant crate:\n\n```bash\nrepomix --include \"{"
+      }, {
+        "text": "Cargo.toml,crates/net/network/src/**,crates/net/eth-wire/src/**,crates"
+      }, {
+        "text": "/net/eth-wire-types/src/**,crates/net/discv5/src/**,crates/chainspec"
+      }, {
+        "text": "/src/**,crates/optimism/chainspec/src/**,crates/primitives-traits/src/**"
+      }, {
+        "text": ",crates/ethereum/primitives/src/**,crates/trie/common/src/**,crates/t"
+      }, {
+        "text": "rie/trie/src/**,examples/manual-p2p/src/**}\" --ignore \"**/{tests,benches"
+      }, {
+        "text": ",test_utils,testdata}/**\"\n```\n\n### Key Logic used for these selections:\n1."
+      }, {
+        "text": "  **Skip the \"Sub-Tries\":** `crates/trie/sparse-parallel` alone is 7"
+      }, {
+        "text": "6k tokens. You only need `trie/common` to build a standard Merkle Patricia Trie for verification."
+      }, {
+        "text": "\n2.  **No `tests`/`benches`:** In Reth, the test code is often 2x the size"
+      }, {
+        "text": " of the implementation code.\n3.  **The \"src\" Only Rule:** By targeting `src/**` specifically"
+      }, {
+        "text": ", we ignore `README.md`, `Makefile`, and other root-level crate files that add up.\n4."
+      }, {
+        "text": "  **Optimism Scope:** I included `optimism/chainspec` (Base genesis) and `optimism/primitives"
+      }, {
+        "text": "` (L2 Receipt types), but skipped the rest of the `optimism/` folder (which includes the sequencer"
+      }, {
+        "text": ", state, and batcher logic you don\u0027t need).\n\n**Which to run first?** \nI recommend **"
+      }, {
+        "text": "Split 1**. Once you have the code that successfully connects to a Base peer and receives a `Receipts` R"
+      }, {
+        "text": "LP message, you will know exactly what types you need to import for **Split 2** (Verification)."
+      }, {
+        "text": "",
+        "thoughtSignature": "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"
+      }]
+    }],
+    "pendingInputs": [{
+      "text": "",
+      "role": "user"
+    }]
+  }
+}

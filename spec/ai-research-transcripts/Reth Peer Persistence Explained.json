@@ -1,0 +1,221 @@
+{
+  "runSettings": {
+    "temperature": 1.0,
+    "model": "models/gemini-3-pro-preview",
+    "topP": 0.95,
+    "topK": 64,
+    "maxOutputTokens": 65536,
+    "safetySettings": [{
+      "category": "HARM_CATEGORY_HARASSMENT",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_HATE_SPEECH",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+      "threshold": "OFF"
+    }],
+    "enableCodeExecution": false,
+    "enableSearchAsATool": false,
+    "enableBrowseAsATool": false,
+    "enableAutoFunctionResponse": false,
+    "thinkingBudget": -1,
+    "outputResolution": "1K",
+    "thinkingLevel": "THINKING_HIGH"
+  },
+  "citations": [{
+    "uri": "https://reth.rs/docs/src/reth_network/manager.rs.html"
+  }],
+  "systemInstruction": {
+  },
+  "chunkedPrompt": {
+    "chunks": [{
+      "driveDocument": {
+        "id": "1rGSB_en-F_5Gv02D1rVQD_FhzEh76624"
+      },
+      "role": "user",
+      "tokenCount": 1031370
+    }, {
+      "text": "You are analyzing a repository packed by Repomix (attached).\nUse the attached Repomix file(s): repomix-peer-persistence.xml.\n\nTask:\nExplain how peer persistence works in reth: disk format + lifecycle. Include how peer records are stored, loaded on startup, updated during runtime, and any pruning/expiration behavior.\n\nConstraints:\n- Cite file paths for every non-trivial claim.\n- When reasoning about behavior, trace cross-file call paths and data flow.\n- Avoid speculation. If information is missing or ambiguous, state what’s missing and what additional pack/file would resolve it.\n\nOutput format:\n- Summary (3–7 bullets)\n- Key files/modules (path → responsibility)\n- Detailed analysis\n- Actionable next steps / follow-up questions (only if needed)",
+      "role": "user",
+      "tokenCount": 178
+    }, {
+      "text": "**Analyzing Reth Persistence**\n\nI\u0027m currently focused on dissecting the peer persistence mechanism within `reth`. My initial goal is understanding the \"how\" – specifically, how peers retain data and their role in the overall system. I\u0027m exploring the nuances of `reth` and its architecture to create a structured approach to the investigation. The intention is to create a complete model for the process of peer persitence in `reth`, in order to give a complete explanation of its inner workings.\n\n\n**Examining Configuration Details**\n\nMy focus has shifted to the granular details of peer persistence configuration within `reth`. I\u0027ve located the crucial `peers_file` field within `NetworkArgs` in `crates/net/network/src/config.rs`. The code shows the path determination (custom or default) during startup. The `PeersConfig` is constructed using `peers_config_with_basic_nodes_from_file`, confirmed in `crates/net/network-types/src/peers/config.rs`.\n\n\n**Tracing Saving Operations**\n\nI\u0027m now tracing the saving operations, specifically focusing on how peer data is persisted to disk. I\u0027ve uncovered that the saving logic is primarily triggered during shutdown, not periodically during runtime. My investigation pinpointed `NetworkManager::start_network_with_policies` (indirectly via `BuilderContext`), within the `reth` build process, as the key location for initiating these saves.\n\n\n**Pinpointing Shutdown Saves**\n\nI\u0027ve traced the peer data saving process further. I\u0027ve found that `NetworkManager::write_peers_to_file` does the actual writing, collecting peers from `all_peers()` (via `PeersManager::iter_peers()`) and serializing them to JSON. The crucial task, `spawn_critical_with_graceful_shutdown_signal`, handles this during shutdown. It then gathers known peers, serializes to JSON, and persists them.\n\n\n**Detailing Persisted Data**\n\nI\u0027ve outlined the high-level flow, data format, loading, runtime behavior, saving mechanism, and pruning strategy of peer persistence. The data format, a `known-peers.json` file, stores enode URLs as strings. Loading involves CLI arguments and configuration. The saving utilizes a graceful shutdown hook, triggered in the builder. The data is managed using an in-memory `HashMap`, and only known, valid peers persist across restarts. I\u0027m focusing on the `serde_json` serialization and deserialization, and the structure of `NodeRecord` which implements SerializeDisplay.\n\n\n**Clarifying Peer Lifecycle**\n\nMy exploration is honing in on the peer lifecycle. I\u0027ve tracked that network configuration dictates the peer file path, while `PeersManager` adds initial peers, which are subsequently saved during shutdown. I\u0027m noting the `write_peers_to_file` logic in `crates/net/network/src/manager.rs`, and the shutdown hook in `crates/node/builder/src/launch/common.rs`. Pruning occurs via reputation changes and connection failures, with bans affecting runtime but not storage.\n\n\n**Confirming Persistence Strategy**\n\nMy attention has now turned to confirming the persistence strategy. I\u0027ve re-evaluated and confirmed that writes only occur during shutdown. I\u0027ve also clarified the exact data stored: it\u0027s only `NodeRecord`s, including IP, ports, and ID; no reputation or connection history. The `known-peers.json` file is specifically about discovery/connectivity.\n\n\n**Documenting Persistence Details**\n\nI\u0027m presently documenting the use of `reth_fs_util::write_json_file` for the writing operation. This utility function is the final step in writing the JSON file during shutdown. The utility itself handles the file system operations, with proper error handling and synchronization for data integrity during the persisting of peer data. I\u0027m focusing on the integration of this utility within the larger context of the saving process, to provide a complete view.\n\n\n",
+      "role": "model",
+      "isThought": true,
+      "parts": [{
+        "text": "**Analyzing Reth Persistence**\n\nI\u0027m currently focused on dissecting the peer persistence mechanism within `reth`. My initial goal is understanding the \"how\" – specifically, how peers retain data and their role in the overall system. I\u0027m exploring the nuances of `reth` and its architecture to create a structured approach to the investigation. The intention is to create a complete model for the process of peer persitence in `reth`, in order to give a complete explanation of its inner workings.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Examining Configuration Details**\n\nMy focus has shifted to the granular details of peer persistence configuration within `reth`. I\u0027ve located the crucial `peers_file` field within `NetworkArgs` in `crates/net/network/src/config.rs`. The code shows the path determination (custom or default) during startup. The `PeersConfig` is constructed using `peers_config_with_basic_nodes_from_file`, confirmed in `crates/net/network-types/src/peers/config.rs`.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Tracing Saving Operations**\n\nI\u0027m now tracing the saving operations, specifically focusing on how peer data is persisted to disk. I\u0027ve uncovered that the saving logic is primarily triggered during shutdown, not periodically during runtime. My investigation pinpointed `NetworkManager::start_network_with_policies` (indirectly via `BuilderContext`), within the `reth` build process, as the key location for initiating these saves.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Pinpointing Shutdown Saves**\n\nI\u0027ve traced the peer data saving process further. I\u0027ve found that `NetworkManager::write_peers_to_file` does the actual writing, collecting peers from `all_peers()` (via `PeersManager::iter_peers()`) and serializing them to JSON. The crucial task, `spawn_critical_with_graceful_shutdown_signal`, handles this during shutdown. It then gathers known peers, serializes to JSON, and persists them.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Detailing Persisted Data**\n\nI\u0027ve outlined the high-level flow, data format, loading, runtime behavior, saving mechanism, and pruning strategy of peer persistence. The data format, a `known-peers.json` file, stores enode URLs as strings. Loading involves CLI arguments and configuration. The saving utilizes a graceful shutdown hook, triggered in the builder. The data is managed using an in-memory `HashMap`, and only known, valid peers persist across restarts. I\u0027m focusing on the `serde_json` serialization and deserialization, and the structure of `NodeRecord` which implements SerializeDisplay.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Clarifying Peer Lifecycle**\n\nMy exploration is honing in on the peer lifecycle. I\u0027ve tracked that network configuration dictates the peer file path, while `PeersManager` adds initial peers, which are subsequently saved during shutdown. I\u0027m noting the `write_peers_to_file` logic in `crates/net/network/src/manager.rs`, and the shutdown hook in `crates/node/builder/src/launch/common.rs`. Pruning occurs via reputation changes and connection failures, with bans affecting runtime but not storage.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Confirming Persistence Strategy**\n\nMy attention has now turned to confirming the persistence strategy. I\u0027ve re-evaluated and confirmed that writes only occur during shutdown. I\u0027ve also clarified the exact data stored: it\u0027s only `NodeRecord`s, including IP, ports, and ID; no reputation or connection history. The `known-peers.json` file is specifically about discovery/connectivity.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Documenting Persistence Details**\n\nI\u0027m presently documenting the use of `reth_fs_util::write_json_file` for the writing operation. This utility function is the final step in writing the JSON file during shutdown. The utility itself handles the file system operations, with proper error handling and synchronization for data integrity during the persisting of peer data. I\u0027m focusing on the integration of this utility within the larger context of the saving process, to provide a complete view.\n\n\n",
+        "thought": true
+      }]
+    }, {
+      "text": "Based on the provided codebase, here is the explanation of how peer persistence works in Reth.\n\n### Summary\n*   **Format**: Peers are stored in a simple JSON file (default `known-peers.json`) containing a list of Enode URL strings.\n*   **Startup**: The file is read during node initialization; entries are parsed into `NodeRecord` objects and added to the `PeersManager` as \"Basic\" peers.\n*   **Runtime**: There is **no periodic persistence** during runtime. Peer management (addition, removal, banning) happens entirely in-memory within the `PeersManager`.\n*   **Shutdown**: The current list of known peers is flushed to disk only when the node receives a graceful shutdown signal.\n*   **Pruning**: Pruning is implicit. Peers removed from memory during runtime (due to reputation loss or connection failures) are simply absent from the final list written to disk at shutdown. No reputation scores or ban expiry times are persisted in this file.\n\n---\n\n### Key Files and Responsibilities\n\n| File Path | Responsibility |\n| :--- | :--- |\n| `crates/node/core/src/args/network.rs` | Defines CLI arguments for the peers file path (`--peers-file`) and persistence toggles (`--no-persist-peers`). |\n| `crates/net/network-types/src/peers/config.rs` | Implements `with_basic_nodes_from_file`, responsible for reading and deserializing the JSON file. |\n| `crates/net/network/src/manager.rs` | Implements `write_peers_to_file`, responsible for collecting in-memory peers and serializing them to disk. |\n| `crates/node/builder/src/launch/common.rs` | Sets up the `shutdown` hook that triggers the save operation. |\n| `crates/net/network/src/peers.rs` | `PeersManager` holds the in-memory state (`HashMap\u003cPeerId, Peer\u003e`) that serves as the source of truth. |\n\n---\n\n### Detailed Analysis\n\n#### 1. Disk Format\nThe persistence file is a JSON array of strings, where each string is a serialized `NodeRecord` (Enode URL).\n\n*   **File Location**: Defaults to `\u003cDATADIR\u003e/\u003cCHAIN_ID\u003e/known-peers.json`. This path is resolved in `ChainPath::known_peers` in `crates/node/core/src/dirs.rs`.\n*   **Data Structure**: The file deserializes into a `HashSet\u003cNodeRecord\u003e`.\n*   **Serialization**: `NodeRecord` implements `SerializeDisplay` (via `serde_with`), which formats the record as an Enode string (e.g., `enode://\u003cid\u003e@\u003cip\u003e:\u003cport\u003e`).\n\n#### 2. Loading on Startup\nPeer loading occurs during the construction of the `NetworkConfig`.\n\n1.  **CLI Argument Parsing**:\n    In `crates/node/core/src/args/network.rs`, `NetworkArgs` captures optional `--peers-file` and `--no-persist-peers` flags.\n2.  **Config Construction**:\n    The method `NetworkArgs::network_config` determines the path. It calls `peers_config_with_basic_nodes_from_file` on the global `Config` object.\n3.  **Deserialization**:\n    In `crates/net/network-types/src/peers/config.rs`, `with_basic_nodes_from_file`:\n    ```rust\n    // crates/net/network-types/src/peers/config.rs\n    let nodes: HashSet\u003cNodeRecord\u003e \u003d serde_json::from_reader(reader)?;\n    Ok(self.with_basic_nodes(nodes))\n    ```\n    These nodes are added to the `basic_nodes` field of `PeersConfig`.\n4.  **Manager Initialization**:\n    In `crates/net/network/src/peers.rs`, `PeersManager::new` iterates over `basic_nodes` and inserts them into the in-memory `peers` map with `PeerKind::Basic`.\n\n#### 3. Runtime Behavior\nDuring runtime, the `PeersManager` maintains the state of peers in memory (`HashMap\u003cPeerId, Peer\u003e`).\n\n*   **Discovery**: New peers discovered via Discv4/Discv5/DNS are added to this map.\n*   **Updates**: If a peer\u0027s IP or port changes, the in-memory record is updated.\n*   **No Disk I/O**: The `known-peers.json` file is **not** touched during normal operation. There is no background task flushing peers to disk.\n\n#### 4. Saving on Shutdown\nPersistence is triggered exclusively during the graceful shutdown sequence.\n\n1.  **Shutdown Signal**: The node builder sets up a critical task for the network.\n    In `crates/node/builder/src/launch/common.rs` inside `start_network_with_policies`:\n    ```rust\n    // crates/node/builder/src/launch/common.rs\n    self.executor.spawn_critical_with_graceful_shutdown_signal(\n        \"p2p network task\",\n        |shutdown| {\n            Box::pin(network.run_until_graceful_shutdown(shutdown, |network| {\n                if let Some(peers_file) \u003d known_peers_file {\n                    // ... logging ...\n                    match network.write_peers_to_file(peers_file.as_path()) {\n                         // ... handle result ...\n                    }\n                }\n            }))\n        },\n    );\n    ```\n2.  **Writing to Disk**:\n    The method `NetworkManager::write_peers_to_file` in `crates/net/network/src/manager.rs` performs the actual write:\n    ```rust\n    // crates/net/network/src/manager.rs\n    pub fn write_peers_to_file(\u0026self, persistent_peers_file: \u0026Path) -\u003e Result\u003c(), FsPathError\u003e {\n        let known_peers \u003d self.all_peers().collect::\u003cVec\u003c_\u003e\u003e();\n        persistent_peers_file.parent().map(fs::create_dir_all).transpose()?;\n        reth_fs_util::write_json_file(persistent_peers_file, \u0026known_peers)?;\n        Ok(())\n    }\n    ```\n    It calls `self.all_peers()`, which delegates to `PeersManager::iter_peers`, effectively dumping the current in-memory state.\n\n#### 5. Pruning and Expiration\nThere is no explicit \"garbage collection\" logic that runs against the JSON file itself. Pruning happens naturally via the lifecycle of the in-memory `PeersManager`:\n\n*   **Reputation System**: In `crates/net/network/src/peers.rs`, if a peer\u0027s reputation drops sufficiently (e.g., `ReputationChangeKind::BadProtocol` or repeated `FailedToConnect`), the `PeersManager` removes the peer from the `peers` HashMap via `remove_peer`.\n*   **Eviction**: Since `write_peers_to_file` only iterates over currently existing peers in the HashMap, any peer removed during runtime will simply be omitted from the JSON file on shutdown.\n*   **Limitation**: Peer reputation scores, ban expirations, and backoff timers are **not** persisted. When the node restarts, all loaded peers start with default reputation and state. Banned peers are not saved to the file if they were removed from the map, but the *fact* that they were banned (and for how long) is lost unless they are part of a separate static banlist configuration.",
+      "role": "model",
+      "finishReason": "STOP",
+      "tokenCount": 1676,
+      "parts": [{
+        "text": "Based on the provided codebase, here is the explanation of how peer persistence works in"
+      }, {
+        "text": " Reth.\n\n### Summary\n*   **Format**: Peers are stored in a simple JSON file (default `known-peers.json`)"
+      }, {
+        "text": " containing a list of Enode URL strings.\n*   **Startup**: The file is read during node initialization; entries"
+      }, {
+        "text": " are parsed into `NodeRecord` objects and added to the `PeersManager` as \"Basic\" peers.\n"
+      }, {
+        "text": "*   **Runtime**: There is **no periodic persistence** during runtime. Peer management (addition, removal, banning) happens entirely in-memory within the"
+      }, {
+        "text": " `PeersManager`.\n*   **Shutdown**: The current list of known peers is flushed to disk only when the node receives a graceful shutdown"
+      }, {
+        "text": " signal.\n*   **Pruning**: Pruning is implicit. Peers removed from memory during runtime (due to reputation loss"
+      }, {
+        "text": " or connection failures) are simply absent from the final list written to disk at shutdown. No reputation scores or ban expiry times"
+      }, {
+        "text": " are persisted in this file.\n\n---\n\n### Key Files and Responsibilities\n\n| File Path | Responsibility |\n| :--- |"
+      }, {
+        "text": " :--- |\n| `crates/node/core/src/args/network.rs` | Defines CLI arguments for"
+      }, {
+        "text": " the peers file path (`--peers-file`) and persistence toggles (`--no-persist-peers`). |\n| `crates/net/"
+      }, {
+        "text": "network-types/src/peers/config.rs` | Implements `with_basic_nodes_from_file"
+      }, {
+        "text": "`, responsible for reading and deserializing the JSON file. |\n| `crates/net/network/src/manager.rs"
+      }, {
+        "text": "` | Implements `write_peers_to_file`, responsible for collecting in-memory peers and serializing them"
+      }, {
+        "text": " to disk. |\n| `crates/node/builder/src/launch/common.rs` | Sets up the "
+      }, {
+        "text": "`shutdown` hook that triggers the save operation. |\n| `crates/net/network/src/peers.rs` | "
+      }, {
+        "text": "`PeersManager` holds the in-memory state (`HashMap\u003cPeerId, Peer\u003e`) that serves as the source of truth."
+      }, {
+        "text": " |\n\n---\n\n### Detailed Analysis\n\n#### 1. Disk Format\nThe persistence file is a JSON array of strings"
+      }, {
+        "text": ", where each string is a serialized `NodeRecord` (Enode URL).\n\n*   **File Location**: Defaults to `\u003c"
+      }, {
+        "text": "DATADIR\u003e/\u003cCHAIN_ID\u003e/known-peers.json`. This path is resolved in `ChainPath::known"
+      }, {
+        "text": "_peers` in `crates/node/core/src/dirs.rs`.\n*   **Data Structure**:"
+      }, {
+        "text": " The file deserializes into a `HashSet\u003cNodeRecord\u003e`.\n*   **Serialization**: `NodeRecord` implements `SerializeDisplay"
+      }, {
+        "text": "` (via `serde_with`), which formats the record as an Enode string (e.g., `enode://"
+      }, {
+        "text": "\u003cid\u003e@\u003cip\u003e:\u003cport\u003e`).\n\n#### 2. Loading on Startup\nPeer loading occurs during the construction"
+      }, {
+        "text": " of the `NetworkConfig`.\n\n1.  **CLI Argument Parsing**:\n    In `crates/node/core/src"
+      }, {
+        "text": "/args/network.rs`, `NetworkArgs` captures optional `--peers-file` and `--no-persist-peers"
+      }, {
+        "text": "` flags.\n2.  **Config Construction**:\n    The method `NetworkArgs::network_config` determines the path."
+      }, {
+        "text": " It calls `peers_config_with_basic_nodes_from_file` on the global `Config` object.\n3"
+      }, {
+        "text": ".  **Deserialization**:\n    In `crates/net/network-types/src/peers/config."
+      }, {
+        "text": "rs`, `with_basic_nodes_from_file`:\n    ```rust\n    // crates/net/network-types/"
+      }, {
+        "text": "src/peers/config.rs\n    let nodes: HashSet\u003cNodeRecord\u003e \u003d serde_json::from_reader(reader"
+      }, {
+        "text": ")?;\n    Ok(self.with_basic_nodes(nodes))\n    ```\n    These nodes are added to the `basic_"
+      }, {
+        "text": "nodes` field of `PeersConfig`.\n4.  **Manager Initialization**:\n    In `crates/net/network/src/"
+      }, {
+        "text": "peers.rs`, `PeersManager::new` iterates over `basic_nodes` and inserts them into the in-memory `peers"
+      }, {
+        "text": "` map with `PeerKind::Basic`.\n\n#### 3. Runtime Behavior\nDuring runtime, the `Peers"
+      }, {
+        "text": "Manager` maintains the state of peers in memory (`HashMap\u003cPeerId, Peer\u003e`).\n\n*   **Discovery**: New"
+      }, {
+        "text": " peers discovered via Discv4/Discv5/DNS are added to this map.\n*   **Updates**:"
+      }, {
+        "text": " If a peer\u0027s IP or port changes, the in-memory record is updated.\n*   **No Disk I"
+      }, {
+        "text": "/O**: The `known-peers.json` file is **not** touched during normal operation. There is no background"
+      }, {
+        "text": " task flushing peers to disk.\n\n#### 4. Saving on Shutdown\nPersistence is triggered exclusively during the graceful shutdown sequence.\n\n1."
+      }, {
+        "text": "  **Shutdown Signal**: The node builder sets up a critical task for the network.\n    In `crates/node/builder/"
+      }, {
+        "text": "src/launch/common.rs` inside `start_network_with_policies`:\n    ```rust\n    //"
+      }, {
+        "text": " crates/node/builder/src/launch/common.rs\n    self.executor.spawn_critical_with"
+      }, {
+        "text": "_graceful_shutdown_signal(\n        \"p2p network task\",\n        |shutdown| {\n"
+      }, {
+        "text": "            Box::pin(network.run_until_graceful_shutdown(shutdown, |network| {\n                "
+      }, {
+        "text": "if let Some(peers_file) \u003d known_peers_file {\n                    // ... logging ...\n                    match network.write_"
+      }, {
+        "text": "peers_to_file(peers_file.as_path()) {\n                         // ... handle result ...\n                    }\n                }\n"
+      }, {
+        "text": "            }))\n        },\n    );\n    ```\n2.  **Writing to Disk**:\n    The method"
+      }, {
+        "text": " `NetworkManager::write_peers_to_file` in `crates/net/network/src/manager."
+      }, {
+        "text": "rs` performs the actual write:\n    ```rust\n    // crates/net/network/src/manager.rs\n    pub fn"
+      }, {
+        "text": " write_peers_to_file(\u0026self, persistent_peers_file: \u0026Path) -\u003e Result\u003c(), FsPath"
+      }, {
+        "text": "Error\u003e {\n        let known_peers \u003d self.all_peers().collect::\u003cVec\u003c_\u003e\u003e();\n        persistent"
+      }, {
+        "text": "_peers_file.parent().map(fs::create_dir_all).transpose()?;\n        reth_fs"
+      }, {
+        "text": "_util::write_json_file(persistent_peers_file, \u0026known_peers)?;\n        Ok(())"
+      }, {
+        "text": "\n    }\n    ```\n    It calls `self.all_peers()`, which delegates to `PeersManager"
+      }, {
+        "text": "::iter_peers`, effectively dumping the current in-memory state.\n\n#### 5. Pruning and Expiration"
+      }, {
+        "text": "\nThere is no explicit \"garbage collection\" logic that runs against the JSON file itself. Pruning happens naturally via the lifecycle"
+      }, {
+        "text": " of the in-memory `PeersManager`:\n\n*   **Reputation System**: In `crates/net/network/"
+      }, {
+        "text": "src/peers.rs`, if a peer\u0027s reputation drops sufficiently (e.g., `ReputationChangeKind::Bad"
+      }, {
+        "text": "Protocol` or repeated `FailedToConnect`), the `PeersManager` removes the peer from the `peers` HashMap"
+      }, {
+        "text": " via `remove_peer`.\n*   **Eviction**: Since `write_peers_to_file` only iterates"
+      }, {
+        "text": " over currently existing peers in the HashMap, any peer removed during runtime will simply be omitted from the JSON file on shutdown.\n*   **"
+      }, {
+        "text": "Limitation**: Peer reputation scores, ban expirations, and backoff timers are **not** persisted. When the node restarts, all loaded"
+      }, {
+        "text": " peers start with default reputation and state. Banned peers are not saved to the file if they were removed from the map,"
+      }, {
+        "text": " but the *fact* that they were banned (and for how long) is lost unless they are part of a separate static"
+      }, {
+        "text": " banlist configuration."
+      }, {
+        "text": "",
+        "thoughtSignature": "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"
+      }]
+    }],
+    "pendingInputs": [{
+      "text": "",
+      "role": "user"
+    }]
+  }
+}
