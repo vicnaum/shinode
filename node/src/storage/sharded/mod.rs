@@ -24,7 +24,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use wal::{append_record, append_records, read_records, WalRecord};
+use wal::{append_records, read_records, WalRecord};
 
 const SCHEMA_VERSION: u64 = 2;
 const META_FILE_NAME: &str = "meta.json";
@@ -398,6 +398,7 @@ impl Storage {
         Ok(meta.max_present_block)
     }
 
+    #[allow(dead_code)]
     pub fn set_last_indexed_block(&self, value: u64) -> Result<()> {
         let mut meta = self.meta.lock().expect("meta lock");
         meta.max_present_block = Some(value);
@@ -509,38 +510,6 @@ impl Storage {
             }
         }
         Ok(written_blocks)
-    }
-
-    pub fn write_block_bundle_wal(&self, bundle: &BlockBundle) -> Result<bool> {
-        let shard_start = shard_start(bundle.number, self.shard_size());
-        let shard = self.get_or_create_shard(shard_start)?;
-        let mut state = shard.lock().expect("shard lock");
-        let offset = (bundle.number - shard_start) as usize;
-        if state.bitset.is_set(offset) {
-            return Ok(false);
-        }
-        let record = WalBundleRecord {
-            number: bundle.number,
-            header: encode_bincode_compat_value(&bundle.header)?,
-            tx_hashes: encode_bincode_value(&bundle.tx_hashes)?,
-            tx_meta: encode_bincode_value(&bundle.transactions)?,
-            receipts: encode_bincode_compat_value(&bundle.receipts)?,
-            size: encode_u64_value(bundle.size.size),
-        };
-        let payload = encode_bincode_value(&record)?;
-        append_record(&wal_path(&state.dir), bundle.number, &payload)?;
-        if state.bitset.set(offset) {
-            state.meta.present_count = state.meta.present_count.saturating_add(1);
-            state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
-            state.meta.sorted = false;
-            state.meta.sealed = false;
-            state.meta.content_hash = None;
-            if state.meta.complete {
-                persist_shard_meta(&state.dir, &state.meta)?;
-            }
-        }
-        self.bump_max_present(bundle.number)?;
-        Ok(true)
     }
 
     pub fn write_block_bundle_follow(&self, bundle: &BlockBundle) -> Result<()> {
@@ -826,6 +795,7 @@ impl Storage {
         segments.tx_hashes.read_row(number)
     }
 
+    #[allow(dead_code)]
     pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
         let shard_start = shard_start(number, self.shard_size());
         let shard = self.get_shard(shard_start)?;
@@ -845,6 +815,7 @@ impl Storage {
         segments.tx_meta.read_row(number)
     }
 
+    #[allow(dead_code)]
     pub fn block_withdrawals(&self, _number: u64) -> Result<Option<StoredWithdrawals>> {
         Ok(None)
     }
@@ -890,6 +861,7 @@ impl Storage {
         segments.receipts.read_row_compat(number)
     }
 
+    #[allow(dead_code)]
     pub fn block_logs(&self, _number: u64) -> Result<Option<StoredLogs>> {
         Ok(None)
     }
@@ -933,6 +905,7 @@ impl Storage {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn block_logs_range(
         &self,
         _range: std::ops::RangeInclusive<u64>,
@@ -940,6 +913,7 @@ impl Storage {
         Ok(Vec::new())
     }
 
+    #[allow(dead_code)]
     pub fn log_index_by_address_range(
         &self,
         _address: alloy_primitives::Address,
@@ -948,6 +922,7 @@ impl Storage {
         Ok(Vec::new())
     }
 
+    #[allow(dead_code)]
     pub fn log_index_by_topic0_range(
         &self,
         _topic0: alloy_primitives::B256,
@@ -1487,7 +1462,7 @@ mod tests {
         let storage = Storage::open(&config).expect("open storage");
         let bundle = bundle_with_number(5);
         storage
-            .write_block_bundle_wal(&bundle)
+            .write_block_bundles_wal(&[bundle])
             .expect("write wal");
         drop(storage);
 
@@ -1503,11 +1478,8 @@ mod tests {
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("open storage");
         storage
-            .write_block_bundle_wal(&bundle_with_number(2))
-            .expect("write 2");
-        storage
-            .write_block_bundle_wal(&bundle_with_number(0))
-            .expect("write 0");
+            .write_block_bundles_wal(&[bundle_with_number(2), bundle_with_number(0)])
+            .expect("write wal");
         storage.compact_shard(0).expect("compact shard");
 
         assert!(storage.block_header(0).expect("header 0").is_some());

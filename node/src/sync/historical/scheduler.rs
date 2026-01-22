@@ -19,6 +19,7 @@ pub struct SchedulerConfig {
     /// Initial blocks per peer batch (before AIMD adjusts).
     pub initial_blocks_per_assignment: usize,
     /// Max blocks ahead of the DB writer low watermark to assign (0 = unlimited).
+    #[allow(dead_code)]
     pub max_lookahead_blocks: u64,
     pub max_attempts_per_block: u32,
     pub peer_failure_threshold: u32,
@@ -449,6 +450,7 @@ pub struct PeerWorkScheduler {
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
     escalation: Mutex<EscalationState>,
+    #[allow(dead_code)]
     low_watermark: Arc<AtomicU64>,
 }
 

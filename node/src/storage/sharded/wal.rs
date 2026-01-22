@@ -10,31 +10,6 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
-pub fn append_record(path: &Path, block_number: u64, payload: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).wrap_err("failed to create wal dir")?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .wrap_err("failed to open staging.wal")?;
-
-    let mut hasher = Hasher::new();
-    hasher.update(&block_number.to_le_bytes());
-    let len = payload.len() as u32;
-    hasher.update(&len.to_le_bytes());
-    hasher.update(payload);
-    let crc = hasher.finalize();
-
-    file.write_all(&block_number.to_le_bytes())?;
-    file.write_all(&len.to_le_bytes())?;
-    file.write_all(payload)?;
-    file.write_all(&crc.to_le_bytes())?;
-    file.flush()?;
-    Ok(())
-}
-
 pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -141,8 +116,20 @@ mod tests {
     #[test]
     fn wal_truncates_partial_tail() {
         let path = temp_path();
-        append_record(&path, 1, b"hello").expect("append 1");
-        append_record(&path, 2, b"world").expect("append 2");
+        append_records(
+            &path,
+            &[
+                WalRecord {
+                    block_number: 1,
+                    payload: b"hello".to_vec(),
+                },
+                WalRecord {
+                    block_number: 2,
+                    payload: b"world".to_vec(),
+                },
+            ],
+        )
+        .expect("append records");
 
         let len = fs::metadata(&path).expect("meta").len();
         let truncated = len.saturating_sub(3);

@@ -173,6 +173,7 @@ impl DbWriteConfig {
 
 pub enum DbWriterMessage {
     Block(BlockBundle),
+    #[allow(dead_code)]
     Flush,
     Finalize,
 }
