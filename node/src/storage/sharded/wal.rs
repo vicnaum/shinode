@@ -10,6 +10,15 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WalIndexEntry {
+    pub block_number: u64,
+    /// Offset of the record start (block_number field) within the WAL file.
+    pub record_offset: u64,
+    /// Length of the record payload (not including the header or CRC trailer).
+    pub payload_len: u32,
+}
+
 pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -40,6 +49,7 @@ pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn read_records(path: &Path) -> Result<Vec<WalRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -93,6 +103,70 @@ pub fn read_records(path: &Path) -> Result<Vec<WalRecord>> {
     }
 
     Ok(records)
+}
+
+/// Scans the WAL and returns record offsets + payload sizes without loading payloads into memory.
+///
+/// This also truncates an invalid / partial tail (same behavior as [`read_records`]), but it does
+/// NOT validate per-record CRCs.
+pub fn build_index(path: &Path) -> Result<Vec<WalIndexEntry>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .wrap_err("failed to open staging.wal")?;
+
+    let mut entries = Vec::new();
+    let mut last_good_offset: u64 = 0;
+    let mut buf = [0u8; 8];
+    let mut len_buf = [0u8; 4];
+
+    loop {
+        let record_offset = file.stream_position()?;
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        if read < 8 {
+            break;
+        }
+
+        let block_number = u64::from_le_bytes(buf);
+        if file.read_exact(&mut len_buf).is_err() {
+            break;
+        }
+        let payload_len = u32::from_le_bytes(len_buf);
+
+        let file_len = file.metadata()?.len();
+        let next_offset = record_offset
+            .saturating_add(8)
+            .saturating_add(4)
+            .saturating_add(payload_len as u64)
+            .saturating_add(4);
+        if next_offset > file_len {
+            break;
+        }
+
+        entries.push(WalIndexEntry {
+            block_number,
+            record_offset,
+            payload_len,
+        });
+
+        file.seek(SeekFrom::Start(next_offset))?;
+        last_good_offset = next_offset;
+    }
+
+    if last_good_offset < file.metadata()?.len() {
+        file.set_len(last_good_offset)?;
+        file.seek(SeekFrom::End(0))?;
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

@@ -194,7 +194,9 @@ pub async fn run_db_writer(
     remaining_per_shard: Option<Arc<Mutex<HashMap<u64, usize>>>>,
 ) -> Result<()> {
     let mut interval = config.flush_interval.map(tokio::time::interval);
-    let semaphore = Arc::new(Semaphore::new(2));
+    // Compaction is a large, bursty workload (reads WAL + writes new segment files).
+    // Serializing it avoids compaction fan-out doubling peak memory/IO.
+    let semaphore = Arc::new(Semaphore::new(1));
     let mut compactions = Vec::new();
     let mut buffer: Vec<BlockBundle> = Vec::new();
     let mut gauge_tick = tokio::time::interval(Duration::from_secs(10));

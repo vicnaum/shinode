@@ -13,6 +13,7 @@ use crate::storage::{
     StoredWithdrawals, ZSTD_DICT_MAX_SIZE,
 };
 use bitset::Bitset;
+use crc32fast::Hasher;
 use eyre::{eyre, Result, WrapErr};
 use hash::compute_shard_hash;
 use reth_nippy_jar::{NippyJar, NippyJarCursor, NippyJarWriter, CONFIG_FILE_EXTENSION};
@@ -21,10 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use wal::{append_records, read_records, WalRecord};
+use wal::{append_records, build_index as build_wal_index, WalIndexEntry, WalRecord};
 
 const SCHEMA_VERSION: u64 = 2;
 const META_FILE_NAME: &str = "meta.json";
@@ -162,17 +164,23 @@ impl SegmentWriter {
             ));
         }
         let gap = start_block.saturating_sub(state.next_block) as usize;
-        let all_rows = if gap == 0 {
-            rows.to_vec()
-        } else {
-            let mut filled = vec![Vec::new(); gap];
-            filled.extend_from_slice(rows);
-            filled
-        };
-        let iter = all_rows.iter().map(|bytes| Ok(bytes.as_slice()));
+        // IMPORTANT: avoid cloning potentially huge row payloads.
+        //
+        // We intentionally feed the writer an iterator of borrowed slices. This keeps memory usage
+        // bounded by the caller-owned `rows` buffer, and prevents `append_rows` from duplicating
+        // shard-sized data during compaction.
+        let gap_iter = std::iter::repeat_with(|| {
+            Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(&[][..])
+        })
+        .take(gap);
+        let rows_iter = rows.iter().map(|bytes| {
+            Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(bytes.as_slice())
+        });
+        let iter = gap_iter.chain(rows_iter);
+        let total_rows = gap.saturating_add(rows.len()) as u64;
         state
             .writer
-            .append_rows(vec![iter], all_rows.len() as u64)
+            .append_rows(vec![iter], total_rows)
             .wrap_err("failed to append rows")?;
         state
             .writer
@@ -180,7 +188,7 @@ impl SegmentWriter {
             .wrap_err("failed to commit static segment")?;
         state.next_block = state
             .next_block
-            .saturating_add(all_rows.len() as u64);
+            .saturating_add(total_rows);
         Ok(())
     }
 
@@ -567,9 +575,27 @@ impl Storage {
         };
         let mut state = shard.lock().expect("shard lock");
         let wal_path = wal_path(&state.dir);
-        let wal_records = read_records(&wal_path)?;
-        let wal_map = records_to_map(&wal_records, shard_start, state.meta.shard_size)?;
-        if wal_map.is_empty() && state.meta.sorted {
+        let wal_entries = build_wal_index(&wal_path)?;
+        let mut wal_index: Vec<Option<(u64, u32)>> =
+            vec![None; state.meta.shard_size as usize];
+        for WalIndexEntry {
+            block_number,
+            record_offset,
+            payload_len,
+        } in wal_entries
+        {
+            if block_number < shard_start {
+                continue;
+            }
+            let offset = (block_number - shard_start) as usize;
+            if offset >= wal_index.len() {
+                continue;
+            }
+            // Keep the last entry if duplicates exist (shouldn't happen, but robust).
+            wal_index[offset] = Some((record_offset, payload_len));
+        }
+        let has_wal = wal_index.iter().any(|entry| entry.is_some());
+        if !has_wal && state.meta.sorted {
             return Ok(());
         }
 
@@ -597,70 +623,101 @@ impl Storage {
 
         let existing = shard_segment_readers(&sorted_dir, shard_start)?;
         let writers = shard_segment_writers(&temp_dir, shard_start)?;
+        let mut wal_file = if has_wal {
+            Some(
+                fs::File::open(&wal_path)
+                    .wrap_err("failed to open staging.wal for compaction")?,
+            )
+        } else {
+            None
+        };
 
         let end_offset = (tail_block - shard_start) as usize;
-        let mut headers = Vec::with_capacity(end_offset + 1);
-        let mut tx_hashes = Vec::with_capacity(end_offset + 1);
-        let mut tx_meta = Vec::with_capacity(end_offset + 1);
-        let mut receipts = Vec::with_capacity(end_offset + 1);
-        let mut sizes = Vec::with_capacity(end_offset + 1);
+        // Write the rebuilt shard in chunks to keep compaction peak memory bounded.
+        // This avoids holding `O(shard_size)` of decoded bytes per segment in memory at once.
+        const COMPACTION_CHUNK_ROWS: usize = 256;
+        let total_rows = end_offset.saturating_add(1);
+        let mut offset = 0usize;
+        while offset < total_rows {
+            let chunk_end = (offset + COMPACTION_CHUNK_ROWS).min(total_rows);
+            let chunk_len = chunk_end - offset;
+            let start_block = shard_start + offset as u64;
 
-        for offset in 0..=end_offset {
-            if !state.bitset.is_set(offset) {
-                headers.push(Vec::new());
-                tx_hashes.push(Vec::new());
-                tx_meta.push(Vec::new());
-                receipts.push(Vec::new());
-                sizes.push(Vec::new());
-                continue;
+            let mut headers = Vec::with_capacity(chunk_len);
+            let mut tx_hashes = Vec::with_capacity(chunk_len);
+            let mut tx_meta = Vec::with_capacity(chunk_len);
+            let mut receipts = Vec::with_capacity(chunk_len);
+            let mut sizes = Vec::with_capacity(chunk_len);
+
+            for local_offset in offset..chunk_end {
+                if !state.bitset.is_set(local_offset) {
+                    headers.push(Vec::new());
+                    tx_hashes.push(Vec::new());
+                    tx_meta.push(Vec::new());
+                    receipts.push(Vec::new());
+                    sizes.push(Vec::new());
+                    continue;
+                }
+
+                let block_number = shard_start + local_offset as u64;
+                if let Some((record_offset, payload_len)) = wal_index[local_offset] {
+                    let bundle = read_wal_bundle_record_at(
+                        wal_file
+                            .as_mut()
+                            .expect("wal file should exist when wal index is non-empty"),
+                        record_offset,
+                        payload_len,
+                    )
+                    .wrap_err_with(|| format!("failed to read WAL bundle for block {block_number}"))?;
+                    headers.push(bundle.header);
+                    tx_hashes.push(bundle.tx_hashes);
+                    tx_meta.push(bundle.tx_meta);
+                    receipts.push(bundle.receipts);
+                    sizes.push(bundle.size);
+                    continue;
+                }
+
+                let Some(existing) = existing.as_ref() else {
+                    return Err(eyre!(
+                        "missing block {} in WAL and sorted segment",
+                        block_number
+                    ));
+                };
+                let header_bytes = existing
+                    .headers
+                    .read_row_raw(block_number)?
+                    .ok_or_else(|| eyre!("missing header for block {}", block_number))?;
+                let tx_hash_bytes = existing
+                    .tx_hashes
+                    .read_row_raw(block_number)?
+                    .ok_or_else(|| eyre!("missing tx_hashes for block {}", block_number))?;
+                let tx_meta_bytes = existing
+                    .tx_meta
+                    .read_row_raw(block_number)?
+                    .ok_or_else(|| eyre!("missing tx_meta for block {}", block_number))?;
+                let receipt_bytes = existing
+                    .receipts
+                    .read_row_raw(block_number)?
+                    .ok_or_else(|| eyre!("missing receipts for block {}", block_number))?;
+                let size_bytes = existing
+                    .sizes
+                    .read_row_raw(block_number)?
+                    .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
+                headers.push(header_bytes);
+                tx_hashes.push(tx_hash_bytes);
+                tx_meta.push(tx_meta_bytes);
+                receipts.push(receipt_bytes);
+                sizes.push(size_bytes);
             }
-            let block_number = shard_start + offset as u64;
-            if let Some(bundle) = wal_map.get(&offset) {
-                headers.push(bundle.header.clone());
-                tx_hashes.push(bundle.tx_hashes.clone());
-                tx_meta.push(bundle.tx_meta.clone());
-                receipts.push(bundle.receipts.clone());
-                sizes.push(bundle.size.clone());
-                continue;
-            }
-            let Some(existing) = existing.as_ref() else {
-                return Err(eyre!(
-                    "missing block {} in WAL and sorted segment",
-                    block_number
-                ));
-            };
-            let header_bytes = existing
-                .headers
-                .read_row_raw(block_number)?
-                .ok_or_else(|| eyre!("missing header for block {}", block_number))?;
-            let tx_hash_bytes = existing
-                .tx_hashes
-                .read_row_raw(block_number)?
-                .ok_or_else(|| eyre!("missing tx_hashes for block {}", block_number))?;
-            let tx_meta_bytes = existing
-                .tx_meta
-                .read_row_raw(block_number)?
-                .ok_or_else(|| eyre!("missing tx_meta for block {}", block_number))?;
-            let receipt_bytes = existing
-                .receipts
-                .read_row_raw(block_number)?
-                .ok_or_else(|| eyre!("missing receipts for block {}", block_number))?;
-            let size_bytes = existing
-                .sizes
-                .read_row_raw(block_number)?
-                .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
-            headers.push(header_bytes);
-            tx_hashes.push(tx_hash_bytes);
-            tx_meta.push(tx_meta_bytes);
-            receipts.push(receipt_bytes);
-            sizes.push(size_bytes);
+
+            writers.headers.append_rows(start_block, &headers)?;
+            writers.tx_hashes.append_rows(start_block, &tx_hashes)?;
+            writers.tx_meta.append_rows(start_block, &tx_meta)?;
+            writers.receipts.append_rows(start_block, &receipts)?;
+            writers.sizes.append_rows(start_block, &sizes)?;
+
+            offset = chunk_end;
         }
-
-        writers.headers.append_rows(shard_start, &headers)?;
-        writers.tx_hashes.append_rows(shard_start, &tx_hashes)?;
-        writers.tx_meta.append_rows(shard_start, &tx_meta)?;
-        writers.receipts.append_rows(shard_start, &receipts)?;
-        writers.sizes.append_rows(shard_start, &sizes)?;
 
         if sorted_dir.exists() {
             fs::remove_dir_all(&sorted_dir).wrap_err("failed to remove old sorted")?;
@@ -1309,8 +1366,9 @@ fn max_present_in_bitset(state: &ShardState, shard_size: u64) -> Option<u64> {
     max_offset.map(|offset| state.meta.shard_start + offset as u64)
 }
 
+#[allow(dead_code)]
 fn records_to_map(
-    records: &[WalRecord],
+    records: Vec<WalRecord>,
     shard_start: u64,
     shard_size: u64,
 ) -> Result<HashMap<usize, WalBundleRecord>> {
@@ -1329,14 +1387,103 @@ fn records_to_map(
     Ok(map)
 }
 
+struct WalPayloadCrcReader<'a> {
+    file: &'a mut fs::File,
+    hasher: Hasher,
+    remaining: u64,
+}
+
+impl<'a> WalPayloadCrcReader<'a> {
+    fn new(file: &'a mut fs::File, block_number: u64, payload_len: u32) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(&block_number.to_le_bytes());
+        hasher.update(&payload_len.to_le_bytes());
+        Self {
+            file,
+            hasher,
+            remaining: payload_len as u64,
+        }
+    }
+
+    fn finish(mut self) -> Result<Hasher> {
+        let mut buf = [0u8; 64 * 1024];
+        while self.remaining > 0 {
+            let to_read = (self.remaining as usize).min(buf.len());
+            self.file.read_exact(&mut buf[..to_read])?;
+            self.hasher.update(&buf[..to_read]);
+            self.remaining = self.remaining.saturating_sub(to_read as u64);
+        }
+        Ok(self.hasher)
+    }
+}
+
+impl<'a> Read for WalPayloadCrcReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let to_read = buf.len().min(self.remaining as usize);
+        let n = self.file.read(&mut buf[..to_read])?;
+        self.hasher.update(&buf[..n]);
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        Ok(n)
+    }
+}
+
+fn read_wal_bundle_record_at(
+    file: &mut fs::File,
+    record_offset: u64,
+    expected_payload_len: u32,
+) -> Result<WalBundleRecord> {
+    file.seek(SeekFrom::Start(record_offset))?;
+    let mut num_buf = [0u8; 8];
+    file.read_exact(&mut num_buf)?;
+    let block_number = u64::from_le_bytes(num_buf);
+
+    let mut len_buf = [0u8; 4];
+    file.read_exact(&mut len_buf)?;
+    let payload_len = u32::from_le_bytes(len_buf);
+    if payload_len != expected_payload_len {
+        return Err(eyre!(
+            "wal payload length mismatch at offset {} (block {}): expected {}, got {}",
+            record_offset,
+            block_number,
+            expected_payload_len,
+            payload_len
+        ));
+    }
+
+    let mut reader = WalPayloadCrcReader::new(file, block_number, payload_len);
+    let bundle: WalBundleRecord = bincode::deserialize_from(&mut reader)
+        .wrap_err("failed to decode WAL bundle record")?;
+    let hasher = reader.finish()?;
+
+    let mut crc_buf = [0u8; 4];
+    file.read_exact(&mut crc_buf)?;
+    let crc_expected = u32::from_le_bytes(crc_buf);
+    let crc_actual = hasher.finalize();
+    if crc_actual != crc_expected {
+        return Err(eyre!(
+            "wal crc mismatch at offset {} (block {}): expected {}, got {}",
+            record_offset,
+            block_number,
+            crc_expected,
+            crc_actual
+        ));
+    }
+
+    Ok(bundle)
+}
+
 fn repair_shard_from_wal(state: &mut ShardState) -> Result<()> {
     let wal_path = wal_path(&state.dir);
     if !wal_path.exists() {
         return Ok(());
     }
-    let records = read_records(&wal_path)?;
-    for record in records {
-        let block = record.block_number;
+    // Avoid loading the entire WAL into memory on startup; we only need block numbers.
+    let entries = build_wal_index(&wal_path)?;
+    for entry in entries {
+        let block = entry.block_number;
         if block < state.meta.shard_start {
             continue;
         }
