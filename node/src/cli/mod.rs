@@ -142,10 +142,10 @@ pub struct NodeConfig {
     #[arg(long, default_value = DEFAULT_BENCHMARK_TRACE_FILTER)]
     pub benchmark_trace_filter: String,
     /// Include span/event args in benchmark traces.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub benchmark_trace_include_args: bool,
     /// Include file+line in benchmark traces.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub benchmark_trace_include_locations: bool,
     /// Emit a JSONL event log during benchmark runs.
     #[arg(long, default_value_t = false)]
@@ -255,8 +255,8 @@ mod tests {
             config.benchmark_trace_filter,
             DEFAULT_BENCHMARK_TRACE_FILTER
         );
-        assert!(!config.benchmark_trace_include_args);
-        assert!(!config.benchmark_trace_include_locations);
+        assert!(config.benchmark_trace_include_args);
+        assert!(config.benchmark_trace_include_locations);
         assert!(!config.benchmark_events);
         assert_eq!(config.benchmark_min_peers, None);
         assert!(config.command.is_none());

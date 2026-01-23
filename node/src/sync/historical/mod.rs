@@ -31,9 +31,9 @@ use process::process_ingest;
 use scheduler::{PeerHealthConfig, PeerWorkScheduler, SchedulerConfig};
 pub(crate) use scheduler::PeerHealthTracker;
 use sink::run_probe_sink;
-pub use stats::{BenchEventLogger, IngestBenchStats, IngestBenchSummary, ProbeStats};
+pub use stats::{BenchEvent, BenchEventLogger, IngestBenchStats, IngestBenchSummary, ProbeStats};
 pub use follow::run_follow_loop;
-use stats::{BenchEvent, FetchByteTotals};
+use stats::FetchByteTotals;
 use types::{BenchmarkConfig, ProbeRecord, FetchMode};
 use crate::storage::Storage;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -594,6 +594,51 @@ pub async fn run_ingest_pipeline(
         Arc::clone(&low_watermark),
     ));
 
+    let (gauge_stop_tx, gauge_stop_rx) = watch::channel(false);
+    let scheduler_gauge_handle = if let Some(events) = events.clone() {
+        let scheduler = Arc::clone(&scheduler);
+        let mut stop_rx = gauge_stop_rx.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let pending_total = scheduler.pending_count().await as u64;
+                        let pending_main = scheduler.pending_main_count().await as u64;
+                        let inflight = scheduler.inflight_count().await as u64;
+                        let failed = scheduler.failed_count().await as u64;
+                        let completed = scheduler.completed_count().await as u64;
+                        let attempts = scheduler.attempts_len().await as u64;
+                        let escalation_len = scheduler.escalation_len().await as u64;
+                        let escalation_attempted = scheduler.escalation_attempted_count().await as u64;
+                        events.record(BenchEvent::SchedulerGaugeSample {
+                            pending_total,
+                            pending_main,
+                            inflight,
+                            failed,
+                            completed,
+                            attempts,
+                            escalation_len,
+                            escalation_attempted,
+                        });
+                    }
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    let scheduler_gauge_stop = if scheduler_gauge_handle.is_some() {
+        Some(gauge_stop_tx)
+    } else {
+        None
+    };
+
     let (fetched_blocks_tx, fetched_blocks_rx) = mpsc::channel::<BlockPayload>(2048);
     let (processed_blocks_tx, processed_blocks_rx) = mpsc::channel(2048);
     let db_flush_tx = processed_blocks_tx.clone();
@@ -1146,6 +1191,13 @@ pub async fn run_ingest_pipeline(
     );
 
     let logs = logs_total.load(Ordering::SeqCst);
+    if let Some(stop_tx) = scheduler_gauge_stop {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(handle) = scheduler_gauge_handle {
+        let _ = handle.await;
+    }
+
     Ok(IngestPipelineOutcome::RangeApplied { range, logs })
 }
 

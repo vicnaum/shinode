@@ -1,0 +1,25 @@
+signal	after_impl	where	mode	cadence	notes
+scheduler_pending_total	yes	events+logs	direct	10s(events),1s(logs)	events: SchedulerGaugeSample.pending_total; logs: progress/resources logs
+scheduler_pending_main	yes	events	direct	10s	scheduler.pending_main_count()
+scheduler_inflight	yes	events+logs	direct	10s(events),1s(logs)	events: SchedulerGaugeSample.inflight; logs: progress/resources
+scheduler_failed_set_size	yes	events+logs	direct	10s(events),1s(logs)	events: SchedulerGaugeSample.failed; logs: progress/resources
+scheduler_completed_set_size	yes	events	direct	10s	scheduler.completed_count()
+scheduler_attempts_map_size	yes	events	direct	10s	attempts.len() (silent grower)
+escalation_queue_len	yes	events	direct	10s	scheduler.escalation_len()
+escalation_attempted_count	yes	events	direct	10s	scheduler.escalation_attempted_count()
+active_fetch_tasks	yes	logs	direct	1s	already in benchmark resources logs as peers_active
+peer_connect_disconnect_ban	yes	events	direct	per-event	PeerConnected/PeerDisconnected/PeerBanned/PeerUnbanned
+fetch_batch_latency_bytes	yes	events	direct	per-batch	FetchStart/FetchEnd/FetchTimeout (+ per-stage stats)
+process_block_latency_logs	yes	events	direct	per-block	ProcessStart/ProcessEnd (duration_us, logs)
+db_flush_sizes_latency	yes	events	direct	per-flush	DbFlushStart/DbFlushEnd
+compaction_start_end_duration	yes	events	direct	per-compaction	CompactionStart/CompactionEnd (+ CompactAllDirty*, SealCompleted*)
+compactions_inflight	yes	events	derived	derived/offline or 10s	overlap CompactionStart/End; optional gauge in DbWriterGaugeSample
+pipeline_backlog_fetched_minus_processed	yes	events	derived	offline	cum(fetch_completed_blocks) - count(ProcessEnd)
+pipeline_backlog_processed_minus_written	yes	events	derived	offline	count(ProcessEnd) - cum(DbFlushEnd.blocks)
+db_writer_buffer_len	yes	events	direct	10s	DbWriterGaugeSample.buffer_len
+rss_kb_swap_kb_cpu_disk_rates	yes	events+logs	direct	1s	events: ResourcesSample; logs: mirrored console
+rss_anon_file_shmem_split	yes(linux)	events+logs	direct	1s	ResourcesSample fields from /proc/self/status
+trace_writer_backlog	n/a	-	no	-	not exposed by tracing-chrome
+exact_tokio_channel_occupancy	no	-	no	-	not exposed; use backlog proxies above
+wal_sortedtmp_sizes_over_time	no	-	no	-	would require explicit file-size sampling
+storage_segment_sizes_timeseries	no	-	no	-	only end-of-run StorageDiskStats in summary

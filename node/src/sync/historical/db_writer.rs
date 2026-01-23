@@ -197,6 +197,7 @@ pub async fn run_db_writer(
     let semaphore = Arc::new(Semaphore::new(2));
     let mut compactions = Vec::new();
     let mut buffer: Vec<BlockBundle> = Vec::new();
+    let mut gauge_tick = tokio::time::interval(Duration::from_secs(10));
 
     tracing::debug!(
         mode = ?mode,
@@ -345,6 +346,19 @@ pub async fn run_db_writer(
                     )
                     .await?;
                     compact_and_seal(&storage, events.as_ref())?;
+                }
+            }
+            _ = gauge_tick.tick() => {
+                if let Some(events) = events.as_ref() {
+                    let compactions_inflight = compactions
+                        .iter()
+                        .filter(|handle| !handle.is_finished())
+                        .count() as u64;
+                    events.record(BenchEvent::DbWriterGaugeSample {
+                        buffer_len: buffer.len() as u64,
+                        compactions_total: compactions.len() as u64,
+                        compactions_inflight,
+                    });
                 }
             }
         }

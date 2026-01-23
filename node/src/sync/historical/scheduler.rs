@@ -833,6 +833,11 @@ impl PeerWorkScheduler {
         escalation.attempts.len()
     }
 
+    pub async fn attempts_len(&self) -> usize {
+        let attempts = self.attempts.lock().await;
+        attempts.len()
+    }
+
     /// Number of in-flight blocks.
     pub async fn inflight_count(&self) -> usize {
         let in_flight = self.in_flight.lock().await;

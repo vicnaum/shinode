@@ -12,18 +12,22 @@ use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use metrics::range_len;
 use serde::Serialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
     collections::VecDeque,
     env,
     fs,
-    io::IsTerminal,
+    io::{BufWriter, IsTerminal, Write},
     path::{Path, PathBuf},
     process,
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
         Arc,
+        Mutex,
     },
+    thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use p2p::{PeerPool, p2p_limits};
@@ -31,8 +35,10 @@ use reth_network_api::PeerId;
 use sync::{
     BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus,
 };
-use sync::historical::{BenchEventLogger, IngestBenchStats, PeerHealthTracker, ProbeStats};
-use tracing::{info, warn};
+use sync::historical::{
+    BenchEvent, BenchEventLogger, IngestBenchStats, PeerHealthTracker, ProbeStats,
+};
+use tracing::{Event, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -41,6 +47,7 @@ use tracing_subscriber::Layer;
 use tokio::signal::unix::{signal, SignalKind};
 
 const DEFAULT_BENCHMARK_MIN_PEERS: u64 = 5;
+const BENCHMARK_LOG_BUFFER: usize = 10_000;
 
 async fn apply_cached_peer_limits(
     storage: &storage::Storage,
@@ -138,6 +145,7 @@ struct BenchmarkRunReport {
     peer_health_top: Vec<PeerHealthSummary>,
     peer_health_worst: Vec<PeerHealthSummary>,
     events: Option<BenchmarkEventsSummary>,
+    logs: Option<BenchmarkLogsSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +230,13 @@ struct BenchmarkEventsSummary {
     path: String,
 }
 
+#[derive(Debug, Serialize)]
+struct BenchmarkLogsSummary {
+    total_events: usize,
+    dropped_events: u64,
+    path: String,
+}
+
 #[derive(Debug)]
 struct BenchmarkRunContext {
     timestamp_utc: String,
@@ -231,6 +246,192 @@ struct BenchmarkRunContext {
     argv: Vec<String>,
     trace_tmp_path: Option<PathBuf>,
     events_tmp_path: Option<PathBuf>,
+    logs_tmp_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkLogRecord {
+    t_ms: u64,
+    level: String,
+    target: String,
+    file: Option<String>,
+    line: Option<u32>,
+    message: Option<String>,
+    fields: JsonMap<String, JsonValue>,
+}
+
+#[derive(Default)]
+struct JsonLogVisitor {
+    fields: JsonMap<String, JsonValue>,
+}
+
+impl tracing::field::Visit for JsonLogVisitor {
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), JsonValue::Bool(value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields.insert(
+            field.name().to_string(),
+            JsonValue::Number(value.into()),
+        );
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields.insert(
+            field.name().to_string(),
+            JsonValue::Number(value.into()),
+        );
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        let number = serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .unwrap_or_else(|| JsonValue::String(value.to_string()));
+        self.fields.insert(field.name().to_string(), number);
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.fields.insert(
+            field.name().to_string(),
+            JsonValue::String(value.to_string()),
+        );
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields.insert(
+            field.name().to_string(),
+            JsonValue::String(format!("{value:?}")),
+        );
+    }
+}
+
+#[derive(Debug)]
+struct BenchmarkLogWriter {
+    started_at: Instant,
+    sender: Mutex<Option<SyncSender<BenchmarkLogRecord>>>,
+    handle: Mutex<Option<JoinHandle<eyre::Result<()>>>>,
+    dropped_events: AtomicU64,
+    total_events: AtomicU64,
+}
+
+impl BenchmarkLogWriter {
+    fn new(path: PathBuf, capacity: usize) -> eyre::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+        let (tx, rx) = mpsc::sync_channel::<BenchmarkLogRecord>(capacity);
+        let handle = std::thread::spawn(move || -> eyre::Result<()> {
+            let mut since_flush = 0usize;
+            for record in rx {
+                serde_json::to_writer(&mut writer, &record)?;
+                writer.write_all(b"\n")?;
+                since_flush = since_flush.saturating_add(1);
+                if since_flush >= 4096 {
+                    writer.flush()?;
+                    since_flush = 0;
+                }
+            }
+            writer.flush()?;
+            Ok(())
+        });
+
+        Ok(Self {
+            started_at: Instant::now(),
+            sender: Mutex::new(Some(tx)),
+            handle: Mutex::new(Some(handle)),
+            dropped_events: AtomicU64::new(0),
+            total_events: AtomicU64::new(0),
+        })
+    }
+
+    fn record(&self, record: BenchmarkLogRecord) {
+        let sender = self
+            .sender
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(sender) = sender {
+            match sender.try_send(record) {
+                Ok(()) => {
+                    self.total_events.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    self.dropped_events.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        } else {
+            self.dropped_events.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn finish(&self) -> eyre::Result<()> {
+        let sender = match self.sender.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        drop(sender);
+        let handle = match self.handle.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(handle) = handle {
+            match handle.join() {
+                Ok(res) => res?,
+                Err(_) => return Err(eyre::eyre!("benchmark log writer thread panicked")),
+            }
+        }
+        Ok(())
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::SeqCst)
+    }
+
+    fn total_events(&self) -> u64 {
+        self.total_events.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+struct BenchmarkLogLayer {
+    writer: Arc<BenchmarkLogWriter>,
+}
+
+impl BenchmarkLogLayer {
+    fn new(writer: Arc<BenchmarkLogWriter>) -> Self {
+        Self { writer }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for BenchmarkLogLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let meta = event.metadata();
+        let mut visitor = JsonLogVisitor::default();
+        event.record(&mut visitor);
+        let mut fields = visitor.fields;
+        let message = match fields.remove("message") {
+            Some(JsonValue::String(value)) => Some(value),
+            Some(value) => Some(value.to_string()),
+            None => None,
+        };
+        let record = BenchmarkLogRecord {
+            t_ms: self.writer.started_at.elapsed().as_millis() as u64,
+            level: meta.level().as_str().to_string(),
+            target: meta.target().to_string(),
+            file: meta.file().map(|file| file.to_string()),
+            line: meta.line(),
+            message,
+            fields,
+        };
+        self.writer.record(record);
+    }
 }
 
 fn bench_timestamp_utc(now: SystemTime) -> String {
@@ -386,6 +587,7 @@ async fn emit_benchmark_artifacts(
     peer_health: &PeerHealthTracker,
     summary: sync::historical::IngestBenchSummary,
     events: Option<&BenchEventLogger>,
+    log_writer: Option<&BenchmarkLogWriter>,
     chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
 ) -> Result<()> {
     let build = build_info();
@@ -551,6 +753,40 @@ async fn emit_benchmark_artifacts(
         None
     };
 
+    let logs_summary = if let Some(logger) = log_writer {
+        let tmp_path = bench_context.logs_tmp_path.as_ref();
+        let final_path = bench_context
+            .output_dir
+            .join(format!("{base_name}.logs.jsonl"));
+        if let Err(err) = logger.finish() {
+            warn!(error = %err, "failed to finalize benchmark logs");
+        }
+        let mut path_str = final_path.display().to_string();
+        if let Some(tmp_path) = tmp_path {
+            match fs::rename(tmp_path, &final_path) {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        tmp = %tmp_path.display(),
+                        final_path = %final_path.display(),
+                        "failed to rename benchmark log output"
+                    );
+                    path_str = tmp_path.display().to_string();
+                }
+            }
+        } else {
+            warn!("benchmark log writer present but no tmp path configured");
+        }
+        Some(BenchmarkLogsSummary {
+            total_events: logger.total_events() as usize,
+            dropped_events: logger.dropped_events(),
+            path: path_str,
+        })
+    } else {
+        None
+    };
+
     let report = BenchmarkRunReport {
         meta: BenchmarkMeta {
             timestamp_utc: bench_context.timestamp_utc.clone(),
@@ -568,6 +804,7 @@ async fn emit_benchmark_artifacts(
         peer_health_top: top,
         peer_health_worst: worst,
         events: events_summary,
+        logs: logs_summary,
     };
     let report_path = write_benchmark_report(&bench_context.output_dir, &base_name, &report)?;
     info!(path = %report_path.display(), "benchmark summary written");
@@ -633,6 +870,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        let logs_tmp_path = Some(output_dir.join(format!("logs__{}__tmp.jsonl", timestamp_utc)));
         fs::create_dir_all(&output_dir)?;
         Some(BenchmarkRunContext {
             timestamp_utc,
@@ -642,6 +880,7 @@ async fn main() -> Result<()> {
             argv,
             trace_tmp_path,
             events_tmp_path,
+            logs_tmp_path,
         })
     } else {
         None
@@ -654,9 +893,10 @@ async fn main() -> Result<()> {
     if config.peer_cache_dir.is_none() {
         config.peer_cache_dir = default_peer_cache_dir();
     }
-    let mut chrome_guard = init_tracing(
+    let mut tracing_guards = init_tracing(
         &config,
         bench_context.as_ref().and_then(|ctx| ctx.trace_tmp_path.clone()),
+        bench_context.as_ref().and_then(|ctx| ctx.logs_tmp_path.clone()),
     );
 
     if let Some(command) = &config.command {
@@ -682,7 +922,7 @@ async fn main() -> Result<()> {
         if !matches!(config.head_source, cli::HeadSource::P2p) {
             return Err(eyre::eyre!("benchmark probe requires --head-source p2p"));
         }
-        spawn_benchmark_resource_logger(None);
+        spawn_benchmark_resource_logger(None, None);
         let peer_cache = storage::Storage::open_existing(&config)?
             .map(Arc::new);
         info!("starting p2p network");
@@ -775,15 +1015,10 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        spawn_benchmark_resource_logger(progress_stats.clone());
-        let peer_health_local = sync::historical::build_peer_health_tracker(&config);
-        apply_cached_peer_limits(&storage, &peer_health_local).await;
-        #[cfg(unix)]
-        spawn_usr1_state_logger(
-            progress_stats.clone(),
-            Some(Arc::clone(&session.pool)),
-            Some(Arc::clone(&peer_health_local)),
-        );
+        if let Some(stats) = progress_stats.as_ref() {
+            // In benchmark ingest, the head we target is fixed at startup.
+            stats.set_head_seen(head_at_startup);
+        }
         let events = if config.benchmark_events {
             let tmp_path = bench_context
                 .events_tmp_path
@@ -793,7 +1028,15 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-
+        spawn_benchmark_resource_logger(progress_stats.clone(), events.clone());
+        let peer_health_local = sync::historical::build_peer_health_tracker(&config);
+        apply_cached_peer_limits(&storage, &peer_health_local).await;
+        #[cfg(unix)]
+        spawn_usr1_state_logger(
+            progress_stats.clone(),
+            Some(Arc::clone(&session.pool)),
+            Some(Arc::clone(&peer_health_local)),
+        );
         let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
             let bar = ProgressBar::new(total_len);
             bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
@@ -875,7 +1118,8 @@ async fn main() -> Result<()> {
                     &peer_health_local,
                     summary,
                     events.as_deref(),
-                    &mut chrome_guard,
+                    tracing_guards.log_writer.as_deref(),
+                    &mut tracing_guards.chrome_guard,
                 )
                 .await
                 {
@@ -916,7 +1160,8 @@ async fn main() -> Result<()> {
             &peer_health_local,
             summary,
             events.as_deref(),
-            &mut chrome_guard,
+            tracing_guards.log_writer.as_deref(),
+            &mut tracing_guards.chrome_guard,
         )
         .await
         {
@@ -1110,10 +1355,16 @@ async fn wait_for_peer_head(
     }
 }
 
+struct TracingGuards {
+    chrome_guard: Option<tracing_chrome::FlushGuard>,
+    log_writer: Option<Arc<BenchmarkLogWriter>>,
+}
+
 fn init_tracing(
     config: &NodeConfig,
     chrome_trace_path: Option<PathBuf>,
-) -> Option<tracing_chrome::FlushGuard> {
+    log_path: Option<PathBuf>,
+) -> TracingGuards {
     let log_filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
         Err(_) => {
@@ -1128,7 +1379,15 @@ fn init_tracing(
     };
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
-        .with_filter(log_filter);
+        .with_filter(log_filter.clone());
+
+    let log_writer = log_path.and_then(|path| match BenchmarkLogWriter::new(path, BENCHMARK_LOG_BUFFER) {
+        Ok(writer) => Some(Arc::new(writer)),
+        Err(err) => {
+            warn!(error = %err, "failed to initialize benchmark log writer");
+            None
+        }
+    });
 
     let mut chrome_guard = None;
     if let Some(path) = chrome_trace_path {
@@ -1141,24 +1400,49 @@ fn init_tracing(
             .include_args(config.benchmark_trace_include_args)
             .include_locations(config.benchmark_trace_include_locations)
             .build();
-        tracing_subscriber::registry()
+        let log_layer = log_writer
+            .as_ref()
+            .map(|writer| BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone()));
+        let registry = tracing_subscriber::registry()
             .with(fmt_layer)
+            .with(log_layer);
+        registry
             .with(chrome_layer.with_filter(trace_filter))
             .init();
         chrome_guard = Some(guard);
     } else {
-        tracing_subscriber::registry()
+        let log_layer = log_writer
+            .as_ref()
+            .map(|writer| BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone()));
+        let registry = tracing_subscriber::registry()
             .with(fmt_layer)
-            .init();
+            .with(log_layer);
+        registry.init();
     }
-    chrome_guard
+    TracingGuards {
+        chrome_guard,
+        log_writer,
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc_status_mem_kb() -> Option<(u64, u64)> {
+#[derive(Clone, Copy)]
+struct ProcMemSample {
+    rss_kb: u64,
+    swap_kb: u64,
+    rss_anon_kb: u64,
+    rss_file_kb: u64,
+    rss_shmem_kb: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_status_mem_kb() -> Option<ProcMemSample> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     let mut rss = None;
     let mut swap = None;
+    let mut rss_anon = None;
+    let mut rss_file = None;
+    let mut rss_shmem = None;
     for line in status.lines() {
         if line.starts_with("VmRSS:") {
             rss = line
@@ -1170,15 +1454,38 @@ fn read_proc_status_mem_kb() -> Option<(u64, u64)> {
                 .split_whitespace()
                 .nth(1)
                 .and_then(|value| value.parse::<u64>().ok());
-        }
-        if rss.is_some() && swap.is_some() {
-            break;
+        } else if line.starts_with("RssAnon:") {
+            rss_anon = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
+        } else if line.starts_with("RssFile:") {
+            rss_file = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
+        } else if line.starts_with("RssShmem:") {
+            rss_shmem = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok());
         }
     }
-    if rss.is_none() && swap.is_none() {
+    if rss.is_none()
+        && swap.is_none()
+        && rss_anon.is_none()
+        && rss_file.is_none()
+        && rss_shmem.is_none()
+    {
         return None;
     }
-    Some((rss.unwrap_or(0), swap.unwrap_or(0)))
+    Some(ProcMemSample {
+        rss_kb: rss.unwrap_or(0),
+        swap_kb: swap.unwrap_or(0),
+        rss_anon_kb: rss_anon.unwrap_or(0),
+        rss_file_kb: rss_file.unwrap_or(0),
+        rss_shmem_kb: rss_shmem.unwrap_or(0),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1285,7 +1592,10 @@ fn read_proc_disk_sample() -> Option<DiskSample> {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
+fn spawn_benchmark_resource_logger(
+    stats: Option<Arc<SyncProgressStats>>,
+    events: Option<Arc<BenchEventLogger>>,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         let mut prev_cpu = read_proc_cpu_sample();
@@ -1337,15 +1647,50 @@ fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
                 continue;
             }
 
-            let (rss_kb, swap_kb) = mem.unwrap_or((0, 0));
+            let (rss_kb, swap_kb, rss_anon_kb, rss_file_kb, rss_shmem_kb) =
+                mem.map(|sample| {
+                    (
+                        sample.rss_kb,
+                        sample.swap_kb,
+                        sample.rss_anon_kb,
+                        sample.rss_file_kb,
+                        sample.rss_shmem_kb,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0));
             let (cpu_busy_pct, cpu_iowait_pct) = cpu_metrics.unwrap_or((0.0, 0.0));
             let (disk_read_mib_s, disk_write_mib_s) = disk_metrics.unwrap_or((0.0, 0.0));
 
             if let Some(stats) = stats.as_ref() {
                 let snapshot = stats.snapshot();
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::ResourcesSample {
+                        rss_kb,
+                        swap_kb,
+                        rss_anon_kb,
+                        rss_file_kb,
+                        rss_shmem_kb,
+                        cpu_busy_pct,
+                        cpu_iowait_pct,
+                        disk_read_mib_s,
+                        disk_write_mib_s,
+                        status: Some(snapshot.status.as_str().to_string()),
+                        processed: Some(snapshot.processed),
+                        queue: Some(snapshot.queue),
+                        inflight: Some(snapshot.inflight),
+                        failed: Some(snapshot.failed),
+                        peers_active: Some(snapshot.peers_active),
+                        peers_total: Some(snapshot.peers_total),
+                        head_block: Some(snapshot.head_block),
+                        head_seen: Some(snapshot.head_seen),
+                    });
+                }
                 info!(
                     rss_kb,
                     swap_kb,
+                    rss_anon_kb,
+                    rss_file_kb,
+                    rss_shmem_kb,
                     cpu_busy_pct,
                     cpu_iowait_pct,
                     disk_read_mib_s,
@@ -1362,9 +1707,34 @@ fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
                     "benchmark resources"
                 );
             } else {
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::ResourcesSample {
+                        rss_kb,
+                        swap_kb,
+                        rss_anon_kb,
+                        rss_file_kb,
+                        rss_shmem_kb,
+                        cpu_busy_pct,
+                        cpu_iowait_pct,
+                        disk_read_mib_s,
+                        disk_write_mib_s,
+                        status: None,
+                        processed: None,
+                        queue: None,
+                        inflight: None,
+                        failed: None,
+                        peers_active: None,
+                        peers_total: None,
+                        head_block: None,
+                        head_seen: None,
+                    });
+                }
                 info!(
                     rss_kb,
                     swap_kb,
+                    rss_anon_kb,
+                    rss_file_kb,
+                    rss_shmem_kb,
                     cpu_busy_pct,
                     cpu_iowait_pct,
                     disk_read_mib_s,
@@ -1377,7 +1747,10 @@ fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
+fn spawn_benchmark_resource_logger(
+    stats: Option<Arc<SyncProgressStats>>,
+    events: Option<Arc<BenchEventLogger>>,
+) {
     use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 
     tokio::spawn(async move {
@@ -1413,6 +1786,9 @@ fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
             let cpu_busy_pct = sys.global_cpu_usage() as f64 / cpu_count;
             let swap_kb = sys.used_swap().saturating_div(1024);
             let cpu_iowait_pct = 0.0;
+            let rss_anon_kb = 0u64;
+            let rss_file_kb = 0u64;
+            let rss_shmem_kb = 0u64;
 
             let mut disk_read_bytes = 0u64;
             let mut disk_write_bytes = 0u64;
@@ -1426,9 +1802,34 @@ fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
 
             if let Some(stats) = stats.as_ref() {
                 let snapshot = stats.snapshot();
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::ResourcesSample {
+                        rss_kb,
+                        swap_kb,
+                        rss_anon_kb,
+                        rss_file_kb,
+                        rss_shmem_kb,
+                        cpu_busy_pct,
+                        cpu_iowait_pct,
+                        disk_read_mib_s,
+                        disk_write_mib_s,
+                        status: Some(snapshot.status.as_str().to_string()),
+                        processed: Some(snapshot.processed),
+                        queue: Some(snapshot.queue),
+                        inflight: Some(snapshot.inflight),
+                        failed: Some(snapshot.failed),
+                        peers_active: Some(snapshot.peers_active),
+                        peers_total: Some(snapshot.peers_total),
+                        head_block: Some(snapshot.head_block),
+                        head_seen: Some(snapshot.head_seen),
+                    });
+                }
                 info!(
                     rss_kb,
                     swap_kb,
+                    rss_anon_kb,
+                    rss_file_kb,
+                    rss_shmem_kb,
                     cpu_busy_pct,
                     cpu_iowait_pct,
                     disk_read_mib_s,
@@ -1445,9 +1846,34 @@ fn spawn_benchmark_resource_logger(stats: Option<Arc<SyncProgressStats>>) {
                     "benchmark resources"
                 );
             } else {
+                if let Some(events) = events.as_ref() {
+                    events.record(BenchEvent::ResourcesSample {
+                        rss_kb,
+                        swap_kb,
+                        rss_anon_kb,
+                        rss_file_kb,
+                        rss_shmem_kb,
+                        cpu_busy_pct,
+                        cpu_iowait_pct,
+                        disk_read_mib_s,
+                        disk_write_mib_s,
+                        status: None,
+                        processed: None,
+                        queue: None,
+                        inflight: None,
+                        failed: None,
+                        peers_active: None,
+                        peers_total: None,
+                        head_block: None,
+                        head_seen: None,
+                    });
+                }
                 info!(
                     rss_kb,
                     swap_kb,
+                    rss_anon_kb,
+                    rss_file_kb,
+                    rss_shmem_kb,
                     cpu_busy_pct,
                     cpu_iowait_pct,
                     disk_read_mib_s,

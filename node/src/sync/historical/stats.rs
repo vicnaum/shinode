@@ -827,6 +827,41 @@ impl DbWriteByteTotals {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum BenchEvent {
+    ResourcesSample {
+        rss_kb: u64,
+        swap_kb: u64,
+        rss_anon_kb: u64,
+        rss_file_kb: u64,
+        rss_shmem_kb: u64,
+        cpu_busy_pct: f64,
+        cpu_iowait_pct: f64,
+        disk_read_mib_s: f64,
+        disk_write_mib_s: f64,
+        status: Option<String>,
+        processed: Option<u64>,
+        queue: Option<u64>,
+        inflight: Option<u64>,
+        failed: Option<u64>,
+        peers_active: Option<u64>,
+        peers_total: Option<u64>,
+        head_block: Option<u64>,
+        head_seen: Option<u64>,
+    },
+    SchedulerGaugeSample {
+        pending_total: u64,
+        pending_main: u64,
+        inflight: u64,
+        failed: u64,
+        completed: u64,
+        attempts: u64,
+        escalation_len: u64,
+        escalation_attempted: u64,
+    },
+    DbWriterGaugeSample {
+        buffer_len: u64,
+        compactions_total: u64,
+        compactions_inflight: u64,
+    },
     BatchAssigned {
         peer_id: String,
         range_start: u64,
