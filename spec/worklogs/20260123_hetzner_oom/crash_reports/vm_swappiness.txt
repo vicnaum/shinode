@@ -1,0 +1,2 @@
+60
+vm.swappiness = 60
