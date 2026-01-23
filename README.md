@@ -150,7 +150,21 @@ Benchmark timeline artifacts:
 
 Notes:
 
-- Jemalloc, tracing_samply, and tokio-console integrations are planned but not wired yet.
+- Jemalloc is available as an optional allocator (`--features jemalloc`). `tracing_samply` and `tokio-console` integrations are planned but not wired yet.
+
+## Allocator tuning (Linux)
+
+Some benchmark workloads are allocation-heavy (WAL replay/compaction, decompression, etc.). On Linux/glibc you can reduce RSS fragmentation by limiting malloc arenas:
+
+```bash
+MALLOC_ARENA_MAX=2 cargo run --manifest-path node/Cargo.toml --release -- --benchmark ingest ...
+```
+
+Alternatively, build/run with jemalloc (compile-time):
+
+```bash
+cargo run --manifest-path node/Cargo.toml --release --features jemalloc -- --benchmark ingest ...
+```
 
 ## Configuration and storage
 

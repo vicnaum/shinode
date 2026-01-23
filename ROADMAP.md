@@ -141,6 +141,8 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [ ] Peer scoring/backoff beyond simple rotation (timeouts, slow peers, disconnect reasons)
 - [x] Fast-sync WAL batch writes (out-of-order) + reduced syscall overhead
 - [x] Benchmark events: compaction + sealing duration instrumentation
+- [x] Compaction memory hardening: stream WAL during compaction, avoid large payload clones, and serialize compactions (queue).
+- [x] Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) and `--features jemalloc` build.
 - [x] Backpressure + memory caps for queues (bounded lookahead + max buffered blocks)
 - [x] Safe boundary switch to slow path near the reorg window (historical head = head - rollback_window)
 - [ ] Deep reorg recovery: optional auto-rebootstrap (policy B)

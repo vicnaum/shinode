@@ -6,6 +6,8 @@ The v0.1 product contract is implemented. v0.2 focuses on reliability/performanc
 - Peer pool warmup: head probes performed asynchronously (avoid blocking peer session watcher).
 - Fast-sync WAL batching (out-of-order) to reduce per-block WAL syscall overhead.
 - Benchmark events include compaction + sealing duration instrumentation for attribution.
+- Compaction memory hardening: stream WAL during compaction + serialize compactions to avoid OOM-scale peaks.
+- Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) or `--features jemalloc` build.
 
 ## Context
 We already have a working **receipt availability harness** (`harness/`) that uses Reth as a library to do devp2p discovery, dialing, `eth` handshake, and `GetBlockHeaders`/`GetReceipts*` probing. The next product is a **long-running stateless history node**: it ingests history artifacts and serves an indexer-compatible RPC subset.
@@ -368,4 +370,3 @@ Deliverables:
 ## Open questions (for you)
 These don’t block writing code, but they affect the “default” product contract:
 1. If/when Ponder support becomes a goal: decide the `eth_call` strategy (proxy to upstream vs. stateless execution via RESS vs. running execution/state).
-

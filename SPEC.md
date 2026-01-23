@@ -16,6 +16,8 @@ This repo contains a working **receipt availability harness** (see Appendix A) a
 - Benchmark modes: probe (headers/receipts only) and ingest (full pipeline timing).
 - Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
 - Fast-sync WAL batching (out-of-order) + benchmark events for compaction/sealing timings.
+- Compaction memory hardening: stream WAL during compaction, avoid large payload clones, and serialize compactions (queue).
+- Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) or `--features jemalloc` build.
 - Peer pool warmup: head probes performed asynchronously (avoid blocking peer session watcher).
 - Not yet: extra RPC methods, metrics export, stronger head/finalization signals (safe/finalized).
 
