@@ -32,3 +32,4 @@ indicatif = "0.18.3"
 alloy-rlp = "0.3.12"
 alloy-consensus = { version = "1.4.3", features = ["serde", "serde-bincode-compat"] }
 tracing-chrome = "0.7.2"
+sysinfo = "0.37.2"

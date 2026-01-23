@@ -3,9 +3,12 @@
 use crate::storage::StorageDiskStats;
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 #[derive(Debug)]
@@ -238,7 +241,6 @@ fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
 }
 
 const SAMPLE_LIMIT: usize = 100_000;
-const EVENT_LOG_LIMIT: usize = 10_000_000;
 
 fn push_sample(samples: &Mutex<Vec<u64>>, value: u64) {
     if let Ok(mut guard) = samples.lock() {
@@ -921,21 +923,54 @@ pub struct BenchEventRecord {
 }
 
 #[derive(Debug)]
+enum BenchEventMessage {
+    Record(BenchEventRecord),
+}
+
+#[derive(Debug)]
 pub struct BenchEventLogger {
     started_at: Instant,
-    events: Mutex<Vec<BenchEventRecord>>,
+    sender: Mutex<Option<mpsc::Sender<BenchEventMessage>>>,
+    handle: Mutex<Option<JoinHandle<eyre::Result<()>>>>,
     dropped_events: AtomicU64,
-    max_events: usize,
+    total_events: AtomicU64,
 }
 
 impl BenchEventLogger {
-    pub fn new() -> Self {
-        Self {
-            started_at: Instant::now(),
-            events: Mutex::new(Vec::new()),
-            dropped_events: AtomicU64::new(0),
-            max_events: EVENT_LOG_LIMIT,
+    pub fn new(path: PathBuf) -> eyre::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        let file = fs::File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+
+        let (tx, rx) = mpsc::channel::<BenchEventMessage>();
+        let handle = std::thread::spawn(move || -> eyre::Result<()> {
+            let mut since_flush = 0usize;
+            for msg in rx {
+                match msg {
+                    BenchEventMessage::Record(record) => {
+                        serde_json::to_writer(&mut writer, &record)?;
+                        writer.write_all(b"\n")?;
+                        since_flush = since_flush.saturating_add(1);
+                        if since_flush >= 4096 {
+                            writer.flush()?;
+                            since_flush = 0;
+                        }
+                    }
+                }
+            }
+            writer.flush()?;
+            Ok(())
+        });
+
+        Ok(Self {
+            started_at: Instant::now(),
+            sender: Mutex::new(Some(tx)),
+            handle: Mutex::new(Some(handle)),
+            dropped_events: AtomicU64::new(0),
+            total_events: AtomicU64::new(0),
+        })
     }
 
     pub fn record(&self, event: BenchEvent) {
@@ -943,33 +978,61 @@ impl BenchEventLogger {
             t_ms: self.started_at.elapsed().as_millis() as u64,
             event,
         };
-        if let Ok(mut guard) = self.events.lock() {
-            if guard.len() < self.max_events {
-                guard.push(record);
-            } else {
-                self.dropped_events.fetch_add(1, Ordering::SeqCst);
+        let sender = self
+            .sender
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(sender) = sender {
+            match sender.send(BenchEventMessage::Record(record)) {
+                Ok(()) => {
+                    self.total_events.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    self.dropped_events.fetch_add(1, Ordering::SeqCst);
+                }
             }
+        } else {
+            self.dropped_events.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    pub fn dump_jsonl(&self, path: &Path) -> eyre::Result<usize> {
-        let records = match self.events.lock() {
-            Ok(mut guard) => std::mem::take(&mut *guard),
-            Err(_) => Vec::new(),
+    pub fn finish(&self) -> eyre::Result<()> {
+        let sender = match self.sender.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        drop(sender);
+
+        let handle = match self.handle.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(handle) = handle {
+            match handle.join() {
+                Ok(res) => res?,
+                Err(_) => return Err(eyre::eyre!("event writer thread panicked")),
+            }
         }
-        let mut file = std::io::BufWriter::new(fs::File::create(path)?);
-        use std::io::Write;
-        for record in &records {
-            serde_json::to_writer(&mut file, record)?;
-            file.write_all(b"\n")?;
-        }
-        Ok(records.len())
+        Ok(())
     }
 
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::SeqCst)
+    }
+
+    pub fn total_events(&self) -> u64 {
+        self.total_events.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for BenchEventLogger {
+    fn drop(&mut self) {
+        let sender = self.sender.lock().ok().and_then(|mut g| g.take());
+        drop(sender);
+        let handle = self.handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
     }
 }

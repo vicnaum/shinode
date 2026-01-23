@@ -19,6 +19,8 @@ pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 pub const DEFAULT_SHARD_SIZE: u64 = 10_000;
 pub const DEFAULT_BENCHMARK_OUTPUT_DIR: &str = "benchmarks";
+pub const DEFAULT_BENCHMARK_TRACE_FILTER: &str =
+    "off,stateless_history_node=trace,reth_eth_wire::p2pstream=trace";
 
 /// Retention mode for stored history.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +136,17 @@ pub struct NodeConfig {
     /// Emit a Chrome trace during benchmark runs.
     #[arg(long, default_value_t = false)]
     pub benchmark_trace: bool,
+    /// EnvFilter-style trace filter used only for the benchmark trace layer.
+    ///
+    /// Defaults to a minimal filter that excludes `net::*` targets.
+    #[arg(long, default_value = DEFAULT_BENCHMARK_TRACE_FILTER)]
+    pub benchmark_trace_filter: String,
+    /// Include span/event args in benchmark traces.
+    #[arg(long, default_value_t = false)]
+    pub benchmark_trace_include_args: bool,
+    /// Include file+line in benchmark traces.
+    #[arg(long, default_value_t = false)]
+    pub benchmark_trace_include_locations: bool,
     /// Emit a JSONL event log during benchmark runs.
     #[arg(long, default_value_t = false)]
     pub benchmark_events: bool,
@@ -238,6 +251,12 @@ mod tests {
         assert_eq!(config.benchmark_name, None);
         assert_eq!(config.benchmark_output_dir, PathBuf::from(DEFAULT_BENCHMARK_OUTPUT_DIR));
         assert!(!config.benchmark_trace);
+        assert_eq!(
+            config.benchmark_trace_filter,
+            DEFAULT_BENCHMARK_TRACE_FILTER
+        );
+        assert!(!config.benchmark_trace_include_args);
+        assert!(!config.benchmark_trace_include_locations);
         assert!(!config.benchmark_events);
         assert_eq!(config.benchmark_min_peers, None);
         assert!(config.command.is_none());
