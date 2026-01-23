@@ -5,6 +5,10 @@ mod rpc;
 mod storage;
 mod sync;
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use cli::{
     compute_target_range, BenchmarkMode, NodeConfig, DEFAULT_BENCHMARK_TRACE_FILTER,
 };
@@ -484,7 +488,10 @@ fn build_info() -> BuildInfo {
     } else {
         "release"
     };
-    let features = Vec::new();
+    let mut features = Vec::new();
+    if cfg!(feature = "jemalloc") {
+        features.push("jemalloc".to_string());
+    }
     BuildInfo {
         profile: profile.to_string(),
         debug_assertions: cfg!(debug_assertions),
