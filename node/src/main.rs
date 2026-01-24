@@ -1133,7 +1133,9 @@ async fn main() -> Result<()> {
                     warn!(error = %err, "failed to write benchmark artifacts");
                 }
                 flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
-                return Ok(());
+                // Benchmark mode: force an immediate exit so we don't hang on in-flight compaction
+                // tasks (which are synchronous and not cooperatively cancellable).
+                process::exit(0);
             }
         };
 
