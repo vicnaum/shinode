@@ -1040,7 +1040,32 @@ async fn main() -> Result<()> {
             config.rollback_window,
         );
         let bench_context = bench_context.as_ref();
+        let missing_started = Instant::now();
         let blocks = storage.missing_blocks_in_range(range.clone())?;
+        let missing_elapsed_ms = missing_started.elapsed().as_millis() as u64;
+        let requested_total = range_len(&range);
+        let missing_total = blocks.len() as u64;
+        let already_present = requested_total.saturating_sub(missing_total);
+        if already_present > 0 {
+            info!(
+                range_start = *range.start(),
+                range_end = *range.end(),
+                requested_total,
+                already_present,
+                missing_total,
+                elapsed_ms = missing_elapsed_ms,
+                "resume: found existing blocks in range; skipping already present blocks"
+            );
+        } else {
+            info!(
+                range_start = *range.start(),
+                range_end = *range.end(),
+                requested_total,
+                missing_total,
+                elapsed_ms = missing_elapsed_ms,
+                "resume: no existing blocks in range"
+            );
+        }
         let total_len = blocks.len() as u64;
 
         let progress_stats = if std::io::stderr().is_terminal() {
