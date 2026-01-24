@@ -213,10 +213,15 @@ impl SegmentWriter {
         self.append_rows_inner(start_block, rows, true)
     }
 
+    // Reserved for future optimizations where we want to amortize NippyJar commits across
+    // multiple appends (e.g. compaction writing in larger batches).
+    #[allow(dead_code)]
     fn append_rows_no_commit(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
         self.append_rows_inner(start_block, rows, false)
     }
 
+    // Reserved for future use alongside `append_rows_no_commit`.
+    #[allow(dead_code)]
     fn commit(&self) -> Result<()> {
         let mut state = self.state.lock().expect("segment lock");
         state
@@ -1522,12 +1527,16 @@ fn records_to_map(
     Ok(map)
 }
 
+// Helper for optional WAL CRC validation (currently unused; retained for future verification
+// tooling / debugging).
+#[allow(dead_code)]
 struct WalPayloadCrcReader<'a> {
     file: &'a mut fs::File,
     hasher: Hasher,
     remaining: u64,
 }
 
+#[allow(dead_code)]
 impl<'a> WalPayloadCrcReader<'a> {
     fn new(file: &'a mut fs::File, block_number: u64, payload_len: u32) -> Self {
         let mut hasher = Hasher::new();
@@ -1552,6 +1561,7 @@ impl<'a> WalPayloadCrcReader<'a> {
     }
 }
 
+#[allow(dead_code)]
 impl<'a> Read for WalPayloadCrcReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
@@ -1565,6 +1575,7 @@ impl<'a> Read for WalPayloadCrcReader<'a> {
     }
 }
 
+#[allow(dead_code)]
 fn read_wal_bundle_record_at(
     file: &mut fs::File,
     record_offset: u64,
