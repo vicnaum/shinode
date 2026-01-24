@@ -9,9 +9,8 @@ use crate::cli::NodeConfig;
 use crate::storage::{
     decode_bincode, decode_bincode_compat_value, decode_u64, encode_bincode_compat_value,
     encode_bincode_value, encode_u64_value, BlockBundle, LogIndexEntry, PeerCacheLoad,
-    SegmentDiskStats, StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredLogs,
-    StoredPeer, StoredReceipts, StoredTransactions, StoredTxHashes,
-    StoredWithdrawals, ZSTD_DICT_MAX_SIZE,
+    SegmentDiskStats, StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredLogs, StoredPeer,
+    StoredReceipts, StoredTransactions, StoredTxHashes, StoredWithdrawals, ZSTD_DICT_MAX_SIZE,
 };
 use bitset::Bitset;
 use crc32fast::Hasher;
@@ -27,11 +26,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::io;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use wal::{append_records, build_index as build_wal_index, WalIndexEntry, WalRecord};
+use wal::{append_records, build_index as build_wal_index, build_slice_index, WalRecord};
 use zstd::bulk::Compressor;
 
 const SCHEMA_VERSION: u64 = 2;
@@ -93,7 +92,10 @@ struct SegmentHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentCompression {
     None,
-    Zstd { use_dict: bool, max_dict_size: usize },
+    Zstd {
+        use_dict: bool,
+        max_dict_size: usize,
+    },
 }
 
 fn segment_compressor(compression: SegmentCompression) -> Option<Compressors> {
@@ -125,8 +127,8 @@ impl SegmentWriter {
             fs::create_dir_all(parent).wrap_err("failed to create segment dir")?;
         }
         let jar = if segment_exists(&path) {
-            let jar = NippyJar::<SegmentHeader>::load(&path)
-                .wrap_err("failed to load static segment")?;
+            let jar =
+                NippyJar::<SegmentHeader>::load(&path).wrap_err("failed to load static segment")?;
             let header = jar.user_header();
             if header.start_block != start_block {
                 return Err(eyre!(
@@ -138,10 +140,7 @@ impl SegmentWriter {
             }
             let expected_compress = matches!(compression, SegmentCompression::Zstd { .. });
             if jar.compressor().is_some() != expected_compress {
-                return Err(eyre!(
-                    "segment compression mismatch for {}",
-                    path.display()
-                ));
+                return Err(eyre!("segment compression mismatch for {}", path.display()));
             }
             jar
         } else {
@@ -168,12 +167,7 @@ impl SegmentWriter {
         })
     }
 
-    fn append_rows_inner(
-        &self,
-        start_block: u64,
-        rows: &[Vec<u8>],
-        commit: bool,
-    ) -> Result<()> {
+    fn append_rows_inner(&self, start_block: u64, rows: &[Vec<u8>], commit: bool) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -196,9 +190,9 @@ impl SegmentWriter {
             Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(&[][..])
         })
         .take(gap);
-        let rows_iter = rows.iter().map(|bytes| {
-            Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(bytes.as_slice())
-        });
+        let rows_iter = rows
+            .iter()
+            .map(|bytes| Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(bytes.as_slice()));
         let iter = gap_iter.chain(rows_iter);
         let total_rows = gap.saturating_add(rows.len()) as u64;
         state
@@ -211,9 +205,7 @@ impl SegmentWriter {
                 .commit()
                 .wrap_err("failed to commit static segment")?;
         }
-        state.next_block = state
-            .next_block
-            .saturating_add(total_rows);
+        state.next_block = state.next_block.saturating_add(total_rows);
         Ok(())
     }
 
@@ -243,7 +235,10 @@ impl SegmentWriter {
                     .writer
                     .prune_rows(prune_rows as usize)
                     .wrap_err("failed to prune segment")?;
-                state.writer.commit().wrap_err("failed to commit segment prune")?;
+                state
+                    .writer
+                    .commit()
+                    .wrap_err("failed to commit segment prune")?;
             }
             state.next_block = self.start_block;
             return Ok(());
@@ -477,7 +472,10 @@ impl Storage {
         Ok(state.bitset.is_set(offset))
     }
 
-    pub fn missing_blocks_in_range(&self, range: std::ops::RangeInclusive<u64>) -> Result<Vec<u64>> {
+    pub fn missing_blocks_in_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<u64>> {
         let mut out = Vec::new();
         for block in range {
             if !self.has_block(block)? {
@@ -514,13 +512,10 @@ impl Storage {
                 size: encode_u64_value(bundle.size.size),
             };
             let payload = encode_bincode_value(&record)?;
-            per_shard
-                .entry(shard_start)
-                .or_default()
-                .push(WalRecord {
-                    block_number: bundle.number,
-                    payload,
-                });
+            per_shard.entry(shard_start).or_default().push(WalRecord {
+                block_number: bundle.number,
+                payload,
+            });
         }
 
         let mut written_blocks = Vec::new();
@@ -550,8 +545,7 @@ impl Storage {
                 let offset = (record.block_number - shard_start) as usize;
                 if state.bitset.set(offset) {
                     state.meta.present_count = state.meta.present_count.saturating_add(1);
-                    state.meta.complete =
-                        state.meta.present_count as u64 >= state.meta.shard_size;
+                    state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
                     state.meta.sorted = false;
                     state.meta.sealed = false;
                     state.meta.content_hash = None;
@@ -559,7 +553,11 @@ impl Storage {
                         meta_completed = true;
                     }
                     written_blocks.push(record.block_number);
-                    max_written = Some(max_written.unwrap_or(record.block_number).max(record.block_number));
+                    max_written = Some(
+                        max_written
+                            .unwrap_or(record.block_number)
+                            .max(record.block_number),
+                    );
                 }
             }
 
@@ -585,18 +583,21 @@ impl Storage {
         fs::create_dir_all(&sorted_dir).wrap_err("failed to create sorted dir")?;
 
         let segments = shard_segment_writers(&sorted_dir, shard_start)?;
-        segments
-            .headers
-            .append_rows(bundle.number, &[encode_bincode_compat_value(&bundle.header)?])?;
+        segments.headers.append_rows(
+            bundle.number,
+            &[encode_bincode_compat_value(&bundle.header)?],
+        )?;
         segments
             .tx_hashes
             .append_rows(bundle.number, &[encode_bincode_value(&bundle.tx_hashes)?])?;
-        segments
-            .tx_meta
-            .append_rows(bundle.number, &[encode_bincode_value(&bundle.transactions)?])?;
-        segments
-            .receipts
-            .append_rows(bundle.number, &[encode_bincode_compat_value(&bundle.receipts)?])?;
+        segments.tx_meta.append_rows(
+            bundle.number,
+            &[encode_bincode_value(&bundle.transactions)?],
+        )?;
+        segments.receipts.append_rows(
+            bundle.number,
+            &[encode_bincode_compat_value(&bundle.receipts)?],
+        )?;
         segments
             .sizes
             .append_rows(bundle.number, &[encode_u64_value(bundle.size.size)])?;
@@ -628,26 +629,8 @@ impl Storage {
         };
         let mut state = shard.lock().expect("shard lock");
         let wal_path = wal_path(&state.dir);
-        let wal_entries = build_wal_index(&wal_path)?;
-        let mut wal_index: Vec<Option<(u64, u32)>> =
-            vec![None; state.meta.shard_size as usize];
-        for WalIndexEntry {
-            block_number,
-            record_offset,
-            payload_len,
-        } in wal_entries
-        {
-            if block_number < shard_start {
-                continue;
-            }
-            let offset = (block_number - shard_start) as usize;
-            if offset >= wal_index.len() {
-                continue;
-            }
-            // Keep the last entry if duplicates exist (shouldn't happen, but robust).
-            wal_index[offset] = Some((record_offset, payload_len));
-        }
-        let has_wal = wal_index.iter().any(|entry| entry.is_some());
+        let wal_slices = build_slice_index(&wal_path, shard_start, state.meta.shard_size as usize)?;
+        let has_wal = wal_slices.is_some();
         if !has_wal && state.meta.sorted {
             return Ok(());
         }
@@ -669,8 +652,7 @@ impl Storage {
         let sorted_dir = sorted_dir(&state.dir);
         let temp_dir = state.dir.join("sorted.tmp");
         if temp_dir.exists() {
-            fs::remove_dir_all(&temp_dir)
-                .wrap_err("failed to clean sorted.tmp")?;
+            fs::remove_dir_all(&temp_dir).wrap_err("failed to clean sorted.tmp")?;
         }
         fs::create_dir_all(&temp_dir).wrap_err("failed to create sorted.tmp")?;
 
@@ -688,7 +670,9 @@ impl Storage {
 
         let headers_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
+            user_header: SegmentHeader {
+                start_block: shard_start,
+            },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::None),
@@ -699,7 +683,9 @@ impl Storage {
         };
         let tx_hashes_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
+            user_header: SegmentHeader {
+                start_block: shard_start,
+            },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::None),
@@ -710,7 +696,9 @@ impl Storage {
         };
         let tx_meta_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
+            user_header: SegmentHeader {
+                start_block: shard_start,
+            },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::Zstd {
@@ -724,7 +712,9 @@ impl Storage {
         };
         let receipts_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
+            user_header: SegmentHeader {
+                start_block: shard_start,
+            },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::Zstd {
@@ -738,7 +728,9 @@ impl Storage {
         };
         let sizes_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
+            user_header: SegmentHeader {
+                start_block: shard_start,
+            },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::None),
@@ -752,17 +744,8 @@ impl Storage {
         let mut tx_hashes_out =
             SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?;
         let mut tx_meta_out = SegmentRawWriter::create(&temp_dir.join("tx_meta"), tx_meta_cfg)?;
-        let mut receipts_out =
-            SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?;
+        let mut receipts_out = SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?;
         let mut sizes_out = SegmentRawWriter::create(&temp_dir.join("block_sizes"), sizes_cfg)?;
-        let mut wal_file = if has_wal {
-            Some(
-                fs::File::open(&wal_path)
-                    .wrap_err("failed to open staging.wal for compaction")?,
-            )
-        } else {
-            None
-        };
 
         let end_offset = (tail_block - shard_start) as usize;
         let total_rows = end_offset.saturating_add(1);
@@ -777,27 +760,23 @@ impl Storage {
             }
 
             let block_number = shard_start + local_offset as u64;
-            if let Some((record_offset, payload_len)) = wal_index[local_offset] {
-                let bundle = read_wal_bundle_record_at(
-                    wal_file
-                        .as_mut()
-                        .expect("wal file should exist when wal index is non-empty"),
-                    record_offset,
-                    payload_len,
-                )
-                .wrap_err_with(|| format!("failed to read WAL bundle for block {block_number}"))?;
-                headers_out.push_bytes(&bundle.header, bundle.header.len())?;
-                tx_hashes_out.push_bytes(&bundle.tx_hashes, bundle.tx_hashes.len())?;
-                tx_meta_out.push_bytes(
-                    &bundle.tx_meta,
-                    bundle.tx_meta_uncompressed_len as usize,
-                )?;
-                receipts_out.push_bytes(
-                    &bundle.receipts,
-                    bundle.receipts_uncompressed_len as usize,
-                )?;
-                sizes_out.push_bytes(&bundle.size, bundle.size.len())?;
-                continue;
+            if let Some(wal) = wal_slices.as_ref() {
+                if let Some(slices) = wal.entries[local_offset] {
+                    let header_bytes = &wal.mmap[slices.header.as_range()];
+                    let tx_hash_bytes = &wal.mmap[slices.tx_hashes.as_range()];
+                    let tx_meta_bytes = &wal.mmap[slices.tx_meta.as_range()];
+                    let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
+                    let size_bytes = &wal.mmap[slices.size.as_range()];
+
+                    headers_out.push_bytes(header_bytes, slices.header.len())?;
+                    tx_hashes_out.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
+                    tx_meta_out
+                        .push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
+                    receipts_out
+                        .push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
+                    sizes_out.push_bytes(size_bytes, slices.size.len())?;
+                    continue;
+                }
             }
 
             let Some(existing) = existing.as_ref() else {
@@ -917,7 +896,9 @@ impl Storage {
             let start_offset = if ancestor_number < shard_start {
                 0
             } else {
-                (ancestor_number.saturating_sub(shard_start).saturating_add(1)) as usize
+                (ancestor_number
+                    .saturating_sub(shard_start)
+                    .saturating_add(1)) as usize
             };
             for offset in start_offset..state.meta.shard_size as usize {
                 if state.bitset.clear(offset) {
@@ -1282,19 +1263,37 @@ struct ShardSegments {
 
 fn shard_segment_writers(sorted_dir: &Path, shard_start: u64) -> Result<ShardSegments> {
     Ok(ShardSegments {
-        headers: SegmentWriter::open(sorted_dir.join("headers"), shard_start, SegmentCompression::None)?,
-        tx_hashes: SegmentWriter::open(sorted_dir.join("tx_hashes"), shard_start, SegmentCompression::None)?,
+        headers: SegmentWriter::open(
+            sorted_dir.join("headers"),
+            shard_start,
+            SegmentCompression::None,
+        )?,
+        tx_hashes: SegmentWriter::open(
+            sorted_dir.join("tx_hashes"),
+            shard_start,
+            SegmentCompression::None,
+        )?,
         tx_meta: SegmentWriter::open(
             sorted_dir.join("tx_meta"),
             shard_start,
-            SegmentCompression::Zstd { use_dict: false, max_dict_size: ZSTD_DICT_MAX_SIZE },
+            SegmentCompression::Zstd {
+                use_dict: false,
+                max_dict_size: ZSTD_DICT_MAX_SIZE,
+            },
         )?,
         receipts: SegmentWriter::open(
             sorted_dir.join("receipts"),
             shard_start,
-            SegmentCompression::Zstd { use_dict: false, max_dict_size: ZSTD_DICT_MAX_SIZE },
+            SegmentCompression::Zstd {
+                use_dict: false,
+                max_dict_size: ZSTD_DICT_MAX_SIZE,
+            },
         )?,
-        sizes: SegmentWriter::open(sorted_dir.join("block_sizes"), shard_start, SegmentCompression::None)?,
+        sizes: SegmentWriter::open(
+            sorted_dir.join("block_sizes"),
+            shard_start,
+            SegmentCompression::None,
+        )?,
     })
 }
 
@@ -1478,7 +1477,10 @@ fn load_peer_cache(data_dir: &Path) -> Result<HashMap<String, StoredPeer>> {
     let bytes = fs::read(&path).wrap_err("failed to read peers.json")?;
     let peers: Vec<StoredPeer> =
         serde_json::from_slice(&bytes).wrap_err("failed to decode peers.json")?;
-    Ok(peers.into_iter().map(|peer| (peer.peer_id.clone(), peer)).collect())
+    Ok(peers
+        .into_iter()
+        .map(|peer| (peer.peer_id.clone(), peer))
+        .collect())
 }
 
 fn persist_peer_cache(data_dir: &Path, peers: &[StoredPeer]) -> Result<()> {
@@ -1587,8 +1589,8 @@ fn read_wal_bundle_record_at(
     }
 
     let mut reader = WalPayloadCrcReader::new(file, block_number, payload_len);
-    let bundle: WalBundleRecord = bincode::deserialize_from(&mut reader)
-        .wrap_err("failed to decode WAL bundle record")?;
+    let bundle: WalBundleRecord =
+        bincode::deserialize_from(&mut reader).wrap_err("failed to decode WAL bundle record")?;
     let hasher = reader.finish()?;
 
     let mut crc_buf = [0u8; 4];
@@ -1733,7 +1735,9 @@ mod tests {
             },
             withdrawals: StoredWithdrawals { withdrawals: None },
             size: StoredBlockSize { size: 0 },
-            receipts: StoredReceipts { receipts: Vec::<Receipt>::new() },
+            receipts: StoredReceipts {
+                receipts: Vec::<Receipt>::new(),
+            },
             logs: StoredLogs { logs: Vec::new() },
         }
     }

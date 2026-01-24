@@ -5946,6 +5946,7 @@ dependencies = [
  "futures",
  "indicatif",
  "jsonrpsee",
+ "memmap2",
  "modular-bitfield",
  "reth-chainspec",
  "reth-eth-wire",
