@@ -5964,6 +5964,7 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber 0.3.22",
+ "zstd",
 ]
 
 [[package]]

@@ -354,6 +354,11 @@ pub async fn run_db_writer(
     for handle in compactions {
         handle.await??;
     }
+    // Safety net: if shard completion tracking isn't provided (or we have a partial tail shard),
+    // compact whatever is still in WAL so reads work after finalize.
+    if mode == DbWriteMode::FastSync {
+        storage.compact_all_dirty()?;
+    }
     if mode == DbWriteMode::FastSync {
         if let Some(events) = events.as_ref() {
             events.record(BenchEvent::CompactAllDirtyEnd {
