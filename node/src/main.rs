@@ -1059,6 +1059,8 @@ async fn main() -> Result<()> {
                 0,
                 0,
                 0,
+                0,
+                0,
                 0.0,
                 "--",
             ));
@@ -1250,6 +1252,8 @@ async fn main() -> Result<()> {
             bar.set_style(style.progress_chars("█▉░"));
             bar.set_message(format_progress_message(
                 SyncStatus::LookingForPeers,
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -1997,17 +2001,25 @@ fn format_progress_message(
     queue: u64,
     inflight: u64,
     failed: u64,
+    compactions_done: u64,
+    compactions_total: u64,
     speed: f64,
     eta: &str,
 ) -> String {
+    let compact = if status == SyncStatus::Finalizing && compactions_total > 0 {
+        format!(" | compact {compactions_done}/{compactions_total}")
+    } else {
+        String::new()
+    };
     format!(
-        "status {} | peers {}/{} | queue {} | inflight {} | failed {} | speed {:.1}/s | eta {}",
+        "status {} | peers {}/{} | queue {} | inflight {} | failed {}{} | speed {:.1}/s | eta {}",
         status.as_str(),
         peers_active,
         peers_total,
         queue,
         inflight,
         failed,
+        compact,
         speed,
         eta
     )
@@ -2187,6 +2199,8 @@ fn spawn_progress_updater(
                     snapshot.queue,
                     snapshot.inflight,
                     snapshot.failed,
+                    snapshot.compactions_done,
+                    snapshot.compactions_total,
                     speed,
                     &eta,
                 );
@@ -2256,11 +2270,23 @@ fn spawn_progress_updater(
                         width_l = left_pad,
                         width_r = right_pad,
                     );
+
+                    let compact = if snapshot.status == SyncStatus::Finalizing
+                        && snapshot.compactions_total > 0
+                    {
+                        let done = snapshot
+                            .compactions_done
+                            .min(snapshot.compactions_total);
+                        format!(" | compact {done}/{}", snapshot.compactions_total)
+                    } else {
+                        String::new()
+                    };
                     
                     let msg = format!(
-                        "{} {} | head {} | peers {}/{} | failed {}",
+                        "{} {}{} | head {} | peers {}/{} | failed {}",
                         bar,
                         status_str,
+                        compact,
                         head_seen,
                         peers_active,
                         peers_total,
@@ -2295,7 +2321,7 @@ mod tests {
     #[test]
     fn progress_message_formats_status() {
         assert_eq!(
-            format_progress_message(SyncStatus::Fetching, 2, 5, 10, 1, 0, 1.5, "12s"),
+            format_progress_message(SyncStatus::Fetching, 2, 5, 10, 1, 0, 0, 0, 1.5, "12s"),
             "status fetching | peers 2/5 | queue 10 | inflight 1 | failed 0 | speed 1.5/s | eta 12s"
         );
     }

@@ -1,6 +1,7 @@
 //! Batched DB writer for ingest mode.
 
 use crate::storage::{BlockBundle, Storage};
+use crate::sync::SyncProgressStats;
 use crate::sync::historical::stats::{
     BenchEvent, BenchEventLogger, DbWriteByteTotals, IngestBenchStats,
 };
@@ -21,6 +22,7 @@ async fn flush_fast_sync_buffer(
     bench: Option<&Arc<IngestBenchStats>>,
     events: Option<&Arc<BenchEventLogger>>,
     remaining_per_shard: Option<&Arc<Mutex<HashMap<u64, usize>>>>,
+    progress_stats: Option<&Arc<SyncProgressStats>>,
     compactions: &mut Vec<JoinHandle<Result<()>>>,
     semaphore: &Arc<Semaphore>,
 ) -> Result<()> {
@@ -103,6 +105,7 @@ async fn flush_fast_sync_buffer(
             let storage = Arc::clone(storage);
             let semaphore = Arc::clone(semaphore);
             let events = events.cloned();
+            let progress_stats = progress_stats.cloned();
             compactions.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
                 if let Some(events) = events.as_ref() {
@@ -115,6 +118,9 @@ async fn flush_fast_sync_buffer(
                         shard_start,
                         duration_ms: started.elapsed().as_millis() as u64,
                     });
+                }
+                if let Some(stats) = progress_stats.as_ref() {
+                    stats.inc_compactions_done(1);
                 }
                 result
             }));
@@ -162,6 +168,7 @@ pub async fn run_db_writer(
     bench: Option<Arc<IngestBenchStats>>,
     events: Option<Arc<BenchEventLogger>>,
     mode: DbWriteMode,
+    progress_stats: Option<Arc<SyncProgressStats>>,
     remaining_per_shard: Option<Arc<Mutex<HashMap<u64, usize>>>>,
 ) -> Result<()> {
     let mut interval = config.flush_interval.map(tokio::time::interval);
@@ -189,13 +196,14 @@ pub async fn run_db_writer(
                                 flush_fast_sync_buffer(
                                     &storage,
                                     &mut buffer,
-                                    bench.as_ref(),
-                                    events.as_ref(),
-                                    remaining_per_shard.as_ref(),
-                                    &mut compactions,
-                                    &semaphore,
-                                )
-                                .await?;
+                                bench.as_ref(),
+                                events.as_ref(),
+                                remaining_per_shard.as_ref(),
+                                progress_stats.as_ref(),
+                                &mut compactions,
+                                &semaphore,
+                            )
+                            .await?;
                             }
                         } else {
                             let bytes = if bench.is_some() || events.is_some() {
@@ -261,6 +269,7 @@ pub async fn run_db_writer(
                                 bench.as_ref(),
                                 events.as_ref(),
                                 remaining_per_shard.as_ref(),
+                                progress_stats.as_ref(),
                                 &mut compactions,
                                 &semaphore,
                             )
@@ -275,6 +284,7 @@ pub async fn run_db_writer(
                                 bench.as_ref(),
                                 events.as_ref(),
                                 remaining_per_shard.as_ref(),
+                                progress_stats.as_ref(),
                                 &mut compactions,
                                 &semaphore,
                             )
@@ -290,6 +300,7 @@ pub async fn run_db_writer(
                                 bench.as_ref(),
                                 events.as_ref(),
                                 remaining_per_shard.as_ref(),
+                                progress_stats.as_ref(),
                                 &mut compactions,
                                 &semaphore,
                             )
@@ -308,13 +319,14 @@ pub async fn run_db_writer(
                     flush_fast_sync_buffer(
                         &storage,
                         &mut buffer,
-                        bench.as_ref(),
-                        events.as_ref(),
-                        remaining_per_shard.as_ref(),
-                        &mut compactions,
-                        &semaphore,
-                    )
-                    .await?;
+                    bench.as_ref(),
+                    events.as_ref(),
+                    remaining_per_shard.as_ref(),
+                    progress_stats.as_ref(),
+                    &mut compactions,
+                    &semaphore,
+                )
+                .await?;
                 }
             }
             _ = gauge_tick.tick() => {
@@ -509,6 +521,7 @@ mod tests {
             None,
             None,
             DbWriteMode::FastSync,
+            None,
             None,
         ));
 

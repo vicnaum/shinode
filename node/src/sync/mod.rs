@@ -76,6 +76,8 @@ pub struct SyncProgressStats {
     failed: std::sync::atomic::AtomicU64,
     queue: std::sync::atomic::AtomicU64,
     inflight: std::sync::atomic::AtomicU64,
+    compactions_done: std::sync::atomic::AtomicU64,
+    compactions_total: std::sync::atomic::AtomicU64,
     peers_active: std::sync::atomic::AtomicU64,
     peers_total: std::sync::atomic::AtomicU64,
     status: std::sync::atomic::AtomicU8,
@@ -89,6 +91,8 @@ pub struct SyncProgressSnapshot {
     pub failed: u64,
     pub queue: u64,
     pub inflight: u64,
+    pub compactions_done: u64,
+    pub compactions_total: u64,
     pub peers_active: u64,
     pub peers_total: u64,
     pub status: SyncStatus,
@@ -103,6 +107,12 @@ impl SyncProgressStats {
             failed: self.failed.load(std::sync::atomic::Ordering::SeqCst),
             queue: self.queue.load(std::sync::atomic::Ordering::SeqCst),
             inflight: self.inflight.load(std::sync::atomic::Ordering::SeqCst),
+            compactions_done: self
+                .compactions_done
+                .load(std::sync::atomic::Ordering::SeqCst),
+            compactions_total: self
+                .compactions_total
+                .load(std::sync::atomic::Ordering::SeqCst),
             peers_active: self.peers_active.load(std::sync::atomic::Ordering::SeqCst),
             peers_total: self.peers_total.load(std::sync::atomic::Ordering::SeqCst),
             status: match self.status.load(std::sync::atomic::Ordering::SeqCst) {
@@ -158,6 +168,19 @@ impl SyncProgressStats {
     pub fn set_inflight(&self, inflight: u64) {
         self.inflight
             .store(inflight, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_compactions_total(&self, total: u64) {
+        self.compactions_total
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn inc_compactions_done(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        self.compactions_done
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_peers_active(&self, active: u64) {

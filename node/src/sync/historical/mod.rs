@@ -730,6 +730,9 @@ pub async fn run_ingest_pipeline(
             let shard_start = (block / shard_size) * shard_size;
             *remaining.entry(shard_start).or_insert(0) += 1;
         }
+        if let Some(stats) = stats.as_ref() {
+            stats.set_compactions_total(remaining.len() as u64);
+        }
         Some(Arc::new(tokio::sync::Mutex::new(remaining)))
     } else {
         None
@@ -741,6 +744,7 @@ pub async fn run_ingest_pipeline(
         bench.clone(),
         events.clone(),
         db_mode,
+        stats.clone(),
         remaining_per_shard,
     ));
 
