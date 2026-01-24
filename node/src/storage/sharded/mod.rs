@@ -150,7 +150,12 @@ impl SegmentWriter {
         })
     }
 
-    fn append_rows(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
+    fn append_rows_inner(
+        &self,
+        start_block: u64,
+        rows: &[Vec<u8>],
+        commit: bool,
+    ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -182,13 +187,32 @@ impl SegmentWriter {
             .writer
             .append_rows(vec![iter], total_rows)
             .wrap_err("failed to append rows")?;
+        if commit {
+            state
+                .writer
+                .commit()
+                .wrap_err("failed to commit static segment")?;
+        }
+        state.next_block = state
+            .next_block
+            .saturating_add(total_rows);
+        Ok(())
+    }
+
+    fn append_rows(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
+        self.append_rows_inner(start_block, rows, true)
+    }
+
+    fn append_rows_no_commit(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
+        self.append_rows_inner(start_block, rows, false)
+    }
+
+    fn commit(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("segment lock");
         state
             .writer
             .commit()
             .wrap_err("failed to commit static segment")?;
-        state.next_block = state
-            .next_block
-            .saturating_add(total_rows);
         Ok(())
     }
 
@@ -710,14 +734,21 @@ impl Storage {
                 sizes.push(size_bytes);
             }
 
-            writers.headers.append_rows(start_block, &headers)?;
-            writers.tx_hashes.append_rows(start_block, &tx_hashes)?;
-            writers.tx_meta.append_rows(start_block, &tx_meta)?;
-            writers.receipts.append_rows(start_block, &receipts)?;
-            writers.sizes.append_rows(start_block, &sizes)?;
+            writers.headers.append_rows_no_commit(start_block, &headers)?;
+            writers.tx_hashes.append_rows_no_commit(start_block, &tx_hashes)?;
+            writers.tx_meta.append_rows_no_commit(start_block, &tx_meta)?;
+            writers.receipts.append_rows_no_commit(start_block, &receipts)?;
+            writers.sizes.append_rows_no_commit(start_block, &sizes)?;
 
             offset = chunk_end;
         }
+
+        // Sync and persist segment metadata once per shard rebuild.
+        writers.headers.commit()?;
+        writers.tx_hashes.commit()?;
+        writers.tx_meta.commit()?;
+        writers.receipts.commit()?;
+        writers.sizes.commit()?;
 
         if sorted_dir.exists() {
             fs::remove_dir_all(&sorted_dir).wrap_err("failed to remove old sorted")?;
@@ -737,6 +768,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn compact_all_dirty(&self) -> Result<()> {
         let shard_starts: Vec<u64> = {
             let shards = self.shards.lock().expect("shards lock");

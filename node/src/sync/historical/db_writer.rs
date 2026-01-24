@@ -125,35 +125,6 @@ async fn flush_fast_sync_buffer(
     Ok(())
 }
 
-fn compact_and_seal(
-    storage: &Storage,
-    events: Option<&Arc<BenchEventLogger>>,
-) -> Result<()> {
-    if let Some(events) = events.as_ref() {
-        events.record(BenchEvent::CompactAllDirtyStart);
-    }
-    let started = Instant::now();
-    storage.compact_all_dirty()?;
-    if let Some(events) = events.as_ref() {
-        events.record(BenchEvent::CompactAllDirtyEnd {
-            duration_ms: started.elapsed().as_millis() as u64,
-        });
-    }
-
-    if let Some(events) = events.as_ref() {
-        events.record(BenchEvent::SealCompletedStart);
-    }
-    let started = Instant::now();
-    storage.seal_completed_shards()?;
-    if let Some(events) = events.as_ref() {
-        events.record(BenchEvent::SealCompletedEnd {
-            duration_ms: started.elapsed().as_millis() as u64,
-        });
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct DbWriteConfig {
     pub batch_blocks: usize,
@@ -294,7 +265,6 @@ pub async fn run_db_writer(
                                 &semaphore,
                             )
                             .await?;
-                            compact_and_seal(&storage, events.as_ref())?;
                         }
                     }
                     Some(DbWriterMessage::Finalize) => {
@@ -309,7 +279,6 @@ pub async fn run_db_writer(
                                 &semaphore,
                             )
                             .await?;
-                            compact_and_seal(&storage, events.as_ref())?;
                         }
                         break;
                     }
@@ -325,7 +294,6 @@ pub async fn run_db_writer(
                                 &semaphore,
                             )
                             .await?;
-                            compact_and_seal(&storage, events.as_ref())?;
                         }
                         break;
                     }
@@ -347,7 +315,6 @@ pub async fn run_db_writer(
                         &semaphore,
                     )
                     .await?;
-                    compact_and_seal(&storage, events.as_ref())?;
                 }
             }
             _ = gauge_tick.tick() => {
@@ -366,8 +333,35 @@ pub async fn run_db_writer(
         }
     }
 
+    let compaction_started = Instant::now();
+    if mode == DbWriteMode::FastSync {
+        if let Some(events) = events.as_ref() {
+            events.record(BenchEvent::CompactAllDirtyStart);
+        }
+    }
     for handle in compactions {
         handle.await??;
+    }
+    if mode == DbWriteMode::FastSync {
+        if let Some(events) = events.as_ref() {
+            events.record(BenchEvent::CompactAllDirtyEnd {
+                duration_ms: compaction_started.elapsed().as_millis() as u64,
+            });
+        }
+    }
+
+    // Seal shards after all queued compactions are done.
+    if mode == DbWriteMode::FastSync {
+        if let Some(events) = events.as_ref() {
+            events.record(BenchEvent::SealCompletedStart);
+        }
+        let started = Instant::now();
+        storage.seal_completed_shards()?;
+        if let Some(events) = events.as_ref() {
+            events.record(BenchEvent::SealCompletedEnd {
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+        }
     }
 
     Ok(())
