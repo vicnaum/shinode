@@ -520,7 +520,7 @@ async fn wait_for_benchmark_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
             return;
         }
         if last_log.elapsed() >= Duration::from_secs(5) {
-            info!(peers, min_peers, "waiting for benchmark peer warmup");
+            info!(peers, min_peers, "waiting for peer warmup");
             last_log = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -828,13 +828,9 @@ async fn main() -> Result<()> {
         config.benchmark,
         BenchmarkMode::Probe | BenchmarkMode::Ingest
     );
-    let benchmark_min_peers = if is_benchmark {
-        config
-            .benchmark_min_peers
-            .unwrap_or(DEFAULT_BENCHMARK_MIN_PEERS)
-    } else {
-        0
-    };
+    let benchmark_min_peers = config
+        .benchmark_min_peers
+        .unwrap_or(DEFAULT_BENCHMARK_MIN_PEERS);
     let chunk_max = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -976,23 +972,60 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if matches!(config.benchmark, BenchmarkMode::Ingest) {
+    // Temporary refactor (see REFACTOR_PLAN.md):
+    // Run the benchmark ingest pipeline by default, and only emit JSON artifacts when
+    // `--benchmark ingest` is explicitly enabled.
+    if matches!(config.benchmark, BenchmarkMode::Ingest)
+        || matches!(config.benchmark, BenchmarkMode::Disabled)
+    {
+        let write_benchmark_artifacts = matches!(config.benchmark, BenchmarkMode::Ingest);
+        let start_msg = if write_benchmark_artifacts {
+            "starting stateless history node (benchmark ingest)"
+        } else {
+            "starting stateless history node (ingest)"
+        };
         info!(
             chain_id = config.chain_id,
             data_dir = %config.data_dir.display(),
-            "starting stateless history node (benchmark ingest)"
+            "{}", start_msg
         );
         if !matches!(config.head_source, cli::HeadSource::P2p) {
-            return Err(eyre::eyre!("benchmark ingest requires --head-source p2p"));
+            return Err(eyre::eyre!("ingest requires --head-source p2p"));
         }
 
         let storage = Arc::new(storage::Storage::open(&config)?);
 
+        // Resume behavior: if the previous run exited before compaction finished, ensure we
+        // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
+        // across restarts.
+        let dirty_shards = storage.dirty_complete_shards()?;
+        if !dirty_shards.is_empty() {
+            let storage = Arc::clone(&storage);
+            let shard_count = dirty_shards.len();
+            info!(shard_count, "startup: compacting completed dirty shards");
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                for shard_start in dirty_shards {
+                    storage.compact_shard(shard_start)?;
+                }
+                Ok(())
+            })
+            .await??;
+            info!(shard_count, "startup: completed shard compaction done");
+        }
+
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
-        wait_for_benchmark_min_peers(&session.pool, benchmark_min_peers as usize).await;
-        info!(peers = session.pool.len(), "benchmark peer warmup complete");
+        let min_peers = if write_benchmark_artifacts {
+            benchmark_min_peers as usize
+        } else {
+            1
+        };
+        wait_for_benchmark_min_peers(&session.pool, min_peers).await;
+        info!(
+            peers = session.pool.len(),
+            min_peers, "peer warmup complete"
+        );
         let head_at_startup = wait_for_peer_head(
             &session.pool,
             config.start_block,
@@ -1006,8 +1039,9 @@ async fn main() -> Result<()> {
             head_at_startup,
             config.rollback_window,
         );
-        let bench_context = bench_context.as_ref().expect("benchmark context");
-        let total_len = range_len(&range);
+        let bench_context = bench_context.as_ref();
+        let blocks = storage.missing_blocks_in_range(range.clone())?;
+        let total_len = blocks.len() as u64;
 
         let progress_stats = if std::io::stderr().is_terminal() {
             Some(Arc::new(SyncProgressStats::default()))
@@ -1018,7 +1052,8 @@ async fn main() -> Result<()> {
             // In benchmark ingest, the head we target is fixed at startup.
             stats.set_head_seen(head_at_startup);
         }
-        let events = if config.benchmark_events {
+        let events = if write_benchmark_artifacts && config.benchmark_events {
+            let bench_context = bench_context.expect("benchmark context");
             let tmp_path = bench_context
                 .events_tmp_path
                 .clone()
@@ -1076,11 +1111,23 @@ async fn main() -> Result<()> {
         let progress_ref = progress
             .as_ref()
             .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-        let ingest_future = sync::historical::run_ingest_pipeline(
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                warn!("shutdown signal received; stopping ingest after draining");
+                let _ = stop_tx.send(true);
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    warn!("second shutdown signal received; forcing exit");
+                    process::exit(130);
+                }
+            }
+        });
+        let outcome = sync::historical::run_ingest_pipeline(
             Arc::clone(&storage),
             Arc::clone(&session.pool),
             &config,
             range.clone(),
+            blocks,
             head_at_startup,
             progress_ref,
             progress_stats.clone(),
@@ -1088,50 +1135,13 @@ async fn main() -> Result<()> {
             None,
             Arc::clone(&peer_health_local),
             events.clone(),
-        );
-        tokio::pin!(ingest_future);
-        let outcome = tokio::select! {
-            res = &mut ingest_future => res?,
-            _ = tokio::signal::ctrl_c() => {
-                let storage_stats = match storage.disk_usage() {
-                    Ok(stats) => Some(stats),
-                    Err(err) => {
-                        warn!(error = %err, "failed to collect storage disk stats");
-                        None
-                    }
-                };
-                let summary = bench.summary(
-                    *range.start(),
-                    *range.end(),
-                    head_at_startup,
-                    config.rollback_window > 0,
-                    session.pool.len() as u64,
-                    bench.logs_total(),
-                    storage_stats,
-                );
-                let summary_json = serde_json::to_string_pretty(&summary)?;
-                println!("{summary_json}");
-                if let Err(err) = emit_benchmark_artifacts(
-                    bench_context,
-                    &config,
-                    &range,
-                    head_at_startup,
-                    &peer_health_local,
-                    summary,
-                    events.as_deref(),
-                    tracing_guards.log_writer.as_deref(),
-                    &mut tracing_guards.chrome_guard,
-                )
-                .await
-                {
-                    warn!(error = %err, "failed to write benchmark artifacts");
-                }
-                flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
-                // Benchmark mode: force an immediate exit so we don't hang on in-flight compaction
-                // tasks (which are synchronous and not cooperatively cancellable).
-                process::exit(0);
-            }
-        };
+            Some(stop_rx),
+        )
+        .await?;
+
+        if let Some(tracker) = progress.as_ref() {
+            tracker.finish();
+        }
 
         let logs_total = match outcome {
             sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
@@ -1155,20 +1165,23 @@ async fn main() -> Result<()> {
         );
         let summary_json = serde_json::to_string_pretty(&summary)?;
         println!("{summary_json}");
-        if let Err(err) = emit_benchmark_artifacts(
-            bench_context,
-            &config,
-            &range,
-            head_at_startup,
-            &peer_health_local,
-            summary,
-            events.as_deref(),
-            tracing_guards.log_writer.as_deref(),
-            &mut tracing_guards.chrome_guard,
-        )
-        .await
-        {
-            warn!(error = %err, "failed to write benchmark artifacts");
+        if write_benchmark_artifacts {
+            let bench_context = bench_context.expect("benchmark context");
+            if let Err(err) = emit_benchmark_artifacts(
+                bench_context,
+                &config,
+                &range,
+                head_at_startup,
+                &peer_health_local,
+                summary,
+                events.as_deref(),
+                tracing_guards.log_writer.as_deref(),
+                &mut tracing_guards.chrome_guard,
+            )
+            .await
+            {
+                warn!(error = %err, "failed to write benchmark artifacts");
+            }
         }
         flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
         return Ok(());

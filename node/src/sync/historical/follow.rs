@@ -209,17 +209,21 @@ pub async fn run_follow_loop(
             .as_ref()
             .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
         let ingest_started = Instant::now();
+        let range = start..=target_head;
+        let blocks = storage.missing_blocks_in_range(range.clone())?;
         let outcome = run_ingest_pipeline(
             Arc::clone(&storage),
             Arc::clone(&pool),
             config,
-            start..=target_head,
+            range,
+            blocks,
             observed_head,
             progress_ref,
             stats.clone(),
             None,
             Some(target_head),
             Arc::clone(&peer_health),
+            None,
             None,
         )
         .await?;

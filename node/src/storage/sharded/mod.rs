@@ -382,6 +382,7 @@ impl Storage {
                 Err(_) => continue,
             };
             let shard_dir = entry.path();
+            recover_compaction_dirs(&shard_dir)?;
             let shard_meta = load_shard_meta(&shard_dir)?;
             let bitset = Bitset::load(&bitset_path(&shard_dir), meta.shard_size as usize)?;
             let mut state = ShardState {
@@ -481,12 +482,70 @@ impl Storage {
         &self,
         range: std::ops::RangeInclusive<u64>,
     ) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
-        for block in range {
-            if !self.has_block(block)? {
-                out.push(block);
-            }
+        let start = *range.start();
+        let end = *range.end();
+        if end < start {
+            return Ok(Vec::new());
         }
+
+        // Hot-path: this gets called for large ranges (e.g. 1M blocks). Avoid per-block shard map
+        // lookups and locks; scan shard bitsets in larger chunks instead.
+        let shard_size = self.shard_size().max(1);
+        let first_shard = shard_start(start, shard_size);
+        let last_shard = shard_start(end, shard_size);
+
+        let mut out = Vec::new();
+        let mut shard_start = first_shard;
+        while shard_start <= last_shard {
+            let shard_end = shard_start.saturating_add(shard_size).saturating_sub(1);
+            let local_start = start.max(shard_start);
+            let local_end = end.min(shard_end);
+            let off_start = (local_start - shard_start) as usize;
+            let off_end = (local_end - shard_start) as usize;
+
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                out.extend(local_start..=local_end);
+                shard_start = shard_start.saturating_add(shard_size);
+                continue;
+            };
+            let state = shard.lock().expect("shard lock");
+            if state.meta.complete {
+                shard_start = shard_start.saturating_add(shard_size);
+                continue;
+            }
+
+            let bytes = state.bitset.bytes();
+            let start_byte = off_start / 8;
+            let end_byte = off_end / 8;
+            for byte_idx in start_byte..=end_byte {
+                let mut mask = 0xFFu8;
+                if byte_idx == start_byte {
+                    mask &= 0xFFu8 << (off_start % 8);
+                }
+                if byte_idx == end_byte {
+                    let end_bit = off_end % 8;
+                    // Shifting by 8 would panic on `u8`; `end_bit == 7` means keep all bits.
+                    mask &= if end_bit == 7 {
+                        0xFF
+                    } else {
+                        (1u8 << (end_bit + 1)) - 1
+                    };
+                }
+
+                let byte = bytes.get(byte_idx).copied().unwrap_or_default();
+                let mut missing = (!byte) & mask;
+                while missing != 0 {
+                    let bit = missing.trailing_zeros() as usize;
+                    let offset = byte_idx * 8 + bit;
+                    out.push(shard_start + offset as u64);
+                    missing &= missing - 1;
+                }
+            }
+
+            shard_start = shard_start.saturating_add(shard_size);
+        }
+
         Ok(out)
     }
 
@@ -655,7 +714,18 @@ impl Storage {
         };
 
         let sorted_dir = sorted_dir(&state.dir);
+        let backup_dir = state.dir.join("sorted.old");
         let temp_dir = state.dir.join("sorted.tmp");
+        // If a previous compaction was interrupted after moving `sorted/` aside, restore it so the
+        // shard stays readable and we can safely retry compaction.
+        if backup_dir.exists() && !sorted_dir.exists() {
+            fs::rename(&backup_dir, &sorted_dir).wrap_err("failed to restore sorted.old")?;
+        }
+        // If both directories exist, the compaction likely succeeded but cleanup didn't run.
+        // Prefer the live `sorted/` and delete the stale backup.
+        if backup_dir.exists() && sorted_dir.exists() {
+            fs::remove_dir_all(&backup_dir).wrap_err("failed to remove stale sorted.old")?;
+        }
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir).wrap_err("failed to clean sorted.tmp")?;
         }
@@ -827,10 +897,18 @@ impl Storage {
         receipts_out.finish()?;
         sizes_out.finish()?;
 
+        // Swap the new segments in atomically, keeping a backup directory so an unexpected abort
+        // cannot drop us into a state where neither WAL nor sorted segments contain the full shard.
         if sorted_dir.exists() {
-            fs::remove_dir_all(&sorted_dir).wrap_err("failed to remove old sorted")?;
+            if backup_dir.exists() {
+                fs::remove_dir_all(&backup_dir).wrap_err("failed to remove stale sorted.old")?;
+            }
+            fs::rename(&sorted_dir, &backup_dir).wrap_err("failed to backup old sorted")?;
         }
         fs::rename(&temp_dir, &sorted_dir).wrap_err("failed to swap sorted dir")?;
+        if backup_dir.exists() {
+            fs::remove_dir_all(&backup_dir).wrap_err("failed to remove sorted.old")?;
+        }
         if wal_path.exists() {
             fs::remove_file(&wal_path).wrap_err("failed to remove staging.wal")?;
         }
@@ -855,6 +933,31 @@ impl Storage {
             self.compact_shard(shard_start)?;
         }
         Ok(())
+    }
+
+    /// Returns shard starts that are complete but still have WAL data and/or are not compacted.
+    pub fn dirty_complete_shards(&self) -> Result<Vec<u64>> {
+        let shard_starts: Vec<u64> = {
+            let shards = self.shards.lock().expect("shards lock");
+            shards.keys().copied().collect()
+        };
+        let mut out = Vec::new();
+        for shard_start in shard_starts {
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                continue;
+            };
+            let state = shard.lock().expect("shard lock");
+            if !state.meta.complete {
+                continue;
+            }
+            let wal_exists = wal_path(&state.dir).exists();
+            if wal_exists || !state.meta.sorted {
+                out.push(shard_start);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
     }
 
     pub fn seal_completed_shards(&self) -> Result<()> {
@@ -1641,6 +1744,28 @@ fn repair_shard_from_wal(state: &mut ShardState) -> Result<()> {
     state.meta.sorted = false;
     state.meta.sealed = false;
     state.meta.content_hash = None;
+    Ok(())
+}
+
+fn recover_compaction_dirs(shard_dir: &Path) -> Result<()> {
+    let sorted = sorted_dir(shard_dir);
+    let backup = shard_dir.join("sorted.old");
+    let temp = shard_dir.join("sorted.tmp");
+
+    // If a compaction was interrupted after moving `sorted/` aside, restore it so reads work and
+    // future compactions can safely retry.
+    if backup.exists() && !sorted.exists() {
+        fs::rename(&backup, &sorted).wrap_err("failed to restore sorted.old")?;
+    }
+    // If both exist, compaction likely succeeded but cleanup didn't run.
+    if backup.exists() && sorted.exists() {
+        fs::remove_dir_all(&backup).wrap_err("failed to remove stale sorted.old")?;
+    }
+    // `sorted.tmp` is never a stable output; remove it on startup so we don't accumulate trash.
+    if temp.exists() {
+        fs::remove_dir_all(&temp).wrap_err("failed to remove sorted.tmp")?;
+    }
+
     Ok(())
 }
 

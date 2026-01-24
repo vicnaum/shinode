@@ -458,6 +458,7 @@ impl IngestBenchStats {
         self.logs_total.fetch_add(count, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
     pub fn logs_total(&self) -> u64 {
         self.logs_total.load(Ordering::SeqCst)
     }

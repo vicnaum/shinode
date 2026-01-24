@@ -535,6 +535,7 @@ pub async fn run_ingest_pipeline(
     pool: Arc<PeerPool>,
     config: &NodeConfig,
     range: RangeInclusive<u64>,
+    blocks: Vec<u64>,
     head_at_startup: u64,
     progress: Option<Arc<dyn ProgressReporter>>,
     stats: Option<Arc<SyncProgressStats>>,
@@ -542,8 +543,8 @@ pub async fn run_ingest_pipeline(
     head_cap_override: Option<u64>,
     peer_health: Arc<PeerHealthTracker>,
     events: Option<Arc<BenchEventLogger>>,
+    stop_rx: Option<watch::Receiver<bool>>,
 ) -> Result<IngestPipelineOutcome> {
-    let blocks = storage.missing_blocks_in_range(range.clone())?;
     let total = blocks.len() as u64;
     if total == 0 {
         if let Some(stats) = stats {
@@ -585,9 +586,29 @@ pub async fn run_ingest_pipeline(
     if head_cap_override.is_some() {
         scheduler_config.max_attempts_per_block = u32::MAX;
     }
+    let mut stop_rx = stop_rx;
+    let db_mode = if head_cap_override.is_some() {
+        DbWriteMode::Follow
+    } else {
+        DbWriteMode::FastSync
+    };
+    let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
+        let mut remaining: HashMap<u64, usize> = HashMap::new();
+        let shard_size = storage.shard_size();
+        for block in &blocks {
+            let shard_start = (block / shard_size) * shard_size;
+            *remaining.entry(shard_start).or_insert(0) += 1;
+        }
+        if let Some(stats) = stats.as_ref() {
+            stats.set_compactions_total(remaining.len() as u64);
+        }
+        Some(Arc::new(tokio::sync::Mutex::new(remaining)))
+    } else {
+        None
+    };
     let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
         scheduler_config,
-        blocks.clone(),
+        blocks,
         Arc::clone(&peer_health),
         Arc::clone(&low_watermark),
     ));
@@ -721,25 +742,6 @@ pub async fn run_ingest_pipeline(
     drop(processed_blocks_tx);
 
     let db_config = DbWriteConfig::new(config.db_write_batch_blocks, None);
-    let db_mode = if head_cap_override.is_some() {
-        DbWriteMode::Follow
-    } else {
-        DbWriteMode::FastSync
-    };
-    let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
-        let mut remaining: HashMap<u64, usize> = HashMap::new();
-        let shard_size = storage.shard_size();
-        for block in &blocks {
-            let shard_start = (block / shard_size) * shard_size;
-            *remaining.entry(shard_start).or_insert(0) += 1;
-        }
-        if let Some(stats) = stats.as_ref() {
-            stats.set_compactions_total(remaining.len() as u64);
-        }
-        Some(Arc::new(tokio::sync::Mutex::new(remaining)))
-    } else {
-        None
-    };
     let db_handle = tokio::spawn(run_db_writer(
         Arc::clone(&storage),
         processed_blocks_rx,
@@ -824,7 +826,17 @@ pub async fn run_ingest_pipeline(
             }
         }
         if ready_peers.is_empty() {
-            let Some(peer) = ready_rx.recv().await else {
+            let peer = tokio::select! {
+                peer = ready_rx.recv() => peer,
+                _ = async {
+                    if let Some(stop_rx) = stop_rx.as_mut() {
+                        let _ = stop_rx.changed().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => None,
+            };
+            let Some(peer) = peer else {
                 break;
             };
             if ready_set.insert(peer.peer_id) {
@@ -833,6 +845,9 @@ pub async fn run_ingest_pipeline(
             continue;
         }
         while fetch_tasks.try_join_next().is_some() {}
+        if stop_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false) {
+            break;
+        }
         if scheduler.is_done().await {
             break;
         }
