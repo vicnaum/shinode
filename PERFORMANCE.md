@@ -262,3 +262,115 @@ Comparison vs 2026-01-24T15:31:21Z (system allocator, inflight30/chunk32):
 Attribution caveat (again):
 - The throughput gain is mostly “more parallel fetch work” (peers_active saturates at 30 and effective fetch parallelism is ~22.9).
 - This may reflect peer/network variance in addition to allocator choice; repeat A/B runs to isolate jemalloc’s impact.
+
+## Hetzner ingest-1M (v0.2, inflight60/chunk64, jemalloc) - 2026-01-24T17:23:39Z
+
+Artifacts:
+- `benchmarks_hetzner/ingest_1M_v0_2_inflight60_chunk64__20260124T172339Z__range-23283452-24283451__chunk64__chunkmax256__inflight60__timeout15000__profile-release__alloc-jemalloc.json`
+- `benchmarks_hetzner/ingest_1M_v0_2_inflight60_chunk64__20260124T172339Z__range-23283452-24283451__chunk64__chunkmax256__inflight60__timeout15000__profile-release__alloc-jemalloc.events.jsonl`
+
+Environment / config:
+- env: linux x86_64, cpu_count=12
+- range: 23,283,452..24,283,451 (1,000,000 blocks)
+- shard_size: 10,000
+- fast-sync: chunk=64, chunk_max=256, inflight=60, timeout=15000ms, lookahead=200,000, buffered=8192
+- db writer: batch_blocks=512
+- build: release, allocator=jemalloc
+
+Top-line results (from summary JSON):
+- elapsed: 1,106.129s (18m 26s)
+- throughput: 904.0 blocks/s avg, 721,195 logs/s avg
+- totals: 1,000,000 blocks fetched/processed/written; 797,734,479 logs total
+- fetch failures: 15,676 failed blocks across 5,977 failures; 0 process failures
+- peers: 44 peers_used; 228 peer_failures_total
+- storage on disk (compacted): 74.49 GB (`storage.total_bytes`)
+
+Resource envelope (from `.events.jsonl`):
+- rss max: 3.33 GiB; swap max: 0
+- cpu_busy_pct: avg 29.6%, p95 38.6%, max 46.8%
+- cpu_iowait_pct: avg 0.32%, p95 1.42% (max 16.44%; spiky during flush bursts)
+- peers_active: max 22, p95 21
+
+Fetch characteristics:
+- 115,300 batches total; avg 273,352 bytes/block; download 15.26 MiB/s avg
+- per-batch blocks: p50=9, p95=14, max=64
+- per-batch duration_ms: p50=35ms, p95=646ms, p99=1491ms, max=6857ms
+- request durations (p50/p95/p99): headers=3/161/299ms, bodies=22/335/818ms, receipts=32/481/1247ms
+- timeouts: 0
+- fetch backlog (cum_fetch - cum_processed): max ~2,136 blocks
+
+Processing characteristics (per-block `process_end` events):
+- duration_us: p50=1,216us, p95=2,787us, p99=3,945us, max=18,441us
+- logs/block: p50=597, p95=1,810, p99=6,551, max=24,167
+- avg processing breakdown (us/block): header_hash=5, tx_hashes=645, transactions=549, block_size=120
+
+DB writer flush characteristics (`db_flush_end` events):
+- 1,954 flushes of 512 blocks
+- flush duration_ms: p50=341ms, p95=444ms, max=754ms
+- flush size (bytes_total): p50=107.8 MiB, p95=204.6 MiB, max=340.3 MiB
+- flush throughput: p50=321.7 MiB/s, p95=602.5 MiB/s
+
+Compaction characteristics:
+- compaction_end count: 100
+- compaction duration_ms: p50=1052ms, p95=1559ms, max=5484ms
+- range completion (`pending_total=0`) at ~1080.1s; 82 compactions finished by then
+- final compaction window (`compact_all_dirty` duration): 24.07s
+
+## Hetzner ingest-1M (v0.2, inflight60/chunk64, jemalloc, buffered=16384) - 2026-01-24T18:36:30Z
+
+Artifacts:
+- `benchmarks_hetzner/ingest_1M_v0_2_inflight60_chunk64_jemalloc_buffered_16384__20260124T183630Z__range-23283452-24283451__chunk64__chunkmax256__inflight60__timeout15000__profile-release__alloc-jemalloc.json`
+- `benchmarks_hetzner/ingest_1M_v0_2_inflight60_chunk64_jemalloc_buffered_16384__20260124T183630Z__range-23283452-24283451__chunk64__chunkmax256__inflight60__timeout15000__profile-release__alloc-jemalloc.events.jsonl`
+
+Environment / config:
+- env: linux x86_64, cpu_count=12
+- range: 23,283,452..24,283,451 (1,000,000 blocks)
+- shard_size: 10,000
+- fast-sync: chunk=64, chunk_max=256, inflight=60, timeout=15000ms, lookahead=200,000, buffered=16384
+- db writer: batch_blocks=512
+- build: release, allocator=jemalloc
+
+Top-line results (from summary JSON):
+- elapsed: 1,201.835s (20m 02s)
+- throughput: 832.1 blocks/s avg, 663,766 logs/s avg
+- totals: 1,000,000 blocks fetched/processed/written; 797,736,715 logs total
+- fetch failures: 15,273 failed blocks across 6,116 failures; 0 process failures
+- peers: 38 peers_used; 154 peer_failures_total
+- storage on disk (compacted): 74.49 GB (`storage.total_bytes`)
+
+Resource envelope (from `.events.jsonl`):
+- rss max: 10.19 GiB; swap max: 0
+- cpu_busy_pct: avg 27.6%, p95 35.9%, max 44.5%
+- cpu_iowait_pct: avg 0.31%, p95 1.35% (max 16.68%; spiky during flush bursts)
+- peers_active: max 24, p95 24
+
+Fetch characteristics:
+- 117,939 batches total; avg 273,352 bytes/block; download 12.16 MiB/s avg
+- per-batch blocks: p50=9, p95=14, max=64
+- per-batch duration_ms: p50=67ms, p95=591ms, p99=1303ms, max=6600ms
+- request durations (p50/p95/p99): headers=25/141/257ms, bodies=34/329/728ms, receipts=54/502/1057ms
+- timeouts: 0
+- fetch backlog (cum_fetch - cum_processed): max ~16,480 blocks (RSS peaks alongside this)
+
+Processing characteristics (per-block `process_end` events):
+- duration_us: p50=1,224us, p95=2,789us, p99=3,947us, max=41,282us
+- logs/block: p50=597, p95=1,810, p99=6,551, max=24,167
+- avg processing breakdown (us/block): header_hash=5, tx_hashes=646, transactions=553, block_size=123
+
+DB writer flush characteristics (`db_flush_end` events):
+- 1,954 flushes of 512 blocks
+- flush duration_ms: p50=340ms, p95=443ms, max=579ms
+- flush size (bytes_total): p50=108.0 MiB, p95=202.7 MiB, max=341.9 MiB
+- flush throughput: p50=321.9 MiB/s, p95=629.4 MiB/s
+
+Compaction characteristics:
+- compaction_end count: 101
+- compaction duration_ms: p50=1045ms, p95=1456ms, max=6148ms
+- range completion (`pending_total=0`) at ~1180.1s; 87/101 compactions finished by then
+- final compaction window (`compact_all_dirty` duration): 21.77s
+
+Comparison vs 2026-01-24T17:23:39Z (inflight60/chunk64, buffered=8192):
+- wall time: 1106s -> 1202s (slower by ~8.7%)
+- throughput: 904.0 -> 832.1 blocks/s (~-8.0%)
+- fetch backlog max: ~2.1k -> ~16.5k blocks; rss max: 3.33 -> 10.19 GiB
+- despite the deeper buffer, this run is slower due to worse fetch conditions (batch duration p50 35ms -> 67ms and fewer peers_used: 44 -> 38)
