@@ -249,7 +249,10 @@ mod tests {
         assert_eq!(config.verbosity, 0);
         assert_eq!(config.benchmark, BenchmarkMode::Disabled);
         assert_eq!(config.benchmark_name, None);
-        assert_eq!(config.benchmark_output_dir, PathBuf::from(DEFAULT_BENCHMARK_OUTPUT_DIR));
+        assert_eq!(
+            config.benchmark_output_dir,
+            PathBuf::from(DEFAULT_BENCHMARK_OUTPUT_DIR)
+        );
         assert!(!config.benchmark_trace);
         assert_eq!(
             config.benchmark_trace_filter,
@@ -260,15 +263,33 @@ mod tests {
         assert!(!config.benchmark_events);
         assert_eq!(config.benchmark_min_peers, None);
         assert!(config.command.is_none());
-        assert_eq!(config.rpc_max_request_body_bytes, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES);
-        assert_eq!(config.rpc_max_response_body_bytes, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES);
+        assert_eq!(
+            config.rpc_max_request_body_bytes,
+            DEFAULT_RPC_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(
+            config.rpc_max_response_body_bytes,
+            DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES
+        );
         assert_eq!(config.rpc_max_connections, DEFAULT_RPC_MAX_CONNECTIONS);
-        assert_eq!(config.rpc_max_batch_requests, DEFAULT_RPC_MAX_BATCH_REQUESTS);
-        assert_eq!(config.rpc_max_blocks_per_filter, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER);
-        assert_eq!(config.rpc_max_logs_per_response, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE);
+        assert_eq!(
+            config.rpc_max_batch_requests,
+            DEFAULT_RPC_MAX_BATCH_REQUESTS
+        );
+        assert_eq!(
+            config.rpc_max_blocks_per_filter,
+            DEFAULT_RPC_MAX_BLOCKS_PER_FILTER
+        );
+        assert_eq!(
+            config.rpc_max_logs_per_response,
+            DEFAULT_RPC_MAX_LOGS_PER_RESPONSE
+        );
         assert_eq!(config.fast_sync_chunk_size, DEFAULT_FAST_SYNC_CHUNK_SIZE);
         assert_eq!(config.fast_sync_chunk_max, None);
-        assert_eq!(config.fast_sync_max_inflight, DEFAULT_FAST_SYNC_MAX_INFLIGHT);
+        assert_eq!(
+            config.fast_sync_max_inflight,
+            DEFAULT_FAST_SYNC_MAX_INFLIGHT
+        );
         assert_eq!(
             config.fast_sync_batch_timeout_ms,
             DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS

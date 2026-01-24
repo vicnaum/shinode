@@ -147,6 +147,7 @@ cargo run --manifest-path node/Cargo.toml --release -- \
 Benchmark timeline artifacts:
 
 - Add `--benchmark-trace` to emit a Chrome trace file alongside the summary JSON.
+- See `PERFORMANCE.md` for saved benchmark run summaries + bottleneck notes.
 
 Notes:
 

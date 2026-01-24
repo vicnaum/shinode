@@ -39,8 +39,9 @@ pub struct SegmentRawSource<H> {
 impl<H: DeserializeOwned> SegmentRawSource<H> {
     pub fn open(data_path: &Path) -> Result<Self> {
         let config = load_config(data_path)?;
-        let reader = DataReader::new(data_path)
-            .wrap_err_with(|| format!("failed to open nippy data reader {}", data_path.display()))?;
+        let reader = DataReader::new(data_path).wrap_err_with(|| {
+            format!("failed to open nippy data reader {}", data_path.display())
+        })?;
         Ok(Self {
             data_path: data_path.to_path_buf(),
             config,

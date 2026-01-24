@@ -4,8 +4,8 @@ use crate::p2p::{
     fetch_payloads_for_peer, request_headers_batch, request_receipt_counts, NetworkPeer,
     PayloadFetchOutcome,
 };
-use crate::sync::{BlockPayload};
 use crate::sync::historical::types::{FetchTiming, ProbeRecord};
+use crate::sync::BlockPayload;
 use eyre::{eyre, Result};
 use reth_primitives_traits::SealedHeader;
 use std::collections::HashMap;
@@ -97,10 +97,7 @@ pub async fn fetch_probe_batch(
 }
 
 /// Fetch full block payloads for ingest mode.
-pub async fn fetch_ingest_batch(
-    peer: &NetworkPeer,
-    blocks: &[u64],
-) -> Result<FetchIngestOutcome> {
+pub async fn fetch_ingest_batch(peer: &NetworkPeer, blocks: &[u64]) -> Result<FetchIngestOutcome> {
     if blocks.is_empty() {
         return Ok(FetchIngestOutcome {
             payloads: Vec::new(),

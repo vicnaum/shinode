@@ -7,9 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::sync::historical::types::{FetchBatch, FetchMode};
 use reth_network_api::PeerId;
 use tokio::sync::Mutex;
-use crate::sync::historical::types::{FetchBatch, FetchMode};
 
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
@@ -61,10 +61,7 @@ pub(crate) struct PeerHealthConfig {
 impl PeerHealthConfig {
     pub(crate) fn from_scheduler_config(config: &SchedulerConfig) -> Self {
         let max_batch = config.blocks_per_assignment.max(1);
-        let initial_batch = config
-            .initial_blocks_per_assignment
-            .max(1)
-            .min(max_batch);
+        let initial_batch = config.initial_blocks_per_assignment.max(1).min(max_batch);
         Self {
             peer_failure_threshold: config.peer_failure_threshold,
             peer_ban_duration: config.peer_ban_duration,
@@ -221,7 +218,8 @@ impl PeerHealthTracker {
         entry.consecutive_partials = entry.consecutive_partials.saturating_add(1);
         entry.last_partial_at = Some(Instant::now());
         entry.success_streak = 0;
-        let reduced = (entry.batch_limit as f64 * self.config.aimd_partial_decrease).floor() as usize;
+        let reduced =
+            (entry.batch_limit as f64 * self.config.aimd_partial_decrease).floor() as usize;
         entry.batch_limit = self.clamp_batch_limit(reduced);
     }
 
@@ -233,7 +231,8 @@ impl PeerHealthTracker {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_failure_at = Some(Instant::now());
         entry.success_streak = 0;
-        let reduced = (entry.batch_limit as f64 * self.config.aimd_failure_decrease).floor() as usize;
+        let reduced =
+            (entry.batch_limit as f64 * self.config.aimd_failure_decrease).floor() as usize;
         entry.batch_limit = self.clamp_batch_limit(reduced);
         if entry.consecutive_failures >= self.config.peer_failure_threshold {
             entry.banned_until = Some(Instant::now() + self.config.peer_ban_duration);
@@ -387,7 +386,11 @@ impl PeerHealthTracker {
                 last_error_count: entry.last_error_count,
             });
         }
-        out.sort_by(|a, b| b.quality_score.partial_cmp(&a.quality_score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.quality_score
+                .partial_cmp(&a.quality_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out
     }
 
@@ -460,8 +463,9 @@ mod tests {
 
     fn scheduler_with_blocks(config: SchedulerConfig, start: u64, end: u64) -> PeerWorkScheduler {
         let blocks = (start..=end).collect::<Vec<_>>();
-        let peer_health =
-            Arc::new(PeerHealthTracker::new(PeerHealthConfig::from_scheduler_config(&config)));
+        let peer_health = Arc::new(PeerHealthTracker::new(
+            PeerHealthConfig::from_scheduler_config(&config),
+        ));
         let low_watermark = Arc::new(AtomicU64::new(start));
         PeerWorkScheduler::new_with_health(config, blocks, peer_health, low_watermark)
     }
@@ -575,7 +579,11 @@ impl PeerWorkScheduler {
                 mode: FetchMode::Normal,
             };
         }
-        if self.peer_health.should_defer_peer(peer_id, active_peers).await {
+        if self
+            .peer_health
+            .should_defer_peer(peer_id, active_peers)
+            .await
+        {
             return FetchBatch {
                 blocks: Vec::new(),
                 mode: FetchMode::Normal,
@@ -660,11 +668,7 @@ impl PeerWorkScheduler {
         escalation.active = true;
     }
 
-    async fn pop_escalation_for_peer(
-        &self,
-        peer_id: PeerId,
-        active_peers: usize,
-    ) -> Vec<u64> {
+    async fn pop_escalation_for_peer(&self, peer_id: PeerId, active_peers: usize) -> Vec<u64> {
         let mut escalation = self.escalation.lock().await;
         let completed = self.completed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
@@ -763,7 +767,11 @@ impl PeerWorkScheduler {
             return;
         }
 
-        let tried = escalation.attempts.get(&block).map(|s| s.len()).unwrap_or(0);
+        let tried = escalation
+            .attempts
+            .get(&block)
+            .map(|s| s.len())
+            .unwrap_or(0);
         if active_peers == 0 || tried >= active_peers {
             return;
         }

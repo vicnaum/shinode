@@ -1,8 +1,6 @@
 //! Reorg detection and common-ancestor search for follow mode.
 
-use crate::p2p::{
-    request_headers_batch, request_headers_chunked_strict, NetworkPeer, PeerPool,
-};
+use crate::p2p::{request_headers_batch, request_headers_chunked_strict, NetworkPeer, PeerPool};
 use crate::storage::Storage;
 use alloy_primitives::B256;
 use eyre::{eyre, Result};
@@ -113,7 +111,10 @@ fn find_common_ancestor_number(
     None
 }
 
-async fn fetch_single_header(peer: &NetworkPeer, number: u64) -> Result<Option<reth_primitives_traits::Header>> {
+async fn fetch_single_header(
+    peer: &NetworkPeer,
+    number: u64,
+) -> Result<Option<reth_primitives_traits::Header>> {
     let mut headers = request_headers_batch(peer, number, 1).await?;
     Ok(headers.pop())
 }
@@ -210,7 +211,9 @@ mod tests {
             transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             withdrawals: crate::storage::StoredWithdrawals { withdrawals: None },
             size: crate::storage::StoredBlockSize { size: 0 },
-            receipts: crate::storage::StoredReceipts { receipts: Vec::new() },
+            receipts: crate::storage::StoredReceipts {
+                receipts: Vec::new(),
+            },
             logs: crate::storage::StoredLogs { logs: Vec::new() },
         };
         storage
@@ -222,7 +225,10 @@ mod tests {
     fn ancestor_picks_highest_match() {
         let stored = HashMap::from([(1u64, b(1)), (2, b(2)), (3, b(3))]);
         let network = HashMap::from([(1u64, b(1)), (2, b(9)), (3, b(3))]);
-        assert_eq!(find_common_ancestor_number(&stored, &network, 1, 3), Some(3));
+        assert_eq!(
+            find_common_ancestor_number(&stored, &network, 1, 3),
+            Some(3)
+        );
     }
 
     #[test]

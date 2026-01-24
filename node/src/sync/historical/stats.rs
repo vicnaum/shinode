@@ -52,9 +52,11 @@ impl ProbeStats {
         if count == 0 {
             return;
         }
-        self.blocks_failed.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            Some(current.saturating_sub(count))
-        }).ok();
+        self.blocks_failed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(count))
+            })
+            .ok();
     }
 
     pub fn record_peer_failure(&self) {
@@ -446,12 +448,10 @@ impl IngestBenchStats {
             .fetch_add(bytes.transactions, Ordering::SeqCst);
         self.db_bytes_withdrawals
             .fetch_add(bytes.withdrawals, Ordering::SeqCst);
-        self.db_bytes_sizes
-            .fetch_add(bytes.sizes, Ordering::SeqCst);
+        self.db_bytes_sizes.fetch_add(bytes.sizes, Ordering::SeqCst);
         self.db_bytes_receipts
             .fetch_add(bytes.receipts, Ordering::SeqCst);
-        self.db_bytes_logs
-            .fetch_add(bytes.logs, Ordering::SeqCst);
+        self.db_bytes_logs.fetch_add(bytes.logs, Ordering::SeqCst);
     }
 
     pub fn record_logs(&self, count: u64) {

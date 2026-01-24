@@ -1,8 +1,8 @@
 //! Shared types for historical sync.
 
 use alloy_primitives::B256;
-use reth_ethereum_primitives::Receipt;
 use reth_eth_wire::EthVersion;
+use reth_ethereum_primitives::Receipt;
 use reth_network_api::PeerId;
 use reth_primitives_traits::Header;
 use std::time::Duration;

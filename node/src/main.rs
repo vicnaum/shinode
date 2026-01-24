@@ -9,18 +9,17 @@ mod sync;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use cli::{
-    compute_target_range, BenchmarkMode, NodeConfig, DEFAULT_BENCHMARK_TRACE_FILTER,
-};
+use cli::{compute_target_range, BenchmarkMode, NodeConfig, DEFAULT_BENCHMARK_TRACE_FILTER};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use metrics::range_len;
+use p2p::{p2p_limits, PeerPool};
+use reth_network_api::PeerId;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
     collections::VecDeque,
-    env,
-    fs,
+    env, fs,
     io::{BufWriter, IsTerminal, Write},
     path::{Path, PathBuf},
     process,
@@ -28,35 +27,27 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
-        Arc,
-        Mutex,
+        Arc, Mutex,
     },
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use p2p::{PeerPool, p2p_limits};
-use reth_network_api::PeerId;
-use sync::{
-    BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus,
-};
 use sync::historical::{
     BenchEvent, BenchEventLogger, IngestBenchStats, PeerHealthTracker, ProbeStats,
 };
-use tracing::{Event, info, warn};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
+use sync::{BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+use tracing::{info, warn, Event};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 
 const DEFAULT_BENCHMARK_MIN_PEERS: u64 = 5;
 const BENCHMARK_LOG_BUFFER: usize = 10_000;
 
-async fn apply_cached_peer_limits(
-    storage: &storage::Storage,
-    peer_health: &PeerHealthTracker,
-) {
+async fn apply_cached_peer_limits(storage: &storage::Storage, peer_health: &PeerHealthTracker) {
     let peers = storage.peer_cache_snapshot();
     for peer in peers {
         let Some(limit) = peer.aimd_batch_limit else {
@@ -276,17 +267,13 @@ impl tracing::field::Visit for JsonLogVisitor {
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.fields.insert(
-            field.name().to_string(),
-            JsonValue::Number(value.into()),
-        );
+        self.fields
+            .insert(field.name().to_string(), JsonValue::Number(value.into()));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields.insert(
-            field.name().to_string(),
-            JsonValue::Number(value.into()),
-        );
+        self.fields
+            .insert(field.name().to_string(), JsonValue::Number(value.into()));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
@@ -475,7 +462,8 @@ fn sanitize_label(value: &str) -> String {
 
 fn arg_present(args: &[String], flag: &str) -> bool {
     let flag_eq = format!("{flag}=");
-    args.iter().any(|arg| arg == flag || arg.starts_with(&flag_eq))
+    args.iter()
+        .any(|arg| arg == flag || arg.starts_with(&flag_eq))
 }
 
 fn default_peer_cache_dir() -> Option<PathBuf> {
@@ -523,18 +511,16 @@ async fn wait_for_benchmark_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
     if min_peers == 0 {
         return;
     }
-    let mut last_log = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
+    let mut last_log = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
     loop {
         let peers = pool.len();
         if peers >= min_peers {
             return;
         }
         if last_log.elapsed() >= Duration::from_secs(5) {
-            info!(
-                peers,
-                min_peers,
-                "waiting for benchmark peer warmup"
-            );
+            info!(peers, min_peers, "waiting for benchmark peer warmup");
             last_log = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -838,7 +824,10 @@ async fn main() -> Result<()> {
     let mut config = NodeConfig::from_args();
     let argv: Vec<String> = env::args().collect();
     let data_dir_specified = arg_present(&argv, "--data-dir");
-    let is_benchmark = matches!(config.benchmark, BenchmarkMode::Probe | BenchmarkMode::Ingest);
+    let is_benchmark = matches!(
+        config.benchmark,
+        BenchmarkMode::Probe | BenchmarkMode::Ingest
+    );
     let benchmark_min_peers = if is_benchmark {
         config
             .benchmark_min_peers
@@ -902,8 +891,12 @@ async fn main() -> Result<()> {
     }
     let mut tracing_guards = init_tracing(
         &config,
-        bench_context.as_ref().and_then(|ctx| ctx.trace_tmp_path.clone()),
-        bench_context.as_ref().and_then(|ctx| ctx.logs_tmp_path.clone()),
+        bench_context
+            .as_ref()
+            .and_then(|ctx| ctx.trace_tmp_path.clone()),
+        bench_context
+            .as_ref()
+            .and_then(|ctx| ctx.logs_tmp_path.clone()),
     );
 
     if let Some(command) = &config.command {
@@ -930,8 +923,7 @@ async fn main() -> Result<()> {
             return Err(eyre::eyre!("benchmark probe requires --head-source p2p"));
         }
         spawn_benchmark_resource_logger(None, None);
-        let peer_cache = storage::Storage::open_existing(&config)?
-            .map(Arc::new);
+        let peer_cache = storage::Storage::open_existing(&config)?.map(Arc::new);
         info!("starting p2p network");
         let session = p2p::connect_mainnet_peers(peer_cache).await?;
         info!(peers = session.pool.len(), "p2p peers connected");
@@ -1198,8 +1190,12 @@ async fn main() -> Result<()> {
         "sync checkpoints loaded"
     );
 
-    let rpc_handle =
-        rpc::start(config.rpc_bind, rpc::RpcConfig::from(&config), Arc::clone(&storage)).await?;
+    let rpc_handle = rpc::start(
+        config.rpc_bind,
+        rpc::RpcConfig::from(&config),
+        Arc::clone(&storage),
+    )
+    .await?;
     info!(rpc_bind = %config.rpc_bind, "rpc server started");
 
     let mut _network_session = None;
@@ -1342,11 +1338,7 @@ async fn wait_for_peer_head(
     let mut last_log = Instant::now() - Duration::from_secs(10);
     loop {
         let peers = pool.snapshot();
-        let best_head = peers
-            .iter()
-            .map(|peer| peer.head_number)
-            .max()
-            .unwrap_or(0);
+        let best_head = peers.iter().map(|peer| peer.head_number).max().unwrap_or(0);
         let safe_head = best_head.saturating_sub(rollback_window);
         let requested_end = end_block.unwrap_or(safe_head);
         let end = requested_end.min(safe_head);
@@ -1394,39 +1386,38 @@ fn init_tracing(
         .with_writer(std::io::stdout)
         .with_filter(log_filter.clone());
 
-    let log_writer = log_path.and_then(|path| match BenchmarkLogWriter::new(path, BENCHMARK_LOG_BUFFER) {
-        Ok(writer) => Some(Arc::new(writer)),
-        Err(err) => {
-            warn!(error = %err, "failed to initialize benchmark log writer");
-            None
-        }
-    });
+    let log_writer =
+        log_path.and_then(
+            |path| match BenchmarkLogWriter::new(path, BENCHMARK_LOG_BUFFER) {
+                Ok(writer) => Some(Arc::new(writer)),
+                Err(err) => {
+                    warn!(error = %err, "failed to initialize benchmark log writer");
+                    None
+                }
+            },
+        );
 
     let mut chrome_guard = None;
     if let Some(path) = chrome_trace_path {
-        let trace_filter =
-            EnvFilter::try_new(&config.benchmark_trace_filter).unwrap_or_else(|_| {
-                EnvFilter::new(DEFAULT_BENCHMARK_TRACE_FILTER)
-            });
+        let trace_filter = EnvFilter::try_new(&config.benchmark_trace_filter)
+            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_BENCHMARK_TRACE_FILTER));
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(path)
             .include_args(config.benchmark_trace_include_args)
             .include_locations(config.benchmark_trace_include_locations)
             .build();
-        let log_layer = log_writer
-            .as_ref()
-            .map(|writer| BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone()));
+        let log_layer = log_writer.as_ref().map(|writer| {
+            BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone())
+        });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(log_layer);
-        registry
-            .with(chrome_layer.with_filter(trace_filter))
-            .init();
+        registry.with(chrome_layer.with_filter(trace_filter)).init();
         chrome_guard = Some(guard);
     } else {
-        let log_layer = log_writer
-            .as_ref()
-            .map(|writer| BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone()));
+        let log_layer = log_writer.as_ref().map(|writer| {
+            BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone())
+        });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(log_layer);
@@ -1558,7 +1549,11 @@ fn is_disk_device(name: &str) -> bool {
         return !name.contains('p');
     }
     if name.starts_with("sd") || name.starts_with("vd") || name.starts_with("xvd") {
-        return name.chars().last().map(|c| !c.is_ascii_digit()).unwrap_or(false);
+        return name
+            .chars()
+            .last()
+            .map(|c| !c.is_ascii_digit())
+            .unwrap_or(false);
     }
     if name.starts_with("md") {
         return true;
@@ -1646,10 +1641,8 @@ fn spawn_benchmark_resource_logger(
                 (Some(prev), Some(cur)) if dt_s > 0.0 => {
                     let delta_read = cur.read_sectors.saturating_sub(prev.read_sectors);
                     let delta_write = cur.write_sectors.saturating_sub(prev.write_sectors);
-                    let read_mib_s =
-                        (delta_read as f64 * 512.0) / (1024.0 * 1024.0) / dt_s;
-                    let write_mib_s =
-                        (delta_write as f64 * 512.0) / (1024.0 * 1024.0) / dt_s;
+                    let read_mib_s = (delta_read as f64 * 512.0) / (1024.0 * 1024.0) / dt_s;
+                    let write_mib_s = (delta_write as f64 * 512.0) / (1024.0 * 1024.0) / dt_s;
                     Some((read_mib_s, write_mib_s))
                 }
                 _ => None,
@@ -1660,8 +1653,8 @@ fn spawn_benchmark_resource_logger(
                 continue;
             }
 
-            let (rss_kb, swap_kb, rss_anon_kb, rss_file_kb, rss_shmem_kb) =
-                mem.map(|sample| {
+            let (rss_kb, swap_kb, rss_anon_kb, rss_file_kb, rss_shmem_kb) = mem
+                .map(|sample| {
                     (
                         sample.rss_kb,
                         sample.swap_kb,
@@ -2025,11 +2018,7 @@ fn format_progress_message(
     )
 }
 
-fn print_db_stats(
-    data_dir: &Path,
-    stats: &storage::StorageDiskStats,
-    json: bool,
-) -> Result<()> {
+fn print_db_stats(data_dir: &Path, stats: &storage::StorageDiskStats, json: bool) -> Result<()> {
     if json {
         let payload = serde_json::to_string_pretty(stats)?;
         println!("{payload}");
@@ -2037,10 +2026,7 @@ fn print_db_stats(
     }
 
     println!("DB stats for {}", data_dir.display());
-    println!(
-        "{:<18} {:>14} {:>12}",
-        "Component", "Bytes", "Size"
-    );
+    println!("{:<18} {:>14} {:>12}", "Component", "Bytes", "Size");
     println!("{}", "-".repeat(46));
     print_row("total", stats.total_bytes);
     print_row("static", stats.static_total_bytes);
@@ -2071,12 +2057,7 @@ fn print_db_stats(
 }
 
 fn print_row(label: &str, bytes: u64) {
-    println!(
-        "{:<18} {:>14} {:>12}",
-        label,
-        bytes,
-        human_bytes(bytes)
-    );
+    println!("{:<18} {:>14} {:>12}", label, bytes, human_bytes(bytes));
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -2108,7 +2089,7 @@ fn spawn_progress_updater(
         let mut last_peer_update = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
-        
+
         loop {
             ticker.tick().await;
             let now = Instant::now();
@@ -2139,11 +2120,9 @@ fn spawn_progress_updater(
                     Some(failed_total.max(1)),
                     ProgressDrawTarget::stderr_with_hz(2),
                 );
-                let style = ProgressStyle::with_template(
-                    "{bar:40.red/black} {pos}/{len} | {msg}",
-                )
-                .expect("progress style")
-                .progress_chars("▓▒░");
+                let style = ProgressStyle::with_template("{bar:40.red/black} {pos}/{len} | {msg}")
+                    .expect("progress style")
+                    .progress_chars("▓▒░");
                 fb.set_style(style);
                 failed_bar = Some(fb);
             }
@@ -2161,7 +2140,7 @@ fn spawn_progress_updater(
                     failed_total = 0;
                 }
             }
-            
+
             // Check if initial sync is complete and we're now in follow mode
             if !initial_sync_done {
                 let processed = snapshot.processed.min(total_len);
@@ -2173,18 +2152,17 @@ fn spawn_progress_updater(
                         break;
                     }
                 }
-                let speed = if let (Some((t0, v0)), Some((t1, v1))) =
-                    (window.front(), window.back())
-                {
-                    let dt = t1.duration_since(*t0).as_secs_f64();
-                    if dt > 0.0 && v1 >= v0 {
-                        (v1 - v0) as f64 / dt
+                let speed =
+                    if let (Some((t0, v0)), Some((t1, v1))) = (window.front(), window.back()) {
+                        let dt = t1.duration_since(*t0).as_secs_f64();
+                        if dt > 0.0 && v1 >= v0 {
+                            (v1 - v0) as f64 / dt
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
-                    }
-                } else {
-                    0.0
-                };
+                    };
                 let remaining = total_len.saturating_sub(processed) as f64;
                 let eta = if speed > 0.0 {
                     sync::format_eta_seconds(remaining / speed)
@@ -2206,19 +2184,18 @@ fn spawn_progress_updater(
                 );
                 bar.set_message(msg);
                 bar.set_position(processed);
-                
+
                 // Transition to follow mode when initial sync completes
                 if processed >= total_len {
                     initial_sync_done = true;
                     bar.finish_and_clear();
-                    
+
                     // Create the live follow status bar (message only, we format the bar ourselves)
                     let fb = ProgressBar::with_draw_target(
                         Some(100),
                         ProgressDrawTarget::stderr_with_hz(2),
                     );
-                    let style = ProgressStyle::with_template("{msg}")
-                        .expect("progress style");
+                    let style = ProgressStyle::with_template("{msg}").expect("progress style");
                     fb.set_style(style);
                     follow_bar = Some(fb);
                 }
@@ -2229,7 +2206,7 @@ fn spawn_progress_updater(
                     let head_seen = snapshot.head_seen;
                     let peers_active = snapshot.peers_active.min(snapshot.peers_total);
                     let peers_total = snapshot.peers_total;
-                    
+
                     let status_str = if snapshot.status == SyncStatus::Following {
                         "Synced"
                     } else if snapshot.status == SyncStatus::Fetching {
@@ -2240,8 +2217,8 @@ fn spawn_progress_updater(
                         snapshot.status.as_str()
                     };
 
-                    let catching_up =
-                        snapshot.status == SyncStatus::Fetching || snapshot.status == SyncStatus::Finalizing;
+                    let catching_up = snapshot.status == SyncStatus::Fetching
+                        || snapshot.status == SyncStatus::Finalizing;
                     let catchup_suffix = if catching_up {
                         let start = catchup_start_block.get_or_insert(head_block);
                         let done = head_block.saturating_sub(*start);
@@ -2251,7 +2228,7 @@ fn spawn_progress_updater(
                         catchup_start_block = None;
                         None
                     };
-                    
+
                     // Format block number centered in a fixed-width field
                     let content = match catchup_suffix {
                         Some(suffix) => format!("[ {} ]{}", head_block, suffix),
@@ -2261,12 +2238,14 @@ fn spawn_progress_updater(
                     let padding = bar_width.saturating_sub(content.len());
                     let left_pad = padding / 2;
                     let right_pad = padding - left_pad;
-                    
+
                     // ANSI: force truecolor white text on truecolor green background, then reset.
                     // (Some terminals/themes remap ANSI "white" to a dark color; truecolor avoids that.)
                     let bar = format!(
                         "\x1b[38;2;255;255;255;48;2;0;128;0m{:>width_l$}{}{:<width_r$}\x1b[0m",
-                        "", content, "",
+                        "",
+                        content,
+                        "",
                         width_l = left_pad,
                         width_r = right_pad,
                     );
@@ -2274,23 +2253,15 @@ fn spawn_progress_updater(
                     let compact = if snapshot.status == SyncStatus::Finalizing
                         && snapshot.compactions_total > 0
                     {
-                        let done = snapshot
-                            .compactions_done
-                            .min(snapshot.compactions_total);
+                        let done = snapshot.compactions_done.min(snapshot.compactions_total);
                         format!(" | compact {done}/{}", snapshot.compactions_total)
                     } else {
                         String::new()
                     };
-                    
+
                     let msg = format!(
                         "{} {}{} | head {} | peers {}/{} | failed {}",
-                        bar,
-                        status_str,
-                        compact,
-                        head_seen,
-                        peers_active,
-                        peers_total,
-                        failed,
+                        bar, status_str, compact, head_seen, peers_active, peers_total, failed,
                     );
                     fb.set_message(msg);
                 }
@@ -2301,7 +2272,7 @@ fn spawn_progress_updater(
 
 #[cfg(test)]
 mod tests {
-        use super::{format_progress_message, select_start_from, total_blocks_to_head, SyncStatus};
+    use super::{format_progress_message, select_start_from, total_blocks_to_head, SyncStatus};
 
     #[test]
     fn start_from_respects_start_block() {

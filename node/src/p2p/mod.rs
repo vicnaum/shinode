@@ -12,25 +12,16 @@ use reth_eth_wire_types::{
     BlockHashOrNumber, GetBlockBodies, GetBlockHeaders, GetReceipts, GetReceipts70,
     HeadersDirection,
 };
+use reth_ethereum_primitives::Receipt;
 use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
-use reth_network::PeersConfig;
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network::NetworkHandle;
+use reth_network::PeersConfig;
 use reth_network_api::{
-    events::PeerEvent,
-    DiscoveryEvent,
-    DiscoveredEvent,
-    NetworkEvent,
-    NetworkEventListenerProvider,
-    PeerId,
-    PeerKind,
-    PeerRequest,
-    PeerRequestSender,
-    Peers,
+    events::PeerEvent, DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider,
+    PeerId, PeerKind, PeerRequest, PeerRequestSender, Peers,
 };
-use tracing::{info, warn};
 use reth_primitives_traits::{Header, SealedHeader};
-use reth_ethereum_primitives::Receipt;
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -43,6 +34,7 @@ use std::{
 use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration, Instant};
+use tracing::{info, warn};
 
 /// Identifier for a peer in the selection pool.
 #[allow(dead_code)]
@@ -65,7 +57,10 @@ pub struct RoundRobinPeerSelector {
 #[allow(dead_code)]
 impl RoundRobinPeerSelector {
     pub fn new(peers: Vec<SelectorPeerId>) -> Self {
-        Self { peers, next_index: 0 }
+        Self {
+            peers,
+            next_index: 0,
+        }
     }
 }
 
@@ -212,12 +207,8 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
         peer_cache.as_ref().map(|cache| Arc::clone(&cache.buffer)),
     );
     let warmup_started = Instant::now();
-    let _connected = wait_for_peer_pool(
-        Arc::clone(&pool),
-        MIN_PEER_START,
-        PEER_DISCOVERY_TIMEOUT,
-    )
-    .await?;
+    let _connected =
+        wait_for_peer_pool(Arc::clone(&pool), MIN_PEER_START, PEER_DISCOVERY_TIMEOUT).await?;
     if PEER_START_WARMUP_SECS > 0 {
         let min = Duration::from_secs(PEER_START_WARMUP_SECS);
         let elapsed = warmup_started.elapsed();
@@ -290,7 +281,10 @@ impl PeerPool {
 
     fn add_peer(&self, peer: NetworkPeer) {
         let mut peers = self.peers.write().expect("peer pool lock");
-        if peers.iter().any(|existing| existing.peer_id == peer.peer_id) {
+        if peers
+            .iter()
+            .any(|existing| existing.peer_id == peer.peer_id)
+        {
             return;
         }
         peers.push(peer);
@@ -326,9 +320,7 @@ pub struct MultiPeerBlockPayloadSource {
 
 impl MultiPeerBlockPayloadSource {
     pub fn new(pool: Arc<PeerPool>) -> Self {
-        Self {
-            pool,
-        }
+        Self { pool }
     }
 }
 
@@ -428,12 +420,8 @@ fn spawn_peer_discovery_watcher(
     });
 }
 
-fn seed_peer_cache(
-    handle: &NetworkHandle<EthNetworkPrimitives>,
-    storage: &Storage,
-) -> Result<()> {
-    let ttl_ms = Duration::from_secs(PEER_CACHE_TTL_DAYS * 24 * 60 * 60)
-        .as_millis() as u64;
+fn seed_peer_cache(handle: &NetworkHandle<EthNetworkPrimitives>, storage: &Storage) -> Result<()> {
+    let ttl_ms = Duration::from_secs(PEER_CACHE_TTL_DAYS * 24 * 60 * 60).as_millis() as u64;
     let expire_before_ms = now_ms().saturating_sub(ttl_ms);
     let load = storage.load_peers(expire_before_ms, PEER_CACHE_MAX)?;
     let mut seeded = 0usize;
@@ -518,8 +506,7 @@ pub(crate) async fn request_headers_batch(
     start_block: u64,
     limit: usize,
 ) -> Result<Vec<Header>> {
-    request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages)
-        .await
+    request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages).await
 }
 
 pub(crate) async fn discover_head_p2p(
@@ -613,11 +600,9 @@ pub(crate) async fn request_headers_chunked(
     start_block: u64,
     count: usize,
 ) -> Result<Vec<Header>> {
-    Ok(
-        request_headers_chunked_with_stats(peer, start_block, count)
-            .await?
-            .headers,
-    )
+    Ok(request_headers_chunked_with_stats(peer, start_block, count)
+        .await?
+        .headers)
 }
 
 pub(crate) async fn request_headers_chunked_with_stats(
@@ -744,7 +729,8 @@ pub(crate) async fn fetch_payloads_for_peer(
         let resp = request_receipts_chunked_partial_with_stats(peer, &hashes).await?;
         Ok::<_, eyre::Report>((resp, started.elapsed().as_millis() as u64))
     };
-    let ((bodies, bodies_ms), (receipts, receipts_ms)) = tokio::try_join!(bodies_fut, receipts_fut)?;
+    let ((bodies, bodies_ms), (receipts, receipts_ms)) =
+        tokio::try_join!(bodies_fut, receipts_fut)?;
     let bodies_requests = bodies.requests;
     let receipts_requests = receipts.requests;
     let mut bodies = bodies.results;
@@ -802,12 +788,16 @@ async fn request_headers_by_number(
     };
     let (tx, rx) = oneshot::channel();
     messages
-        .try_send(PeerRequest::GetBlockHeaders { request, response: tx })
+        .try_send(PeerRequest::GetBlockHeaders {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send header request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("header request to {peer_id:?} timed out"))??;
-    let headers = response.map_err(|err| eyre!("header response error from {peer_id:?}: {err:?}"))?;
+    let headers =
+        response.map_err(|err| eyre!("header response error from {peer_id:?}: {err:?}"))?;
     Ok(headers.0)
 }
 
@@ -824,12 +814,16 @@ async fn request_headers_by_hash(
     };
     let (tx, rx) = oneshot::channel();
     messages
-        .try_send(PeerRequest::GetBlockHeaders { request, response: tx })
+        .try_send(PeerRequest::GetBlockHeaders {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send header request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("header request to {peer_id:?} timed out"))??;
-    let headers = response.map_err(|err| eyre!("header response error from {peer_id:?}: {err:?}"))?;
+    let headers =
+        response.map_err(|err| eyre!("header response error from {peer_id:?}: {err:?}"))?;
     Ok(headers.0)
 }
 
@@ -840,12 +834,16 @@ async fn request_bodies(
     let request = GetBlockBodies::from(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetBlockBodies { request, response: tx })
+        .try_send(PeerRequest::GetBlockBodies {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send body request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("body request to {:?} timed out", peer.peer_id))??;
-    let bodies = response.map_err(|err| eyre!("body response error from {:?}: {err:?}", peer.peer_id))?;
+    let bodies =
+        response.map_err(|err| eyre!("body response error from {:?}: {err:?}", peer.peer_id))?;
     Ok(bodies.0)
 }
 
@@ -918,7 +916,10 @@ pub(crate) async fn request_receipts(
     }
 }
 
-pub(crate) async fn request_receipt_counts(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
+pub(crate) async fn request_receipt_counts(
+    peer: &NetworkPeer,
+    hashes: &[B256],
+) -> Result<Vec<usize>> {
     match peer.eth_version {
         EthVersion::Eth70 => request_receipt_counts70(peer, hashes).await,
         EthVersion::Eth69 => request_receipt_counts69(peer, hashes).await,
@@ -930,12 +931,16 @@ async fn request_receipt_counts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> R
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetReceipts { request, response: tx })
+        .try_send(PeerRequest::GetReceipts {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send receipts request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("receipts request to {:?} timed out", peer.peer_id))??;
-    let receipts = response.map_err(|err| eyre!("receipts response error from {:?}: {err:?}", peer.peer_id))?;
+    let receipts = response
+        .map_err(|err| eyre!("receipts response error from {:?}: {err:?}", peer.peer_id))?;
     Ok(receipts.0.iter().map(|block| block.len()).collect())
 }
 
@@ -943,12 +948,16 @@ async fn request_receipt_counts69(peer: &NetworkPeer, hashes: &[B256]) -> Result
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetReceipts69 { request, response: tx })
+        .try_send(PeerRequest::GetReceipts69 {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send receipts69 request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("receipts69 request to {:?} timed out", peer.peer_id))??;
-    let receipts = response.map_err(|err| eyre!("receipts69 response error from {:?}: {err:?}", peer.peer_id))?;
+    let receipts = response
+        .map_err(|err| eyre!("receipts69 response error from {:?}: {err:?}", peer.peer_id))?;
     Ok(receipts.0.iter().map(|block| block.len()).collect())
 }
 
@@ -959,12 +968,16 @@ async fn request_receipt_counts70(peer: &NetworkPeer, hashes: &[B256]) -> Result
     };
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetReceipts70 { request, response: tx })
+        .try_send(PeerRequest::GetReceipts70 {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send receipts70 request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("receipts70 request to {:?} timed out", peer.peer_id))??;
-    let receipts = response.map_err(|err| eyre!("receipts70 response error from {:?}: {err:?}", peer.peer_id))?;
+    let receipts = response
+        .map_err(|err| eyre!("receipts70 response error from {:?}: {err:?}", peer.peer_id))?;
     // Note: eth/70 can flag `last_block_incomplete` (partial). Harness treats this as a partial
     // response and requeues the missing block(s), rather than failing the whole batch.
     Ok(receipts.receipts.iter().map(|block| block.len()).collect())
@@ -1023,57 +1036,61 @@ async fn request_receipts_chunked_partial_with_stats(
     Ok(ChunkedResponse { results, requests })
 }
 
-async fn request_receipts_legacy(
-    peer: &NetworkPeer,
-    hashes: &[B256],
-) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetReceipts { request, response: tx })
+        .try_send(PeerRequest::GetReceipts {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send receipts request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("receipts request to {:?} timed out", peer.peer_id))??;
-    let receipts = response.map_err(|err| eyre!("receipts response error from {:?}: {err:?}", peer.peer_id))?;
-    Ok(receipts.0
+    let receipts = response
+        .map_err(|err| eyre!("receipts response error from {:?}: {err:?}", peer.peer_id))?;
+    Ok(receipts
+        .0
         .into_iter()
         .map(|block| block.into_iter().map(|r| r.receipt).collect())
         .collect())
 }
 
-async fn request_receipts69(
-    peer: &NetworkPeer,
-    hashes: &[B256],
-) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts69(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetReceipts69 { request, response: tx })
+        .try_send(PeerRequest::GetReceipts69 {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send receipts69 request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("receipts69 request to {:?} timed out", peer.peer_id))??;
-    let receipts = response.map_err(|err| eyre!("receipts69 response error from {:?}: {err:?}", peer.peer_id))?;
+    let receipts = response
+        .map_err(|err| eyre!("receipts69 response error from {:?}: {err:?}", peer.peer_id))?;
     Ok(receipts.0)
 }
 
-async fn request_receipts70(
-    peer: &NetworkPeer,
-    hashes: &[B256],
-) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts70(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
     let request = GetReceipts70 {
         first_block_receipt_index: 0,
         block_hashes: hashes.to_vec(),
     };
     let (tx, rx) = oneshot::channel();
     peer.messages
-        .try_send(PeerRequest::GetReceipts70 { request, response: tx })
+        .try_send(PeerRequest::GetReceipts70 {
+            request,
+            response: tx,
+        })
         .map_err(|err| eyre!("failed to send receipts70 request: {err:?}"))?;
     let response = timeout(REQUEST_TIMEOUT, rx)
         .await
         .map_err(|_| eyre!("receipts70 request to {:?} timed out", peer.peer_id))??;
-    let receipts = response.map_err(|err| eyre!("receipts70 response error from {:?}: {err:?}", peer.peer_id))?;
+    let receipts = response
+        .map_err(|err| eyre!("receipts70 response error from {:?}: {err:?}", peer.peer_id))?;
     // eth/70 can flag `last_block_incomplete` (partial). Treat this as a partial response:
     // downstream will requeue any missing blocks.
     Ok(receipts.receipts)

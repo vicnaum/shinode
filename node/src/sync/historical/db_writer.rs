@@ -1,10 +1,10 @@
 //! Batched DB writer for ingest mode.
 
 use crate::storage::{BlockBundle, Storage};
-use crate::sync::SyncProgressStats;
 use crate::sync::historical::stats::{
     BenchEvent, BenchEventLogger, DbWriteByteTotals, IngestBenchStats,
 };
+use crate::sync::SyncProgressStats;
 use eyre::Result;
 use reth_primitives_traits::serde_bincode_compat::SerdeBincodeCompat;
 use serde::Serialize;
@@ -507,7 +507,9 @@ mod tests {
             },
             withdrawals: StoredWithdrawals { withdrawals: None },
             size: StoredBlockSize { size: 0 },
-            receipts: StoredReceipts { receipts: Vec::<Receipt>::new() },
+            receipts: StoredReceipts {
+                receipts: Vec::<Receipt>::new(),
+            },
             logs: StoredLogs { logs: Vec::new() },
         }
     }
@@ -536,9 +538,7 @@ mod tests {
         tx.send(DbWriterMessage::Block(bundle_with_number(0)))
             .await
             .expect("send block 0");
-        tx.send(DbWriterMessage::Finalize)
-            .await
-            .expect("finalize");
+        tx.send(DbWriterMessage::Finalize).await.expect("finalize");
         drop(tx);
 
         handle.await.expect("db writer").expect("db writer result");

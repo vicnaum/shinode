@@ -98,11 +98,11 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_chainId",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
-            let params: Option<Value> = params.parse()?;
-            ensure_empty_params(params, "eth_chainId expects no params")?;
+                let params: Option<Value> = params.parse()?;
+                ensure_empty_params(params, "eth_chainId expects no params")?;
 
-            info!(method = "eth_chainId", "rpc request");
-            Ok(format!("0x{:x}", ctx.config.chain_id))
+                info!(method = "eth_chainId", "rpc request");
+                Ok(format!("0x{:x}", ctx.config.chain_id))
             },
         )
         .wrap_err("failed to register eth_chainId")?;
@@ -111,17 +111,17 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_blockNumber",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
-            let params: Option<Value> = params.parse()?;
-            ensure_empty_params(params, "eth_blockNumber expects no params")?;
+                let params: Option<Value> = params.parse()?;
+                ensure_empty_params(params, "eth_blockNumber expects no params")?;
 
-            info!(method = "eth_blockNumber", "rpc request");
-            let latest = ctx
-                .storage
-                .last_indexed_block()
-                .map_err(internal_error)?
-                .unwrap_or(0);
-            info!(method = "eth_blockNumber", latest, "rpc response");
-            Ok(format!("0x{:x}", latest))
+                info!(method = "eth_blockNumber", "rpc request");
+                let latest = ctx
+                    .storage
+                    .last_indexed_block()
+                    .map_err(internal_error)?
+                    .unwrap_or(0);
+                info!(method = "eth_blockNumber", latest, "rpc response");
+                Ok(format!("0x{:x}", latest))
             },
         )
         .wrap_err("failed to register eth_blockNumber")?;
@@ -130,99 +130,107 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_getBlockByNumber",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
-            let params: Vec<Value> = params.parse().map_err(|_| {
-                invalid_params("eth_getBlockByNumber expects [blockTag, includeTransactions]")
-            })?;
-            if params.len() != 2 {
-                return Err(invalid_params(
-                    "eth_getBlockByNumber expects [blockTag, includeTransactions]",
-                ));
-            }
+                let params: Vec<Value> = params.parse().map_err(|_| {
+                    invalid_params("eth_getBlockByNumber expects [blockTag, includeTransactions]")
+                })?;
+                if params.len() != 2 {
+                    return Err(invalid_params(
+                        "eth_getBlockByNumber expects [blockTag, includeTransactions]",
+                    ));
+                }
 
-            let include_txs = params[1]
-                .as_bool()
-                .ok_or_else(|| invalid_params("includeTransactions must be a boolean"))?;
-            info!(
-                method = "eth_getBlockByNumber",
-                block_tag = ?params[0],
-                include_txs,
-                "rpc request"
-            );
-            if include_txs {
-                return Err(invalid_params(
-                    "eth_getBlockByNumber only supports includeTransactions=false",
-                ));
-            }
+                let include_txs = params[1]
+                    .as_bool()
+                    .ok_or_else(|| invalid_params("includeTransactions must be a boolean"))?;
+                info!(
+                    method = "eth_getBlockByNumber",
+                    block_tag = ?params[0],
+                    include_txs,
+                    "rpc request"
+                );
+                if include_txs {
+                    return Err(invalid_params(
+                        "eth_getBlockByNumber only supports includeTransactions=false",
+                    ));
+                }
 
-            let tag = parse_block_tag(&params[0])?;
-            let latest = ctx.storage.last_indexed_block().map_err(internal_error)?;
-            let Some(number) = resolve_block_tag_optional(tag, latest)? else {
-                info!(method = "eth_getBlockByNumber", found = false, "rpc response");
-                return Ok(Value::Null);
-            };
+                let tag = parse_block_tag(&params[0])?;
+                let latest = ctx.storage.last_indexed_block().map_err(internal_error)?;
+                let Some(number) = resolve_block_tag_optional(tag, latest)? else {
+                    info!(
+                        method = "eth_getBlockByNumber",
+                        found = false,
+                        "rpc response"
+                    );
+                    return Ok(Value::Null);
+                };
 
-            let Some(header) = ctx.storage.block_header(number).map_err(internal_error)? else {
-                info!(method = "eth_getBlockByNumber", found = false, "rpc response");
-                return Ok(Value::Null);
-            };
+                let Some(header) = ctx.storage.block_header(number).map_err(internal_error)? else {
+                    info!(
+                        method = "eth_getBlockByNumber",
+                        found = false,
+                        "rpc response"
+                    );
+                    return Ok(Value::Null);
+                };
 
-            let hash = SealedHeader::seal_slow(header.clone()).hash();
-            let tx_hashes = ctx
-                .storage
-                .block_tx_hashes(number)
-                .map_err(internal_error)?
-                .map(|stored| stored.hashes)
-                .unwrap_or_default();
-            let txs = tx_hashes
-                .into_iter()
-                .map(|tx| format!("{:#x}", tx))
-                .collect::<Vec<_>>();
-            let size = ctx
-                .storage
-                .block_size(number)
-                .map_err(internal_error)?
-                .map(|stored| stored.size)
-                .unwrap_or(0);
-            let withdrawals = None;
+                let hash = SealedHeader::seal_slow(header.clone()).hash();
+                let tx_hashes = ctx
+                    .storage
+                    .block_tx_hashes(number)
+                    .map_err(internal_error)?
+                    .map(|stored| stored.hashes)
+                    .unwrap_or_default();
+                let txs = tx_hashes
+                    .into_iter()
+                    .map(|tx| format!("{:#x}", tx))
+                    .collect::<Vec<_>>();
+                let size = ctx
+                    .storage
+                    .block_size(number)
+                    .map_err(internal_error)?
+                    .map(|stored| stored.size)
+                    .unwrap_or(0);
+                let withdrawals = None;
 
-            let response = RpcBlock {
-                number: format!("0x{:x}", header.number),
-                hash: format!("{:#x}", hash),
-                parent_hash: format!("{:#x}", header.parent_hash),
-                nonce: format!("{:#x}", header.nonce),
-                sha3_uncles: format!("{:#x}", header.ommers_hash),
-                timestamp: format!("0x{:x}", header.timestamp),
-                logs_bloom: format!("{:#x}", header.logs_bloom),
-                transactions_root: format!("{:#x}", header.transactions_root),
-                state_root: format!("{:#x}", header.state_root),
-                receipts_root: format!("{:#x}", header.receipts_root),
-                miner: format!("{:#x}", header.beneficiary),
-                difficulty: format!("{:#x}", header.difficulty),
-                total_difficulty: "0x0".to_string(),
-                extra_data: format!("{:#x}", header.extra_data),
-                size: format!("0x{:x}", size),
-                gas_limit: format!("0x{:x}", header.gas_limit),
-                gas_used: format!("0x{:x}", header.gas_used),
-                transactions: txs,
-                uncles: Vec::new(),
-                mix_hash: format!("{:#x}", header.mix_hash),
-                base_fee_per_gas: header.base_fee_per_gas.map(|fee| format!("0x{:x}", fee)),
-                withdrawals_root: header.withdrawals_root.map(|root| format!("{:#x}", root)),
-                withdrawals,
-                blob_gas_used: header.blob_gas_used.map(|gas| format!("0x{:x}", gas)),
-                excess_blob_gas: header.excess_blob_gas.map(|gas| format!("0x{:x}", gas)),
-                parent_beacon_block_root: header
-                    .parent_beacon_block_root
-                    .map(|root| format!("{:#x}", root)),
-            };
+                let response = RpcBlock {
+                    number: format!("0x{:x}", header.number),
+                    hash: format!("{:#x}", hash),
+                    parent_hash: format!("{:#x}", header.parent_hash),
+                    nonce: format!("{:#x}", header.nonce),
+                    sha3_uncles: format!("{:#x}", header.ommers_hash),
+                    timestamp: format!("0x{:x}", header.timestamp),
+                    logs_bloom: format!("{:#x}", header.logs_bloom),
+                    transactions_root: format!("{:#x}", header.transactions_root),
+                    state_root: format!("{:#x}", header.state_root),
+                    receipts_root: format!("{:#x}", header.receipts_root),
+                    miner: format!("{:#x}", header.beneficiary),
+                    difficulty: format!("{:#x}", header.difficulty),
+                    total_difficulty: "0x0".to_string(),
+                    extra_data: format!("{:#x}", header.extra_data),
+                    size: format!("0x{:x}", size),
+                    gas_limit: format!("0x{:x}", header.gas_limit),
+                    gas_used: format!("0x{:x}", header.gas_used),
+                    transactions: txs,
+                    uncles: Vec::new(),
+                    mix_hash: format!("{:#x}", header.mix_hash),
+                    base_fee_per_gas: header.base_fee_per_gas.map(|fee| format!("0x{:x}", fee)),
+                    withdrawals_root: header.withdrawals_root.map(|root| format!("{:#x}", root)),
+                    withdrawals,
+                    blob_gas_used: header.blob_gas_used.map(|gas| format!("0x{:x}", gas)),
+                    excess_blob_gas: header.excess_blob_gas.map(|gas| format!("0x{:x}", gas)),
+                    parent_beacon_block_root: header
+                        .parent_beacon_block_root
+                        .map(|root| format!("{:#x}", root)),
+                };
 
-            info!(
-                method = "eth_getBlockByNumber",
-                found = true,
-                number = header.number,
-                "rpc response"
-            );
-            serde_json::to_value(response).map_err(internal_error)
+                info!(
+                    method = "eth_getBlockByNumber",
+                    found = true,
+                    number = header.number,
+                    "rpc response"
+                );
+                serde_json::to_value(response).map_err(internal_error)
             },
         )
         .wrap_err("failed to register eth_getBlockByNumber")?;
@@ -231,135 +239,143 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_getLogs",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
-            let params: Vec<Value> = params.parse().map_err(|_| {
-                invalid_params("eth_getLogs expects a single filter object")
-            })?;
-            if params.len() != 1 {
-                return Err(invalid_params("eth_getLogs expects a single filter object"));
-            }
-            let filter = params[0]
-                .as_object()
-                .ok_or_else(|| invalid_params("eth_getLogs expects a filter object"))?;
-            if filter.contains_key("blockHash") {
-                return Err(invalid_params("eth_getLogs does not support blockHash yet"));
-            }
-
-            let latest = ctx.storage.last_indexed_block().map_err(internal_error)?.unwrap_or(0);
-            let from_block = filter
-                .get("fromBlock")
-                .map(parse_block_tag)
-                .transpose()?
-                .map(|tag| resolve_block_tag_required(tag, latest))
-                .transpose()?
-                .unwrap_or(0);
-            let to_block = filter
-                .get("toBlock")
-                .map(parse_block_tag)
-                .transpose()?
-                .map(|tag| resolve_block_tag_required(tag, latest))
-                .transpose()?
-                .unwrap_or(latest);
-            let address_filter = filter.get("address").map(parse_address_filter).transpose()?;
-            let topics_filter = filter.get("topics").map(parse_topics_filter).transpose()?;
-            let topic0_filter = topics_filter
-                .as_ref()
-                .and_then(|topics| topics.first())
-                .and_then(|entry| entry.clone());
-            let address_count = address_filter.as_ref().map(|v| v.len()).unwrap_or(0);
-            let topic0_count = topic0_filter.as_ref().map(|v| v.len()).unwrap_or(0);
-            info!(
-                method = "eth_getLogs",
-                from_block,
-                to_block,
-                address_count,
-                topic0_count,
-                "rpc request"
-            );
-            if from_block > to_block {
-                return Ok(Value::Array(Vec::new()));
-            }
-        let block_span = to_block.saturating_sub(from_block).saturating_add(1);
-        if ctx.config.max_blocks_per_filter != 0
-            && block_span > ctx.config.max_blocks_per_filter
-        {
-                return Err(invalid_params("block range exceeds max_blocks_per_filter"));
-            }
-
-            for block in from_block..=to_block {
-                if !ctx.storage.has_block(block).map_err(internal_error)? {
-                    return Err(missing_block_error(block));
+                let params: Vec<Value> = params
+                    .parse()
+                    .map_err(|_| invalid_params("eth_getLogs expects a single filter object"))?;
+                if params.len() != 1 {
+                    return Err(invalid_params("eth_getLogs expects a single filter object"));
                 }
-            }
-
-            let headers = ctx
-                .storage
-                .block_headers_range(from_block..=to_block)
-                .map_err(internal_error)?;
-            let tx_hashes = ctx
-                .storage
-                .block_tx_hashes_range(from_block..=to_block)
-                .map_err(internal_error)?;
-            let receipts = ctx
-                .storage
-                .block_receipts_range(from_block..=to_block)
-                .map_err(internal_error)?;
-            let headers_by_number: HashMap<u64, _> = headers.into_iter().collect();
-            let tx_hashes_by_number: HashMap<u64, _> = tx_hashes.into_iter().collect();
-
-            let mut out = Vec::new();
-            for (block_number, stored) in receipts {
-                let Some(header) = headers_by_number.get(&block_number) else {
-                    continue;
-                };
-                let Some(tx_hashes) = tx_hashes_by_number.get(&block_number) else {
-                    continue;
-                };
-                if stored.receipts.len() != tx_hashes.hashes.len() {
-                    warn!(
-                        block_number,
-                        receipts = stored.receipts.len(),
-                        tx_hashes = tx_hashes.hashes.len(),
-                        "receipt/tx hash count mismatch while deriving logs"
-                    );
-                    continue;
+                let filter = params[0]
+                    .as_object()
+                    .ok_or_else(|| invalid_params("eth_getLogs expects a filter object"))?;
+                if filter.contains_key("blockHash") {
+                    return Err(invalid_params("eth_getLogs does not support blockHash yet"));
                 }
-                let block_hash = SealedHeader::seal_slow(header.clone()).hash();
-                for (tx_index, (receipt, tx_hash)) in stored
-                    .receipts
-                    .iter()
-                    .zip(tx_hashes.hashes.iter())
-                    .enumerate()
+
+                let latest = ctx
+                    .storage
+                    .last_indexed_block()
+                    .map_err(internal_error)?
+                    .unwrap_or(0);
+                let from_block = filter
+                    .get("fromBlock")
+                    .map(parse_block_tag)
+                    .transpose()?
+                    .map(|tag| resolve_block_tag_required(tag, latest))
+                    .transpose()?
+                    .unwrap_or(0);
+                let to_block = filter
+                    .get("toBlock")
+                    .map(parse_block_tag)
+                    .transpose()?
+                    .map(|tag| resolve_block_tag_required(tag, latest))
+                    .transpose()?
+                    .unwrap_or(latest);
+                let address_filter = filter
+                    .get("address")
+                    .map(parse_address_filter)
+                    .transpose()?;
+                let topics_filter = filter.get("topics").map(parse_topics_filter).transpose()?;
+                let topic0_filter = topics_filter
+                    .as_ref()
+                    .and_then(|topics| topics.first())
+                    .and_then(|entry| entry.clone());
+                let address_count = address_filter.as_ref().map(|v| v.len()).unwrap_or(0);
+                let topic0_count = topic0_filter.as_ref().map(|v| v.len()).unwrap_or(0);
+                info!(
+                    method = "eth_getLogs",
+                    from_block, to_block, address_count, topic0_count, "rpc request"
+                );
+                if from_block > to_block {
+                    return Ok(Value::Array(Vec::new()));
+                }
+                let block_span = to_block.saturating_sub(from_block).saturating_add(1);
+                if ctx.config.max_blocks_per_filter != 0
+                    && block_span > ctx.config.max_blocks_per_filter
                 {
-                    for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
-                        let alloy_primitives::Log { address, data } = log;
-                        let (topics, data) = data.split();
-                        let stored_log = StoredLog {
-                            address,
-                            topics,
-                            data,
+                    return Err(invalid_params("block range exceeds max_blocks_per_filter"));
+                }
+
+                for block in from_block..=to_block {
+                    if !ctx.storage.has_block(block).map_err(internal_error)? {
+                        return Err(missing_block_error(block));
+                    }
+                }
+
+                let headers = ctx
+                    .storage
+                    .block_headers_range(from_block..=to_block)
+                    .map_err(internal_error)?;
+                let tx_hashes = ctx
+                    .storage
+                    .block_tx_hashes_range(from_block..=to_block)
+                    .map_err(internal_error)?;
+                let receipts = ctx
+                    .storage
+                    .block_receipts_range(from_block..=to_block)
+                    .map_err(internal_error)?;
+                let headers_by_number: HashMap<u64, _> = headers.into_iter().collect();
+                let tx_hashes_by_number: HashMap<u64, _> = tx_hashes.into_iter().collect();
+
+                let mut out = Vec::new();
+                for (block_number, stored) in receipts {
+                    let Some(header) = headers_by_number.get(&block_number) else {
+                        continue;
+                    };
+                    let Some(tx_hashes) = tx_hashes_by_number.get(&block_number) else {
+                        continue;
+                    };
+                    if stored.receipts.len() != tx_hashes.hashes.len() {
+                        warn!(
                             block_number,
-                            block_hash,
-                            transaction_hash: *tx_hash,
-                            transaction_index: tx_index as u64,
-                            log_index: log_index as u64,
-                            removed: false,
-                        };
-                        if log_matches(&stored_log, address_filter.as_deref(), topics_filter.as_deref())
-                        {
-                            out.push(format_log(&stored_log));
-                            if ctx.config.max_logs_per_response != 0
-                                && out.len() > ctx.config.max_logs_per_response as usize
-                            {
-                                return Err(invalid_params("response exceeds max_logs_per_response"));
+                            receipts = stored.receipts.len(),
+                            tx_hashes = tx_hashes.hashes.len(),
+                            "receipt/tx hash count mismatch while deriving logs"
+                        );
+                        continue;
+                    }
+                    let block_hash = SealedHeader::seal_slow(header.clone()).hash();
+                    for (tx_index, (receipt, tx_hash)) in stored
+                        .receipts
+                        .iter()
+                        .zip(tx_hashes.hashes.iter())
+                        .enumerate()
+                    {
+                        for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
+                            let alloy_primitives::Log { address, data } = log;
+                            let (topics, data) = data.split();
+                            let stored_log = StoredLog {
+                                address,
+                                topics,
+                                data,
+                                block_number,
+                                block_hash,
+                                transaction_hash: *tx_hash,
+                                transaction_index: tx_index as u64,
+                                log_index: log_index as u64,
+                                removed: false,
+                            };
+                            if log_matches(
+                                &stored_log,
+                                address_filter.as_deref(),
+                                topics_filter.as_deref(),
+                            ) {
+                                out.push(format_log(&stored_log));
+                                if ctx.config.max_logs_per_response != 0
+                                    && out.len() > ctx.config.max_logs_per_response as usize
+                                {
+                                    return Err(invalid_params(
+                                        "response exceeds max_logs_per_response",
+                                    ));
+                                }
                             }
                         }
                     }
                 }
-            }
-            let logs = out;
+                let logs = out;
 
-            info!(method = "eth_getLogs", logs = logs.len(), "rpc response");
-            serde_json::to_value(logs).map_err(internal_error)
+                info!(method = "eth_getLogs", logs = logs.len(), "rpc response");
+                serde_json::to_value(logs).map_err(internal_error)
             },
         )
         .wrap_err("failed to register eth_getLogs")?;
@@ -486,7 +502,11 @@ fn parse_topics_filter(value: &Value) -> Result<Vec<Option<Vec<B256>>>, ErrorObj
                 }
                 out.push(Some(entries));
             }
-            _ => return Err(invalid_params("topic entries must be null, string, or array")),
+            _ => {
+                return Err(invalid_params(
+                    "topic entries must be null, string, or array",
+                ))
+            }
         }
     }
     Ok(out)
@@ -512,8 +532,12 @@ fn log_matches(
 
     if let Some(filters) = topics {
         for (idx, filter) in filters.iter().enumerate() {
-            let Some(filter_values) = filter else { continue };
-            let Some(topic) = log.topics.get(idx) else { return false };
+            let Some(filter_values) = filter else {
+                continue;
+            };
+            let Some(topic) = log.topics.get(idx) else {
+                return false;
+            };
             if !filter_values.contains(topic) {
                 return false;
             }
@@ -526,7 +550,11 @@ fn log_matches(
 fn format_log(log: &StoredLog) -> RpcLog {
     RpcLog {
         address: format!("{:#x}", log.address),
-        topics: log.topics.iter().map(|topic| format!("{:#x}", topic)).collect(),
+        topics: log
+            .topics
+            .iter()
+            .map(|topic| format!("{:#x}", topic))
+            .collect(),
         data: format!("{:x}", log.data),
         block_number: format!("0x{:x}", log.block_number),
         block_hash: format!("{:#x}", log.block_hash),
@@ -595,10 +623,10 @@ struct RpcLog {
 mod tests {
     use super::*;
     use crate::cli::{BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+    use crate::storage::BlockBundle;
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
-    use crate::storage::BlockBundle;
     use reth_ethereum_primitives::{Receipt, TxType};
     use reth_primitives_traits::Header;
     use std::path::PathBuf;
@@ -713,7 +741,10 @@ mod tests {
         let addr = server.local_addr().expect("local addr");
         let handle = server.start(
             module(RpcContext {
-                config: RpcConfig { chain_id, ..rpc_config },
+                config: RpcConfig {
+                    chain_id,
+                    ..rpc_config
+                },
                 storage,
             })
             .expect("module"),
@@ -1045,7 +1076,10 @@ mod tests {
         let storage = Storage::open(&config).expect("storage");
 
         let header = header_with_number(1);
-        write_bundle(&storage, bundle_with_number(1, header, Vec::new(), Vec::new(), 0));
+        write_bundle(
+            &storage,
+            bundle_with_number(1, header, Vec::new(), Vec::new(), 0),
+        );
 
         let (addr, handle) =
             start_test_server(1, Arc::new(storage), RpcConfig::from(&config)).await;

@@ -1,7 +1,7 @@
 //! Storage types and helpers. The sharded backend lives in `sharded`.
 
 use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
-use alloy_primitives::{Address, B256, Bytes, Signature, U256};
+use alloy_primitives::{Address, Bytes, Signature, B256, U256};
 use eyre::{Result, WrapErr};
 use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{
@@ -72,7 +72,10 @@ impl SerdeBincodeCompat for StoredReceipts {
     type BincodeRepr<'a> = Vec<ReceiptBincodeRepr<'a>>;
 
     fn as_repr(&self) -> Self::BincodeRepr<'_> {
-        self.receipts.iter().map(|receipt| receipt.as_repr()).collect()
+        self.receipts
+            .iter()
+            .map(|receipt| receipt.as_repr())
+            .collect()
     }
 
     fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {

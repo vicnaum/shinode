@@ -1,14 +1,14 @@
 //! Processing stage for historical sync.
 
 use crate::storage::{
-    BlockBundle, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransaction, StoredTransactions,
-    StoredTxHashes, StoredWithdrawals,
+    BlockBundle, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransaction,
+    StoredTransactions, StoredTxHashes, StoredWithdrawals,
 };
-use crate::sync::{BlockPayload};
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
 use crate::sync::historical::types::{FetchedBlock, ProbeRecord};
+use crate::sync::BlockPayload;
 use alloy_consensus::{SignableTransaction, Transaction as _};
-use alloy_primitives::{B256, Keccak256, TxKind};
+use alloy_primitives::{Keccak256, TxKind, B256};
 use bytes::buf::UninitSlice;
 use eyre::{eyre, Result};
 use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};

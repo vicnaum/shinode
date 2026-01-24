@@ -161,8 +161,7 @@ impl SyncProgressStats {
     }
 
     pub fn set_queue(&self, queue: u64) {
-        self.queue
-            .store(queue, std::sync::atomic::Ordering::SeqCst);
+        self.queue.store(queue, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_inflight(&self, inflight: u64) {

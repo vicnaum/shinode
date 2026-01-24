@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
-use super::{run_ingest_pipeline, IngestPipelineOutcome, PeerHealthTracker};
 use super::reorg::{find_common_ancestor, preflight_reorg, ReorgCheck};
+use super::{run_ingest_pipeline, IngestPipelineOutcome, PeerHealthTracker};
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -113,23 +113,17 @@ pub async fn run_follow_loop(
             .unwrap_or(config.start_block)
             .max(config.start_block);
 
-        let observed_head = match discover_head_p2p(
-            &pool,
-            baseline,
-            HEAD_PROBE_PEERS,
-            HEAD_PROBE_LIMIT,
-        )
-        .await?
-        {
-            Some(head) => head,
-            None => {
-                if let Some(stats) = stats.as_ref() {
-                    stats.set_status(SyncStatus::LookingForPeers);
+        let observed_head =
+            match discover_head_p2p(&pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT).await? {
+                Some(head) => head,
+                None => {
+                    if let Some(stats) = stats.as_ref() {
+                        stats.set_status(SyncStatus::LookingForPeers);
+                    }
+                    sleep(poll).await;
+                    continue;
                 }
-                sleep(poll).await;
-                continue;
-            }
-        };
+            };
 
         storage.set_head_seen(observed_head)?;
         if let Some(stats) = stats.as_ref() {
@@ -175,11 +169,7 @@ pub async fn run_follow_loop(
             {
                 ReorgCheck::NoReorg => {}
                 ReorgCheck::Inconclusive => {
-                    tracing::debug!(
-                        last_indexed,
-                        start,
-                        "reorg check inconclusive; retrying"
-                    );
+                    tracing::debug!(last_indexed, start, "reorg check inconclusive; retrying");
                     sleep(poll).await;
                     continue;
                 }
@@ -194,14 +184,10 @@ pub async fn run_follow_loop(
                         peer_id = ?anchor.peer_id,
                         "reorg detected; searching for common ancestor"
                     );
-                    let ancestor = find_common_ancestor(storage.as_ref(), &anchor, low, last_indexed)
-                        .await?;
+                    let ancestor =
+                        find_common_ancestor(storage.as_ref(), &anchor, low, last_indexed).await?;
                     if let Some(ancestor) = ancestor {
-                        tracing::warn!(
-                            last_indexed,
-                            ancestor,
-                            "reorg rollback to ancestor"
-                        );
+                        tracing::warn!(last_indexed, ancestor, "reorg rollback to ancestor");
                         storage.rollback_to(ancestor)?;
                         continue;
                     }
@@ -244,11 +230,7 @@ pub async fn run_follow_loop(
                 if let Some(s) = stats.as_ref() {
                     s.set_head_block(head);
                 }
-                tracing::info!(
-                    head,
-                    elapsed_ms = elapsed.as_millis(),
-                    "ingest up to date"
-                );
+                tracing::info!(head, elapsed_ms = elapsed.as_millis(), "ingest up to date");
             }
             IngestPipelineOutcome::RangeApplied { range, logs } => {
                 if let Some(s) = stats.as_ref() {
