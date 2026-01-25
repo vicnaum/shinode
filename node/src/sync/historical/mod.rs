@@ -77,6 +77,14 @@ pub(crate) fn build_peer_health_tracker(config: &NodeConfig) -> Arc<PeerHealthTr
     ))
 }
 
+pub struct TailIngestConfig {
+    pub ranges_rx: mpsc::UnboundedReceiver<RangeInclusive<u64>>,
+    pub head_seen_rx: watch::Receiver<u64>,
+    pub stop_tx: watch::Sender<bool>,
+    pub stop_when_caught_up: bool,
+    pub head_offset: u64,
+}
+
 /// Run benchmark probe mode over a fixed range.
 pub async fn run_benchmark_probe(
     config: &NodeConfig,
@@ -527,7 +535,26 @@ pub enum IngestPipelineOutcome {
     RangeApplied {
         range: RangeInclusive<u64>,
         logs: u64,
+        finalize: IngestFinalizeStats,
     },
+}
+
+pub enum MissingBlocks {
+    Precomputed(Vec<u64>),
+    Ranges {
+        ranges: Vec<RangeInclusive<u64>>,
+        total: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IngestFinalizeStats {
+    pub drain_workers_ms: u64,
+    pub db_flush_ms: u64,
+    pub compactions_wait_ms: u64,
+    pub compact_all_dirty_ms: u64,
+    pub seal_completed_ms: u64,
+    pub total_ms: u64,
 }
 
 pub async fn run_ingest_pipeline(
@@ -535,18 +562,26 @@ pub async fn run_ingest_pipeline(
     pool: Arc<PeerPool>,
     config: &NodeConfig,
     range: RangeInclusive<u64>,
-    blocks: Vec<u64>,
+    missing: MissingBlocks,
     head_at_startup: u64,
     progress: Option<Arc<dyn ProgressReporter>>,
     stats: Option<Arc<SyncProgressStats>>,
     bench: Option<Arc<IngestBenchStats>>,
+    db_mode_override: Option<DbWriteMode>,
     head_cap_override: Option<u64>,
     peer_health: Arc<PeerHealthTracker>,
     events: Option<Arc<BenchEventLogger>>,
     stop_rx: Option<watch::Receiver<bool>>,
+    tail: Option<TailIngestConfig>,
 ) -> Result<IngestPipelineOutcome> {
-    let total = blocks.len() as u64;
-    if total == 0 {
+    let (blocks, mut ranges, total) = match missing {
+        MissingBlocks::Precomputed(blocks) => {
+            let total = blocks.len() as u64;
+            (blocks, Vec::new(), total)
+        }
+        MissingBlocks::Ranges { ranges, total } => (Vec::new(), ranges, total),
+    };
+    if total == 0 && tail.is_none() {
         if let Some(stats) = stats {
             stats.set_status(SyncStatus::UpToDate);
             stats.set_queue(0);
@@ -581,23 +616,33 @@ pub async fn run_ingest_pipeline(
         max_lookahead_blocks: config.fast_sync_max_lookahead_blocks,
         ..SchedulerConfig::default()
     };
+    let mut stop_rx = stop_rx;
+    let db_mode = db_mode_override.unwrap_or_else(|| {
+        if head_cap_override.is_some() {
+            DbWriteMode::Follow
+        } else {
+            DbWriteMode::FastSync
+        }
+    });
     // In follow mode, missing blocks are typically due to propagation lag near the tip.
     // Keep retrying indefinitely instead of marking them as permanently failed.
-    if head_cap_override.is_some() {
+    if db_mode == DbWriteMode::Follow {
         scheduler_config.max_attempts_per_block = u32::MAX;
     }
-    let mut stop_rx = stop_rx;
-    let db_mode = if head_cap_override.is_some() {
-        DbWriteMode::Follow
-    } else {
-        DbWriteMode::FastSync
-    };
     let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
         let mut remaining: HashMap<u64, usize> = HashMap::new();
         let shard_size = storage.shard_size();
-        for block in &blocks {
-            let shard_start = (block / shard_size) * shard_size;
-            *remaining.entry(shard_start).or_insert(0) += 1;
+        if !ranges.is_empty() {
+            for range in &ranges {
+                let shard_start = (range.start() / shard_size) * shard_size;
+                let count = range_len(range) as usize;
+                *remaining.entry(shard_start).or_insert(0) += count;
+            }
+        } else {
+            for block in &blocks {
+                let shard_start = (block / shard_size) * shard_size;
+                *remaining.entry(shard_start).or_insert(0) += 1;
+            }
         }
         if let Some(stats) = stats.as_ref() {
             stats.set_compactions_total(remaining.len() as u64);
@@ -612,6 +657,94 @@ pub async fn run_ingest_pipeline(
         Arc::clone(&peer_health),
         Arc::clone(&low_watermark),
     ));
+    if !ranges.is_empty() {
+        for range in ranges.drain(..) {
+            let _ = scheduler.enqueue_range(range).await;
+        }
+    }
+
+    let total_blocks = Arc::new(AtomicU64::new(total));
+    let max_scheduled = Arc::new(AtomicU64::new(*range.end()));
+    let tail_head_seen = tail.as_ref().map(|t| t.head_seen_rx.clone());
+    let mut tail_head_seen_rx = tail_head_seen.clone();
+    let tail_stop_tx = tail.as_ref().map(|t| t.stop_tx.clone());
+    let tail_stop_when_caught_up = tail.as_ref().map(|t| t.stop_when_caught_up).unwrap_or(true);
+    let tail_head_offset = tail.as_ref().map(|t| t.head_offset).unwrap_or(0);
+    let mut tail_stop_sent = false;
+    let tail_task = if let Some(mut tail) = tail {
+        let scheduler = Arc::clone(&scheduler);
+        let remaining_per_shard = remaining_per_shard.clone();
+        let progress = progress.clone();
+        let stats = stats.clone();
+        let bench = bench.clone();
+        let total_blocks = Arc::clone(&total_blocks);
+        let max_scheduled = Arc::clone(&max_scheduled);
+        let shard_size = storage.shard_size();
+        Some(tokio::spawn(async move {
+            while let Some(range) = tail.ranges_rx.recv().await {
+                let start = *range.start();
+                let end = *range.end();
+                if end < start {
+                    continue;
+                }
+                let added = scheduler.enqueue_range(range.clone()).await;
+                if added == 0 {
+                    continue;
+                }
+                let new_total = total_blocks
+                    .fetch_add(added as u64, Ordering::SeqCst)
+                    .saturating_add(added as u64);
+                if let Some(progress) = progress.as_ref() {
+                    progress.set_length(new_total);
+                }
+                if let Some(bench) = bench.as_ref() {
+                    bench.add_blocks_total(added as u64);
+                }
+                if let Some(stats) = stats.as_ref() {
+                    let pending = scheduler.pending_count().await as u64;
+                    stats.set_queue(pending);
+                }
+                let prev_max = max_scheduled.load(Ordering::SeqCst);
+                if end > prev_max {
+                    max_scheduled.store(end, Ordering::SeqCst);
+                }
+                if let Some(remaining) = remaining_per_shard.as_ref() {
+                    let mut guard = remaining.lock().await;
+                    let mut new_shards = 0u64;
+                    let mut cursor = start;
+                    while cursor <= end {
+                        let shard_start = (cursor / shard_size) * shard_size;
+                        let shard_end = shard_start.saturating_add(shard_size).saturating_sub(1);
+                        let span_end = end.min(shard_end);
+                        let count = span_end.saturating_sub(cursor).saturating_add(1) as usize;
+                        let entry = guard.entry(shard_start).or_insert(0);
+                        if *entry == 0 {
+                            new_shards = new_shards.saturating_add(1);
+                        }
+                        *entry = entry.saturating_add(count);
+                        cursor = span_end.saturating_add(1);
+                    }
+                    drop(guard);
+                    if let Some(stats) = stats.as_ref() {
+                        if new_shards > 0 {
+                            let total = remaining.lock().await.len() as u64;
+                            stats.set_compactions_total(total);
+                        }
+                    }
+                }
+                tracing::debug!(
+                    range_start = start,
+                    range_end = end,
+                    target_end = end,
+                    blocks_added = added,
+                    total_blocks = new_total,
+                    "tail: appended range"
+                );
+            }
+        }))
+    } else {
+        None
+    };
 
     let (gauge_stop_tx, gauge_stop_rx) = watch::channel(false);
     let scheduler_gauge_handle = if let Some(events) = events.clone() {
@@ -742,6 +875,11 @@ pub async fn run_ingest_pipeline(
     drop(processed_blocks_tx);
 
     let db_config = DbWriteConfig::new(config.db_write_batch_blocks, None);
+    let follow_expected_start = if db_mode == DbWriteMode::Follow {
+        Some(*range.start())
+    } else {
+        None
+    };
     let db_handle = tokio::spawn(run_db_writer(
         Arc::clone(&storage),
         processed_blocks_rx,
@@ -751,6 +889,7 @@ pub async fn run_ingest_pipeline(
         db_mode,
         stats.clone(),
         remaining_per_shard,
+        follow_expected_start,
     ));
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
@@ -849,7 +988,42 @@ pub async fn run_ingest_pipeline(
             break;
         }
         if scheduler.is_done().await {
-            break;
+            if let Some(head_seen_rx) = tail_head_seen_rx.as_mut() {
+                let head_seen = *head_seen_rx.borrow();
+                let safe_head = head_seen.saturating_sub(tail_head_offset);
+                let scheduled = max_scheduled.load(Ordering::SeqCst);
+                if scheduled >= safe_head {
+                    if let Some(stop_tx) = tail_stop_tx.as_ref() {
+                        if !tail_stop_sent && tail_stop_when_caught_up {
+                            let _ = stop_tx.send(true);
+                            tail_stop_sent = true;
+                            continue;
+                        }
+                    }
+                    if tail_stop_when_caught_up {
+                        break;
+                    }
+                    // Follow-style tailing: wait for head updates and continue.
+                    tokio::select! {
+                        _ = async {
+                            if let Some(stop_rx) = stop_rx.as_mut() {
+                                let _ = stop_rx.changed().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            if stop_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false) {
+                                break;
+                            }
+                        }
+                        _ = head_seen_rx.changed() => {}
+                        _ = sleep(Duration::from_millis(200)) => {}
+                    }
+                    continue;
+                }
+            } else {
+                break;
+            }
         }
 
         let active_peers = pool.len();
@@ -868,7 +1042,14 @@ pub async fn run_ingest_pipeline(
             Some(cap) => cap,
             None => {
                 if peer.head_number == 0 {
-                    *range.end()
+                    if db_mode == DbWriteMode::Follow {
+                        tail_head_seen
+                            .as_ref()
+                            .map(|rx| *rx.borrow())
+                            .unwrap_or(*range.end())
+                    } else {
+                        *range.end()
+                    }
                 } else {
                     peer.head_number
                 }
@@ -1193,8 +1374,9 @@ pub async fn run_ingest_pipeline(
     for handle in processor_handles {
         let _ = handle.await;
     }
+    let drain_workers_ms = processors_started.elapsed().as_millis() as u64;
     tracing::info!(
-        elapsed_ms = processors_started.elapsed().as_millis() as u64,
+        elapsed_ms = drain_workers_ms,
         "finalizing: processor workers drained"
     );
     tracing::info!("finalizing: flushing DB writer");
@@ -1202,13 +1384,18 @@ pub async fn run_ingest_pipeline(
     let _ = db_flush_tx.send(DbWriterMessage::Finalize).await;
     drop(db_flush_tx);
     let db_result = db_handle.await.map_err(|err| eyre!(err))?;
-    db_result?;
+    let db_finalize_stats = db_result?;
+    let db_flush_ms = db_flush_started.elapsed().as_millis() as u64;
     tracing::info!(
-        elapsed_ms = db_flush_started.elapsed().as_millis() as u64,
+        elapsed_ms = db_flush_ms,
         "finalizing: DB writer flushed"
     );
+    let total_ms = finalize_started.elapsed().as_millis() as u64;
     tracing::info!(
-        elapsed_ms = finalize_started.elapsed().as_millis() as u64,
+        elapsed_ms = total_ms,
+        compactions_wait_ms = db_finalize_stats.compactions_wait_ms,
+        compact_all_dirty_ms = db_finalize_stats.compact_all_dirty_ms,
+        seal_completed_ms = db_finalize_stats.seal_completed_ms,
         "finalizing: complete"
     );
 
@@ -1219,8 +1406,23 @@ pub async fn run_ingest_pipeline(
     if let Some(handle) = scheduler_gauge_handle {
         let _ = handle.await;
     }
+    if let Some(handle) = tail_task {
+        handle.abort();
+        let _ = handle.await;
+    }
 
-    Ok(IngestPipelineOutcome::RangeApplied { range, logs })
+    Ok(IngestPipelineOutcome::RangeApplied {
+        range,
+        logs,
+        finalize: IngestFinalizeStats {
+            drain_workers_ms,
+            db_flush_ms,
+            compactions_wait_ms: db_finalize_stats.compactions_wait_ms,
+            compact_all_dirty_ms: db_finalize_stats.compact_all_dirty_ms,
+            seal_completed_ms: db_finalize_stats.seal_completed_ms,
+            total_ms,
+        },
+    })
 }
 
 fn range_len(range: &RangeInclusive<u64>) -> u64 {

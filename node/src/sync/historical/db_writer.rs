@@ -161,6 +161,13 @@ pub enum DbWriteMode {
     Follow,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbWriterFinalizeStats {
+    pub compactions_wait_ms: u64,
+    pub compact_all_dirty_ms: u64,
+    pub seal_completed_ms: u64,
+}
+
 pub async fn run_db_writer(
     storage: Arc<Storage>,
     mut rx: mpsc::Receiver<DbWriterMessage>,
@@ -170,7 +177,8 @@ pub async fn run_db_writer(
     mode: DbWriteMode,
     progress_stats: Option<Arc<SyncProgressStats>>,
     remaining_per_shard: Option<Arc<Mutex<HashMap<u64, usize>>>>,
-) -> Result<()> {
+    follow_expected_start: Option<u64>,
+) -> Result<DbWriterFinalizeStats> {
     let mut interval = config.flush_interval.map(tokio::time::interval);
     // Compaction is a large, bursty workload (reads WAL + writes new segment files).
     // Serializing it avoids compaction fan-out doubling peak memory/IO.
@@ -178,12 +186,78 @@ pub async fn run_db_writer(
     let mut compactions = Vec::new();
     let mut buffer: Vec<BlockBundle> = Vec::new();
     let mut gauge_tick = tokio::time::interval(Duration::from_secs(10));
+    let mut follow_expected = if mode == DbWriteMode::Follow {
+        follow_expected_start
+            .or_else(|| storage.last_indexed_block().ok().flatten().map(|v| v + 1))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut follow_buffer: std::collections::BTreeMap<u64, BlockBundle> =
+        std::collections::BTreeMap::new();
 
     tracing::debug!(
         mode = ?mode,
         batch_blocks = config.batch_blocks,
         "db writer started"
     );
+
+    let write_follow_bundle = |bundle: BlockBundle| -> Result<()> {
+        let bytes = if bench.is_some() || events.is_some() {
+            Some(db_bytes_for_bundles(&[bundle.clone()])?)
+        } else {
+            None
+        };
+        if let Some(events) = events.as_ref() {
+            let bytes_total = bytes
+                .as_ref()
+                .map(|totals| {
+                    totals
+                        .headers
+                        .saturating_add(totals.tx_hashes)
+                        .saturating_add(totals.transactions)
+                        .saturating_add(totals.withdrawals)
+                        .saturating_add(totals.sizes)
+                        .saturating_add(totals.receipts)
+                        .saturating_add(totals.logs)
+                })
+                .unwrap_or(0);
+            events.record(BenchEvent::DbFlushStart {
+                blocks: 1,
+                bytes_total,
+            });
+        }
+        let started = Instant::now();
+        storage.write_block_bundle_follow(&bundle)?;
+        if let Some(bench) = bench.as_ref() {
+            bench.record_db_write(1, started.elapsed());
+            if let Some(bytes) = bytes.as_ref() {
+                bench.record_db_write_bytes(*bytes);
+            }
+        }
+        if let Some(events) = events.as_ref() {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let bytes_total = bytes
+                .as_ref()
+                .map(|totals| {
+                    totals
+                        .headers
+                        .saturating_add(totals.tx_hashes)
+                        .saturating_add(totals.transactions)
+                        .saturating_add(totals.withdrawals)
+                        .saturating_add(totals.sizes)
+                        .saturating_add(totals.receipts)
+                        .saturating_add(totals.logs)
+                })
+                .unwrap_or(0);
+            events.record(BenchEvent::DbFlushEnd {
+                blocks: 1,
+                bytes_total,
+                duration_ms: elapsed_ms,
+            });
+        }
+        Ok(())
+    };
 
     loop {
         tokio::select! {
@@ -196,68 +270,24 @@ pub async fn run_db_writer(
                                 flush_fast_sync_buffer(
                                     &storage,
                                     &mut buffer,
-                                bench.as_ref(),
-                                events.as_ref(),
-                                remaining_per_shard.as_ref(),
-                                progress_stats.as_ref(),
-                                &mut compactions,
-                                &semaphore,
-                            )
-                            .await?;
+                                    bench.as_ref(),
+                                    events.as_ref(),
+                                    remaining_per_shard.as_ref(),
+                                    progress_stats.as_ref(),
+                                    &mut compactions,
+                                    &semaphore,
+                                )
+                                .await?;
                             }
                         } else {
-                            let bytes = if bench.is_some() || events.is_some() {
-                                Some(db_bytes_for_bundles(&[block.clone()])?)
-                            } else {
-                                None
-                            };
-                            if let Some(events) = events.as_ref() {
-                                let bytes_total = bytes
-                                    .as_ref()
-                                    .map(|totals| {
-                                        totals
-                                            .headers
-                                            .saturating_add(totals.tx_hashes)
-                                            .saturating_add(totals.transactions)
-                                            .saturating_add(totals.withdrawals)
-                                            .saturating_add(totals.sizes)
-                                            .saturating_add(totals.receipts)
-                                            .saturating_add(totals.logs)
-                                    })
-                                    .unwrap_or(0);
-                                events.record(BenchEvent::DbFlushStart {
-                                    blocks: 1,
-                                    bytes_total,
-                                });
+                            let number = block.number;
+                            if number < follow_expected {
+                                continue;
                             }
-                            let started = Instant::now();
-                            storage.write_block_bundle_follow(&block)?;
-                            if let Some(bench) = bench.as_ref() {
-                                bench.record_db_write(1, started.elapsed());
-                                if let Some(bytes) = bytes.as_ref() {
-                                    bench.record_db_write_bytes(*bytes);
-                                }
-                            }
-                            if let Some(events) = events.as_ref() {
-                                let elapsed_ms = started.elapsed().as_millis() as u64;
-                                let bytes_total = bytes
-                                    .as_ref()
-                                    .map(|totals| {
-                                        totals
-                                            .headers
-                                            .saturating_add(totals.tx_hashes)
-                                            .saturating_add(totals.transactions)
-                                            .saturating_add(totals.withdrawals)
-                                            .saturating_add(totals.sizes)
-                                            .saturating_add(totals.receipts)
-                                            .saturating_add(totals.logs)
-                                    })
-                                    .unwrap_or(0);
-                                events.record(BenchEvent::DbFlushEnd {
-                                    blocks: 1,
-                                    bytes_total,
-                                    duration_ms: elapsed_ms,
-                                });
+                            follow_buffer.insert(number, block);
+                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
+                                write_follow_bundle(bundle)?;
+                                follow_expected = follow_expected.saturating_add(1);
                             }
                         }
                     }
@@ -274,6 +304,11 @@ pub async fn run_db_writer(
                                 &semaphore,
                             )
                             .await?;
+                        } else {
+                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
+                                write_follow_bundle(bundle)?;
+                                follow_expected = follow_expected.saturating_add(1);
+                            }
                         }
                     }
                     Some(DbWriterMessage::Finalize) => {
@@ -289,6 +324,11 @@ pub async fn run_db_writer(
                                 &semaphore,
                             )
                             .await?;
+                        } else {
+                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
+                                write_follow_bundle(bundle)?;
+                                follow_expected = follow_expected.saturating_add(1);
+                            }
                         }
                         break;
                     }
@@ -305,6 +345,11 @@ pub async fn run_db_writer(
                                 &semaphore,
                             )
                             .await?;
+                        } else {
+                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
+                                write_follow_bundle(bundle)?;
+                                follow_expected = follow_expected.saturating_add(1);
+                            }
                         }
                         break;
                     }
@@ -341,11 +386,33 @@ pub async fn run_db_writer(
                         compactions_inflight,
                     });
                 }
+                if mode == DbWriteMode::Follow && !follow_buffer.is_empty() {
+                    let min_key = follow_buffer.keys().next().copied().unwrap_or(0);
+                    let max_key = follow_buffer.keys().next_back().copied().unwrap_or(0);
+                    let max_gap = max_key.saturating_sub(follow_expected);
+                    tracing::debug!(
+                        expected = follow_expected,
+                        buffer_len = follow_buffer.len(),
+                        min_key,
+                        max_key,
+                        max_gap,
+                        "follow reorder buffer"
+                    );
+                }
             }
         }
     }
 
+    if mode == DbWriteMode::Follow && !follow_buffer.is_empty() {
+        tracing::warn!(
+            buffer_len = follow_buffer.len(),
+            expected = follow_expected,
+            "follow finalize: reorder buffer not empty after flush"
+        );
+    }
+
     let compaction_started = Instant::now();
+    let mut finalize_stats = DbWriterFinalizeStats::default();
     if mode == DbWriteMode::FastSync {
         if let Some(events) = events.as_ref() {
             events.record(BenchEvent::CompactAllDirtyStart);
@@ -354,10 +421,29 @@ pub async fn run_db_writer(
     for handle in compactions {
         handle.await??;
     }
+    finalize_stats.compactions_wait_ms = compaction_started.elapsed().as_millis() as u64;
     // Safety net: if shard completion tracking isn't provided (or we have a partial tail shard),
     // compact whatever is still in WAL so reads work after finalize.
     if mode == DbWriteMode::FastSync {
+        if let Ok(mut dirty) = storage.dirty_shards() {
+            if !dirty.is_empty() {
+                let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
+                dirty.sort_by_key(|info| std::cmp::Reverse(info.wal_bytes));
+                let top = dirty.iter().take(5).collect::<Vec<_>>();
+                tracing::info!(
+                    dirty_shards = dirty.len(),
+                    total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round(),
+                    top_shards = ?top,
+                    "finalizing: compacting dirty shards (WAL present or unsorted)"
+                );
+                if let Some(stats) = progress_stats.as_ref() {
+                    stats.set_compactions_total(dirty.len() as u64);
+                }
+            }
+        }
+        let compact_started = Instant::now();
         storage.compact_all_dirty()?;
+        finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
     }
     if mode == DbWriteMode::FastSync {
         if let Some(events) = events.as_ref() {
@@ -379,9 +465,10 @@ pub async fn run_db_writer(
                 duration_ms: started.elapsed().as_millis() as u64,
             });
         }
+        finalize_stats.seal_completed_ms = started.elapsed().as_millis() as u64;
     }
 
-    Ok(())
+    Ok(finalize_stats)
 }
 
 fn encoded_len<T: Serialize>(value: &T) -> Result<u64> {
@@ -530,6 +617,7 @@ mod tests {
             DbWriteMode::FastSync,
             None,
             None,
+            None,
         ));
 
         tx.send(DbWriterMessage::Block(bundle_with_number(2)))
@@ -541,7 +629,10 @@ mod tests {
         tx.send(DbWriterMessage::Finalize).await.expect("finalize");
         drop(tx);
 
-        handle.await.expect("db writer").expect("db writer result");
+        handle
+            .await
+            .expect("db writer")
+            .expect("db writer result");
 
         assert!(storage.block_header(0).expect("header 0").is_some());
         assert!(storage.block_header(1).expect("header 1").is_none());

@@ -266,7 +266,7 @@ pub struct ProcessTiming {
 #[derive(Debug)]
 pub struct IngestBenchStats {
     started_at: Instant,
-    blocks_total: u64,
+    blocks_total: AtomicU64,
     fetch_blocks: AtomicU64,
     fetch_failed_blocks: AtomicU64,
     fetch_batches: AtomicU64,
@@ -311,7 +311,7 @@ impl IngestBenchStats {
     pub fn new(blocks_total: u64) -> Self {
         Self {
             started_at: Instant::now(),
-            blocks_total,
+            blocks_total: AtomicU64::new(blocks_total),
             fetch_blocks: AtomicU64::new(0),
             fetch_failed_blocks: AtomicU64::new(0),
             fetch_batches: AtomicU64::new(0),
@@ -571,7 +571,7 @@ impl IngestBenchStats {
                 rollback_window_applied,
             },
             totals: IngestTotalsSummary {
-                blocks_total: self.blocks_total,
+                blocks_total: self.blocks_total.load(Ordering::SeqCst),
                 blocks_fetched: fetch_blocks,
                 blocks_processed: process_blocks,
                 blocks_written: db_write_blocks,
@@ -654,6 +654,13 @@ impl IngestBenchStats {
                 peer_failures_total: peer_failures,
             },
         }
+    }
+
+    pub fn add_blocks_total(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        self.blocks_total.fetch_add(delta, Ordering::SeqCst);
     }
 }
 

@@ -607,6 +607,28 @@ impl PeerWorkScheduler {
         }
     }
 
+    /// Append a contiguous range of blocks to the pending queue.
+    ///
+    /// NOTE: Callers must ensure this range does not overlap with already scheduled blocks.
+    /// This is intended for "tail" scheduling of new block ranges that were never enqueued.
+    pub async fn enqueue_range(&self, range: std::ops::RangeInclusive<u64>) -> usize {
+        let start = *range.start();
+        let end = *range.end();
+        if end < start {
+            return 0;
+        }
+        let mut pending = self.pending.lock().await;
+        let mut queued = self.queued.lock().await;
+        let mut added = 0usize;
+        for block in start..=end {
+            if queued.insert(block) {
+                pending.push(Reverse(block));
+                added += 1;
+            }
+        }
+        added
+    }
+
     async fn pop_next_batch_for_head(&self, peer_head: u64, max_blocks: usize) -> Vec<u64> {
         let mut pending = self.pending.lock().await;
         let mut queued = self.queued.lock().await;

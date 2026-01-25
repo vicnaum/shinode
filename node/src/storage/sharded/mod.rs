@@ -323,6 +323,16 @@ pub struct Storage {
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DirtyShardInfo {
+    pub shard_start: u64,
+    pub wal_bytes: u64,
+    #[allow(dead_code)]
+    pub sorted: bool,
+    #[allow(dead_code)]
+    pub complete: bool,
+}
+
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Storage")
@@ -547,6 +557,66 @@ impl Storage {
         }
 
         Ok(out)
+    }
+
+    pub fn missing_ranges_in_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<(Vec<std::ops::RangeInclusive<u64>>, u64)> {
+        let start = *range.start();
+        let end = *range.end();
+        if end < start {
+            return Ok((Vec::new(), 0));
+        }
+
+        let shard_size = self.shard_size().max(1);
+        let first_shard = shard_start(start, shard_size);
+        let last_shard = shard_start(end, shard_size);
+
+        let mut ranges = Vec::new();
+        let mut missing = 0u64;
+        let mut shard_start = first_shard;
+        while shard_start <= last_shard {
+            let shard_end = shard_start.saturating_add(shard_size).saturating_sub(1);
+            let local_start = start.max(shard_start);
+            let local_end = end.min(shard_end);
+            let off_start = (local_start - shard_start) as usize;
+            let off_end = (local_end - shard_start) as usize;
+
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                ranges.push(local_start..=local_end);
+                missing = missing.saturating_add(local_end.saturating_sub(local_start).saturating_add(1));
+                shard_start = shard_start.saturating_add(shard_size);
+                continue;
+            };
+            let state = shard.lock().expect("shard lock");
+            if state.meta.complete {
+                shard_start = shard_start.saturating_add(shard_size);
+                continue;
+            }
+
+            let mut current_start: Option<u64> = None;
+            for offset in off_start..=off_end {
+                let present = state.bitset.is_set(offset);
+                if !present {
+                    missing = missing.saturating_add(1);
+                    if current_start.is_none() {
+                        current_start = Some(shard_start + offset as u64);
+                    }
+                } else if let Some(start_block) = current_start.take() {
+                    let end_block = shard_start + offset as u64 - 1;
+                    ranges.push(start_block..=end_block);
+                }
+            }
+            if let Some(start_block) = current_start {
+                ranges.push(start_block..=local_end);
+            }
+
+            shard_start = shard_start.saturating_add(shard_size);
+        }
+
+        Ok((ranges, missing))
     }
 
     pub fn write_block_bundles_wal(&self, bundles: &[BlockBundle]) -> Result<Vec<u64>> {
@@ -957,6 +1027,34 @@ impl Storage {
             }
         }
         out.sort_unstable();
+        Ok(out)
+    }
+
+    pub fn dirty_shards(&self) -> Result<Vec<DirtyShardInfo>> {
+        let shard_starts: Vec<u64> = {
+            let shards = self.shards.lock().expect("shards lock");
+            shards.keys().copied().collect()
+        };
+        let mut out = Vec::new();
+        for shard_start in shard_starts {
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                continue;
+            };
+            let state = shard.lock().expect("shard lock");
+            let wal_path = wal_path(&state.dir);
+            let wal_bytes = wal_path.metadata().map(|meta| meta.len()).unwrap_or(0);
+            let is_dirty = wal_bytes > 0 || !state.meta.sorted;
+            if is_dirty {
+                out.push(DirtyShardInfo {
+                    shard_start,
+                    wal_bytes,
+                    sorted: state.meta.sorted,
+                    complete: state.meta.complete,
+                });
+            }
+        }
+        out.sort_by_key(|info| info.shard_start);
         Ok(out)
     }
 

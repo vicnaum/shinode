@@ -1026,6 +1026,9 @@ async fn main() -> Result<()> {
             peers = session.pool.len(),
             min_peers, "peer warmup complete"
         );
+        let follow_after =
+            matches!(config.benchmark, BenchmarkMode::Disabled) && config.end_block.is_none();
+
         let head_at_startup = wait_for_peer_head(
             &session.pool,
             config.start_block,
@@ -1041,10 +1044,9 @@ async fn main() -> Result<()> {
         );
         let bench_context = bench_context.as_ref();
         let missing_started = Instant::now();
-        let blocks = storage.missing_blocks_in_range(range.clone())?;
+        let (missing_ranges, missing_total) = storage.missing_ranges_in_range(range.clone())?;
         let missing_elapsed_ms = missing_started.elapsed().as_millis() as u64;
         let requested_total = range_len(&range);
-        let missing_total = blocks.len() as u64;
         let already_present = requested_total.saturating_sub(missing_total);
         if already_present > 0 {
             info!(
@@ -1066,7 +1068,11 @@ async fn main() -> Result<()> {
                 "resume: no existing blocks in range"
             );
         }
-        let total_len = blocks.len() as u64;
+        let total_len = missing_total;
+        let blocks = sync::historical::MissingBlocks::Ranges {
+            ranges: missing_ranges,
+            total: missing_total,
+        };
 
         let progress_stats = if std::io::stderr().is_terminal() {
             Some(Arc::new(SyncProgressStats::default()))
@@ -1132,15 +1138,114 @@ async fn main() -> Result<()> {
             None
         };
 
+        let mut head_tracker_handle = None;
+        let mut tail_feeder_handle = None;
+        let mut head_stop_tx = None;
+        let mut tail_stop_tx = None;
+        let mut tail_config = None;
+        if follow_after {
+            let (head_stop, head_stop_rx) = tokio::sync::watch::channel(false);
+            let (tail_stop, tail_stop_rx) = tokio::sync::watch::channel(false);
+            head_stop_tx = Some(head_stop.clone());
+            tail_stop_tx = Some(tail_stop.clone());
+
+            let (head_seen_tx, head_seen_rx) = tokio::sync::watch::channel(head_at_startup);
+            let pool = Arc::clone(&session.pool);
+            let storage = Arc::clone(&storage);
+            let stats = progress_stats.clone();
+            let rollback_window = config.rollback_window;
+            let mut stop_rx_head = head_stop_rx.clone();
+            head_tracker_handle = Some(tokio::spawn(async move {
+                let mut last_head = head_at_startup;
+                loop {
+                    if *stop_rx_head.borrow() {
+                        break;
+                    }
+                    let snapshot = pool.snapshot();
+                    let best_head = snapshot
+                        .iter()
+                        .map(|peer| peer.head_number)
+                        .max()
+                        .unwrap_or(last_head);
+                    if best_head > last_head {
+                        last_head = best_head;
+                        let _ = head_seen_tx.send(best_head);
+                        if let Err(err) = storage.set_head_seen(best_head) {
+                            tracing::debug!(error = %err, "head tracker: failed to persist head_seen");
+                        }
+                        if let Some(stats) = stats.as_ref() {
+                            stats.set_head_seen(best_head);
+                        }
+                    }
+                    tokio::select! {
+                        _ = stop_rx_head.changed() => {
+                            if *stop_rx_head.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
+            }));
+
+            let (tail_tx, tail_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut stop_rx_tail = tail_stop_rx.clone();
+            let mut head_seen_rx_tail = head_seen_rx.clone();
+            let mut next_to_schedule = range.end().saturating_add(1);
+            tail_feeder_handle = Some(tokio::spawn(async move {
+                loop {
+                    if *stop_rx_tail.borrow() {
+                        break;
+                    }
+                    let head_seen = *head_seen_rx_tail.borrow();
+                    let safe_head = head_seen.saturating_sub(rollback_window);
+                    if safe_head >= next_to_schedule {
+                        let start = next_to_schedule;
+                        let end = safe_head;
+                        let _ = tail_tx.send(start..=end);
+                        next_to_schedule = end.saturating_add(1);
+                    }
+                    tokio::select! {
+                        _ = head_seen_rx_tail.changed() => {}
+                        _ = stop_rx_tail.changed() => {
+                            if *stop_rx_tail.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                }
+            }));
+
+            tail_config = Some(sync::historical::TailIngestConfig {
+                ranges_rx: tail_rx,
+                head_seen_rx,
+                stop_tx: tail_stop,
+                stop_when_caught_up: true,
+                head_offset: config.rollback_window,
+            });
+        }
+
         let bench = Arc::new(IngestBenchStats::new(total_len));
         let progress_ref = progress
             .as_ref()
             .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let head_stop_tx_for_shutdown = head_stop_tx.clone();
+        let tail_stop_tx_for_shutdown = tail_stop_tx.clone();
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::clone(&shutdown_requested);
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
+                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 warn!("shutdown signal received; stopping ingest after draining");
                 let _ = stop_tx.send(true);
+                if let Some(stop_tx) = head_stop_tx_for_shutdown {
+                    let _ = stop_tx.send(true);
+                }
+                if let Some(stop_tx) = tail_stop_tx_for_shutdown {
+                    let _ = stop_tx.send(true);
+                }
                 if tokio::signal::ctrl_c().await.is_ok() {
                     warn!("second shutdown signal received; forcing exit");
                     process::exit(130);
@@ -1158,11 +1263,141 @@ async fn main() -> Result<()> {
             progress_stats.clone(),
             Some(Arc::clone(&bench)),
             None,
+            None,
             Arc::clone(&peer_health_local),
             events.clone(),
             Some(stop_rx),
+            tail_config,
         )
         .await?;
+
+        let finalize_stats = match &outcome {
+            sync::historical::IngestPipelineOutcome::RangeApplied { finalize, .. } => Some(*finalize),
+            _ => None,
+        };
+        if follow_after {
+            let last_indexed = storage.last_indexed_block().ok().flatten();
+            let head_seen = storage.head_seen().ok().flatten();
+            let safe_head = head_seen.map(|head| head.saturating_sub(config.rollback_window));
+            let dirty = storage.dirty_shards().unwrap_or_default();
+            let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
+            let total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round();
+            tracing::info!(
+                follow_after,
+                shutdown_requested = shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+                switch_tip = ?last_indexed,
+                head_seen = ?head_seen,
+                safe_head = ?safe_head,
+                dirty_shards = dirty.len(),
+                total_wal_mib,
+                drain_workers_ms = finalize_stats.map(|s| s.drain_workers_ms),
+                db_flush_ms = finalize_stats.map(|s| s.db_flush_ms),
+                compactions_wait_ms = finalize_stats.map(|s| s.compactions_wait_ms),
+                compact_all_dirty_ms = finalize_stats.map(|s| s.compact_all_dirty_ms),
+                seal_completed_ms = finalize_stats.map(|s| s.seal_completed_ms),
+                total_finalize_ms = finalize_stats.map(|s| s.total_ms),
+                "fast-sync -> follow boundary"
+            );
+        }
+
+        if follow_after && !shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(stop_tx) = tail_stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(handle) = tail_feeder_handle.take() {
+                let _ = handle.await;
+            }
+
+            info!("fast-sync complete; switching to follow mode");
+
+            let progress_ref = progress
+                .as_ref()
+                .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
+            let (synced_tx, synced_rx) = tokio::sync::oneshot::channel();
+            let follow_future = sync::historical::run_follow_loop(
+                Arc::clone(&storage),
+                Arc::clone(&session.pool),
+                &config,
+                progress_ref,
+                progress_stats.clone(),
+                Arc::clone(&peer_health_local),
+                Some(synced_tx),
+            );
+            tokio::pin!(follow_future);
+
+            let mut rpc_handle = None;
+            let mut synced_rx = Some(synced_rx);
+            loop {
+                tokio::select! {
+                    res = &mut follow_future => {
+                        if let Err(err) = res {
+                            warn!(error = %err, "follow loop exited");
+                        }
+                        break;
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        warn!("shutdown signal received");
+                        break;
+                    }
+                    _ = async {
+                        if let Some(rx) = synced_rx.take() {
+                            let _ = rx.await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        if rpc_handle.is_none() {
+                            let handle = rpc::start(
+                                config.rpc_bind,
+                                rpc::RpcConfig::from(&config),
+                                Arc::clone(&storage),
+                            )
+                            .await?;
+                            info!(rpc_bind = %config.rpc_bind, "rpc server started");
+                            rpc_handle = Some(handle);
+                        }
+                    }
+                }
+            }
+
+            if let Some(tracker) = progress.as_ref() {
+                tracker.finish();
+            }
+            if let Some(handle) = rpc_handle.take() {
+                if let Err(err) = handle.stop() {
+                    warn!(error = %err, "failed to stop rpc server");
+                }
+                handle.stopped().await;
+            }
+            if let Some(stop_tx) = head_stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(handle) = head_tracker_handle.take() {
+                let _ = handle.await;
+            }
+            flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
+            return Ok(());
+        }
+
+        if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(stop_tx) = tail_stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(handle) = tail_feeder_handle.take() {
+                let _ = handle.await;
+            }
+            if let Some(stop_tx) = head_stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(handle) = head_tracker_handle.take() {
+                let _ = handle.await;
+            }
+            if let Some(tracker) = progress.as_ref() {
+                tracker.finish();
+            }
+            flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
+            return Ok(());
+        }
 
         if let Some(tracker) = progress.as_ref() {
             tracker.finish();
@@ -1322,6 +1557,7 @@ async fn main() -> Result<()> {
             progress_ref,
             progress_stats.clone(),
             peer_health_local,
+            None,
         );
 
         _network_session = Some(session);
