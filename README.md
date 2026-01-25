@@ -151,7 +151,9 @@ Benchmark timeline artifacts:
 
 Notes:
 
-- Jemalloc is available as an optional allocator (`--features jemalloc`). `tracing_samply` and `tokio-console` integrations are planned but not wired yet.
+- Jemalloc is enabled by default (Cargo feature `jemalloc` is in `default`).
+  - To build/run *without* jemalloc: add `--no-default-features` to your Cargo command.
+  - `tracing_samply` and `tokio-console` integrations are planned but not wired yet.
 
 ## Allocator tuning (Linux)
 
@@ -164,7 +166,7 @@ MALLOC_ARENA_MAX=2 cargo run --manifest-path node/Cargo.toml --release -- --benc
 Alternatively, build/run with jemalloc (compile-time):
 
 ```bash
-cargo run --manifest-path node/Cargo.toml --release --features jemalloc -- --benchmark ingest ...
+cargo run --manifest-path node/Cargo.toml --release -- --benchmark ingest ...
 ```
 
 ## Configuration and storage
