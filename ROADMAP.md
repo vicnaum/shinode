@@ -145,6 +145,9 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) and `--features jemalloc` build.
 - [x] Backpressure + memory caps for queues (bounded lookahead + max buffered blocks)
 - [x] Safe boundary switch to slow path near the reorg window (historical head = head - rollback_window)
+- [x] Unify ingest pipelines: default ingest uses the benchmark ingest pipeline; artifacts gated by `--benchmark-*` flags.
+- [x] Resume without redownload: skip already-present blocks in range; recompact dirty shards (WAL/unsorted) on finalize/start.
+- [x] Follow mode: long-lived ingest epoch with tail scheduling + in-order DB appends + reorg rollback (within `--rollback-window`).
 - [ ] Deep reorg recovery: optional auto-rebootstrap (policy B)
 - [ ] Tests: sync loop + reorg handling + retry/escalation
 - [ ] Metrics export (Prometheus/OTel)

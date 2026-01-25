@@ -14,7 +14,7 @@ What works:
 - Logs are derived on-demand from receipts; withdrawals are not stored.
 - RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`,
   `eth_getLogs`, with request limits.
-- Graceful shutdown, restart-safe checkpoints, and basic ingest stats.
+- Graceful shutdown, restart-safe checkpoints, and basic ingest stats (resume skips already-present blocks; finalize recompacts dirty shards).
 - Peer health tracking (bans/quality scoring), bounded per-batch timeouts, and partial response handling.
 - Verbosity flags and progress bars (TTY only).
 - Benchmark warmup gating: `--benchmark-min-peers` (default: 5).

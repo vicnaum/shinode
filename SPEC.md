@@ -12,9 +12,11 @@ This repo contains a working **receipt availability harness** (see Appendix A) a
   `eth_getBlockByNumber`, `eth_getLogs`).
 - `eth_getBlockByNumber` returns full block shape; `totalDifficulty` is mocked to `0x0`.
 - Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
+- Resume without redownload: skip already-present blocks in range; recompact dirty shards (WAL/unsorted) before switching to follow.
 - DB stats CLI for on-disk static-file sizes.
 - Benchmark modes: probe (headers/receipts only) and ingest (full pipeline timing).
 - Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
+- Pipeline parity: default ingest uses the ingest benchmark pipeline; benchmark flags only enable artifacts (events/trace/log capture) and range stop behavior.
 - Fast-sync WAL batching (out-of-order) + benchmark events for compaction/sealing timings.
 - Compaction memory hardening: stream WAL during compaction, avoid large payload clones, and serialize compactions (queue).
 - Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) or `--features jemalloc` build.
