@@ -2361,7 +2361,6 @@ fn spawn_progress_updater(
         let mut follow_bar: Option<ProgressBar> = None;
         let mut failed_bar: Option<ProgressBar> = None;
         let mut failed_total = 0u64;
-        let mut catchup_start_block: Option<u64> = None;
         let mut last_peer_update = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
@@ -2484,33 +2483,20 @@ fn spawn_progress_updater(
                     let peers_available = snapshot.peers_total.min(peers_connected);
                     let active_fetch = snapshot.peers_active;
 
-                    let status_str = if snapshot.status == SyncStatus::Following {
-                        "Synced"
-                    } else if snapshot.status == SyncStatus::Fetching {
-                        "Catching up"
-                    } else if snapshot.status == SyncStatus::LookingForPeers {
-                        "Waiting for peers"
-                    } else {
-                        snapshot.status.as_str()
-                    };
-
-                    let catching_up = snapshot.status == SyncStatus::Fetching
-                        || snapshot.status == SyncStatus::Finalizing;
-                    let catchup_suffix = if catching_up {
-                        let start = catchup_start_block.get_or_insert(head_block);
-                        let done = head_block.saturating_sub(*start);
-                        let remaining = head_seen.saturating_sub(head_block);
-                        Some(format!(" {done}/{remaining}"))
-                    } else {
-                        catchup_start_block = None;
-                        None
+                    let (status_str, status_detail) = match snapshot.status {
+                        SyncStatus::Following | SyncStatus::UpToDate => ("Synced", String::new()),
+                        SyncStatus::Fetching => (
+                            "Catching up",
+                            format!(" ({} blocks left)", head_seen.saturating_sub(head_block)),
+                        ),
+                        SyncStatus::Finalizing => {
+                            ("Finalizing", " (flushing/compacting...)".to_string())
+                        }
+                        SyncStatus::LookingForPeers => ("Waiting for peers", String::new()),
                     };
 
                     // Format block number centered in a fixed-width field
-                    let content = match catchup_suffix {
-                        Some(suffix) => format!("[ {} ]{}", head_block, suffix),
-                        None => format!("[ {} ]", head_block),
-                    };
+                    let content = format!("[ {} ]", head_block);
                     let bar_width: usize = 40; // Match main progress bar width
                     let padding = bar_width.saturating_sub(content.len());
                     let left_pad = padding / 2;
@@ -2537,9 +2523,10 @@ fn spawn_progress_updater(
                     };
 
                     let msg = format!(
-                        "{} {}{} | head {} | peers {}/{} | fetch {} | failed {}",
+                        "{} {}{}{} | head {} | peers {}/{} | fetch {} | failed {}",
                         bar,
                         status_str,
+                        status_detail,
                         compact,
                         head_seen,
                         peers_available,
