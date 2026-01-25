@@ -38,7 +38,7 @@ use sync::historical::{
 use sync::{BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn, Event};
+use tracing::{debug, info, warn, Event};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -1967,7 +1967,7 @@ fn spawn_benchmark_resource_logger(
                         head_seen: Some(snapshot.head_seen),
                     });
                 }
-                info!(
+                debug!(
                     rss_kb,
                     swap_kb,
                     rss_anon_kb,
@@ -2011,7 +2011,7 @@ fn spawn_benchmark_resource_logger(
                         head_seen: None,
                     });
                 }
-                info!(
+                debug!(
                     rss_kb,
                     swap_kb,
                     rss_anon_kb,
@@ -2106,7 +2106,7 @@ fn spawn_benchmark_resource_logger(
                         head_seen: Some(snapshot.head_seen),
                     });
                 }
-                info!(
+                debug!(
                     rss_kb,
                     swap_kb,
                     rss_anon_kb,
@@ -2150,7 +2150,7 @@ fn spawn_benchmark_resource_logger(
                         head_seen: None,
                     });
                 }
-                info!(
+                debug!(
                     rss_kb,
                     swap_kb,
                     rss_anon_kb,
