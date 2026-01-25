@@ -111,12 +111,12 @@ RPC safety limits:
 - `--rpc-max-logs-per-response <u64>` (default: 100000; `0` = unlimited).
 
 Ingest tuning:
-- `--fast-sync-chunk-size <u64>`: initial blocks per peer batch (default: 16).
+- `--fast-sync-chunk-size <u64>`: initial blocks per peer batch (default: 32).
 - `--fast-sync-chunk-max <u64>`: hard cap for per-peer AIMD batch size (defaults to `4x --fast-sync-chunk-size`).
-- `--fast-sync-max-inflight <u32>`: max concurrent peer batches (default: 15).
-- `--fast-sync-batch-timeout-ms <u64>`: per-batch timeout (default: 5000).
-- `--fast-sync-max-buffered-blocks <u64>`: max buffered blocks (default: 2048).
-- `--fast-sync-max-lookahead-blocks <u64>`: max blocks ahead of the DB writer low watermark to assign (default: 50_000; `0` = unlimited).
+- `--fast-sync-max-inflight <u32>`: max concurrent peer batches (default: 32).
+- `--fast-sync-batch-timeout-ms <u64>`: per-batch timeout (default: 10_000).
+- `--fast-sync-max-buffered-blocks <u64>`: max buffered blocks (default: 8192).
+- `--fast-sync-max-lookahead-blocks <u64>`: max blocks ahead of the DB writer low watermark to assign (default: 100_000; `0` = unlimited).
 - `--db-write-batch-blocks <u64>`: batch size for fast-sync WAL writes in ingest mode (default: 512). Follow mode remains per-block.
 - `--db-write-flush-interval-ms <u64>`: optional time-based flush interval.
 
