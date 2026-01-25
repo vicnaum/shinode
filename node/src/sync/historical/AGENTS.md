@@ -54,6 +54,8 @@ DB write/compaction, and benchmark stats/event logging.
 - **Knobs / invariants**:
   - Concurrency is bounded by `fast_sync_max_inflight`; per-batch timeout is `fast_sync_batch_timeout_ms`.
   - In follow mode, retries are unbounded (`max_attempts_per_block = u32::MAX`) to tolerate propagation lag near the tip.
+  - In follow mode, scheduling caps batches by the global observed head (from head tracking), not per-peer `head_number` which can go stale.
+  - In follow mode, "missing blocks" responses (including empty batches) are treated as partials to avoid banning peers for near-tip propagation lag.
   - Tail ingestion (when enabled) tracks `head_seen_rx` and stops scheduling once the safe head is caught up (or continues in follow epochs).
 
 ### `scheduler.rs`
@@ -84,7 +86,7 @@ DB write/compaction, and benchmark stats/event logging.
 - **Role**: Runs an infinite loop to keep the store close to the network head, including reorg detection and bounded rollback.
 - **Key items**: `run_follow_loop()`, `FOLLOW_POLL_MS`, `FOLLOW_NEAR_TIP_BLOCKS`, `HEAD_PROBE_PEERS`, `REORG_PROBE_PEERS`
 - **Interactions**: Uses `discover_head_p2p()` to observe head; spawns per-epoch head/tail trackers to extend the ingest range as the head moves; uses `reorg::{preflight_reorg, find_common_ancestor}` and calls `Storage::rollback_to()` when needed; uses `run_ingest_pipeline()` to fill missing blocks in follow mode.
-- **Knobs / invariants**: When caught up, status is reported as `SyncStatus::UpToDate`; an optional one-shot signal can fire on the first UpToDate edge (used to start RPC). Reorg rollback is capped by `NodeConfig.rollback_window`.
+- **Knobs / invariants**: When caught up, follow can report `SyncStatus::UpToDate` (outer follow loop: nothing to ingest) or `SyncStatus::Following` (long-lived ingest epoch: caught up and waiting). An optional one-shot "synced" signal fires on the first UpToDate/Following edge (used to start RPC). Reorg rollback is capped by `NodeConfig.rollback_window`.
 
 ### `reorg.rs`
 - **Role**: Detects reorgs by comparing stored tip hashes against network headers and finds the latest common ancestor for rollback.

@@ -27,5 +27,5 @@ stack, storage backend, sync pipeline, and JSON-RPC server used by `main.rs`.
 - **Data/control flow**:
   - CLI config -> storage open -> P2P connect -> fast-sync ingest.
   - Head tracker persists `head_seen` and feeds tail scheduling to extend the safe-head target.
-  - After fast-sync, switch to follow mode; follow reuses ingest + in-order DB writes, RPC starts only after the first `SyncStatus::UpToDate`.
+  - After fast-sync, switch to follow mode; follow reuses ingest + in-order DB writes. RPC starts only after the first "synced" edge (UpToDate/Following) so clients don't hit an empty DB.
   - RPC reads from `storage` for headers/receipts/logs.
