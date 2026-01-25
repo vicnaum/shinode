@@ -629,10 +629,7 @@ mod tests {
         tx.send(DbWriterMessage::Finalize).await.expect("finalize");
         drop(tx);
 
-        handle
-            .await
-            .expect("db writer")
-            .expect("db writer result");
+        handle.await.expect("db writer").expect("db writer result");
 
         assert!(storage.block_header(0).expect("header 0").is_some());
         assert!(storage.block_header(1).expect("header 1").is_none());

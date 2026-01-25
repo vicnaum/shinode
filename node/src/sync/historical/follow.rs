@@ -10,8 +10,8 @@ use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Duration};
 
-use super::reorg::{find_common_ancestor, preflight_reorg, ReorgCheck};
 use super::db_writer::DbWriteMode;
+use super::reorg::{find_common_ancestor, preflight_reorg, ReorgCheck};
 use super::{run_ingest_pipeline, IngestPipelineOutcome, PeerHealthTracker, TailIngestConfig};
 
 #[cfg(unix)]
@@ -85,6 +85,42 @@ pub async fn run_follow_loop(
     let poll = Duration::from_millis(FOLLOW_POLL_MS);
     let mut synced_once = false;
 
+    // Notify the caller (main) when we become synced for the first time.
+    //
+    // `run_ingest_pipeline()` can run indefinitely in follow mode, so we can't rely on the
+    // outer loop's "start > head" check to trigger this signal.
+    let synced_sender = Arc::new(tokio::sync::Mutex::new(synced_once_tx.take()));
+    if synced_sender.lock().await.is_some() {
+        let synced_sender = Arc::clone(&synced_sender);
+        let storage = Arc::clone(&storage);
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            loop {
+                let synced = if let Some(stats) = stats.as_ref() {
+                    matches!(
+                        stats.snapshot().status,
+                        SyncStatus::UpToDate | SyncStatus::Following
+                    )
+                } else {
+                    match (
+                        storage.last_indexed_block().ok().flatten(),
+                        storage.head_seen().ok().flatten(),
+                    ) {
+                        (Some(last), Some(head)) => last >= head,
+                        _ => false,
+                    }
+                };
+                if synced {
+                    if let Some(tx) = synced_sender.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    break;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        });
+    }
+
     #[cfg(unix)]
     {
         let storage = Arc::clone(&storage);
@@ -155,9 +191,6 @@ pub async fn run_follow_loop(
             }
             if !synced_once {
                 synced_once = true;
-                if let Some(tx) = synced_once_tx.take() {
-                    let _ = tx.send(());
-                }
                 tracing::info!(head = observed_head, "follow: synced (up to date)");
             }
             sleep(poll).await;
@@ -256,7 +289,14 @@ pub async fn run_follow_loop(
                     .flatten()
                     .unwrap_or(start_block)
                     .max(start_block);
-                let head = match discover_head_p2p(&pool_head, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT).await {
+                let head = match discover_head_p2p(
+                    &pool_head,
+                    baseline,
+                    HEAD_PROBE_PEERS,
+                    HEAD_PROBE_LIMIT,
+                )
+                .await
+                {
                     Ok(Some(head)) => head,
                     Ok(None) => {
                         sleep(poll).await;
@@ -356,11 +396,15 @@ pub async fn run_follow_loop(
                             peer_id = ?anchor.peer_id,
                             "reorg detected during follow; searching for common ancestor"
                         );
-                        let ancestor =
-                            find_common_ancestor(storage_reorg.as_ref(), &anchor, low, last_indexed)
-                                .await
-                                .ok()
-                                .flatten();
+                        let ancestor = find_common_ancestor(
+                            storage_reorg.as_ref(),
+                            &anchor,
+                            low,
+                            last_indexed,
+                        )
+                        .await
+                        .ok()
+                        .flatten();
                         if let Some(ancestor) = ancestor {
                             let _ = reorg_tx.send(Ok(ancestor));
                         } else {

@@ -703,6 +703,7 @@ pub async fn run_ingest_pipeline(
                 if let Some(stats) = stats.as_ref() {
                     let pending = scheduler.pending_count().await as u64;
                     stats.set_queue(pending);
+                    stats.set_status(SyncStatus::Fetching);
                 }
                 let prev_max = max_scheduled.load(Ordering::SeqCst);
                 if end > prev_max {
@@ -1003,6 +1004,13 @@ pub async fn run_ingest_pipeline(
                     if tail_stop_when_caught_up {
                         break;
                     }
+                    if let Some(stats) = stats.as_ref() {
+                        if db_mode == DbWriteMode::Follow {
+                            stats.set_status(SyncStatus::Following);
+                            stats.set_queue(0);
+                            stats.set_inflight(0);
+                        }
+                    }
                     // Follow-style tailing: wait for head updates and continue.
                     tokio::select! {
                         _ = async {
@@ -1041,15 +1049,15 @@ pub async fn run_ingest_pipeline(
         let head_cap = match head_cap_override {
             Some(cap) => cap,
             None => {
-                if peer.head_number == 0 {
-                    if db_mode == DbWriteMode::Follow {
-                        tail_head_seen
-                            .as_ref()
-                            .map(|rx| *rx.borrow())
-                            .unwrap_or(*range.end())
-                    } else {
-                        *range.end()
-                    }
+                if db_mode == DbWriteMode::Follow {
+                    // NOTE: `NetworkPeer.head_number` is probed once at connect time and can go
+                    // stale. In follow mode we cap scheduling at the global observed head.
+                    tail_head_seen
+                        .as_ref()
+                        .map(|rx| *rx.borrow())
+                        .unwrap_or(*range.end())
+                } else if peer.head_number == 0 {
+                    *range.end()
                 } else {
                     peer.head_number
                 }
@@ -1271,14 +1279,18 @@ pub async fn run_ingest_pipeline(
                             )
                             .await;
                         let empty_response = completed.is_empty();
-                        if empty_response {
+                        if db_mode == DbWriteMode::Follow {
+                            // Near the tip, "missing" is often just propagation lag. Avoid banning
+                            // peers for empty responses while keeping AIMD/quality feedback.
+                            scheduler.record_peer_partial(peer.peer_id).await;
+                        } else if empty_response {
                             scheduler.record_peer_failure(peer.peer_id).await;
                         } else {
                             scheduler.record_peer_partial(peer.peer_id).await;
                         }
                         if let Some(bench) = bench.as_ref() {
                             bench.record_fetch_failure(missing_blocks.len() as u64, fetch_elapsed);
-                            if empty_response {
+                            if empty_response && db_mode != DbWriteMode::Follow {
                                 bench.record_peer_failure();
                             }
                         }
@@ -1386,10 +1398,7 @@ pub async fn run_ingest_pipeline(
     let db_result = db_handle.await.map_err(|err| eyre!(err))?;
     let db_finalize_stats = db_result?;
     let db_flush_ms = db_flush_started.elapsed().as_millis() as u64;
-    tracing::info!(
-        elapsed_ms = db_flush_ms,
-        "finalizing: DB writer flushed"
-    );
+    tracing::info!(elapsed_ms = db_flush_ms, "finalizing: DB writer flushed");
     let total_ms = finalize_started.elapsed().as_millis() as u64;
     tracing::info!(
         elapsed_ms = total_ms,

@@ -586,7 +586,8 @@ impl Storage {
             let shard = self.get_shard(shard_start)?;
             let Some(shard) = shard else {
                 ranges.push(local_start..=local_end);
-                missing = missing.saturating_add(local_end.saturating_sub(local_start).saturating_add(1));
+                missing =
+                    missing.saturating_add(local_end.saturating_sub(local_start).saturating_add(1));
                 shard_start = shard_start.saturating_add(shard_size);
                 continue;
             };

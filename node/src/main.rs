@@ -1272,7 +1272,9 @@ async fn main() -> Result<()> {
         .await?;
 
         let finalize_stats = match &outcome {
-            sync::historical::IngestPipelineOutcome::RangeApplied { finalize, .. } => Some(*finalize),
+            sync::historical::IngestPipelineOutcome::RangeApplied { finalize, .. } => {
+                Some(*finalize)
+            }
             _ => None,
         };
         if follow_after {
@@ -2478,8 +2480,9 @@ fn spawn_progress_updater(
                 if let Some(ref fb) = follow_bar {
                     let head_block = snapshot.head_block;
                     let head_seen = snapshot.head_seen;
-                    let peers_active = snapshot.peers_active.min(snapshot.peers_total);
-                    let peers_total = snapshot.peers_total;
+                    let peers_connected = peer_pool.len() as u64;
+                    let peers_available = snapshot.peers_total.min(peers_connected);
+                    let active_fetch = snapshot.peers_active;
 
                     let status_str = if snapshot.status == SyncStatus::Following {
                         "Synced"
@@ -2534,8 +2537,15 @@ fn spawn_progress_updater(
                     };
 
                     let msg = format!(
-                        "{} {}{} | head {} | peers {}/{} | failed {}",
-                        bar, status_str, compact, head_seen, peers_active, peers_total, failed,
+                        "{} {}{} | head {} | peers {}/{} | fetch {} | failed {}",
+                        bar,
+                        status_str,
+                        compact,
+                        head_seen,
+                        peers_available,
+                        peers_connected,
+                        active_fetch,
+                        failed,
                     );
                     fb.set_message(msg);
                 }
