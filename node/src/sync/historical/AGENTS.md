@@ -19,8 +19,8 @@ benchmark stats/event logging.
   - **Key items**: `run_follow_loop()`, `SyncStatus::UpToDate`
 - `mod.rs` - Pipeline orchestration for ingest (fetch loop, processing workers, DB writer wiring, progress bars).
   - **Key items**: `run_ingest_pipeline()`, `MissingBlocks`, `TailIngestConfig`, `IngestFinalizeStats`, `IngestPipelineOutcome`, `build_peer_health_tracker()`
-- `process.rs` - Processing stage: turns fetched payloads into `BlockBundle`s (tx hash/signing hash, size/log counts) and records timing.
-  - **Key items**: `process_ingest()`, `KeccakBuf`, `tx_hash_fast()`, `signing_hash_fast()`, `ProcessTiming`
+- `process.rs` - Processing stage: turns fetched payloads into `BlockBundle`s (tx hashes, size, receipts) and records timing.
+  - **Key items**: `process_ingest()`, `KeccakBuf`, `tx_hash_fast()`, `ProcessTiming`
 - `reorg.rs` - Reorg detection and common-ancestor search used by follow mode.
   - **Key items**: `ReorgCheck`, `preflight_reorg()`, `find_common_ancestor()`
 - `scheduler.rs` - Peer-driven scheduler (pending/inflight/failed/escalation) and peer health tracking (AIMD, bans, quality scoring).
@@ -58,7 +58,7 @@ benchmark stats/event logging.
 
 ### `scheduler.rs`
 - **Role**: Maintains the global work queue and per-peer health/quality model so scheduling adapts to real-world peer behavior.
-- **Key items**: `SchedulerConfig`, `PeerWorkScheduler::next_batch_for_peer()`, `PeerWorkScheduler::enqueue_range()`, `PeerHealthTracker::record_success()`, `PeerHealthDump`
+- **Key items**: `SchedulerConfig`, `PeerWorkScheduler::next_batch_for_peer()`, `PeerWorkScheduler::enqueue_range()`, `PeerHealthTracker::record_success()`, `PeerHealthDump`, `completed_count()`, `failed_count()`
 - **Interactions**: Called from `mod.rs` for batch assignment, requeue, and peer health updates; consulted for "best peer" selection via quality scores.
 - **Knobs / invariants**: AIMD batch limit clamps between `aimd_min_batch` and `aimd_max_batch`; bans trigger after `peer_failure_threshold`.
 
@@ -70,13 +70,13 @@ benchmark stats/event logging.
 
 ### `process.rs`
 - **Role**: Converts fetched payloads into storage-ready `BlockBundle`s and records processing timings for benchmarks.
-- **Key items**: `process_ingest()`, `KeccakBuf`, `KECCAK_SCRATCH_LEN`, `block_rlp_size()`, `ProcessTiming`
+- **Key items**: `process_ingest()`, `KeccakBuf`, `KECCAK_SCRATCH_LEN`, `tx_hash_fast()`, `block_rlp_size()`, `ProcessTiming`
 - **Interactions**: Feeds `BlockBundle`s to `db_writer` via `DbWriterMessage::Block`; updates `IngestBenchStats` when enabled.
 - **Knobs / invariants**: Requires tx count to match receipts count; logs are counted from receipts (and derived at query time).
 
 ### `db_writer.rs`
 - **Role**: Applies `BlockBundle` writes to storage and manages compaction/sealing so reads work after ingest completes.
-- **Key items**: `run_db_writer()`, `flush_fast_sync_buffer()`, `DbWriteMode::{FastSync, Follow}`, `DbWriterFinalizeStats`, `BenchEvent::DbFlushStart/End`, `BenchEvent::CompactionStart/End`
+- **Key items**: `run_db_writer()`, `flush_fast_sync_buffer()`, `DbWriteMode::{FastSync, Follow}`, `DbWriterMessage::{Block, Finalize}`, `DbWriterFinalizeStats`, `BenchEvent::DbFlushStart/End`, `BenchEvent::CompactionStart/End`
 - **Interactions**: Calls `Storage::write_block_bundles_wal()` (fast sync) or `Storage::write_block_bundle_follow()` (follow). Follow writes are gated by an in-memory reorder buffer to enforce in-order appends. Returns finalize timing stats used by `main.rs` logging.
 - **Knobs / invariants**: Compaction is serialized with a `Semaphore(1)` to cap peak IO/memory; finalize logs dirty shard/WAL sizes and runs `compact_all_dirty()` as a safety net.
 
@@ -94,8 +94,8 @@ benchmark stats/event logging.
 
 ### `stats.rs`
 - **Role**: Aggregates ingest performance metrics and writes JSON summaries and JSONL event streams.
-- **Key items**: `IngestBenchStats`, `IngestBenchSummary`, `BenchEvent`, `BenchEventLogger`, `IngestBenchStats::add_blocks_total()`, `ProcessTiming`
-- **Interactions**: Updated by fetch/process/db stages; `BenchEventLogger` is used by `mod.rs` and `main.rs` to emit structured time-series events.
+- **Key items**: `IngestBenchStats`, `IngestBenchSummary`, `BenchEvent`, `BenchEventLogger`, `DbWriteByteTotals`, `IngestBenchStats::add_blocks_total()`, `ProcessTiming`
+- **Interactions**: Updated by fetch/process/db stages; `BenchEventLogger` is used by `mod.rs` and `main.rs` to emit structured time-series events. Uses `metrics::{rate_per_sec, percentile_triplet}` for calculations.
 - **Knobs / invariants**: Sample vectors are capped (`SAMPLE_LIMIT`) to bound memory use during long runs; totals can grow when tail ranges are appended.
 
 ### `types.rs`

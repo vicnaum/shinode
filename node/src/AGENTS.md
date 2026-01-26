@@ -18,6 +18,8 @@ stack, storage backend, sync pipeline, and JSON-RPC server used by `main.rs`.
   - **Key items**: `main()`, `IngestProgress`, `TailIngestConfig`, `run_follow_loop()`, `init_tracing()`, `wait_for_peer_head()`
 - `metrics.rs` - Lightweight metrics helpers used for progress and summaries.
   - **Key items**: `range_len()`, `rate_per_sec()`, `percentile_triplet()`, `percentile()`
+- `test_utils.rs` - Shared test utilities for integration tests.
+  - **Key items**: `temp_dir()`, `base_config()`
 
 ## Key APIs (no snippets)
 - **Modules**: `cli`, `p2p`, `rpc`, `storage`, `sync` - primary subsystems wired together by `main.rs`.

@@ -5,6 +5,9 @@ Defines serialized storage types (headers, tx hashes, receipts, block sizes) and
 re-exports the concrete on-disk storage backend. This is the bridge between sync processing and
 the sharded storage implementation.
 
+Note: Transaction details, withdrawals, and logs are not stored—logs are derived on-demand from
+receipts at query time.
+
 ## Contents (one hop)
 ### Subdirectories
 - [x] `sharded/` - Schema v2 sharded backend (segments + WAL + bitset + peer cache).
@@ -14,7 +17,7 @@ the sharded storage implementation.
   - **Key items**: `BlockBundle`, `StoredReceipts`, `StoredPeer`, `PeerCacheLoad`, `StorageConfigKey`, `encode_bincode_value()`
 
 ## Key APIs (no snippets)
-- **Types**: `BlockBundle`, `StoredTxHashes`, `StoredReceipts`, `StoredBlockSize`, `StorageDiskStats`, `StoredPeer`
+- **Types**: `BlockBundle` (header, tx_hashes, size, receipts), `StoredTxHashes`, `StoredReceipts`, `StoredBlockSize`, `StorageDiskStats`, `StoredPeer`
 - **Functions**: `encode_bincode_value()`, `decode_bincode()`, `encode_bincode_compat_value()`, `decode_bincode_compat_value()`, `encode_u64_value()`, `decode_u64()`
 - **Backend**: `Storage` - re-export of `sharded::Storage`.
 
