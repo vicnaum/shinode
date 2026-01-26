@@ -151,6 +151,9 @@ pub struct NodeConfig {
     /// Emit a JSON run report after sync completes.
     #[arg(long, default_value_t = false)]
     pub log_report: bool,
+    /// Emit a separate JSONL file for resource metrics (CPU, memory, disk).
+    #[arg(long, default_value_t = false)]
+    pub log_resources: bool,
     /// Minimum peers to wait for before starting sync.
     #[arg(long, default_value_t = 1)]
     pub min_peers: u64,
@@ -223,6 +226,7 @@ impl NodeConfig {
             self.log_events = true;
             self.log_json = true;
             self.log_report = true;
+            self.log_resources = true;
         }
     }
 }
@@ -274,6 +278,7 @@ mod tests {
         assert!(!config.log_json);
         assert_eq!(config.log_json_filter, DEFAULT_LOG_JSON_FILTER);
         assert!(!config.log_report);
+        assert!(!config.log_resources);
         assert_eq!(config.min_peers, 1);
         assert!(config.command.is_none());
         assert_eq!(
@@ -337,5 +342,6 @@ mod tests {
         assert!(config.log_events);
         assert!(config.log_json);
         assert!(config.log_report);
+        assert!(config.log_resources);
     }
 }

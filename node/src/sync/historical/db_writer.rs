@@ -553,6 +553,7 @@ mod tests {
             log_json: false,
             log_json_filter: crate::cli::DEFAULT_LOG_JSON_FILTER.to_string(),
             log_report: false,
+            log_resources: false,
             min_peers: 1,
             command: None,
             rpc_max_request_body_bytes: 0,

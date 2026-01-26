@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RangeSummary {
     pub start_block: u64,
     pub end_block: u64,
@@ -19,7 +19,7 @@ pub struct RangeSummary {
     pub rollback_window_applied: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PeerSummary {
     pub peers_used: u64,
     pub peer_failures_total: u64,
@@ -478,7 +478,7 @@ impl IngestBenchStats {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IngestBenchSummary {
     pub mode: &'static str,
     pub range: RangeSummary,
@@ -491,7 +491,7 @@ pub struct IngestBenchSummary {
     pub peers: PeerSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IngestTotalsSummary {
     pub blocks_total: u64,
     pub blocks_fetched: u64,
@@ -503,14 +503,14 @@ pub struct IngestTotalsSummary {
     pub process_failures: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IngestPerformanceSummary {
     pub elapsed_ms: u64,
     pub blocks_per_sec_avg: f64,
     pub logs_per_sec_avg: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IngestFetchSummary {
     pub total_us: u64,
     pub batches: u64,
@@ -542,7 +542,7 @@ pub struct IngestFetchSummary {
     pub receipts_ms_p99: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IngestProcessSummary {
     pub total_us: u64,
     pub blocks: u64,
@@ -555,7 +555,7 @@ pub struct IngestProcessSummary {
     pub breakdown_avg_us: ProcessBreakdownSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessBreakdownSummary {
     pub header_hash_us: u64,
     pub tx_hashes_us: u64,
@@ -565,7 +565,7 @@ pub struct ProcessBreakdownSummary {
     pub logs_build_us: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IngestDbWriteSummary {
     pub total_us: u64,
     pub batches: u64,
@@ -874,10 +874,12 @@ impl BenchEventLogger {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub fn total_events(&self) -> u64 {
         self.total_events.load(Ordering::SeqCst)
     }

@@ -238,6 +238,7 @@ struct RunContext {
     trace_tmp_path: Option<PathBuf>,
     events_tmp_path: Option<PathBuf>,
     logs_tmp_path: Option<PathBuf>,
+    resources_tmp_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,23 +375,45 @@ impl JsonLogWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     fn total_events(&self) -> u64 {
         self.total_events.load(Ordering::SeqCst)
     }
 }
 
+/// Filter mode for JSON log layers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonLogFilter {
+    /// Accept all events.
+    All,
+    /// Accept only events where message == "resources".
+    ResourcesOnly,
+    /// Accept all events except where message == "resources".
+    ExcludeResources,
+}
+
 #[derive(Clone)]
 struct JsonLogLayer {
     writer: Arc<JsonLogWriter>,
+    filter: JsonLogFilter,
 }
 
 impl JsonLogLayer {
+    #[allow(dead_code)]
     fn new(writer: Arc<JsonLogWriter>) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            filter: JsonLogFilter::All,
+        }
+    }
+
+    fn with_filter(writer: Arc<JsonLogWriter>, filter: JsonLogFilter) -> Self {
+        Self { writer, filter }
     }
 }
 
@@ -408,6 +431,16 @@ where
             Some(value) => Some(value.to_string()),
             None => None,
         };
+
+        // Apply filter based on message content
+        let is_resources = message.as_deref() == Some("resources");
+        match self.filter {
+            JsonLogFilter::All => {}
+            JsonLogFilter::ResourcesOnly if !is_resources => return,
+            JsonLogFilter::ExcludeResources if is_resources => return,
+            _ => {}
+        }
+
         let record = LogRecord {
             t_ms: self.writer.started_at.elapsed().as_millis() as u64,
             level: meta.level().as_str().to_string(),
@@ -430,7 +463,7 @@ fn run_timestamp_utc(now: SystemTime) -> String {
     let sec = rem % 60;
     let (year, month, day) = civil_from_days(days);
     format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        "{:04}-{:02}-{:02}__{:02}-{:02}-{:02}",
         year, month, day, hour, min, sec
     )
 }
@@ -449,6 +482,7 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
     (year as i32, m as i32, d as i32)
 }
 
+#[allow(dead_code)]
 fn sanitize_label(value: &str) -> String {
     value
         .chars()
@@ -510,36 +544,13 @@ async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
 }
 
 fn run_base_name(
-    run_name: &str,
+    _run_name: &str,
     timestamp: &str,
-    range: &std::ops::RangeInclusive<u64>,
-    config: &NodeConfig,
-    build: &BuildInfo,
+    _range: &std::ops::RangeInclusive<u64>,
+    _config: &NodeConfig,
+    _build: &BuildInfo,
 ) -> String {
-    let base = sanitize_label(run_name);
-    let profile = sanitize_label(&build.profile);
-    let alloc = if build.features.iter().any(|feat| feat == "jemalloc") {
-        "jemalloc"
-    } else {
-        "system"
-    };
-    let chunk_max = config
-        .fast_sync_chunk_max
-        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4));
-    let chunk_max_suffix = if chunk_max != config.fast_sync_chunk_size {
-        format!("__chunkmax{chunk_max}")
-    } else {
-        String::new()
-    };
-    format!(
-        "{base}__{timestamp}__range-{}-{}__chunk{}{}__inflight{}__timeout{}__profile-{profile}__alloc-{alloc}",
-        range.start(),
-        range.end(),
-        config.fast_sync_chunk_size,
-        chunk_max_suffix,
-        config.fast_sync_max_inflight,
-        config.fast_sync_batch_timeout_ms
-    )
+    timestamp.to_string()
 }
 
 fn write_run_report(output_dir: &Path, base_name: &str, report: &RunReport) -> Result<PathBuf> {
@@ -550,29 +561,29 @@ fn write_run_report(output_dir: &Path, base_name: &str, report: &RunReport) -> R
     Ok(path)
 }
 
-/// Finalize log artifacts on shutdown (rename tmp files to final names).
-/// Called when sync is interrupted by Ctrl-C.
-fn finalize_logs_on_shutdown(
+/// Finalize log files by renaming tmp files to final names.
+/// Called on any clean exit (Ctrl-C or natural completion).
+fn finalize_log_files(
     run_context: &RunContext,
+    base_name: &str,
     events: Option<&BenchEventLogger>,
     log_writer: Option<&JsonLogWriter>,
+    resources_writer: Option<&JsonLogWriter>,
     chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
 ) {
-    let base_name = format!("{}__interrupted", run_context.timestamp_utc);
-
     // Finalize events log
     if let Some(logger) = events {
         if let Err(err) = logger.finish() {
-            warn!(error = %err, "failed to finalize event log on shutdown");
+            warn!(error = %err, "failed to finalize event log");
         }
         if let Some(tmp_path) = run_context.events_tmp_path.as_ref() {
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.events.jsonl"));
             if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename event log on shutdown");
+                warn!(error = %err, "failed to rename event log");
             } else {
-                info!(path = %final_path.display(), "event log written (interrupted)");
+                info!(path = %final_path.display(), "event log written");
             }
         }
     }
@@ -580,16 +591,33 @@ fn finalize_logs_on_shutdown(
     // Finalize JSON logs
     if let Some(logger) = log_writer {
         if let Err(err) = logger.finish() {
-            warn!(error = %err, "failed to finalize json logs on shutdown");
+            warn!(error = %err, "failed to finalize json logs");
         }
         if let Some(tmp_path) = run_context.logs_tmp_path.as_ref() {
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.logs.jsonl"));
             if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename json log on shutdown");
+                warn!(error = %err, "failed to rename json log");
             } else {
-                info!(path = %final_path.display(), "json log written (interrupted)");
+                info!(path = %final_path.display(), "json log written");
+            }
+        }
+    }
+
+    // Finalize resources log
+    if let Some(logger) = resources_writer {
+        if let Err(err) = logger.finish() {
+            warn!(error = %err, "failed to finalize resources log");
+        }
+        if let Some(tmp_path) = run_context.resources_tmp_path.as_ref() {
+            let final_path = run_context
+                .output_dir
+                .join(format!("{base_name}.resources.jsonl"));
+            if let Err(err) = fs::rename(tmp_path, &final_path) {
+                warn!(error = %err, "failed to rename resources log");
+            } else {
+                info!(path = %final_path.display(), "resources log written");
             }
         }
     }
@@ -601,24 +629,24 @@ fn finalize_logs_on_shutdown(
             .join(format!("{base_name}.trace.json"));
         drop(chrome_guard.take());
         if let Err(err) = fs::rename(tmp_path, &final_path) {
-            warn!(error = %err, "failed to rename trace on shutdown");
+            warn!(error = %err, "failed to rename trace");
         } else {
-            info!(path = %final_path.display(), "trace written (interrupted)");
+            info!(path = %final_path.display(), "trace written");
         }
     }
 }
 
-async fn emit_run_artifacts(
+/// Generate and save run report. Returns the base_name used for file naming.
+/// Report is saved only if `config.log_report` is true.
+/// Summary is printed to console only if `config.verbosity >= 1`.
+async fn generate_run_report(
     run_context: &RunContext,
     config: &NodeConfig,
     range: &std::ops::RangeInclusive<u64>,
     head_at_startup: u64,
     peer_health: &PeerHealthTracker,
-    summary: sync::historical::IngestBenchSummary,
-    events: Option<&BenchEventLogger>,
-    log_writer: Option<&JsonLogWriter>,
-    chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
-) -> Result<()> {
+    summary: &sync::historical::IngestBenchSummary,
+) -> Result<String> {
     let build = build_info();
     let env = env_info();
     let base_name = run_base_name(
@@ -628,196 +656,135 @@ async fn emit_run_artifacts(
         config,
         &build,
     );
-    let limits = p2p_limits();
-    let derived = RunDerived {
-        range_start: *range.start(),
-        range_end: *range.end(),
-        head_at_startup,
-        safe_head: head_at_startup.saturating_sub(config.rollback_window),
-        rollback_window_applied: config.rollback_window > 0,
-        worker_count: std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(4)
-            .max(1),
-        p2p_limits: P2pLimitsSummary {
-            max_outbound: limits.max_outbound,
-            max_concurrent_dials: limits.max_concurrent_dials,
-            peer_refill_interval_ms: limits.peer_refill_interval_ms,
-            request_timeout_ms: limits.request_timeout_ms,
-            max_headers_per_request: limits.max_headers_per_request,
-            peer_cache_ttl_days: limits.peer_cache_ttl_days,
-            peer_cache_max: limits.peer_cache_max,
-        },
-    };
 
-    let mut snapshot = peer_health.snapshot().await;
-    let peer_health_all: Vec<PeerHealthSummary> = snapshot
-        .iter()
-        .filter(|dump| dump.quality_samples > 0)
-        .map(|dump| PeerHealthSummary {
-            peer_id: format!("{:?}", dump.peer_id),
-            is_banned: dump.is_banned,
-            ban_remaining_ms: dump.ban_remaining_ms,
-            consecutive_failures: dump.consecutive_failures,
-            consecutive_partials: dump.consecutive_partials,
-            successes: dump.successes,
-            failures: dump.failures,
-            partials: dump.partials,
-            assignments: dump.assignments,
-            assigned_blocks: dump.assigned_blocks,
-            inflight_blocks: dump.inflight_blocks,
-            batch_limit: dump.batch_limit as u64,
-            batch_limit_max: dump.batch_limit_max as u64,
-            batch_limit_avg: dump.batch_limit_avg,
-            last_assigned_age_ms: dump.last_assigned_age_ms,
-            last_success_age_ms: dump.last_success_age_ms,
-            last_failure_age_ms: dump.last_failure_age_ms,
-            last_partial_age_ms: dump.last_partial_age_ms,
-            quality_score: dump.quality_score,
-            quality_samples: dump.quality_samples,
-            last_error: dump.last_error.clone(),
-            last_error_age_ms: dump.last_error_age_ms,
-            last_error_count: dump.last_error_count,
-        })
-        .collect();
+    // Print summary to console if verbose
+    if config.verbosity >= 1 {
+        let summary_json = serde_json::to_string_pretty(summary)?;
+        println!("{summary_json}");
+    }
 
-    let top: Vec<PeerHealthSummary> = snapshot
-        .iter()
-        .filter(|dump| dump.quality_samples > 0)
-        .take(10)
-        .map(|dump| PeerHealthSummary {
-            peer_id: format!("{:?}", dump.peer_id),
-            is_banned: dump.is_banned,
-            ban_remaining_ms: dump.ban_remaining_ms,
-            consecutive_failures: dump.consecutive_failures,
-            consecutive_partials: dump.consecutive_partials,
-            successes: dump.successes,
-            failures: dump.failures,
-            partials: dump.partials,
-            assignments: dump.assignments,
-            assigned_blocks: dump.assigned_blocks,
-            inflight_blocks: dump.inflight_blocks,
-            batch_limit: dump.batch_limit as u64,
-            batch_limit_max: dump.batch_limit_max as u64,
-            batch_limit_avg: dump.batch_limit_avg,
-            last_assigned_age_ms: dump.last_assigned_age_ms,
-            last_success_age_ms: dump.last_success_age_ms,
-            last_failure_age_ms: dump.last_failure_age_ms,
-            last_partial_age_ms: dump.last_partial_age_ms,
-            quality_score: dump.quality_score,
-            quality_samples: dump.quality_samples,
-            last_error: dump.last_error.clone(),
-            last_error_age_ms: dump.last_error_age_ms,
-            last_error_count: dump.last_error_count,
-        })
-        .collect();
-
-    snapshot.sort_by(|a, b| {
-        a.quality_score
-            .partial_cmp(&b.quality_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let worst: Vec<PeerHealthSummary> = snapshot
-        .iter()
-        .filter(|dump| dump.quality_samples > 0)
-        .take(10)
-        .map(|dump| PeerHealthSummary {
-            peer_id: format!("{:?}", dump.peer_id),
-            is_banned: dump.is_banned,
-            ban_remaining_ms: dump.ban_remaining_ms,
-            consecutive_failures: dump.consecutive_failures,
-            consecutive_partials: dump.consecutive_partials,
-            successes: dump.successes,
-            failures: dump.failures,
-            partials: dump.partials,
-            assignments: dump.assignments,
-            assigned_blocks: dump.assigned_blocks,
-            inflight_blocks: dump.inflight_blocks,
-            batch_limit: dump.batch_limit as u64,
-            batch_limit_max: dump.batch_limit_max as u64,
-            batch_limit_avg: dump.batch_limit_avg,
-            last_assigned_age_ms: dump.last_assigned_age_ms,
-            last_success_age_ms: dump.last_success_age_ms,
-            last_failure_age_ms: dump.last_failure_age_ms,
-            last_partial_age_ms: dump.last_partial_age_ms,
-            quality_score: dump.quality_score,
-            quality_samples: dump.quality_samples,
-            last_error: dump.last_error.clone(),
-            last_error_age_ms: dump.last_error_age_ms,
-            last_error_count: dump.last_error_count,
-        })
-        .collect();
-
-    let events_summary = if let Some(logger) = events {
-        let tmp_path = run_context.events_tmp_path.as_ref();
-        let final_path = run_context
-            .output_dir
-            .join(format!("{base_name}.events.jsonl"));
-        if let Err(err) = logger.finish() {
-            warn!(error = %err, "failed to finalize event log");
-        }
-        let mut path_str = final_path.display().to_string();
-        if let Some(tmp_path) = tmp_path {
-            match fs::rename(tmp_path, &final_path) {
-                Ok(()) => {}
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        tmp = %tmp_path.display(),
-                        final_path = %final_path.display(),
-                        "failed to rename event log output"
-                    );
-                    path_str = tmp_path.display().to_string();
-                }
-            }
-        } else {
-            warn!("event logger present but no tmp path configured");
-        }
-        Some(EventsSummary {
-            total_events: logger.total_events() as usize,
-            dropped_events: logger.dropped_events(),
-            path: path_str,
-        })
-    } else {
-        None
-    };
-
-    let logs_summary = if let Some(logger) = log_writer {
-        let tmp_path = run_context.logs_tmp_path.as_ref();
-        let final_path = run_context
-            .output_dir
-            .join(format!("{base_name}.logs.jsonl"));
-        if let Err(err) = logger.finish() {
-            warn!(error = %err, "failed to finalize json logs");
-        }
-        let mut path_str = final_path.display().to_string();
-        if let Some(tmp_path) = tmp_path {
-            match fs::rename(tmp_path, &final_path) {
-                Ok(()) => {}
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        tmp = %tmp_path.display(),
-                        final_path = %final_path.display(),
-                        "failed to rename json log output"
-                    );
-                    path_str = tmp_path.display().to_string();
-                }
-            }
-        } else {
-            warn!("json log writer present but no tmp path configured");
-        }
-        Some(LogsSummary {
-            total_events: logger.total_events() as usize,
-            dropped_events: logger.dropped_events(),
-            path: path_str,
-        })
-    } else {
-        None
-    };
-
-    // Write report JSON only if --log-report is enabled.
+    // Save report file if --log-report is enabled
     if config.log_report {
+        let limits = p2p_limits();
+        let derived = RunDerived {
+            range_start: *range.start(),
+            range_end: *range.end(),
+            head_at_startup,
+            safe_head: head_at_startup.saturating_sub(config.rollback_window),
+            rollback_window_applied: config.rollback_window > 0,
+            worker_count: std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(4)
+                .max(1),
+            p2p_limits: P2pLimitsSummary {
+                max_outbound: limits.max_outbound,
+                max_concurrent_dials: limits.max_concurrent_dials,
+                peer_refill_interval_ms: limits.peer_refill_interval_ms,
+                request_timeout_ms: limits.request_timeout_ms,
+                max_headers_per_request: limits.max_headers_per_request,
+                peer_cache_ttl_days: limits.peer_cache_ttl_days,
+                peer_cache_max: limits.peer_cache_max,
+            },
+        };
+
+        let mut snapshot = peer_health.snapshot().await;
+        let peer_health_all: Vec<PeerHealthSummary> = snapshot
+            .iter()
+            .filter(|dump| dump.quality_samples > 0)
+            .map(|dump| PeerHealthSummary {
+                peer_id: format!("{:?}", dump.peer_id),
+                is_banned: dump.is_banned,
+                ban_remaining_ms: dump.ban_remaining_ms,
+                consecutive_failures: dump.consecutive_failures,
+                consecutive_partials: dump.consecutive_partials,
+                successes: dump.successes,
+                failures: dump.failures,
+                partials: dump.partials,
+                assignments: dump.assignments,
+                assigned_blocks: dump.assigned_blocks,
+                inflight_blocks: dump.inflight_blocks,
+                batch_limit: dump.batch_limit as u64,
+                batch_limit_max: dump.batch_limit_max as u64,
+                batch_limit_avg: dump.batch_limit_avg,
+                last_assigned_age_ms: dump.last_assigned_age_ms,
+                last_success_age_ms: dump.last_success_age_ms,
+                last_failure_age_ms: dump.last_failure_age_ms,
+                last_partial_age_ms: dump.last_partial_age_ms,
+                quality_score: dump.quality_score,
+                quality_samples: dump.quality_samples,
+                last_error: dump.last_error.clone(),
+                last_error_age_ms: dump.last_error_age_ms,
+                last_error_count: dump.last_error_count,
+            })
+            .collect();
+
+        let top: Vec<PeerHealthSummary> = snapshot
+            .iter()
+            .filter(|dump| dump.quality_samples > 0)
+            .take(10)
+            .map(|dump| PeerHealthSummary {
+                peer_id: format!("{:?}", dump.peer_id),
+                is_banned: dump.is_banned,
+                ban_remaining_ms: dump.ban_remaining_ms,
+                consecutive_failures: dump.consecutive_failures,
+                consecutive_partials: dump.consecutive_partials,
+                successes: dump.successes,
+                failures: dump.failures,
+                partials: dump.partials,
+                assignments: dump.assignments,
+                assigned_blocks: dump.assigned_blocks,
+                inflight_blocks: dump.inflight_blocks,
+                batch_limit: dump.batch_limit as u64,
+                batch_limit_max: dump.batch_limit_max as u64,
+                batch_limit_avg: dump.batch_limit_avg,
+                last_assigned_age_ms: dump.last_assigned_age_ms,
+                last_success_age_ms: dump.last_success_age_ms,
+                last_failure_age_ms: dump.last_failure_age_ms,
+                last_partial_age_ms: dump.last_partial_age_ms,
+                quality_score: dump.quality_score,
+                quality_samples: dump.quality_samples,
+                last_error: dump.last_error.clone(),
+                last_error_age_ms: dump.last_error_age_ms,
+                last_error_count: dump.last_error_count,
+            })
+            .collect();
+
+        snapshot.sort_by(|a, b| {
+            a.quality_score
+                .partial_cmp(&b.quality_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let worst: Vec<PeerHealthSummary> = snapshot
+            .iter()
+            .filter(|dump| dump.quality_samples > 0)
+            .take(10)
+            .map(|dump| PeerHealthSummary {
+                peer_id: format!("{:?}", dump.peer_id),
+                is_banned: dump.is_banned,
+                ban_remaining_ms: dump.ban_remaining_ms,
+                consecutive_failures: dump.consecutive_failures,
+                consecutive_partials: dump.consecutive_partials,
+                successes: dump.successes,
+                failures: dump.failures,
+                partials: dump.partials,
+                assignments: dump.assignments,
+                assigned_blocks: dump.assigned_blocks,
+                inflight_blocks: dump.inflight_blocks,
+                batch_limit: dump.batch_limit as u64,
+                batch_limit_max: dump.batch_limit_max as u64,
+                batch_limit_avg: dump.batch_limit_avg,
+                last_assigned_age_ms: dump.last_assigned_age_ms,
+                last_success_age_ms: dump.last_success_age_ms,
+                last_failure_age_ms: dump.last_failure_age_ms,
+                last_partial_age_ms: dump.last_partial_age_ms,
+                quality_score: dump.quality_score,
+                quality_samples: dump.quality_samples,
+                last_error: dump.last_error.clone(),
+                last_error_age_ms: dump.last_error_age_ms,
+                last_error_count: dump.last_error_count,
+            })
+            .collect();
+
         let report = RunReport {
             meta: RunMeta {
                 timestamp_utc: run_context.timestamp_utc.clone(),
@@ -829,41 +796,27 @@ async fn emit_run_artifacts(
             argv: run_context.argv.clone(),
             config: config.clone(),
             derived,
-            results: summary,
+            results: summary.clone(),
             peer_health_all,
             peer_health_top: top,
             peer_health_worst: worst,
-            events: events_summary,
-            logs: logs_summary,
+            events: None,
+            logs: None,
         };
         let report_path = write_run_report(&run_context.output_dir, &base_name, &report)?;
-        info!(path = %report_path.display(), "run summary written");
+        info!(path = %report_path.display(), "run report written");
     }
 
-    if let Some(tmp_path) = run_context.trace_tmp_path.as_ref() {
-        let final_path = run_context
-            .output_dir
-            .join(format!("{base_name}.trace.json"));
-        drop(chrome_guard.take());
-        match fs::rename(tmp_path, &final_path) {
-            Ok(()) => {
-                info!(path = %final_path.display(), "trace written");
-            }
-            Err(err) => {
-                warn!(error = %err, tmp = %tmp_path.display(), "failed to rename trace output");
-            }
-        }
-    }
-
-    Ok(())
+    Ok(base_name)
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut config = NodeConfig::from_args();
     let argv: Vec<String> = env::args().collect();
     // Check if any log artifacts are enabled
     let log_artifacts_enabled =
-        config.log_trace || config.log_events || config.log_json || config.log_report;
+        config.log_trace || config.log_events || config.log_json || config.log_report || config.log_resources;
     let chunk_max = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -886,17 +839,22 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "sync".to_string());
         let output_dir = config.log_output_dir.clone();
         let trace_tmp_path = if config.log_trace {
-            Some(output_dir.join(format!("trace__{}__tmp.json", timestamp_utc)))
+            Some(output_dir.join(format!("{}.trace.json.part", timestamp_utc)))
         } else {
             None
         };
         let events_tmp_path = if config.log_events {
-            Some(output_dir.join(format!("events__{}__tmp.jsonl", timestamp_utc)))
+            Some(output_dir.join(format!("{}.events.jsonl.part", timestamp_utc)))
         } else {
             None
         };
         let logs_tmp_path = if config.log_json {
-            Some(output_dir.join(format!("logs__{}__tmp.jsonl", timestamp_utc)))
+            Some(output_dir.join(format!("{}.logs.jsonl.part", timestamp_utc)))
+        } else {
+            None
+        };
+        let resources_tmp_path = if config.log_resources {
+            Some(output_dir.join(format!("{}.resources.jsonl.part", timestamp_utc)))
         } else {
             None
         };
@@ -910,6 +868,7 @@ async fn main() -> Result<()> {
             trace_tmp_path,
             events_tmp_path,
             logs_tmp_path,
+            resources_tmp_path,
         })
     } else {
         None
@@ -925,6 +884,9 @@ async fn main() -> Result<()> {
         run_context
             .as_ref()
             .and_then(|ctx| ctx.logs_tmp_path.clone()),
+        run_context
+            .as_ref()
+            .and_then(|ctx| ctx.resources_tmp_path.clone()),
     );
 
     if let Some(command) = &config.command {
@@ -1264,32 +1226,48 @@ async fn main() -> Result<()> {
 
             info!("fast-sync complete; switching to follow mode");
 
-            // Print summary at fast-sync completion (only if verbose).
-            // Note: we don't finalize log artifacts here - they continue into follow mode.
-            if config.verbosity >= 1 {
-                let logs_total = match &outcome {
-                    sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
-                    sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
-                };
-                let storage_stats = match storage.disk_usage() {
-                    Ok(stats) => Some(stats),
+            // Generate report at fast-sync completion (saved if --log-report, printed if -v).
+            // Log files continue into follow mode - they'll be finalized on exit.
+            let logs_total = match &outcome {
+                sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+                sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+            };
+            let storage_stats = match storage.disk_usage() {
+                Ok(stats) => Some(stats),
+                Err(err) => {
+                    warn!(error = %err, "failed to collect storage disk stats");
+                    None
+                }
+            };
+            let summary = bench.summary(
+                *range.start(),
+                *range.end(),
+                head_at_startup,
+                config.rollback_window > 0,
+                session.pool.len() as u64,
+                logs_total,
+                storage_stats,
+            );
+            let report_base_name = if let Some(run_ctx) = run_context.as_ref() {
+                match generate_run_report(
+                    run_ctx,
+                    &config,
+                    &range,
+                    head_at_startup,
+                    &peer_health_local,
+                    &summary,
+                )
+                .await
+                {
+                    Ok(name) => Some(name),
                     Err(err) => {
-                        warn!(error = %err, "failed to collect storage disk stats");
+                        warn!(error = %err, "failed to generate run report");
                         None
                     }
-                };
-                let summary = bench.summary(
-                    *range.start(),
-                    *range.end(),
-                    head_at_startup,
-                    config.rollback_window > 0,
-                    session.pool.len() as u64,
-                    logs_total,
-                    storage_stats,
-                );
-                let summary_json = serde_json::to_string_pretty(&summary)?;
-                println!("{summary_json}");
-            }
+                }
+            } else {
+                None
+            };
 
             let progress_ref = progress
                 .as_ref()
@@ -1356,14 +1334,18 @@ async fn main() -> Result<()> {
             if let Some(handle) = head_tracker_handle.take() {
                 let _ = handle.await;
             }
-            // Finalize log artifacts on shutdown
+            // Finalize log files on exit from follow mode (report already generated)
             if let Some(run_ctx) = run_context.as_ref() {
-                finalize_logs_on_shutdown(
-                    run_ctx,
-                    events.as_deref(),
-                    tracing_guards.log_writer.as_deref(),
-                    &mut tracing_guards.chrome_guard,
-                );
+                if let Some(base_name) = report_base_name.as_ref() {
+                    finalize_log_files(
+                        run_ctx,
+                        base_name,
+                        events.as_deref(),
+                        tracing_guards.log_writer.as_deref(),
+                        tracing_guards.resources_writer.as_deref(),
+                        &mut tracing_guards.chrome_guard,
+                    );
+                }
             }
             flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
             return Ok(());
@@ -1385,12 +1367,51 @@ async fn main() -> Result<()> {
             if let Some(tracker) = progress.as_ref() {
                 tracker.finish();
             }
-            // Finalize log artifacts on shutdown
+            // Generate report and finalize logs on Ctrl-C during fast-sync
             if let Some(run_ctx) = run_context.as_ref() {
-                finalize_logs_on_shutdown(
+                let logs_total = match &outcome {
+                    sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+                    sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+                };
+                let storage_stats = match storage.disk_usage() {
+                    Ok(stats) => Some(stats),
+                    Err(err) => {
+                        warn!(error = %err, "failed to collect storage disk stats");
+                        None
+                    }
+                };
+                let summary = bench.summary(
+                    *range.start(),
+                    *range.end(),
+                    head_at_startup,
+                    config.rollback_window > 0,
+                    session.pool.len() as u64,
+                    logs_total,
+                    storage_stats,
+                );
+                let base_name = match generate_run_report(
                     run_ctx,
+                    &config,
+                    &range,
+                    head_at_startup,
+                    &peer_health_local,
+                    &summary,
+                )
+                .await
+                {
+                    Ok(name) => name,
+                    Err(err) => {
+                        warn!(error = %err, "failed to generate run report");
+                        // Fallback base name
+                        run_ctx.timestamp_utc.clone()
+                    }
+                };
+                finalize_log_files(
+                    run_ctx,
+                    &base_name,
                     events.as_deref(),
                     tracing_guards.log_writer.as_deref(),
+                    tracing_guards.resources_writer.as_deref(),
                     &mut tracing_guards.chrome_guard,
                 );
             }
@@ -1422,28 +1443,33 @@ async fn main() -> Result<()> {
             logs_total,
             storage_stats,
         );
-    // Print summary to stdout only if verbose.
-    if config.verbosity >= 1 {
-        let summary_json = serde_json::to_string_pretty(&summary)?;
-        println!("{summary_json}");
-    }
-    // Finalize log artifacts (rename tmp files, write report if enabled).
+    // Generate report (if --log-report) and finalize log files.
     if let Some(run_ctx) = run_ctx {
-        if let Err(err) = emit_run_artifacts(
+        let base_name = match generate_run_report(
             run_ctx,
             &config,
             &range,
             head_at_startup,
             &peer_health_local,
-            summary,
-            events.as_deref(),
-            tracing_guards.log_writer.as_deref(),
-            &mut tracing_guards.chrome_guard,
+            &summary,
         )
         .await
         {
-            warn!(error = %err, "failed to write run artifacts");
-        }
+            Ok(name) => name,
+            Err(err) => {
+                warn!(error = %err, "failed to generate run report");
+                // Fallback base name
+                run_ctx.timestamp_utc.clone()
+            }
+        };
+        finalize_log_files(
+            run_ctx,
+            &base_name,
+            events.as_deref(),
+            tracing_guards.log_writer.as_deref(),
+            tracing_guards.resources_writer.as_deref(),
+            &mut tracing_guards.chrome_guard,
+        );
     }
     flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
     Ok(())
@@ -1483,12 +1509,14 @@ async fn wait_for_peer_head(
 struct TracingGuards {
     chrome_guard: Option<tracing_chrome::FlushGuard>,
     log_writer: Option<Arc<JsonLogWriter>>,
+    resources_writer: Option<Arc<JsonLogWriter>>,
 }
 
 fn init_tracing(
     config: &NodeConfig,
     chrome_trace_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
+    resources_path: Option<PathBuf>,
 ) -> TracingGuards {
     let log_filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
@@ -1518,6 +1546,22 @@ fn init_tracing(
         }
     });
 
+    // Resources log file writer (separate file for resource metrics).
+    let resources_writer = resources_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+        Ok(writer) => Some(Arc::new(writer)),
+        Err(err) => {
+            warn!(error = %err, "failed to initialize resources log writer");
+            None
+        }
+    });
+
+    // Determine JSON log filter mode: exclude resources if we have a separate resources file.
+    let json_filter_mode = if resources_writer.is_some() {
+        JsonLogFilter::ExcludeResources
+    } else {
+        JsonLogFilter::All
+    };
+
     let mut chrome_guard = None;
     if let Some(path) = chrome_trace_path {
         let trace_filter = EnvFilter::try_new(&config.log_trace_filter)
@@ -1529,24 +1573,33 @@ fn init_tracing(
             .build();
         let log_layer = log_writer
             .as_ref()
-            .map(|writer| JsonLogLayer::new(Arc::clone(writer)).with_filter(json_log_filter));
+            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode).with_filter(json_log_filter.clone()));
+        let resources_layer = resources_writer
+            .as_ref()
+            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly).with_filter(json_log_filter));
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
-            .with(log_layer);
+            .with(log_layer)
+            .with(resources_layer);
         registry.with(chrome_layer.with_filter(trace_filter)).init();
         chrome_guard = Some(guard);
     } else {
         let log_layer = log_writer
             .as_ref()
-            .map(|writer| JsonLogLayer::new(Arc::clone(writer)).with_filter(json_log_filter));
+            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode).with_filter(json_log_filter.clone()));
+        let resources_layer = resources_writer
+            .as_ref()
+            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly).with_filter(json_log_filter));
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
-            .with(log_layer);
+            .with(log_layer)
+            .with(resources_layer);
         registry.init();
     }
     TracingGuards {
         chrome_guard,
         log_writer,
+        resources_writer,
     }
 }
 
