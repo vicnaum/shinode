@@ -23,8 +23,8 @@ benchmark stats/event logging.
   - **Key items**: `process_ingest()`, `KeccakBuf`, `tx_hash_fast()`, `ProcessTiming`
 - `reorg.rs` - Reorg detection and common-ancestor search used by follow mode.
   - **Key items**: `ReorgCheck`, `preflight_reorg()`, `find_common_ancestor()`
-- `scheduler.rs` - Peer-driven scheduler (pending/inflight/failed/escalation) and peer health tracking (AIMD, bans, quality scoring).
-  - **Key items**: `SchedulerConfig`, `PeerWorkScheduler`, `PeerHealthTracker`, `PeerHealthDump`, `FetchMode`, `enqueue_range()`
+- `scheduler.rs` - Peer-driven scheduler (pending/inflight/escalation) and peer health tracking (AIMD, bans, quality scoring).
+  - **Key items**: `SchedulerConfig`, `PeerWorkScheduler`, `PeerHealthTracker`, `PeerHealthDump`, `EscalationState`, `FetchMode`, `enqueue_range()`
 - `stats.rs` - Ingest stats aggregation and JSONL bench event writer.
   - **Key items**: `IngestBenchStats`, `IngestBenchSummary`, `BenchEvent`, `BenchEventLogger`, `add_blocks_total()`, `ProcessTiming`
 - `types.rs` - Shared types for historical pipeline stages (batches, fetch modes).

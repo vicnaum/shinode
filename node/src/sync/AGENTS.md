@@ -16,8 +16,8 @@ benchmark event streams.
 ## Key APIs (no snippets)
 - **Types / Traits**: `BlockPayload`, `ProgressReporter`, `SyncStatus`, `SyncProgressStats`, `SyncProgressSnapshot`
 - **Functions**: `format_eta_seconds()`, `SyncStatus::display_name()`
-- **Progress fields**: `processed`, `failed`, `queue`, `inflight`, `escalation`, `compactions_done`, `compactions_total`, `peers_active`, `peers_total`, `status`, `head_block`, `head_seen`, `fetch_complete`
-- **Escalation field**: `escalation` tracks blocks in the priority retry queue (blocks that failed N attempts and are being retried indefinitely)
+- **Progress fields**: `processed`, `failed` (vestigial, always 0), `queue`, `inflight`, `escalation`, `compactions_done`, `compactions_total`, `peers_active`, `peers_total`, `status`, `head_block`, `head_seen`, `fetch_complete`
+- **Escalation field**: `escalation` tracks blocks in the priority retry queue (blocks that exceeded N attempts and are being retried indefinitely with shard-aware prioritization)
 
 ## Relationships
 - **Used by**: `node/src/main.rs` for progress rendering and follow-mode status; `node/src/ui` for progress bar state; `node/src/sync/historical` updates `SyncProgressStats` during fetch/process/db phases.
