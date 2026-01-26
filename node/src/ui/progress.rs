@@ -2,7 +2,7 @@
 
 use crate::p2p::PeerPool;
 use crate::sync::historical::PeerHealthTracker;
-use crate::sync::{format_eta_seconds, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
+use crate::sync::{format_eta_seconds, FinalizePhase, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
 use indicatif::{MultiProgress, ProgressBar};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -299,9 +299,13 @@ pub fn spawn_progress_updater(
                     if let Some(ref fb) = finalizing_bar {
                         let done = snapshot.compactions_done.min(snapshot.compactions_total);
                         fb.set_position(done);
+                        let phase_name = match snapshot.finalize_phase {
+                            FinalizePhase::Compacting => "compacting",
+                            FinalizePhase::Sealing => "sealing",
+                        };
                         fb.set_message(format!(
-                            "Finalizing: compacting shards {}/{}",
-                            done, snapshot.compactions_total
+                            "Finalizing: {} shards {}/{}",
+                            phase_name, done, snapshot.compactions_total
                         ));
 
                         // Check if finalizing is done

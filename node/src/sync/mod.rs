@@ -27,6 +27,14 @@ pub enum SyncStatus {
     Following,
 }
 
+/// Sub-phase during finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FinalizePhase {
+    #[default]
+    Compacting,
+    Sealing,
+}
+
 impl SyncStatus {
     /// Machine-readable status string (for logging/metrics).
     pub fn as_str(self) -> &'static str {
@@ -91,6 +99,8 @@ pub struct SyncProgressStats {
     fetch_complete: std::sync::atomic::AtomicBool,
     /// Blocks in escalation queue (priority retry for difficult blocks).
     escalation: std::sync::atomic::AtomicU64,
+    /// Current finalize sub-phase (compacting or sealing).
+    finalize_phase: std::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +119,8 @@ pub struct SyncProgressSnapshot {
     pub fetch_complete: bool,
     /// Blocks in escalation queue (priority retry for difficult blocks).
     pub escalation: u64,
+    /// Current finalize sub-phase.
+    pub finalize_phase: FinalizePhase,
 }
 
 impl SyncProgressStats {
@@ -138,6 +150,10 @@ impl SyncProgressStats {
                 .fetch_complete
                 .load(std::sync::atomic::Ordering::SeqCst),
             escalation: self.escalation.load(std::sync::atomic::Ordering::SeqCst),
+            finalize_phase: match self.finalize_phase.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => FinalizePhase::Sealing,
+                _ => FinalizePhase::Compacting,
+            },
         }
     }
 
@@ -221,5 +237,14 @@ impl SyncProgressStats {
     pub fn set_escalation(&self, count: u64) {
         self.escalation
             .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_finalize_phase(&self, phase: FinalizePhase) {
+        let value = match phase {
+            FinalizePhase::Compacting => 0,
+            FinalizePhase::Sealing => 1,
+        };
+        self.finalize_phase
+            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 }

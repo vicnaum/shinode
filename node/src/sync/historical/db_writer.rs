@@ -4,7 +4,7 @@ use crate::storage::{BlockBundle, Storage};
 use crate::sync::historical::stats::{
     BenchEvent, BenchEventLogger, DbWriteByteTotals, IngestBenchStats,
 };
-use crate::sync::SyncProgressStats;
+use crate::sync::{FinalizePhase, SyncProgressStats};
 use eyre::Result;
 use reth_primitives_traits::serde_bincode_compat::SerdeBincodeCompat;
 use serde::Serialize;
@@ -357,6 +357,7 @@ pub async fn run_db_writer(
     if mode == DbWriteMode::FastSync {
         // Reset compaction progress counters for finalize phase
         if let Some(stats) = progress_stats.as_ref() {
+            stats.set_finalize_phase(FinalizePhase::Compacting);
             stats.set_compactions_done(0);
             stats.set_compactions_total(0);
         }
@@ -403,6 +404,7 @@ pub async fn run_db_writer(
 
         // Set up sealing progress tracking
         if let Some(stats) = progress_stats.as_ref() {
+            stats.set_finalize_phase(FinalizePhase::Sealing);
             let to_seal = storage.shards_to_seal_count().unwrap_or(0);
             stats.set_compactions_done(0);
             stats.set_compactions_total(to_seal as u64);

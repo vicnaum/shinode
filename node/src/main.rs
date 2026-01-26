@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sync::historical::{BenchEvent, BenchEventLogger, IngestBenchStats, PeerHealthTracker};
-use sync::{ProgressReporter, SyncProgressStats, SyncStatus};
+use sync::{FinalizePhase, ProgressReporter, SyncProgressStats, SyncStatus};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn, Event};
@@ -2393,11 +2393,15 @@ fn spawn_progress_updater(
             } else if let Some(ref fb) = finalizing_bar {
                 // Update the finalizing bar
                 if snapshot.compactions_total > 0 {
-                    // We have compaction progress to show
+                    // We have compaction/sealing progress to show
                     let done = snapshot.compactions_done.min(snapshot.compactions_total);
+                    let phase_name = match snapshot.finalize_phase {
+                        FinalizePhase::Compacting => "compacting",
+                        FinalizePhase::Sealing => "sealing",
+                    };
                     fb.set_message(format!(
-                        "Finalizing: compacting shards {}/{}",
-                        done, snapshot.compactions_total
+                        "Finalizing: {} shards {}/{}",
+                        phase_name, done, snapshot.compactions_total
                     ));
                 } else {
                     // Still waiting for compaction info, just show spinner
