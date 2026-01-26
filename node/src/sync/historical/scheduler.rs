@@ -474,7 +474,6 @@ pub struct PeerWorkScheduler {
     queued: Mutex<HashSet<u64>>,
     in_flight: Mutex<HashSet<u64>>,
     completed: Mutex<HashSet<u64>>,
-    failed: Mutex<HashSet<u64>>,
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
     escalation: Mutex<EscalationState>,
@@ -582,7 +581,6 @@ impl PeerWorkScheduler {
             queued: Mutex::new(queued),
             in_flight: Mutex::new(HashSet::new()),
             completed: Mutex::new(HashSet::new()),
-            failed: Mutex::new(HashSet::new()),
             attempts: Mutex::new(HashMap::new()),
             peer_health,
             escalation: Mutex::new(EscalationState::default()),
@@ -943,11 +941,5 @@ impl PeerWorkScheduler {
     pub async fn inflight_count(&self) -> usize {
         let in_flight = self.in_flight.lock().await;
         in_flight.len()
-    }
-
-    /// Number of failed blocks.
-    pub async fn failed_count(&self) -> usize {
-        let failed = self.failed.lock().await;
-        failed.len()
     }
 }

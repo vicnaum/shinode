@@ -355,7 +355,6 @@ pub async fn run_ingest_pipeline(
                         let pending_total = scheduler.pending_count().await as u64;
                         let pending_main = scheduler.pending_main_count().await as u64;
                         let inflight = scheduler.inflight_count().await as u64;
-                        let failed = scheduler.failed_count().await as u64;
                         let completed = scheduler.completed_count().await as u64;
                         let attempts = scheduler.attempts_len().await as u64;
                         let escalation_len = scheduler.escalation_len().await as u64;
@@ -364,7 +363,6 @@ pub async fn run_ingest_pipeline(
                             pending_total,
                             pending_main,
                             inflight,
-                            failed,
                             completed,
                             attempts,
                             escalation_len,
@@ -954,7 +952,7 @@ pub async fn run_ingest_pipeline(
             processed = snapshot.processed,
             queue = snapshot.queue,
             inflight = snapshot.inflight,
-            failed = snapshot.failed,
+            escalation = snapshot.escalation,
             peers_active = snapshot.peers_active,
             peers_total = snapshot.peers_total,
             "finalizing: fetch complete, draining workers and flushing DB"

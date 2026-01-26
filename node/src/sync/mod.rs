@@ -78,7 +78,6 @@ pub fn format_eta_seconds(seconds: f64) -> String {
 #[derive(Debug, Default)]
 pub struct SyncProgressStats {
     processed: std::sync::atomic::AtomicU64,
-    failed: std::sync::atomic::AtomicU64,
     queue: std::sync::atomic::AtomicU64,
     inflight: std::sync::atomic::AtomicU64,
     compactions_done: std::sync::atomic::AtomicU64,
@@ -97,7 +96,6 @@ pub struct SyncProgressStats {
 #[derive(Debug, Clone, Copy)]
 pub struct SyncProgressSnapshot {
     pub processed: u64,
-    pub failed: u64,
     pub queue: u64,
     pub inflight: u64,
     pub compactions_done: u64,
@@ -117,7 +115,6 @@ impl SyncProgressStats {
     pub fn snapshot(&self) -> SyncProgressSnapshot {
         SyncProgressSnapshot {
             processed: self.processed.load(std::sync::atomic::Ordering::SeqCst),
-            failed: self.failed.load(std::sync::atomic::Ordering::SeqCst),
             queue: self.queue.load(std::sync::atomic::Ordering::SeqCst),
             inflight: self.inflight.load(std::sync::atomic::Ordering::SeqCst),
             compactions_done: self
