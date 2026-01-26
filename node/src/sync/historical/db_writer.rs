@@ -429,7 +429,7 @@ fn db_bytes_for_bundles(bundles: &[BlockBundle]) -> Result<DbWriteByteTotals> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{StoredBlockSize, StoredReceipts, StoredTxHashes};
+    use crate::storage::{StoredBlockSize, StoredReceipts, StoredTransactions, StoredTxHashes};
     use crate::test_utils::{base_config, temp_dir};
     use reth_ethereum_primitives::Receipt;
 
@@ -444,6 +444,7 @@ mod tests {
             number,
             header: header_with_number(number),
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
+            transactions: StoredTransactions { txs: Vec::new() },
             size: StoredBlockSize { size: 0 },
             receipts: StoredReceipts {
                 receipts: Vec::<Receipt>::new(),

@@ -1,7 +1,7 @@
 //! Storage types and helpers. The sharded backend lives in `sharded`.
 
 use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
-use alloy_primitives::B256;
+use alloy_primitives::{Address, Signature, B256, U256};
 use eyre::{Result, WrapErr};
 use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{
@@ -15,6 +15,25 @@ pub(crate) const ZSTD_DICT_MAX_SIZE: usize = 5000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTxHashes {
     pub hashes: Vec<B256>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTransaction {
+    pub hash: B256,
+    #[serde(default)]
+    pub from: Option<Address>,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub nonce: u64,
+    #[serde(default)]
+    pub signature: Option<Signature>,
+    #[serde(default)]
+    pub signing_hash: Option<B256>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTransactions {
+    pub txs: Vec<StoredTransaction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +72,7 @@ pub struct BlockBundle {
     pub number: u64,
     pub header: Header,
     pub tx_hashes: StoredTxHashes,
+    pub transactions: StoredTransactions,
     pub size: StoredBlockSize,
     pub receipts: StoredReceipts,
 }

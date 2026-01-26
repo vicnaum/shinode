@@ -156,6 +156,12 @@ pub struct NodeConfig {
     /// Minimum peers to wait for before starting sync.
     #[arg(long, default_value_t = 1)]
     pub min_peers: u64,
+    /// Run storage repair/recovery without starting sync.
+    ///
+    /// Scans all shards for interrupted compactions and orphan files,
+    /// performs recovery, and exits with a summary.
+    #[arg(long, default_value_t = false)]
+    pub repair: bool,
     /// Optional command.
     #[command(subcommand)]
     #[serde(skip)]
@@ -332,5 +338,11 @@ mod tests {
         assert!(config.log_json);
         assert!(config.log_report);
         assert!(config.log_resources);
+    }
+
+    #[test]
+    fn repair_flag_parses() {
+        let config = NodeConfig::parse_from(["stateless-history-node", "--repair"]);
+        assert!(config.repair);
     }
 }

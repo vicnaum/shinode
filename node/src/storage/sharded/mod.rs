@@ -28,7 +28,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use wal::{append_records, build_index as build_wal_index, build_slice_index, WalRecord};
+use wal::{append_records, build_slice_index, WalRecord};
 use zstd::bulk::Compressor;
 
 const SCHEMA_VERSION: u64 = 2;
@@ -38,7 +38,14 @@ const STATIC_DIR_NAME: &str = "static";
 const SHARDS_DIR_NAME: &str = "shards";
 const SHARD_META_NAME: &str = "shard.json";
 const BITSET_NAME: &str = "present.bitset";
+const BITSET_TMP_NAME: &str = "bitset.tmp";
+const BITSET_OLD_NAME: &str = "bitset.old";
 const WAL_NAME: &str = "staging.wal";
+
+// Compaction phase constants
+const PHASE_WRITING: &str = "writing";
+const PHASE_SWAPPING: &str = "swapping";
+const PHASE_CLEANUP: &str = "cleanup";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
@@ -62,6 +69,10 @@ struct ShardMeta {
     content_hash: Option<String>,
     #[serde(default = "default_hash_algo")]
     content_hash_algo: String,
+    /// Tracks compaction progress for crash recovery.
+    /// Values: None (idle), "writing", "swapping", "cleanup"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_phase: Option<String>,
 }
 
 struct ShardState {
@@ -363,16 +374,36 @@ impl Storage {
                 Err(_) => continue,
             };
             let shard_dir = entry.path();
-            recover_compaction_dirs(&shard_dir)?;
-            let shard_meta = load_shard_meta(&shard_dir)?;
+
+            // Load shard metadata
+            let mut shard_meta = load_shard_meta(&shard_dir)?;
+
+            // Perform phase-aware recovery if needed
+            let recovery_result = recover_shard(&shard_dir, &mut shard_meta)?;
+            match &recovery_result {
+                ShardRecoveryResult::Clean => {}
+                ShardRecoveryResult::CleanedOrphans => {
+                    tracing::info!(shard = shard_start, "cleaned orphan files");
+                }
+                result => {
+                    tracing::info!(shard = shard_start, recovery = ?result, "recovered shard from interrupted compaction");
+                    // Persist the updated metadata after recovery
+                    persist_shard_meta(&shard_dir, &shard_meta)?;
+                }
+            }
+
+            // Load bitset (may have been restored by recovery)
             let bitset = Bitset::load(&bitset_path(&shard_dir), meta.shard_size as usize)?;
             let mut state = ShardState {
                 dir: shard_dir,
                 meta: shard_meta,
                 bitset,
             };
+
+            // Mark as needing compaction if WAL exists
             repair_shard_from_wal(&mut state)?;
             reconcile_shard_meta(&mut state);
+
             let max_present = max_present_in_bitset(&state, meta.shard_size);
             if let Some(max_block) = max_present {
                 meta.max_present_block = Some(meta.max_present_block.unwrap_or(0).max(max_block));
@@ -389,6 +420,75 @@ impl Storage {
             shards: Mutex::new(shards),
             peer_cache: Mutex::new(peer_cache),
         })
+    }
+
+    /// Run storage repair without starting the full node.
+    /// Scans all shards for interrupted compactions and orphan files,
+    /// performs recovery, and returns a detailed report.
+    pub fn repair(config: &NodeConfig) -> Result<RepairReport> {
+        // Ensure directories exist
+        if !config.data_dir.exists() {
+            return Ok(RepairReport { shards: vec![] });
+        }
+
+        let shards_root = shards_dir(&config.data_dir);
+        if !shards_root.exists() {
+            return Ok(RepairReport { shards: vec![] });
+        }
+
+        let meta_path = meta_path(&config.data_dir);
+        let _meta = if meta_path.exists() {
+            load_meta(&meta_path)?
+        } else {
+            // No meta file means empty storage
+            return Ok(RepairReport { shards: vec![] });
+        };
+
+        let mut results = Vec::new();
+
+        // Scan all shard directories
+        let mut shard_dirs: Vec<_> = fs::read_dir(&shards_root)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.metadata().map(|m| m.is_dir()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.parse::<u64>().ok().map(|start| (start, e.path()))
+            })
+            .collect();
+
+        // Sort by shard start for consistent output
+        shard_dirs.sort_by_key(|(start, _)| *start);
+
+        for (shard_start, shard_dir) in shard_dirs {
+            // Load shard metadata
+            let mut shard_meta = load_shard_meta(&shard_dir)?;
+            let original_phase = shard_meta.compaction_phase.clone();
+
+            // Perform recovery
+            let result = recover_shard(&shard_dir, &mut shard_meta)?;
+
+            // Persist updated metadata if recovery was performed
+            if result.needs_recovery() {
+                persist_shard_meta(&shard_dir, &shard_meta)?;
+
+                // Also check for WAL and mark as needing compaction if present
+                let wal = wal_path(&shard_dir);
+                if wal.exists() {
+                    shard_meta.sorted = false;
+                    shard_meta.sealed = false;
+                    shard_meta.content_hash = None;
+                    persist_shard_meta(&shard_dir, &shard_meta)?;
+                }
+            }
+
+            results.push(ShardRepairInfo {
+                shard_start,
+                result,
+                original_phase,
+            });
+        }
+
+        Ok(RepairReport { shards: results })
     }
 
     pub fn disk_usage(&self) -> Result<StorageDiskStats> {
@@ -591,14 +691,18 @@ impl Storage {
         let mut per_shard: HashMap<u64, Vec<WalRecord>> = HashMap::new();
         for bundle in bundles {
             let shard_start = shard_start(bundle.number, self.shard_size());
+            let tx_meta_uncompressed = encode_bincode_value(&bundle.transactions)?;
+            let tx_meta_uncompressed_len = tx_meta_uncompressed.len() as u32;
             let receipts_uncompressed = encode_bincode_compat_value(&bundle.receipts)?;
             let receipts_uncompressed_len = receipts_uncompressed.len() as u32;
             let record = WalBundleRecord {
                 number: bundle.number,
                 header: encode_bincode_compat_value(&bundle.header)?,
                 tx_hashes: encode_bincode_value(&bundle.tx_hashes)?,
-                tx_meta: Vec::new(),
-                tx_meta_uncompressed_len: 0,
+                tx_meta: zstd
+                    .compress(&tx_meta_uncompressed)
+                    .wrap_err("failed to compress tx_meta")?,
+                tx_meta_uncompressed_len,
                 receipts: zstd
                     .compress(&receipts_uncompressed)
                     .wrap_err("failed to compress receipts")?,
@@ -633,31 +737,27 @@ impl Storage {
 
             append_records(&wal_path(&state.dir), &to_append)?;
 
+            // Track written blocks and mark shard as needing compaction
+            // NOTE: We do NOT update the bitset here - it only reflects what's in the sorted segment.
+            // The bitset will be rebuilt from actual data during compaction.
             let mut max_written: Option<u64> = None;
-            let mut meta_completed = false;
             for record in &to_append {
-                let offset = (record.block_number - shard_start) as usize;
-                if state.bitset.set(offset) {
-                    state.meta.present_count = state.meta.present_count.saturating_add(1);
-                    state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
-                    state.meta.sorted = false;
-                    state.meta.sealed = false;
-                    state.meta.content_hash = None;
-                    if state.meta.complete {
-                        meta_completed = true;
-                    }
-                    written_blocks.push(record.block_number);
-                    max_written = Some(
-                        max_written
-                            .unwrap_or(record.block_number)
-                            .max(record.block_number),
-                    );
-                }
+                written_blocks.push(record.block_number);
+                max_written = Some(
+                    max_written
+                        .unwrap_or(record.block_number)
+                        .max(record.block_number),
+                );
             }
 
-            if meta_completed {
+            // Mark shard as not sorted (has pending WAL data)
+            if !to_append.is_empty() && state.meta.sorted {
+                state.meta.sorted = false;
+                state.meta.sealed = false;
+                state.meta.content_hash = None;
                 persist_shard_meta(&state.dir, &state.meta)?;
             }
+
             if let Some(max_written) = max_written {
                 self.bump_max_present(max_written)?;
             }
@@ -684,7 +784,9 @@ impl Storage {
         segments
             .tx_hashes
             .append_rows(bundle.number, &[encode_bincode_value(&bundle.tx_hashes)?])?;
-        segments.tx_meta.append_rows(bundle.number, &[Vec::new()])?;
+        segments
+            .tx_meta
+            .append_rows(bundle.number, &[encode_bincode_value(&bundle.transactions)?])?;
         segments.receipts.append_rows(
             bundle.number,
             &[encode_bincode_compat_value(&bundle.receipts)?],
@@ -719,45 +821,37 @@ impl Storage {
             return Ok(());
         };
         let mut state = shard.lock().expect("shard lock");
-        let wal_path = wal_path(&state.dir);
-        let wal_slices = build_slice_index(&wal_path, shard_start, state.meta.shard_size as usize)?;
+        let wal_p = wal_path(&state.dir);
+        let wal_slices = build_slice_index(&wal_p, shard_start, state.meta.shard_size as usize)?;
         let has_wal = wal_slices.is_some();
+
+        // If no WAL and already sorted, nothing to do
         if !has_wal && state.meta.sorted {
             return Ok(());
         }
 
-        let max_present = max_present_in_bitset(&state, state.meta.shard_size);
-        let mut tail_block = state.meta.tail_block;
-        if let Some(max_present) = max_present {
-            tail_block = Some(tail_block.unwrap_or(max_present).max(max_present));
-        }
-        let Some(tail_block) = tail_block else {
-            if wal_path.exists() {
-                fs::remove_file(&wal_path).wrap_err("failed to remove staging.wal")?;
-            }
-            state.meta.sorted = true;
-            persist_shard_meta(&state.dir, &state.meta)?;
-            return Ok(());
-        };
-
         let sorted_dir = sorted_dir(&state.dir);
         let backup_dir = state.dir.join("sorted.old");
         let temp_dir = state.dir.join("sorted.tmp");
-        // If a previous compaction was interrupted after moving `sorted/` aside, restore it so the
-        // shard stays readable and we can safely retry compaction.
-        if backup_dir.exists() && !sorted_dir.exists() {
-            fs::rename(&backup_dir, &sorted_dir).wrap_err("failed to restore sorted.old")?;
-        }
-        // If both directories exist, the compaction likely succeeded but cleanup didn't run.
-        // Prefer the live `sorted/` and delete the stale backup.
-        if backup_dir.exists() && sorted_dir.exists() {
-            fs::remove_dir_all(&backup_dir).wrap_err("failed to remove stale sorted.old")?;
-        }
+        let bitset_tmp = bitset_tmp_path(&state.dir);
+        let bitset_old = bitset_old_path(&state.dir);
+        let bitset_live = bitset_path(&state.dir);
+
+        // ========== PHASE: WRITING ==========
+        // Set phase and persist before making any changes
+        state.meta.compaction_phase = Some(PHASE_WRITING.to_string());
+        persist_shard_meta(&state.dir, &state.meta)?;
+
+        // Clean up any leftover tmp files from previous interrupted compaction
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir).wrap_err("failed to clean sorted.tmp")?;
         }
+        if bitset_tmp.exists() {
+            fs::remove_file(&bitset_tmp).wrap_err("failed to clean bitset.tmp")?;
+        }
         fs::create_dir_all(&temp_dir).wrap_err("failed to create sorted.tmp")?;
 
+        // Open existing segment if it exists
         let existing = if sorted_dir.exists() {
             Some(ShardRawSegments {
                 headers: SegmentRawSource::<SegmentHeader>::open(&sorted_dir.join("headers"))?,
@@ -770,89 +864,127 @@ impl Storage {
             None
         };
 
+        // Create new bitset to track what we actually write (NOT based on old bitset)
+        let shard_size = state.meta.shard_size as usize;
+        let mut new_bitset = Bitset::new(shard_size);
+        let mut actual_tail_block: Option<u64> = None;
+
+        // Determine the range to iterate: max of WAL entries and existing segment rows
+        let wal_max_offset = wal_slices
+            .as_ref()
+            .map(|w| {
+                w.entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.map(|_| i))
+                    .max()
+            })
+            .flatten();
+        let existing_rows = existing.as_ref().map(|e| e.headers.config().rows).unwrap_or(0);
+        let max_offset = wal_max_offset
+            .unwrap_or(0)
+            .max(existing_rows.saturating_sub(1));
+
+        // If nothing to compact, clean up and return
+        if max_offset == 0 && wal_max_offset.is_none() && existing_rows == 0 {
+            if wal_p.exists() {
+                fs::remove_file(&wal_p).wrap_err("failed to remove staging.wal")?;
+            }
+            fs::remove_dir_all(&temp_dir).wrap_err("failed to remove sorted.tmp")?;
+            state.meta.sorted = true;
+            state.meta.compaction_phase = None;
+            persist_shard_meta(&state.dir, &state.meta)?;
+            return Ok(());
+        }
+
+        let total_rows = max_offset.saturating_add(1);
+
+        // Create segment configs
         let headers_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader {
-                start_block: shard_start,
-            },
+            user_header: SegmentHeader { start_block: shard_start },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing
-                .as_ref()
-                .map(|s| s.headers.config().max_row_size)
-                .unwrap_or(0),
+            max_row_size: existing.as_ref().map(|s| s.headers.config().max_row_size).unwrap_or(0),
         };
         let tx_hashes_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader {
-                start_block: shard_start,
-            },
+            user_header: SegmentHeader { start_block: shard_start },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing
-                .as_ref()
-                .map(|s| s.tx_hashes.config().max_row_size)
-                .unwrap_or(0),
+            max_row_size: existing.as_ref().map(|s| s.tx_hashes.config().max_row_size).unwrap_or(0),
         };
         let tx_meta_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader {
-                start_block: shard_start,
-            },
+            user_header: SegmentHeader { start_block: shard_start },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::Zstd {
                 use_dict: false,
                 max_dict_size: ZSTD_DICT_MAX_SIZE,
             }),
-            max_row_size: existing
-                .as_ref()
-                .map(|s| s.tx_meta.config().max_row_size)
-                .unwrap_or(0),
+            max_row_size: existing.as_ref().map(|s| s.tx_meta.config().max_row_size).unwrap_or(0),
         };
         let receipts_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader {
-                start_block: shard_start,
-            },
+            user_header: SegmentHeader { start_block: shard_start },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::Zstd {
                 use_dict: false,
                 max_dict_size: ZSTD_DICT_MAX_SIZE,
             }),
-            max_row_size: existing
-                .as_ref()
-                .map(|s| s.receipts.config().max_row_size)
-                .unwrap_or(0),
+            max_row_size: existing.as_ref().map(|s| s.receipts.config().max_row_size).unwrap_or(0),
         };
         let sizes_cfg = NippyJarConfig {
             version: 1,
-            user_header: SegmentHeader {
-                start_block: shard_start,
-            },
+            user_header: SegmentHeader { start_block: shard_start },
             columns: 1,
             rows: 0,
             compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing
-                .as_ref()
-                .map(|s| s.sizes.config().max_row_size)
-                .unwrap_or(0),
+            max_row_size: existing.as_ref().map(|s| s.sizes.config().max_row_size).unwrap_or(0),
         };
 
         let mut headers_out = SegmentRawWriter::create(&temp_dir.join("headers"), headers_cfg)?;
-        let mut tx_hashes_out =
-            SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?;
+        let mut tx_hashes_out = SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?;
         let mut tx_meta_out = SegmentRawWriter::create(&temp_dir.join("tx_meta"), tx_meta_cfg)?;
         let mut receipts_out = SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?;
         let mut sizes_out = SegmentRawWriter::create(&temp_dir.join("block_sizes"), sizes_cfg)?;
 
-        let end_offset = (tail_block - shard_start) as usize;
-        let total_rows = end_offset.saturating_add(1);
+        // Iterate over all rows, checking WAL and existing segment for actual data
+        // DO NOT use the old bitset - it may be out of sync
         for local_offset in 0..total_rows {
-            if !state.bitset.is_set(local_offset) {
+            // Check if this row has data in WAL
+            let wal_data = wal_slices.as_ref().and_then(|w| w.entries.get(local_offset).copied().flatten());
+
+            // Check if this row has COMPLETE data in existing segment
+            // We must verify ALL segments have data, not just headers, because
+            // a previous interrupted compaction may have left segments in an inconsistent state.
+            let has_existing_data = if let Some(ref ex) = existing {
+                let has_header = ex.headers.row_bytes(local_offset)?.is_some();
+                let has_all = has_header
+                    && ex.tx_hashes.row_bytes(local_offset)?.is_some()
+                    && ex.tx_meta.row_bytes(local_offset)?.is_some()
+                    && ex.receipts.row_bytes(local_offset)?.is_some()
+                    && ex.sizes.row_bytes(local_offset)?.is_some();
+
+                // Warn if we have partial data (header exists but other segments don't)
+                if has_header && !has_all {
+                    let block_number = shard_start + local_offset as u64;
+                    tracing::warn!(
+                        block = block_number,
+                        "existing segment has partial data, will be skipped unless WAL has complete data"
+                    );
+                }
+                has_all
+            } else {
+                false
+            };
+
+            if wal_data.is_none() && !has_existing_data {
+                // No data for this row - write empty
                 headers_out.push_empty()?;
                 tx_hashes_out.push_empty()?;
                 tx_meta_out.push_empty()?;
@@ -861,61 +993,45 @@ impl Storage {
                 continue;
             }
 
+            // This row has data - set bit in new bitset and track tail
+            new_bitset.set(local_offset);
             let block_number = shard_start + local_offset as u64;
-            if let Some(wal) = wal_slices.as_ref() {
-                if let Some(slices) = wal.entries[local_offset] {
-                    let header_bytes = &wal.mmap[slices.header.as_range()];
-                    let tx_hash_bytes = &wal.mmap[slices.tx_hashes.as_range()];
-                    let tx_meta_bytes = &wal.mmap[slices.tx_meta.as_range()];
-                    let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
-                    let size_bytes = &wal.mmap[slices.size.as_range()];
+            actual_tail_block = Some(actual_tail_block.unwrap_or(block_number).max(block_number));
 
-                    headers_out.push_bytes(header_bytes, slices.header.len())?;
-                    tx_hashes_out.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
-                    tx_meta_out
-                        .push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
-                    receipts_out
-                        .push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
-                    sizes_out.push_bytes(size_bytes, slices.size.len())?;
-                    continue;
-                }
+            // Prefer WAL data over existing segment data
+            if let Some(slices) = wal_data {
+                let wal = wal_slices.as_ref().unwrap();
+                let header_bytes = &wal.mmap[slices.header.as_range()];
+                let tx_hash_bytes = &wal.mmap[slices.tx_hashes.as_range()];
+                let tx_meta_bytes = &wal.mmap[slices.tx_meta.as_range()];
+                let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
+                let size_bytes = &wal.mmap[slices.size.as_range()];
+
+                headers_out.push_bytes(header_bytes, slices.header.len())?;
+                tx_hashes_out.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
+                tx_meta_out.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
+                receipts_out.push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
+                sizes_out.push_bytes(size_bytes, slices.size.len())?;
+            } else {
+                // Copy from existing segment (we verified all fields exist above)
+                let ex = existing.as_ref().unwrap();
+                let header_bytes = ex.headers.row_bytes(local_offset)?.unwrap();
+                let tx_hash_bytes = ex.tx_hashes.row_bytes(local_offset)?
+                    .ok_or_else(|| eyre!("missing tx_hashes for block {}", block_number))?;
+                let tx_meta_bytes = ex.tx_meta.row_bytes(local_offset)?
+                    .ok_or_else(|| eyre!("missing tx_meta for block {}", block_number))?;
+                let receipt_bytes = ex.receipts.row_bytes(local_offset)?
+                    .ok_or_else(|| eyre!("missing receipts for block {}", block_number))?;
+                let size_bytes = ex.sizes.row_bytes(local_offset)?
+                    .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
+
+                headers_out.push_bytes(header_bytes, header_bytes.len())?;
+                tx_hashes_out.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
+                // For zstd segments, the bytes are already compressed
+                tx_meta_out.push_bytes(tx_meta_bytes, 0)?;
+                receipts_out.push_bytes(receipt_bytes, 0)?;
+                sizes_out.push_bytes(size_bytes, size_bytes.len())?;
             }
-
-            let Some(existing) = existing.as_ref() else {
-                return Err(eyre!(
-                    "missing block {} in WAL and sorted segment",
-                    block_number
-                ));
-            };
-
-            let header_bytes = existing
-                .headers
-                .row_bytes(local_offset)?
-                .ok_or_else(|| eyre!("missing header for block {}", block_number))?;
-            let tx_hash_bytes = existing
-                .tx_hashes
-                .row_bytes(local_offset)?
-                .ok_or_else(|| eyre!("missing tx_hashes for block {}", block_number))?;
-            let tx_meta_bytes = existing
-                .tx_meta
-                .row_bytes(local_offset)?
-                .ok_or_else(|| eyre!("missing tx_meta for block {}", block_number))?;
-            let receipt_bytes = existing
-                .receipts
-                .row_bytes(local_offset)?
-                .ok_or_else(|| eyre!("missing receipts for block {}", block_number))?;
-            let size_bytes = existing
-                .sizes
-                .row_bytes(local_offset)?
-                .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
-
-            headers_out.push_bytes(header_bytes, header_bytes.len())?;
-            tx_hashes_out.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
-            // For zstd segments, the bytes are already compressed. We rely on the carried over
-            // `max_row_size` for existing rows, and only bump it based on WAL rows.
-            tx_meta_out.push_bytes(tx_meta_bytes, 0)?;
-            receipts_out.push_bytes(receipt_bytes, 0)?;
-            sizes_out.push_bytes(size_bytes, size_bytes.len())?;
         }
 
         headers_out.finish()?;
@@ -924,8 +1040,27 @@ impl Storage {
         receipts_out.finish()?;
         sizes_out.finish()?;
 
-        // Swap the new segments in atomically, keeping a backup directory so an unexpected abort
-        // cannot drop us into a state where neither WAL nor sorted segments contain the full shard.
+        // Write new bitset to tmp file
+        new_bitset.flush(&bitset_tmp)?;
+
+        // If no data was found at all, clean up and return
+        let Some(tail_block) = actual_tail_block else {
+            fs::remove_dir_all(&temp_dir).wrap_err("failed to remove empty sorted.tmp")?;
+            fs::remove_file(&bitset_tmp).wrap_err("failed to remove empty bitset.tmp")?;
+            if wal_p.exists() {
+                fs::remove_file(&wal_p).wrap_err("failed to remove staging.wal")?;
+            }
+            state.meta.sorted = true;
+            state.meta.compaction_phase = None;
+            persist_shard_meta(&state.dir, &state.meta)?;
+            return Ok(());
+        };
+
+        // ========== PHASE: SWAPPING ==========
+        state.meta.compaction_phase = Some(PHASE_SWAPPING.to_string());
+        persist_shard_meta(&state.dir, &state.meta)?;
+
+        // Atomic swap for sorted directory
         if sorted_dir.exists() {
             if backup_dir.exists() {
                 fs::remove_dir_all(&backup_dir).wrap_err("failed to remove stale sorted.old")?;
@@ -933,20 +1068,46 @@ impl Storage {
             fs::rename(&sorted_dir, &backup_dir).wrap_err("failed to backup old sorted")?;
         }
         fs::rename(&temp_dir, &sorted_dir).wrap_err("failed to swap sorted dir")?;
+
+        // Atomic swap for bitset
+        if bitset_live.exists() {
+            if bitset_old.exists() {
+                fs::remove_file(&bitset_old).wrap_err("failed to remove stale bitset.old")?;
+            }
+            fs::rename(&bitset_live, &bitset_old).wrap_err("failed to backup old bitset")?;
+        }
+        fs::rename(&bitset_tmp, &bitset_live).wrap_err("failed to swap bitset")?;
+
+        // ========== PHASE: CLEANUP ==========
+        state.meta.compaction_phase = Some(PHASE_CLEANUP.to_string());
+        persist_shard_meta(&state.dir, &state.meta)?;
+
+        // Delete backups and WAL
         if backup_dir.exists() {
             fs::remove_dir_all(&backup_dir).wrap_err("failed to remove sorted.old")?;
         }
-        if wal_path.exists() {
-            fs::remove_file(&wal_path).wrap_err("failed to remove staging.wal")?;
+        if bitset_old.exists() {
+            fs::remove_file(&bitset_old).wrap_err("failed to remove bitset.old")?;
+        }
+        if wal_p.exists() {
+            fs::remove_file(&wal_p).wrap_err("failed to remove staging.wal")?;
         }
 
+        // Update in-memory state with the new bitset
+        state.bitset = new_bitset;
+        state.meta.present_count = state.bitset.count_ones();
+        state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
         state.meta.sorted = true;
+        state.meta.sealed = false;
+        state.meta.content_hash = None;
         state.meta.tail_block = Some(tail_block);
+        state.meta.compaction_phase = None;
         persist_shard_meta(&state.dir, &state.meta)?;
+
         if state.meta.complete && !state.meta.sealed {
             self.seal_shard_locked(&mut state)?;
         }
-        state.bitset.flush(&bitset_path(&state.dir))?;
+
         Ok(())
     }
 
@@ -1257,6 +1418,7 @@ impl Storage {
             tail_block: None,
             content_hash: None,
             content_hash_algo: "sha256".to_string(),
+            compaction_phase: None,
         };
         persist_shard_meta(&dir, &meta)?;
         let state = ShardState { dir, meta, bitset };
@@ -1412,6 +1574,14 @@ fn shard_meta_path(shard_dir: &Path) -> PathBuf {
 
 fn bitset_path(shard_dir: &Path) -> PathBuf {
     shard_dir.join(BITSET_NAME)
+}
+
+fn bitset_tmp_path(shard_dir: &Path) -> PathBuf {
+    shard_dir.join(BITSET_TMP_NAME)
+}
+
+fn bitset_old_path(shard_dir: &Path) -> PathBuf {
+    shard_dir.join(BITSET_OLD_NAME)
 }
 
 fn wal_path(shard_dir: &Path) -> PathBuf {
@@ -1577,44 +1747,198 @@ fn repair_shard_from_wal(state: &mut ShardState) -> Result<()> {
     if !wal_path.exists() {
         return Ok(());
     }
-    // Avoid loading the entire WAL into memory on startup; we only need block numbers.
-    let entries = build_wal_index(&wal_path)?;
-    for entry in entries {
-        let block = entry.block_number;
-        if block < state.meta.shard_start {
-            continue;
-        }
-        let offset = (block - state.meta.shard_start) as usize;
-        if state.bitset.set(offset) {
-            state.meta.present_count = state.meta.present_count.saturating_add(1);
-        }
-    }
+    // WAL exists - mark shard as needing compaction.
+    // NOTE: We do NOT update the bitset here. The bitset only reflects what's in the sorted
+    // segment. When compaction runs, it will rebuild the bitset from actual segment data + WAL.
     state.meta.sorted = false;
     state.meta.sealed = false;
     state.meta.content_hash = None;
     Ok(())
 }
 
-fn recover_compaction_dirs(shard_dir: &Path) -> Result<()> {
+/// Result of shard recovery operation
+#[derive(Debug, Clone)]
+pub enum ShardRecoveryResult {
+    /// No recovery needed
+    Clean,
+    /// Recovered from interrupted "writing" phase
+    RecoveredWriting,
+    /// Recovered from interrupted "swapping" phase
+    RecoveredSwapping,
+    /// Recovered from interrupted "cleanup" phase
+    RecoveredCleanup,
+    /// Cleaned up orphan files (no phase was set but tmp files existed)
+    CleanedOrphans,
+}
+
+impl ShardRecoveryResult {
+    /// Returns true if recovery was needed
+    pub fn needs_recovery(&self) -> bool {
+        !matches!(self, ShardRecoveryResult::Clean)
+    }
+
+    /// Returns a human-readable description
+    pub fn description(&self) -> &'static str {
+        match self {
+            ShardRecoveryResult::Clean => "OK",
+            ShardRecoveryResult::RecoveredWriting => "recovered from interrupted write phase",
+            ShardRecoveryResult::RecoveredSwapping => "recovered from interrupted swap phase",
+            ShardRecoveryResult::RecoveredCleanup => "completed interrupted cleanup",
+            ShardRecoveryResult::CleanedOrphans => "cleaned orphan files",
+        }
+    }
+}
+
+/// Info about a single shard's repair result
+#[derive(Debug, Clone)]
+pub struct ShardRepairInfo {
+    /// Shard start block
+    pub shard_start: u64,
+    /// What recovery was performed
+    pub result: ShardRecoveryResult,
+    /// The compaction phase that was interrupted (if any)
+    pub original_phase: Option<String>,
+}
+
+/// Summary report of storage repair operation
+#[derive(Debug, Clone)]
+pub struct RepairReport {
+    /// Per-shard repair results
+    pub shards: Vec<ShardRepairInfo>,
+}
+
+impl RepairReport {
+    /// Count of shards that needed repair
+    pub fn repaired_count(&self) -> usize {
+        self.shards.iter().filter(|s| s.result.needs_recovery()).count()
+    }
+
+    /// Count of shards that were already clean
+    pub fn clean_count(&self) -> usize {
+        self.shards.iter().filter(|s| !s.result.needs_recovery()).count()
+    }
+
+    /// Total shard count
+    pub fn total_count(&self) -> usize {
+        self.shards.len()
+    }
+}
+
+/// Recover a shard from an interrupted compaction based on its phase.
+/// Returns what kind of recovery was performed (for UI/logging).
+fn recover_shard(shard_dir: &Path, meta: &mut ShardMeta) -> Result<ShardRecoveryResult> {
     let sorted = sorted_dir(shard_dir);
     let backup = shard_dir.join("sorted.old");
     let temp = shard_dir.join("sorted.tmp");
+    let bitset_tmp = bitset_tmp_path(shard_dir);
+    let bitset_old = bitset_old_path(shard_dir);
+    let bitset_live = bitset_path(shard_dir);
 
-    // If a compaction was interrupted after moving `sorted/` aside, restore it so reads work and
-    // future compactions can safely retry.
-    if backup.exists() && !sorted.exists() {
-        fs::rename(&backup, &sorted).wrap_err("failed to restore sorted.old")?;
-    }
-    // If both exist, compaction likely succeeded but cleanup didn't run.
-    if backup.exists() && sorted.exists() {
-        fs::remove_dir_all(&backup).wrap_err("failed to remove stale sorted.old")?;
-    }
-    // `sorted.tmp` is never a stable output; remove it on startup so we don't accumulate trash.
-    if temp.exists() {
-        fs::remove_dir_all(&temp).wrap_err("failed to remove sorted.tmp")?;
-    }
+    let phase = meta.compaction_phase.as_deref();
 
-    Ok(())
+    match phase {
+        Some(PHASE_WRITING) => {
+            // Interrupted while writing tmp files - discard partial work
+            if temp.exists() {
+                fs::remove_dir_all(&temp).wrap_err("failed to remove sorted.tmp")?;
+            }
+            if bitset_tmp.exists() {
+                fs::remove_file(&bitset_tmp).wrap_err("failed to remove bitset.tmp")?;
+            }
+            // Reset phase - will trigger re-compaction if WAL exists
+            meta.compaction_phase = None;
+            Ok(ShardRecoveryResult::RecoveredWriting)
+        }
+
+        Some(PHASE_SWAPPING) => {
+            // Interrupted during atomic swaps - restore to pre-swap state
+            // Step 1: Ensure sorted/ is valid
+            if !sorted.exists() && backup.exists() {
+                fs::rename(&backup, &sorted).wrap_err("failed to restore sorted.old")?;
+            }
+            // Step 2: Ensure bitset is valid
+            if !bitset_live.exists() && bitset_old.exists() {
+                fs::rename(&bitset_old, &bitset_live).wrap_err("failed to restore bitset.old")?;
+            }
+            // Step 3: Clean up all tmp/old files
+            if temp.exists() {
+                fs::remove_dir_all(&temp).wrap_err("failed to remove sorted.tmp")?;
+            }
+            if backup.exists() {
+                fs::remove_dir_all(&backup).wrap_err("failed to remove sorted.old")?;
+            }
+            if bitset_tmp.exists() {
+                fs::remove_file(&bitset_tmp).wrap_err("failed to remove bitset.tmp")?;
+            }
+            if bitset_old.exists() {
+                fs::remove_file(&bitset_old).wrap_err("failed to remove bitset.old")?;
+            }
+            // Reset phase and mark as needing compaction
+            meta.compaction_phase = None;
+            meta.sorted = false;
+            Ok(ShardRecoveryResult::RecoveredSwapping)
+        }
+
+        Some(PHASE_CLEANUP) => {
+            // Interrupted during cleanup - just finish the cleanup
+            if backup.exists() {
+                fs::remove_dir_all(&backup).wrap_err("failed to remove sorted.old")?;
+            }
+            if bitset_old.exists() {
+                fs::remove_file(&bitset_old).wrap_err("failed to remove bitset.old")?;
+            }
+            let wal = wal_path(shard_dir);
+            if wal.exists() {
+                fs::remove_file(&wal).wrap_err("failed to remove staging.wal")?;
+            }
+            // Complete the phase
+            meta.compaction_phase = None;
+            meta.sorted = true;
+            Ok(ShardRecoveryResult::RecoveredCleanup)
+        }
+
+        None => {
+            // No phase set, but check for orphan files from hard crashes
+            let mut had_orphans = false;
+
+            // Handle sorted.old - if it exists, compaction might have succeeded
+            if backup.exists() && sorted.exists() {
+                fs::remove_dir_all(&backup).wrap_err("failed to remove orphan sorted.old")?;
+                had_orphans = true;
+            } else if backup.exists() && !sorted.exists() {
+                fs::rename(&backup, &sorted).wrap_err("failed to restore orphan sorted.old")?;
+                had_orphans = true;
+            }
+
+            // Clean up any tmp files
+            if temp.exists() {
+                fs::remove_dir_all(&temp).wrap_err("failed to remove orphan sorted.tmp")?;
+                had_orphans = true;
+            }
+            if bitset_tmp.exists() {
+                fs::remove_file(&bitset_tmp).wrap_err("failed to remove orphan bitset.tmp")?;
+                had_orphans = true;
+            }
+            if bitset_old.exists() {
+                fs::remove_file(&bitset_old).wrap_err("failed to remove orphan bitset.old")?;
+                had_orphans = true;
+            }
+
+            if had_orphans {
+                Ok(ShardRecoveryResult::CleanedOrphans)
+            } else {
+                Ok(ShardRecoveryResult::Clean)
+            }
+        }
+
+        Some(unknown) => {
+            // Unknown phase - treat as orphan state
+            tracing::warn!(shard = %shard_dir.display(), phase = %unknown, "unknown compaction phase, resetting");
+            meta.compaction_phase = None;
+            meta.sorted = false;
+            Ok(ShardRecoveryResult::CleanedOrphans)
+        }
+    }
 }
 
 fn reconcile_shard_meta(state: &mut ShardState) {
@@ -1631,6 +1955,7 @@ fn default_hash_algo() -> String {
 mod tests {
     use super::*;
     use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+    use crate::storage::StoredTransactions;
     use reth_ethereum_primitives::Receipt;
     use reth_primitives_traits::Header;
     use std::path::PathBuf;
@@ -1679,6 +2004,7 @@ mod tests {
             log_report: false,
             log_resources: false,
             min_peers: 1,
+            repair: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,
@@ -1707,6 +2033,7 @@ mod tests {
             number,
             header: header_with_number(number),
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
+            transactions: StoredTransactions { txs: Vec::new() },
             size: StoredBlockSize { size: 0 },
             receipts: StoredReceipts {
                 receipts: Vec::<Receipt>::new(),
@@ -1715,7 +2042,10 @@ mod tests {
     }
 
     #[test]
-    fn wal_replay_sets_bitset() {
+    fn wal_replay_triggers_compaction() {
+        // With the new atomic compaction model, WAL writes don't update the bitset.
+        // The bitset is rebuilt during compaction from actual segment data.
+        // This test verifies that after reopen + compact, the block is visible.
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("open storage");
@@ -1726,7 +2056,12 @@ mod tests {
         drop(storage);
 
         let reopened = Storage::open(&config).expect("reopen storage");
-        assert!(reopened.has_block(5).expect("has block"));
+        // Before compaction, block is not visible (only in WAL)
+        assert!(!reopened.has_block(5).expect("has block before compact"));
+
+        // After compaction, block should be visible
+        reopened.compact_shard(0).expect("compact shard");
+        assert!(reopened.has_block(5).expect("has block after compact"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1744,6 +2079,41 @@ mod tests {
         assert!(storage.block_header(0).expect("header 0").is_some());
         assert!(storage.block_header(1).expect("header 1").is_none());
         assert!(storage.block_header(2).expect("header 2").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_on_clean_storage_reports_ok() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+
+        // Create a storage and write + compact some data
+        let storage = Storage::open(&config).expect("open storage");
+        storage
+            .write_block_bundles_wal(&[bundle_with_number(0), bundle_with_number(1)])
+            .expect("write wal");
+        storage.compact_shard(0).expect("compact shard");
+        drop(storage);
+
+        // Run repair on clean storage
+        let report = Storage::repair(&config).expect("repair");
+        assert_eq!(report.shards.len(), 1);
+        assert!(!report.shards[0].result.needs_recovery());
+        assert_eq!(report.repaired_count(), 0);
+        assert_eq!(report.clean_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_empty_storage_returns_empty_report() {
+        let dir = temp_dir();
+        let config = base_config(dir.clone());
+
+        // Run repair on non-existent storage
+        let report = Storage::repair(&config).expect("repair");
+        assert!(report.shards.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

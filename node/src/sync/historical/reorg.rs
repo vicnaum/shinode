@@ -182,6 +182,7 @@ mod tests {
             log_report: false,
             log_resources: false,
             min_peers: 1,
+            repair: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,
@@ -211,6 +212,7 @@ mod tests {
             number: header.number,
             header,
             tx_hashes: crate::storage::StoredTxHashes { hashes: Vec::new() },
+            transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             size: crate::storage::StoredBlockSize { size: 0 },
             receipts: crate::storage::StoredReceipts {
                 receipts: Vec::new(),

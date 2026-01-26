@@ -14,6 +14,7 @@ pub struct WalRecord {
 
 #[derive(Debug, Clone, Copy)]
 pub struct WalIndexEntry {
+    #[allow(dead_code)] // Kept for debugging/future use
     pub block_number: u64,
 }
 

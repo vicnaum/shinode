@@ -53,6 +53,7 @@ pub fn base_config(data_dir: PathBuf) -> NodeConfig {
         log_report: false,
         log_resources: false,
         min_peers: 1,
+        repair: false,
         command: None,
         rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
         rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,

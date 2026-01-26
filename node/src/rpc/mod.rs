@@ -658,6 +658,7 @@ mod tests {
             number,
             header,
             tx_hashes: crate::storage::StoredTxHashes { hashes: tx_hashes },
+            transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             size: crate::storage::StoredBlockSize { size },
             receipts: crate::storage::StoredReceipts { receipts },
         }

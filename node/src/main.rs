@@ -863,6 +863,43 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Handle --repair flag
+    if config.repair {
+        println!("Checking storage integrity...\n");
+        let report = storage::Storage::repair(&config)?;
+
+        if report.shards.is_empty() {
+            println!("No shards found in {}", config.data_dir.display());
+            return Ok(());
+        }
+
+        for info in &report.shards {
+            if info.result.needs_recovery() {
+                let phase_info = info
+                    .original_phase
+                    .as_ref()
+                    .map(|p| format!(" (phase: {})", p))
+                    .unwrap_or_default();
+                println!(
+                    "Shard {}: {}{}",
+                    info.shard_start,
+                    info.result.description(),
+                    phase_info
+                );
+            } else {
+                println!("Shard {}: OK", info.shard_start);
+            }
+        }
+
+        println!(
+            "\nRepair complete. {}/{} shards repaired, {} already clean.",
+            report.repaired_count(),
+            report.total_count(),
+            report.clean_count()
+        );
+        return Ok(());
+    }
+
     // Main ingest path
     info!(
         chain_id = config.chain_id,
