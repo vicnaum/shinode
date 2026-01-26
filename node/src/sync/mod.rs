@@ -28,6 +28,7 @@ pub enum SyncStatus {
 }
 
 impl SyncStatus {
+    /// Machine-readable status string (for logging/metrics).
     pub fn as_str(self) -> &'static str {
         match self {
             SyncStatus::LookingForPeers => "looking_for_peers",
@@ -35,6 +36,18 @@ impl SyncStatus {
             SyncStatus::Finalizing => "finalizing",
             SyncStatus::UpToDate => "up_to_date",
             SyncStatus::Following => "following",
+        }
+    }
+
+    /// Human-readable display name (for UI).
+    #[allow(dead_code)]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            SyncStatus::LookingForPeers => "Waiting for peers",
+            SyncStatus::Fetching => "Syncing",
+            SyncStatus::Finalizing => "Finalizing",
+            SyncStatus::UpToDate => "Synced",
+            SyncStatus::Following => "Synced",
         }
     }
 }
@@ -75,6 +88,8 @@ pub struct SyncProgressStats {
     status: std::sync::atomic::AtomicU8,
     head_block: std::sync::atomic::AtomicU64,
     head_seen: std::sync::atomic::AtomicU64,
+    /// True when all fetch tasks have completed (blocks downloaded from peers).
+    fetch_complete: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +105,8 @@ pub struct SyncProgressSnapshot {
     pub status: SyncStatus,
     pub head_block: u64,
     pub head_seen: u64,
+    /// True when all fetch tasks have completed (blocks downloaded from peers).
+    pub fetch_complete: bool,
 }
 
 impl SyncProgressStats {
@@ -116,6 +133,9 @@ impl SyncProgressStats {
             },
             head_block: self.head_block.load(std::sync::atomic::Ordering::SeqCst),
             head_seen: self.head_seen.load(std::sync::atomic::Ordering::SeqCst),
+            fetch_complete: self
+                .fetch_complete
+                .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -200,5 +220,10 @@ impl SyncProgressStats {
     pub fn set_head_seen(&self, block: u64) {
         self.head_seen
             .store(block, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_fetch_complete(&self, complete: bool) {
+        self.fetch_complete
+            .store(complete, std::sync::atomic::Ordering::SeqCst);
     }
 }

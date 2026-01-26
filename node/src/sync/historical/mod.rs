@@ -953,7 +953,10 @@ pub async fn run_ingest_pipeline(
     let finalize_started = Instant::now();
     if let Some(stats) = stats.as_ref() {
         // Fetching is done; remaining work is local processing/DB flush.
+        // Set status BEFORE fetch_complete to avoid race condition where UI sees
+        // fetch_complete=true but status is still Fetching.
         stats.set_status(SyncStatus::Finalizing);
+        stats.set_fetch_complete(true);
         let snapshot = stats.snapshot();
         tracing::info!(
             processed = snapshot.processed,
