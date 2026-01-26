@@ -832,12 +832,7 @@ pub async fn run_ingest_pipeline(
                         .map(|payload| payload.header.number)
                         .collect();
                     if !completed.is_empty() {
-                        let recovered = scheduler.mark_completed(&completed).await;
-                        if recovered > 0 {
-                            if let Some(stats) = stats.as_ref() {
-                                stats.record_block_recovered(recovered);
-                            }
-                        }
+                        let _ = scheduler.mark_completed(&completed).await;
                     }
 
                     if let Some(bench) = bench.as_ref() {

@@ -161,26 +161,6 @@ impl SyncProgressStats {
             .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Increment failed count (kept for backwards compatibility).
-    #[allow(dead_code)]
-    pub fn inc_failed(&self, delta: u64) {
-        self.failed
-            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Record blocks recovered (kept for backwards compatibility).
-    #[allow(dead_code)]
-    pub fn record_block_recovered(&self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        let _ = self.failed.fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |current| Some(current.saturating_sub(count)),
-        );
-    }
-
     pub fn set_queue(&self, queue: u64) {
         self.queue.store(queue, std::sync::atomic::Ordering::SeqCst);
     }
