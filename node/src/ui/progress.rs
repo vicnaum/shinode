@@ -307,11 +307,14 @@ pub fn spawn_progress_updater(
                                     done.min(total), total
                                 ));
                             }
+                            FinalizePhase::Compacting => {
+                                fb.set_message("Finalizing: compacting...");
+                            }
                             FinalizePhase::Sealing if done > 0 => {
                                 fb.set_message(format!("Finalizing: sealed {} shards", done));
                             }
-                            _ => {
-                                fb.set_message("Finalizing...");
+                            FinalizePhase::Sealing => {
+                                fb.set_message("Finalizing: sealing...");
                             }
                         }
 
