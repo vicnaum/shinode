@@ -942,6 +942,10 @@ pub async fn run_ingest_pipeline(
     while fetch_tasks.join_next().await.is_some() {}
     let finalize_started = Instant::now();
     if let Some(stats) = stats.as_ref() {
+        // Reset compaction counters BEFORE setting status to Finalizing,
+        // so UI never sees stale values from the sync phase.
+        stats.set_compactions_done(0);
+        stats.set_compactions_total(0);
         // Fetching is done; remaining work is local processing/DB flush.
         // Set status BEFORE fetch_complete to avoid race condition where UI sees
         // fetch_complete=true but status is still Fetching.
