@@ -59,24 +59,15 @@ Focus: stability and performance hardening for production use.
 
 ---
 
-## Current: v0.2.x - Remaining Reliability Work
+## Next: v0.3 - Testing & Observability
 
-### In progress
-
-- Deep reorg recovery (auto-rebootstrap policy)
-- Integration tests for sync loop + reorg handling
-- Metrics export (Prometheus/OTel)
-
-### Optional correctness hardening
-
-- Receipts root validation (header `receiptsRoot`)
-- Multi-peer cross-check for headers/receipts
-- Stronger head source (beacon API / CL integration)
-- Tombstone / "removed logs" handling for reorgs
+- [ ] Integration tests for sync loop + reorg handling
+- [ ] Metrics export (Prometheus/OTel)
+- [ ] Deep reorg recovery (auto-rebootstrap policy)
 
 ---
 
-## Later: v0.3+ - Performance & Storage Efficiency
+## Future: Performance & Storage
 
 - Bloom-based short-circuiting (skip blocks via `logsBloom`)
 - Stronger log indexing (topic1-3, composite indexes)
@@ -88,28 +79,25 @@ Focus: stability and performance hardening for production use.
 
 ---
 
-## Later: Correctness / Trust Hardening
+## Future: Correctness & Trust
 
-- Optional receipts root validation
+- Receipts root validation (verify against header `receiptsRoot`)
 - Multi-peer cross-check (majority header hash / receiptsRoot)
+- Stronger head source (beacon API / CL integration)
+- Tombstone / "removed logs" handling for reorgs
 - Confidence levels (unsafe vs safer head)
 
 ---
 
-## Later: Fallbacks for Pruned History
+## Future: Network & Fallbacks
 
+- Serve `GetBlockHeaders` / `GetReceipts` for retained ranges
+- Rate limiting + abuse protection
 - ETH: era1 / Portal for old ranges
 
 ---
 
-## Later: Network Serving
-
-- Serve `GetBlockHeaders` / `GetReceipts` for retained ranges
-- Rate limiting + abuse protection
-
----
-
-## Deferred: RPC Extras
+## Future: RPC Extras
 
 Ponder compatibility and additional endpoints:
 

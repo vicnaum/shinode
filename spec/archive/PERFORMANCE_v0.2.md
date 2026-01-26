@@ -1,4 +1,9 @@
-# Performance Notes
+# Performance Notes (v0.2)
+
+> **HISTORICAL DOCUMENT** - These benchmarks were captured during v0.2 development.
+> For current performance tuning, see CLI options in [docs/configuration.md](../../docs/configuration.md).
+
+---
 
 This file is a running log of notable benchmark runs, key throughput numbers, and suspected
 bottlenecks. The goal is to make it easy to compare versions/flags over time.
@@ -71,7 +76,7 @@ Notable dynamics / bottleneck guess:
   - fetch total_us / wall_clock ~= 13.7 average parallel fetches (close to `--fast-sync-max-inflight=15`)
   - cpu_busy_pct stays <30% most of the time
   - DB flush p95 ~434ms with high MiB/s; iowait is low except during final compactions
-- Throughput dips line up with “heavier” blocks, not a systemic stall:
+- Throughput dips line up with "heavier" blocks, not a systemic stall:
   - 60s windows show bytes/block varying from ~213k to ~451k
   - correlation(bytes_per_block, blocks/s) ~= -0.65 (negative: bigger blocks -> fewer blocks/s)
 
@@ -139,7 +144,7 @@ Comparison vs 2026-01-24T14:00:54Z (system allocator):
 - rss max decreased (2.34 -> 1.91 GiB)
 
 Attribution caveat:
-- The throughput gain is dominated by “better fetch” (lower avg/p95 fetch times + more usable peers). That may reflect network/peer variance in addition to allocator choice; repeat A/B runs to isolate jemalloc’s impact.
+- The throughput gain is dominated by "better fetch" (lower avg/p95 fetch times + more usable peers). That may reflect network/peer variance in addition to allocator choice; repeat A/B runs to isolate jemalloc's impact.
 
 ## Hetzner ingest-1M (v0.2, inflight30/chunk32) - 2026-01-24T15:31:21Z
 
@@ -260,8 +265,8 @@ Comparison vs 2026-01-24T15:31:21Z (system allocator, inflight30/chunk32):
 - compactions done by `pending_total=0`: 80/101 -> 91/101; final compaction window: 29.91s -> 20.82s
 
 Attribution caveat (again):
-- The throughput gain is mostly “more parallel fetch work” (peers_active saturates at 30 and effective fetch parallelism is ~22.9).
-- This may reflect peer/network variance in addition to allocator choice; repeat A/B runs to isolate jemalloc’s impact.
+- The throughput gain is mostly "more parallel fetch work" (peers_active saturates at 30 and effective fetch parallelism is ~22.9).
+- This may reflect peer/network variance in addition to allocator choice; repeat A/B runs to isolate jemalloc's impact.
 
 ## Hetzner ingest-1M (v0.2, inflight60/chunk64, jemalloc) - 2026-01-24T17:23:39Z
 
