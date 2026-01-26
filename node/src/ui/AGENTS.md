@@ -7,8 +7,8 @@ following, and failed block recovery.
 
 ## Contents (one hop)
 ### Files
-- `mod.rs` - Main module exposing public API and simple status bar functions.
-  - **Key items**: `print_status_bar()`, `clear_status_bar()`
+- `mod.rs` - Main module exposing public API, status bar functions, and db stats output.
+  - **Key items**: `print_status_bar()`, `clear_status_bar()`, `print_db_stats()`, `human_bytes()`
 - `state.rs` - UI state machine types for tracking current display phase.
   - **Key items**: `UIState`
 - `bars.rs` - Progress bar creation helpers and color definitions.
@@ -18,7 +18,7 @@ following, and failed block recovery.
 
 ## Key APIs (no snippets)
 - **Types**: `UIState`, `UIController`
-- **Functions**: `print_status_bar()`, `clear_status_bar()`, `format_progress_message()`, `spawn_progress_updater()`
+- **Functions**: `print_status_bar()`, `clear_status_bar()`, `format_progress_message()`, `spawn_progress_updater()`, `print_db_stats()`, `human_bytes()`
 - **Bar creators**: `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`
 
 ## UIController State Machine
