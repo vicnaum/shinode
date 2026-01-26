@@ -355,6 +355,12 @@ pub async fn run_db_writer(
     // Safety net: if shard completion tracking isn't provided (or we have a partial tail shard),
     // compact whatever is still in WAL so reads work after finalize.
     if mode == DbWriteMode::FastSync {
+        // Reset compaction progress counters for finalize phase
+        if let Some(stats) = progress_stats.as_ref() {
+            stats.set_compactions_done(0);
+            stats.set_compactions_total(0);
+        }
+
         if let Ok(mut dirty) = storage.dirty_shards() {
             if !dirty.is_empty() {
                 let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
@@ -367,8 +373,6 @@ pub async fn run_db_writer(
                     "finalizing: compacting dirty shards (WAL present or unsorted)"
                 );
                 if let Some(stats) = progress_stats.as_ref() {
-                    // Reset progress for finalize phase - show only dirty shards
-                    stats.set_compactions_done(0);
                     stats.set_compactions_total(dirty.len() as u64);
                 }
             }
@@ -396,7 +400,21 @@ pub async fn run_db_writer(
             events.record(BenchEvent::SealCompletedStart);
         }
         let started = Instant::now();
-        storage.seal_completed_shards()?;
+
+        // Set up sealing progress tracking
+        if let Some(stats) = progress_stats.as_ref() {
+            let to_seal = storage.shards_to_seal_count().unwrap_or(0);
+            stats.set_compactions_done(0);
+            stats.set_compactions_total(to_seal as u64);
+        }
+
+        let stats_for_seal = progress_stats.clone();
+        storage.seal_completed_shards_with_progress(|_shard_start| {
+            if let Some(stats) = stats_for_seal.as_ref() {
+                stats.inc_compactions_done(1);
+            }
+        })?;
+
         if let Some(events) = events.as_ref() {
             events.record(BenchEvent::SealCompletedEnd {
                 duration_ms: started.elapsed().as_millis() as u64,

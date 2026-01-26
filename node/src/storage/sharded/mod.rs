@@ -1183,7 +1183,36 @@ impl Storage {
         Ok(out)
     }
 
+    #[allow(dead_code)] // Convenience wrapper
     pub fn seal_completed_shards(&self) -> Result<()> {
+        self.seal_completed_shards_with_progress(|_| {})
+    }
+
+    /// Returns the count of shards that need sealing (complete, sorted, not sealed).
+    pub fn shards_to_seal_count(&self) -> Result<usize> {
+        let shard_starts: Vec<u64> = {
+            let shards = self.shards.lock().expect("shards lock");
+            shards.keys().copied().collect()
+        };
+        let mut count = 0;
+        for shard_start in shard_starts {
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                continue;
+            };
+            let state = shard.lock().expect("shard lock");
+            if state.meta.complete && state.meta.sorted && !state.meta.sealed {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Seal all completed shards, calling progress callback after each.
+    pub fn seal_completed_shards_with_progress<F>(&self, mut on_sealed: F) -> Result<()>
+    where
+        F: FnMut(u64),
+    {
         let shard_starts: Vec<u64> = {
             let shards = self.shards.lock().expect("shards lock");
             shards.keys().copied().collect()
@@ -1197,6 +1226,7 @@ impl Storage {
             if state.meta.complete && state.meta.sorted && !state.meta.sealed {
                 self.seal_shard_locked(&mut state)?;
                 persist_shard_meta(&state.dir, &state.meta)?;
+                on_sealed(shard_start);
             }
         }
         Ok(())
