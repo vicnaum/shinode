@@ -6,6 +6,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 pub mod colors {
     /// Yellow for startup phases (black text on yellow background).
     pub const YELLOW: (u8, u8, u8) = (255, 200, 0);
+    /// Orange for recovery phases (black text on orange background).
+    pub const ORANGE: (u8, u8, u8) = (255, 140, 0);
     /// Teal for finalizing phase (white text on teal background).
     pub const TEAL: (u8, u8, u8) = (0, 200, 200);
     /// Green for synced/following phase (white text on green background).
@@ -114,4 +116,23 @@ pub fn format_finalizing_segment(message: &str) -> String {
 pub fn format_startup_segment(message: &str) -> String {
     // Black text on yellow background
     format_colored_segment(message, (0, 0, 0), colors::YELLOW)
+}
+
+/// Format the orange recovery bar segment.
+pub fn format_recovery_segment(message: &str) -> String {
+    // Black text on orange background
+    format_colored_segment(message, (0, 0, 0), colors::ORANGE)
+}
+
+/// Create a recovery spinner bar (orange themed).
+pub fn create_recovery_bar(multi: &MultiProgress) -> ProgressBar {
+    let bar = multi.add(ProgressBar::new_spinner());
+    bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    // Use yellow as closest approximation since indicatif doesn't have orange
+    let style = ProgressStyle::with_template("{spinner:.yellow} {msg}")
+        .expect("progress style")
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+    bar.set_style(style);
+    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    bar
 }

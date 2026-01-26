@@ -20,6 +20,8 @@ pub enum UIState {
 pub enum StartupPhase {
     /// Opening the storage database.
     OpeningStorage,
+    /// Recovering a shard from interrupted compaction.
+    RecoveringShard { shard: u64, phase: String },
     /// Compacting dirty shards from previous run.
     CompactingShards(usize),
     /// Connecting to the P2P network.
@@ -56,6 +58,9 @@ impl StartupPhase {
     pub fn message(&self) -> String {
         match self {
             StartupPhase::OpeningStorage => "Opening storage...".to_string(),
+            StartupPhase::RecoveringShard { shard, phase } => {
+                format!("Recovering shard {}: {}", shard, phase)
+            }
             StartupPhase::CompactingShards(count) => format!("Compacting {} shards...", count),
             StartupPhase::ConnectingP2P => "Connecting to P2P network...".to_string(),
             StartupPhase::WaitingForPeers { current, min } => {
@@ -63,5 +68,10 @@ impl StartupPhase {
             }
             StartupPhase::DiscoveringHead(head) => format!("Discovering chain head... {}", head),
         }
+    }
+
+    /// Returns true if this phase should be displayed with orange (recovery) color.
+    pub fn is_recovery(&self) -> bool {
+        matches!(self, StartupPhase::RecoveringShard { .. })
     }
 }
