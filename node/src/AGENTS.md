@@ -12,6 +12,7 @@ stack, storage backend, sync pipeline, and JSON-RPC server used by `main.rs`.
 - [x] `rpc/` - jsonrpsee server implementing a minimal Ethereum JSON-RPC surface.
 - [x] `storage/` - Stored types and sharded on-disk backend (segments + WAL + bitset) for history data.
 - [x] `sync/` - Sync primitives (status/progress) and historical backfill/follow pipeline.
+- [x] `ui/` - Terminal UI module for progress bars and status display (yellow/cyan/teal/green/red phases).
 
 ### Files
 - `main.rs` - Binary entrypoint; orchestrates benchmark modes, ingest/follow, tracing, resource logging, and artifact emission.
@@ -22,7 +23,7 @@ stack, storage backend, sync pipeline, and JSON-RPC server used by `main.rs`.
   - **Key items**: `temp_dir()`, `base_config()`
 
 ## Key APIs (no snippets)
-- **Modules**: `cli`, `p2p`, `rpc`, `storage`, `sync` - primary subsystems wired together by `main.rs`.
+- **Modules**: `cli`, `p2p`, `rpc`, `storage`, `sync`, `ui` - primary subsystems wired together by `main.rs`.
 
 ## Relationships
 - **Used by**: `node/src/main.rs` is the binary root; it pulls in each module and drives startup/shutdown.
