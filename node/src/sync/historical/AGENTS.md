@@ -72,7 +72,7 @@ benchmark stats/event logging.
 - **Role**: Converts fetched payloads into storage-ready `BlockBundle`s and records processing timings for benchmarks.
 - **Key items**: `process_ingest()`, `KeccakBuf`, `KECCAK_SCRATCH_LEN`, `block_rlp_size()`, `ProcessTiming`
 - **Interactions**: Feeds `BlockBundle`s to `db_writer` via `DbWriterMessage::Block`; updates `IngestBenchStats` when enabled.
-- **Knobs / invariants**: Requires tx count to match receipts count; logs are counted from receipts but stored logs are currently empty (`StoredLogs { logs: Vec::new() }`).
+- **Knobs / invariants**: Requires tx count to match receipts count; logs are counted from receipts (and derived at query time).
 
 ### `db_writer.rs`
 - **Role**: Applies `BlockBundle` writes to storage and manages compaction/sealing so reads work after ingest completes.

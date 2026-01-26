@@ -8,12 +8,11 @@ mod wal;
 use crate::cli::NodeConfig;
 use crate::storage::{
     decode_bincode, decode_bincode_compat_value, decode_u64, encode_bincode_compat_value,
-    encode_bincode_value, encode_u64_value, BlockBundle, LogIndexEntry, PeerCacheLoad,
-    SegmentDiskStats, StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredLogs, StoredPeer,
-    StoredReceipts, StoredTransactions, StoredTxHashes, StoredWithdrawals, ZSTD_DICT_MAX_SIZE,
+    encode_bincode_value, encode_u64_value, BlockBundle, PeerCacheLoad, SegmentDiskStats,
+    StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredPeer, StoredReceipts,
+    StoredTxHashes, ZSTD_DICT_MAX_SIZE,
 };
 use bitset::Bitset;
-use crc32fast::Hasher;
 use eyre::{eyre, Result, WrapErr};
 use hash::compute_shard_hash;
 use nippy_raw::{NippyJarConfig, SegmentRawSource, SegmentRawWriter};
@@ -27,7 +26,6 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use wal::{append_records, build_index as build_wal_index, build_slice_index, WalRecord};
@@ -116,8 +114,6 @@ struct SegmentState {
 struct SegmentWriter {
     path: PathBuf,
     start_block: u64,
-    #[allow(dead_code)]
-    compression: SegmentCompression,
     state: Mutex<SegmentState>,
 }
 
@@ -162,12 +158,11 @@ impl SegmentWriter {
         Ok(Self {
             path,
             start_block,
-            compression,
             state: Mutex::new(SegmentState { writer, next_block }),
         })
     }
 
-    fn append_rows_inner(&self, start_block: u64, rows: &[Vec<u8>], commit: bool) -> Result<()> {
+    fn append_rows_inner(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -199,36 +194,16 @@ impl SegmentWriter {
             .writer
             .append_rows(vec![iter], total_rows)
             .wrap_err("failed to append rows")?;
-        if commit {
-            state
-                .writer
-                .commit()
-                .wrap_err("failed to commit static segment")?;
-        }
+        state
+            .writer
+            .commit()
+            .wrap_err("failed to commit static segment")?;
         state.next_block = state.next_block.saturating_add(total_rows);
         Ok(())
     }
 
     fn append_rows(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
-        self.append_rows_inner(start_block, rows, true)
-    }
-
-    // Reserved for future optimizations where we want to amortize NippyJar commits across
-    // multiple appends (e.g. compaction writing in larger batches).
-    #[allow(dead_code)]
-    fn append_rows_no_commit(&self, start_block: u64, rows: &[Vec<u8>]) -> Result<()> {
-        self.append_rows_inner(start_block, rows, false)
-    }
-
-    // Reserved for future use alongside `append_rows_no_commit`.
-    #[allow(dead_code)]
-    fn commit(&self) -> Result<()> {
-        let mut state = self.state.lock().expect("segment lock");
-        state
-            .writer
-            .commit()
-            .wrap_err("failed to commit static segment")?;
-        Ok(())
+        self.append_rows_inner(start_block, rows)
     }
 
     fn prune_to(&self, ancestor_number: u64) -> Result<()> {
@@ -327,10 +302,6 @@ pub struct Storage {
 pub struct DirtyShardInfo {
     pub shard_start: u64,
     pub wal_bytes: u64,
-    #[allow(dead_code)]
-    pub sorted: bool,
-    #[allow(dead_code)]
-    pub complete: bool,
 }
 
 impl std::fmt::Debug for Storage {
@@ -451,7 +422,7 @@ impl Storage {
         Ok(meta.max_present_block)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_last_indexed_block(&self, value: u64) -> Result<()> {
         let mut meta = self.meta.lock().expect("meta lock");
         meta.max_present_block = Some(value);
@@ -620,18 +591,14 @@ impl Storage {
         let mut per_shard: HashMap<u64, Vec<WalRecord>> = HashMap::new();
         for bundle in bundles {
             let shard_start = shard_start(bundle.number, self.shard_size());
-            let tx_meta_uncompressed = encode_bincode_value(&bundle.transactions)?;
-            let tx_meta_uncompressed_len = tx_meta_uncompressed.len() as u32;
             let receipts_uncompressed = encode_bincode_compat_value(&bundle.receipts)?;
             let receipts_uncompressed_len = receipts_uncompressed.len() as u32;
             let record = WalBundleRecord {
                 number: bundle.number,
                 header: encode_bincode_compat_value(&bundle.header)?,
                 tx_hashes: encode_bincode_value(&bundle.tx_hashes)?,
-                tx_meta: zstd
-                    .compress(&tx_meta_uncompressed)
-                    .wrap_err("failed to compress tx_meta")?,
-                tx_meta_uncompressed_len,
+                tx_meta: Vec::new(),
+                tx_meta_uncompressed_len: 0,
                 receipts: zstd
                     .compress(&receipts_uncompressed)
                     .wrap_err("failed to compress receipts")?,
@@ -717,10 +684,7 @@ impl Storage {
         segments
             .tx_hashes
             .append_rows(bundle.number, &[encode_bincode_value(&bundle.tx_hashes)?])?;
-        segments.tx_meta.append_rows(
-            bundle.number,
-            &[encode_bincode_value(&bundle.transactions)?],
-        )?;
+        segments.tx_meta.append_rows(bundle.number, &[Vec::new()])?;
         segments.receipts.append_rows(
             bundle.number,
             &[encode_bincode_compat_value(&bundle.receipts)?],
@@ -1041,8 +1005,6 @@ impl Storage {
                 out.push(DirtyShardInfo {
                     shard_start,
                     wal_bytes,
-                    sorted: state.meta.sorted,
-                    complete: state.meta.complete,
                 });
             }
         }
@@ -1118,7 +1080,11 @@ impl Storage {
         Ok(())
     }
 
-    pub fn block_header(&self, number: u64) -> Result<Option<Header>> {
+    fn with_readers_for_present_block<T>(
+        &self,
+        number: u64,
+        f: impl FnOnce(&ShardSegments) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         let shard_start = shard_start(number, self.shard_size());
         let shard = self.get_shard(shard_start)?;
         let Some(shard) = shard else {
@@ -1134,97 +1100,30 @@ impl Storage {
         let Some(segments) = segments else {
             return Ok(None);
         };
-        segments.headers.read_row_compat(number)
+        f(&segments)
+    }
+
+    pub fn block_header(&self, number: u64) -> Result<Option<Header>> {
+        self.with_readers_for_present_block(number, |segments| {
+            segments.headers.read_row_compat(number)
+        })
     }
 
     pub fn block_tx_hashes(&self, number: u64) -> Result<Option<StoredTxHashes>> {
-        let shard_start = shard_start(number, self.shard_size());
-        let shard = self.get_shard(shard_start)?;
-        let Some(shard) = shard else {
-            return Ok(None);
-        };
-        let state = shard.lock().expect("shard lock");
-        let offset = (number - shard_start) as usize;
-        if !state.bitset.is_set(offset) {
-            return Ok(None);
-        }
-        let sorted_dir = sorted_dir(&state.dir);
-        let segments = shard_segment_readers(&sorted_dir, shard_start)?;
-        let Some(segments) = segments else {
-            return Ok(None);
-        };
-        segments.tx_hashes.read_row(number)
-    }
-
-    #[allow(dead_code)]
-    pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
-        let shard_start = shard_start(number, self.shard_size());
-        let shard = self.get_shard(shard_start)?;
-        let Some(shard) = shard else {
-            return Ok(None);
-        };
-        let state = shard.lock().expect("shard lock");
-        let offset = (number - shard_start) as usize;
-        if !state.bitset.is_set(offset) {
-            return Ok(None);
-        }
-        let sorted_dir = sorted_dir(&state.dir);
-        let segments = shard_segment_readers(&sorted_dir, shard_start)?;
-        let Some(segments) = segments else {
-            return Ok(None);
-        };
-        segments.tx_meta.read_row(number)
-    }
-
-    #[allow(dead_code)]
-    pub fn block_withdrawals(&self, _number: u64) -> Result<Option<StoredWithdrawals>> {
-        Ok(None)
+        self.with_readers_for_present_block(number, |segments| segments.tx_hashes.read_row(number))
     }
 
     pub fn block_size(&self, number: u64) -> Result<Option<StoredBlockSize>> {
-        let shard_start = shard_start(number, self.shard_size());
-        let shard = self.get_shard(shard_start)?;
-        let Some(shard) = shard else {
-            return Ok(None);
-        };
-        let state = shard.lock().expect("shard lock");
-        let offset = (number - shard_start) as usize;
-        if !state.bitset.is_set(offset) {
-            return Ok(None);
-        }
-        let sorted_dir = sorted_dir(&state.dir);
-        let segments = shard_segment_readers(&sorted_dir, shard_start)?;
-        let Some(segments) = segments else {
-            return Ok(None);
-        };
-        segments
-            .sizes
-            .read_row_u64(number)
-            .map(|opt| opt.map(|size| StoredBlockSize { size }))
+        self.with_readers_for_present_block(number, |segments| {
+            let size = segments.sizes.read_row_u64(number)?;
+            Ok(size.map(|size| StoredBlockSize { size }))
+        })
     }
 
     pub fn block_receipts(&self, number: u64) -> Result<Option<StoredReceipts>> {
-        let shard_start = shard_start(number, self.shard_size());
-        let shard = self.get_shard(shard_start)?;
-        let Some(shard) = shard else {
-            return Ok(None);
-        };
-        let state = shard.lock().expect("shard lock");
-        let offset = (number - shard_start) as usize;
-        if !state.bitset.is_set(offset) {
-            return Ok(None);
-        }
-        let sorted_dir = sorted_dir(&state.dir);
-        let segments = shard_segment_readers(&sorted_dir, shard_start)?;
-        let Some(segments) = segments else {
-            return Ok(None);
-        };
-        segments.receipts.read_row_compat(number)
-    }
-
-    #[allow(dead_code)]
-    pub fn block_logs(&self, _number: u64) -> Result<Option<StoredLogs>> {
-        Ok(None)
+        self.with_readers_for_present_block(number, |segments| {
+            segments.receipts.read_row_compat(number)
+        })
     }
 
     pub fn block_headers_range(
@@ -1264,32 +1163,6 @@ impl Storage {
             }
         }
         Ok(out)
-    }
-
-    #[allow(dead_code)]
-    pub fn block_logs_range(
-        &self,
-        _range: std::ops::RangeInclusive<u64>,
-    ) -> Result<Vec<(u64, StoredLogs)>> {
-        Ok(Vec::new())
-    }
-
-    #[allow(dead_code)]
-    pub fn log_index_by_address_range(
-        &self,
-        _address: alloy_primitives::Address,
-        _range: std::ops::RangeInclusive<u64>,
-    ) -> Result<Vec<LogIndexEntry>> {
-        Ok(Vec::new())
-    }
-
-    #[allow(dead_code)]
-    pub fn log_index_by_topic0_range(
-        &self,
-        _topic0: alloy_primitives::B256,
-        _range: std::ops::RangeInclusive<u64>,
-    ) -> Result<Vec<LogIndexEntry>> {
-        Ok(Vec::new())
     }
 
     pub fn upsert_peer(&self, mut peer: StoredPeer) -> Result<()> {
@@ -1699,121 +1572,6 @@ fn max_present_in_bitset(state: &ShardState, shard_size: u64) -> Option<u64> {
     max_offset.map(|offset| state.meta.shard_start + offset as u64)
 }
 
-#[allow(dead_code)]
-fn records_to_map(
-    records: Vec<WalRecord>,
-    shard_start: u64,
-    shard_size: u64,
-) -> Result<HashMap<usize, WalBundleRecord>> {
-    let mut map = HashMap::new();
-    for record in records {
-        let wal_bundle: WalBundleRecord = decode_bincode(&record.payload)?;
-        if wal_bundle.number < shard_start {
-            continue;
-        }
-        let offset = (wal_bundle.number - shard_start) as usize;
-        if offset >= shard_size as usize {
-            continue;
-        }
-        map.insert(offset, wal_bundle);
-    }
-    Ok(map)
-}
-
-// Helper for optional WAL CRC validation (currently unused; retained for future verification
-// tooling / debugging).
-#[allow(dead_code)]
-struct WalPayloadCrcReader<'a> {
-    file: &'a mut fs::File,
-    hasher: Hasher,
-    remaining: u64,
-}
-
-impl<'a> WalPayloadCrcReader<'a> {
-    #[allow(dead_code)]
-    fn new(file: &'a mut fs::File, block_number: u64, payload_len: u32) -> Self {
-        let mut hasher = Hasher::new();
-        hasher.update(&block_number.to_le_bytes());
-        hasher.update(&payload_len.to_le_bytes());
-        Self {
-            file,
-            hasher,
-            remaining: payload_len as u64,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn finish(mut self) -> Result<Hasher> {
-        let mut buf = [0u8; 64 * 1024];
-        while self.remaining > 0 {
-            let to_read = (self.remaining as usize).min(buf.len());
-            self.file.read_exact(&mut buf[..to_read])?;
-            self.hasher.update(&buf[..to_read]);
-            self.remaining = self.remaining.saturating_sub(to_read as u64);
-        }
-        Ok(self.hasher)
-    }
-}
-
-impl<'a> Read for WalPayloadCrcReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        let to_read = buf.len().min(self.remaining as usize);
-        let n = self.file.read(&mut buf[..to_read])?;
-        self.hasher.update(&buf[..n]);
-        self.remaining = self.remaining.saturating_sub(n as u64);
-        Ok(n)
-    }
-}
-
-#[allow(dead_code)]
-fn read_wal_bundle_record_at(
-    file: &mut fs::File,
-    record_offset: u64,
-    expected_payload_len: u32,
-) -> Result<WalBundleRecord> {
-    file.seek(SeekFrom::Start(record_offset))?;
-    let mut num_buf = [0u8; 8];
-    file.read_exact(&mut num_buf)?;
-    let block_number = u64::from_le_bytes(num_buf);
-
-    let mut len_buf = [0u8; 4];
-    file.read_exact(&mut len_buf)?;
-    let payload_len = u32::from_le_bytes(len_buf);
-    if payload_len != expected_payload_len {
-        return Err(eyre!(
-            "wal payload length mismatch at offset {} (block {}): expected {}, got {}",
-            record_offset,
-            block_number,
-            expected_payload_len,
-            payload_len
-        ));
-    }
-
-    let mut reader = WalPayloadCrcReader::new(file, block_number, payload_len);
-    let bundle: WalBundleRecord =
-        bincode::deserialize_from(&mut reader).wrap_err("failed to decode WAL bundle record")?;
-    let hasher = reader.finish()?;
-
-    let mut crc_buf = [0u8; 4];
-    file.read_exact(&mut crc_buf)?;
-    let crc_expected = u32::from_le_bytes(crc_buf);
-    let crc_actual = hasher.finalize();
-    if crc_actual != crc_expected {
-        return Err(eyre!(
-            "wal crc mismatch at offset {} (block {}): expected {}, got {}",
-            record_offset,
-            block_number,
-            crc_expected,
-            crc_actual
-        ));
-    }
-
-    Ok(bundle)
-}
-
 fn repair_shard_from_wal(state: &mut ShardState) -> Result<()> {
     let wal_path = wal_path(&state.dir);
     if !wal_path.exists() {
@@ -1873,7 +1631,6 @@ fn default_hash_algo() -> String {
 mod tests {
     use super::*;
     use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
-    use alloy_primitives::{Address, B256, U256};
     use reth_ethereum_primitives::Receipt;
     use reth_primitives_traits::Header;
     use std::path::PathBuf;
@@ -1934,7 +1691,6 @@ mod tests {
             fast_sync_max_inflight: 2,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
-            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,
         }
@@ -1947,28 +1703,14 @@ mod tests {
     }
 
     fn bundle_with_number(number: u64) -> BlockBundle {
-        let hash = B256::from([number as u8; 32]);
         BlockBundle {
             number,
             header: header_with_number(number),
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
-            transactions: StoredTransactions {
-                txs: vec![crate::storage::StoredTransaction {
-                    hash,
-                    from: Some(Address::from([0x0au8; 20])),
-                    to: None,
-                    value: U256::from(number),
-                    nonce: number,
-                    signature: None,
-                    signing_hash: None,
-                }],
-            },
-            withdrawals: StoredWithdrawals { withdrawals: None },
             size: StoredBlockSize { size: 0 },
             receipts: StoredReceipts {
                 receipts: Vec::<Receipt>::new(),
             },
-            logs: StoredLogs { logs: Vec::new() },
         }
     }
 

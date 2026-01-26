@@ -4,6 +4,8 @@ mod p2p;
 mod rpc;
 mod storage;
 mod sync;
+#[cfg(test)]
+mod test_utils;
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -711,65 +713,46 @@ async fn generate_run_report(
         };
 
         let mut snapshot = peer_health.snapshot().await;
+        macro_rules! peer_health_summary {
+            ($dump:expr) => {
+                PeerHealthSummary {
+                    peer_id: format!("{:?}", $dump.peer_id),
+                    is_banned: $dump.is_banned,
+                    ban_remaining_ms: $dump.ban_remaining_ms,
+                    consecutive_failures: $dump.consecutive_failures,
+                    consecutive_partials: $dump.consecutive_partials,
+                    successes: $dump.successes,
+                    failures: $dump.failures,
+                    partials: $dump.partials,
+                    assignments: $dump.assignments,
+                    assigned_blocks: $dump.assigned_blocks,
+                    inflight_blocks: $dump.inflight_blocks,
+                    batch_limit: $dump.batch_limit as u64,
+                    batch_limit_max: $dump.batch_limit_max as u64,
+                    batch_limit_avg: $dump.batch_limit_avg,
+                    last_assigned_age_ms: $dump.last_assigned_age_ms,
+                    last_success_age_ms: $dump.last_success_age_ms,
+                    last_failure_age_ms: $dump.last_failure_age_ms,
+                    last_partial_age_ms: $dump.last_partial_age_ms,
+                    quality_score: $dump.quality_score,
+                    quality_samples: $dump.quality_samples,
+                    last_error: $dump.last_error.clone(),
+                    last_error_age_ms: $dump.last_error_age_ms,
+                    last_error_count: $dump.last_error_count,
+                }
+            };
+        }
         let peer_health_all: Vec<PeerHealthSummary> = snapshot
             .iter()
             .filter(|dump| dump.quality_samples > 0)
-            .map(|dump| PeerHealthSummary {
-                peer_id: format!("{:?}", dump.peer_id),
-                is_banned: dump.is_banned,
-                ban_remaining_ms: dump.ban_remaining_ms,
-                consecutive_failures: dump.consecutive_failures,
-                consecutive_partials: dump.consecutive_partials,
-                successes: dump.successes,
-                failures: dump.failures,
-                partials: dump.partials,
-                assignments: dump.assignments,
-                assigned_blocks: dump.assigned_blocks,
-                inflight_blocks: dump.inflight_blocks,
-                batch_limit: dump.batch_limit as u64,
-                batch_limit_max: dump.batch_limit_max as u64,
-                batch_limit_avg: dump.batch_limit_avg,
-                last_assigned_age_ms: dump.last_assigned_age_ms,
-                last_success_age_ms: dump.last_success_age_ms,
-                last_failure_age_ms: dump.last_failure_age_ms,
-                last_partial_age_ms: dump.last_partial_age_ms,
-                quality_score: dump.quality_score,
-                quality_samples: dump.quality_samples,
-                last_error: dump.last_error.clone(),
-                last_error_age_ms: dump.last_error_age_ms,
-                last_error_count: dump.last_error_count,
-            })
+            .map(|dump| peer_health_summary!(dump))
             .collect();
 
         let top: Vec<PeerHealthSummary> = snapshot
             .iter()
             .filter(|dump| dump.quality_samples > 0)
             .take(10)
-            .map(|dump| PeerHealthSummary {
-                peer_id: format!("{:?}", dump.peer_id),
-                is_banned: dump.is_banned,
-                ban_remaining_ms: dump.ban_remaining_ms,
-                consecutive_failures: dump.consecutive_failures,
-                consecutive_partials: dump.consecutive_partials,
-                successes: dump.successes,
-                failures: dump.failures,
-                partials: dump.partials,
-                assignments: dump.assignments,
-                assigned_blocks: dump.assigned_blocks,
-                inflight_blocks: dump.inflight_blocks,
-                batch_limit: dump.batch_limit as u64,
-                batch_limit_max: dump.batch_limit_max as u64,
-                batch_limit_avg: dump.batch_limit_avg,
-                last_assigned_age_ms: dump.last_assigned_age_ms,
-                last_success_age_ms: dump.last_success_age_ms,
-                last_failure_age_ms: dump.last_failure_age_ms,
-                last_partial_age_ms: dump.last_partial_age_ms,
-                quality_score: dump.quality_score,
-                quality_samples: dump.quality_samples,
-                last_error: dump.last_error.clone(),
-                last_error_age_ms: dump.last_error_age_ms,
-                last_error_count: dump.last_error_count,
-            })
+            .map(|dump| peer_health_summary!(dump))
             .collect();
 
         snapshot.sort_by(|a, b| {
@@ -781,31 +764,7 @@ async fn generate_run_report(
             .iter()
             .filter(|dump| dump.quality_samples > 0)
             .take(10)
-            .map(|dump| PeerHealthSummary {
-                peer_id: format!("{:?}", dump.peer_id),
-                is_banned: dump.is_banned,
-                ban_remaining_ms: dump.ban_remaining_ms,
-                consecutive_failures: dump.consecutive_failures,
-                consecutive_partials: dump.consecutive_partials,
-                successes: dump.successes,
-                failures: dump.failures,
-                partials: dump.partials,
-                assignments: dump.assignments,
-                assigned_blocks: dump.assigned_blocks,
-                inflight_blocks: dump.inflight_blocks,
-                batch_limit: dump.batch_limit as u64,
-                batch_limit_max: dump.batch_limit_max as u64,
-                batch_limit_avg: dump.batch_limit_avg,
-                last_assigned_age_ms: dump.last_assigned_age_ms,
-                last_success_age_ms: dump.last_success_age_ms,
-                last_failure_age_ms: dump.last_failure_age_ms,
-                last_partial_age_ms: dump.last_partial_age_ms,
-                quality_score: dump.quality_score,
-                quality_samples: dump.quality_samples,
-                last_error: dump.last_error.clone(),
-                last_error_age_ms: dump.last_error_age_ms,
-                last_error_count: dump.last_error_count,
-            })
+            .map(|dump| peer_health_summary!(dump))
             .collect();
 
         let report = RunReport {
@@ -838,8 +797,11 @@ async fn main() -> Result<()> {
     let mut config = NodeConfig::from_args();
     let argv: Vec<String> = env::args().collect();
     // Check if any log artifacts are enabled
-    let log_artifacts_enabled =
-        config.log_trace || config.log_events || config.log_json || config.log_report || config.log_resources;
+    let log_artifacts_enabled = config.log_trace
+        || config.log_events
+        || config.log_json
+        || config.log_report
+        || config.log_resources;
     let chunk_max = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -1025,10 +987,7 @@ async fn main() -> Result<()> {
     }
     let events = if config.log_events {
         let run_ctx = run_ctx.expect("run context required for log_events");
-        let tmp_path = run_ctx
-            .events_tmp_path
-            .clone()
-            .expect("events tmp path");
+        let tmp_path = run_ctx.events_tmp_path.clone().expect("events tmp path");
         Some(Arc::new(BenchEventLogger::new(tmp_path)?))
     } else {
         None
@@ -1084,176 +1043,315 @@ async fn main() -> Result<()> {
     let mut tail_stop_tx = None;
     let mut tail_config = None;
     if follow_after {
-            let (head_stop, head_stop_rx) = tokio::sync::watch::channel(false);
-            let (tail_stop, tail_stop_rx) = tokio::sync::watch::channel(false);
-            head_stop_tx = Some(head_stop.clone());
-            tail_stop_tx = Some(tail_stop.clone());
+        let (head_stop, head_stop_rx) = tokio::sync::watch::channel(false);
+        let (tail_stop, tail_stop_rx) = tokio::sync::watch::channel(false);
+        head_stop_tx = Some(head_stop.clone());
+        tail_stop_tx = Some(tail_stop.clone());
 
-            let (head_seen_tx, head_seen_rx) = tokio::sync::watch::channel(head_at_startup);
-            let pool = Arc::clone(&session.pool);
-            let storage = Arc::clone(&storage);
-            let stats = progress_stats.clone();
-            let rollback_window = config.rollback_window;
-            let mut stop_rx_head = head_stop_rx.clone();
-            head_tracker_handle = Some(tokio::spawn(async move {
-                let mut last_head = head_at_startup;
-                loop {
-                    if *stop_rx_head.borrow() {
-                        break;
+        let (head_seen_tx, head_seen_rx) = tokio::sync::watch::channel(head_at_startup);
+        let pool = Arc::clone(&session.pool);
+        let storage = Arc::clone(&storage);
+        let stats = progress_stats.clone();
+        let rollback_window = config.rollback_window;
+        let mut stop_rx_head = head_stop_rx.clone();
+        head_tracker_handle = Some(tokio::spawn(async move {
+            let mut last_head = head_at_startup;
+            loop {
+                if *stop_rx_head.borrow() {
+                    break;
+                }
+                let snapshot = pool.snapshot();
+                let best_head = snapshot
+                    .iter()
+                    .map(|peer| peer.head_number)
+                    .max()
+                    .unwrap_or(last_head);
+                if best_head > last_head {
+                    last_head = best_head;
+                    let _ = head_seen_tx.send(best_head);
+                    if let Err(err) = storage.set_head_seen(best_head) {
+                        tracing::debug!(error = %err, "head tracker: failed to persist head_seen");
                     }
-                    let snapshot = pool.snapshot();
-                    let best_head = snapshot
-                        .iter()
-                        .map(|peer| peer.head_number)
-                        .max()
-                        .unwrap_or(last_head);
-                    if best_head > last_head {
-                        last_head = best_head;
-                        let _ = head_seen_tx.send(best_head);
-                        if let Err(err) = storage.set_head_seen(best_head) {
-                            tracing::debug!(error = %err, "head tracker: failed to persist head_seen");
-                        }
-                        if let Some(stats) = stats.as_ref() {
-                            stats.set_head_seen(best_head);
-                        }
-                    }
-                    tokio::select! {
-                        _ = stop_rx_head.changed() => {
-                            if *stop_rx_head.borrow() {
-                                break;
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    if let Some(stats) = stats.as_ref() {
+                        stats.set_head_seen(best_head);
                     }
                 }
-            }));
-
-            let (tail_tx, tail_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut stop_rx_tail = tail_stop_rx.clone();
-            let mut head_seen_rx_tail = head_seen_rx.clone();
-            let mut next_to_schedule = range.end().saturating_add(1);
-            tail_feeder_handle = Some(tokio::spawn(async move {
-                loop {
-                    if *stop_rx_tail.borrow() {
-                        break;
-                    }
-                    let head_seen = *head_seen_rx_tail.borrow();
-                    let safe_head = head_seen.saturating_sub(rollback_window);
-                    if safe_head >= next_to_schedule {
-                        let start = next_to_schedule;
-                        let end = safe_head;
-                        let _ = tail_tx.send(start..=end);
-                        next_to_schedule = end.saturating_add(1);
-                    }
-                    tokio::select! {
-                        _ = head_seen_rx_tail.changed() => {}
-                        _ = stop_rx_tail.changed() => {
-                            if *stop_rx_tail.borrow() {
-                                break;
-                            }
+                tokio::select! {
+                    _ = stop_rx_head.changed() => {
+                        if *stop_rx_head.borrow() {
+                            break;
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-            }));
+            }
+        }));
 
-            tail_config = Some(sync::historical::TailIngestConfig {
-                ranges_rx: tail_rx,
-                head_seen_rx,
-                stop_tx: tail_stop,
-                stop_when_caught_up: true,
-                head_offset: config.rollback_window,
-            });
+        let (tail_tx, tail_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stop_rx_tail = tail_stop_rx.clone();
+        let mut head_seen_rx_tail = head_seen_rx.clone();
+        let mut next_to_schedule = range.end().saturating_add(1);
+        tail_feeder_handle = Some(tokio::spawn(async move {
+            loop {
+                if *stop_rx_tail.borrow() {
+                    break;
+                }
+                let head_seen = *head_seen_rx_tail.borrow();
+                let safe_head = head_seen.saturating_sub(rollback_window);
+                if safe_head >= next_to_schedule {
+                    let start = next_to_schedule;
+                    let end = safe_head;
+                    let _ = tail_tx.send(start..=end);
+                    next_to_schedule = end.saturating_add(1);
+                }
+                tokio::select! {
+                    _ = head_seen_rx_tail.changed() => {}
+                    _ = stop_rx_tail.changed() => {
+                        if *stop_rx_tail.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
+        }));
+
+        tail_config = Some(sync::historical::TailIngestConfig {
+            ranges_rx: tail_rx,
+            head_seen_rx,
+            stop_tx: tail_stop,
+            stop_when_caught_up: true,
+            head_offset: config.rollback_window,
+        });
+    }
+
+    let bench = Arc::new(IngestBenchStats::new(total_len));
+    let progress_ref = progress
+        .as_ref()
+        .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let head_stop_tx_for_shutdown = head_stop_tx.clone();
+    let tail_stop_tx_for_shutdown = tail_stop_tx.clone();
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = Arc::clone(&shutdown_requested);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            warn!("shutdown signal received; stopping ingest after draining");
+            let _ = stop_tx.send(true);
+            if let Some(stop_tx) = head_stop_tx_for_shutdown {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(stop_tx) = tail_stop_tx_for_shutdown {
+                let _ = stop_tx.send(true);
+            }
+            if tokio::signal::ctrl_c().await.is_ok() {
+                warn!("second shutdown signal received; forcing exit");
+                process::exit(130);
+            }
+        }
+    });
+    let outcome = sync::historical::run_ingest_pipeline(
+        Arc::clone(&storage),
+        Arc::clone(&session.pool),
+        &config,
+        range.clone(),
+        blocks,
+        head_at_startup,
+        progress_ref,
+        progress_stats.clone(),
+        Some(Arc::clone(&bench)),
+        None,
+        None,
+        Arc::clone(&peer_health_local),
+        events.clone(),
+        Some(stop_rx),
+        tail_config,
+    )
+    .await?;
+
+    let finalize_stats = match &outcome {
+        sync::historical::IngestPipelineOutcome::RangeApplied { finalize, .. } => Some(*finalize),
+        _ => None,
+    };
+    if follow_after {
+        let last_indexed = storage.last_indexed_block().ok().flatten();
+        let head_seen = storage.head_seen().ok().flatten();
+        let safe_head = head_seen.map(|head| head.saturating_sub(config.rollback_window));
+        let dirty = storage.dirty_shards().unwrap_or_default();
+        let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
+        let total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round();
+        tracing::info!(
+            follow_after,
+            shutdown_requested = shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+            switch_tip = ?last_indexed,
+            head_seen = ?head_seen,
+            safe_head = ?safe_head,
+            dirty_shards = dirty.len(),
+            total_wal_mib,
+            drain_workers_ms = finalize_stats.map(|s| s.drain_workers_ms),
+            db_flush_ms = finalize_stats.map(|s| s.db_flush_ms),
+            compactions_wait_ms = finalize_stats.map(|s| s.compactions_wait_ms),
+            compact_all_dirty_ms = finalize_stats.map(|s| s.compact_all_dirty_ms),
+            seal_completed_ms = finalize_stats.map(|s| s.seal_completed_ms),
+            total_finalize_ms = finalize_stats.map(|s| s.total_ms),
+            "fast-sync -> follow boundary"
+        );
+    }
+
+    if follow_after && !shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(stop_tx) = tail_stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(handle) = tail_feeder_handle.take() {
+            let _ = handle.await;
         }
 
-        let bench = Arc::new(IngestBenchStats::new(total_len));
+        info!("fast-sync complete; switching to follow mode");
+
+        // Generate report at fast-sync completion (saved if --log-report, printed if -v).
+        // Log files continue into follow mode - they'll be finalized on exit.
+        let logs_total = match &outcome {
+            sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+            sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+        };
+        let storage_stats = match storage.disk_usage() {
+            Ok(stats) => Some(stats),
+            Err(err) => {
+                warn!(error = %err, "failed to collect storage disk stats");
+                None
+            }
+        };
+        let summary = bench.summary(
+            *range.start(),
+            *range.end(),
+            head_at_startup,
+            config.rollback_window > 0,
+            session.pool.len() as u64,
+            logs_total,
+            storage_stats,
+        );
+        let report_base_name = if let Some(run_ctx) = run_context.as_ref() {
+            match generate_run_report(
+                run_ctx,
+                &config,
+                &range,
+                head_at_startup,
+                &peer_health_local,
+                &summary,
+            )
+            .await
+            {
+                Ok(name) => Some(name),
+                Err(err) => {
+                    warn!(error = %err, "failed to generate run report");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let progress_ref = progress
             .as_ref()
             .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let head_stop_tx_for_shutdown = head_stop_tx.clone();
-        let tail_stop_tx_for_shutdown = tail_stop_tx.clone();
-        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let shutdown_flag = Arc::clone(&shutdown_requested);
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                warn!("shutdown signal received; stopping ingest after draining");
-                let _ = stop_tx.send(true);
-                if let Some(stop_tx) = head_stop_tx_for_shutdown {
-                    let _ = stop_tx.send(true);
-                }
-                if let Some(stop_tx) = tail_stop_tx_for_shutdown {
-                    let _ = stop_tx.send(true);
-                }
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    warn!("second shutdown signal received; forcing exit");
-                    process::exit(130);
-                }
-            }
-        });
-        let outcome = sync::historical::run_ingest_pipeline(
+        let (synced_tx, synced_rx) = tokio::sync::oneshot::channel();
+        let follow_future = sync::historical::run_follow_loop(
             Arc::clone(&storage),
             Arc::clone(&session.pool),
             &config,
-            range.clone(),
-            blocks,
-            head_at_startup,
             progress_ref,
             progress_stats.clone(),
-            Some(Arc::clone(&bench)),
-            None,
-            None,
             Arc::clone(&peer_health_local),
-            events.clone(),
-            Some(stop_rx),
-            tail_config,
-        )
-        .await?;
+            Some(synced_tx),
+        );
+        tokio::pin!(follow_future);
 
-        let finalize_stats = match &outcome {
-            sync::historical::IngestPipelineOutcome::RangeApplied { finalize, .. } => {
-                Some(*finalize)
+        let mut rpc_handle = None;
+        let mut synced_rx = Some(synced_rx);
+        loop {
+            tokio::select! {
+                res = &mut follow_future => {
+                    if let Err(err) = res {
+                        warn!(error = %err, "follow loop exited");
+                    }
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    warn!("shutdown signal received");
+                    break;
+                }
+                _ = async {
+                    if let Some(rx) = synced_rx.take() {
+                        let _ = rx.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if rpc_handle.is_none() {
+                        let handle = rpc::start(
+                            config.rpc_bind,
+                            rpc::RpcConfig::from(&config),
+                            Arc::clone(&storage),
+                        )
+                        .await?;
+                        info!(rpc_bind = %config.rpc_bind, "rpc server started");
+                        rpc_handle = Some(handle);
+                    }
+                }
             }
-            _ => None,
-        };
-        if follow_after {
-            let last_indexed = storage.last_indexed_block().ok().flatten();
-            let head_seen = storage.head_seen().ok().flatten();
-            let safe_head = head_seen.map(|head| head.saturating_sub(config.rollback_window));
-            let dirty = storage.dirty_shards().unwrap_or_default();
-            let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
-            let total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round();
-            tracing::info!(
-                follow_after,
-                shutdown_requested = shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
-                switch_tip = ?last_indexed,
-                head_seen = ?head_seen,
-                safe_head = ?safe_head,
-                dirty_shards = dirty.len(),
-                total_wal_mib,
-                drain_workers_ms = finalize_stats.map(|s| s.drain_workers_ms),
-                db_flush_ms = finalize_stats.map(|s| s.db_flush_ms),
-                compactions_wait_ms = finalize_stats.map(|s| s.compactions_wait_ms),
-                compact_all_dirty_ms = finalize_stats.map(|s| s.compact_all_dirty_ms),
-                seal_completed_ms = finalize_stats.map(|s| s.seal_completed_ms),
-                total_finalize_ms = finalize_stats.map(|s| s.total_ms),
-                "fast-sync -> follow boundary"
-            );
         }
 
-        if follow_after && !shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(stop_tx) = tail_stop_tx.take() {
-                let _ = stop_tx.send(true);
+        if let Some(tracker) = progress.as_ref() {
+            tracker.finish();
+        }
+        if let Some(handle) = rpc_handle.take() {
+            if let Err(err) = handle.stop() {
+                warn!(error = %err, "failed to stop rpc server");
             }
-            if let Some(handle) = tail_feeder_handle.take() {
-                let _ = handle.await;
+            handle.stopped().await;
+        }
+        if let Some(stop_tx) = head_stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(handle) = head_tracker_handle.take() {
+            let _ = handle.await;
+        }
+        // Finalize log files on exit from follow mode (report already generated)
+        if let Some(run_ctx) = run_context.as_ref() {
+            if let Some(base_name) = report_base_name.as_ref() {
+                finalize_log_files(
+                    run_ctx,
+                    base_name,
+                    events.as_deref(),
+                    tracing_guards.log_writer.as_deref(),
+                    tracing_guards.resources_writer.as_deref(),
+                    &mut tracing_guards.chrome_guard,
+                );
             }
+        }
+        flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
+        return Ok(());
+    }
 
-            info!("fast-sync complete; switching to follow mode");
-
-            // Generate report at fast-sync completion (saved if --log-report, printed if -v).
-            // Log files continue into follow mode - they'll be finalized on exit.
+    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(stop_tx) = tail_stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(handle) = tail_feeder_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(stop_tx) = head_stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(handle) = head_tracker_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(tracker) = progress.as_ref() {
+            tracker.finish();
+        }
+        // Generate report and finalize logs on Ctrl-C during fast-sync
+        if let Some(run_ctx) = run_context.as_ref() {
             let logs_total = match &outcome {
                 sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
                 sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
@@ -1274,201 +1372,60 @@ async fn main() -> Result<()> {
                 logs_total,
                 storage_stats,
             );
-            let report_base_name = if let Some(run_ctx) = run_context.as_ref() {
-                match generate_run_report(
-                    run_ctx,
-                    &config,
-                    &range,
-                    head_at_startup,
-                    &peer_health_local,
-                    &summary,
-                )
-                .await
-                {
-                    Ok(name) => Some(name),
-                    Err(err) => {
-                        warn!(error = %err, "failed to generate run report");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let progress_ref = progress
-                .as_ref()
-                .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-            let (synced_tx, synced_rx) = tokio::sync::oneshot::channel();
-            let follow_future = sync::historical::run_follow_loop(
-                Arc::clone(&storage),
-                Arc::clone(&session.pool),
+            let base_name = match generate_run_report(
+                run_ctx,
                 &config,
-                progress_ref,
-                progress_stats.clone(),
-                Arc::clone(&peer_health_local),
-                Some(synced_tx),
+                &range,
+                head_at_startup,
+                &peer_health_local,
+                &summary,
+            )
+            .await
+            {
+                Ok(name) => name,
+                Err(err) => {
+                    warn!(error = %err, "failed to generate run report");
+                    // Fallback base name
+                    run_ctx.timestamp_utc.clone()
+                }
+            };
+            finalize_log_files(
+                run_ctx,
+                &base_name,
+                events.as_deref(),
+                tracing_guards.log_writer.as_deref(),
+                tracing_guards.resources_writer.as_deref(),
+                &mut tracing_guards.chrome_guard,
             );
-            tokio::pin!(follow_future);
-
-            let mut rpc_handle = None;
-            let mut synced_rx = Some(synced_rx);
-            loop {
-                tokio::select! {
-                    res = &mut follow_future => {
-                        if let Err(err) = res {
-                            warn!(error = %err, "follow loop exited");
-                        }
-                        break;
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        warn!("shutdown signal received");
-                        break;
-                    }
-                    _ = async {
-                        if let Some(rx) = synced_rx.take() {
-                            let _ = rx.await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
-                        if rpc_handle.is_none() {
-                            let handle = rpc::start(
-                                config.rpc_bind,
-                                rpc::RpcConfig::from(&config),
-                                Arc::clone(&storage),
-                            )
-                            .await?;
-                            info!(rpc_bind = %config.rpc_bind, "rpc server started");
-                            rpc_handle = Some(handle);
-                        }
-                    }
-                }
-            }
-
-            if let Some(tracker) = progress.as_ref() {
-                tracker.finish();
-            }
-            if let Some(handle) = rpc_handle.take() {
-                if let Err(err) = handle.stop() {
-                    warn!(error = %err, "failed to stop rpc server");
-                }
-                handle.stopped().await;
-            }
-            if let Some(stop_tx) = head_stop_tx.take() {
-                let _ = stop_tx.send(true);
-            }
-            if let Some(handle) = head_tracker_handle.take() {
-                let _ = handle.await;
-            }
-            // Finalize log files on exit from follow mode (report already generated)
-            if let Some(run_ctx) = run_context.as_ref() {
-                if let Some(base_name) = report_base_name.as_ref() {
-                    finalize_log_files(
-                        run_ctx,
-                        base_name,
-                        events.as_deref(),
-                        tracing_guards.log_writer.as_deref(),
-                        tracing_guards.resources_writer.as_deref(),
-                        &mut tracing_guards.chrome_guard,
-                    );
-                }
-            }
-            flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
-            return Ok(());
         }
+        flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
+        return Ok(());
+    }
 
-        if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(stop_tx) = tail_stop_tx.take() {
-                let _ = stop_tx.send(true);
-            }
-            if let Some(handle) = tail_feeder_handle.take() {
-                let _ = handle.await;
-            }
-            if let Some(stop_tx) = head_stop_tx.take() {
-                let _ = stop_tx.send(true);
-            }
-            if let Some(handle) = head_tracker_handle.take() {
-                let _ = handle.await;
-            }
-            if let Some(tracker) = progress.as_ref() {
-                tracker.finish();
-            }
-            // Generate report and finalize logs on Ctrl-C during fast-sync
-            if let Some(run_ctx) = run_context.as_ref() {
-                let logs_total = match &outcome {
-                    sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
-                    sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
-                };
-                let storage_stats = match storage.disk_usage() {
-                    Ok(stats) => Some(stats),
-                    Err(err) => {
-                        warn!(error = %err, "failed to collect storage disk stats");
-                        None
-                    }
-                };
-                let summary = bench.summary(
-                    *range.start(),
-                    *range.end(),
-                    head_at_startup,
-                    config.rollback_window > 0,
-                    session.pool.len() as u64,
-                    logs_total,
-                    storage_stats,
-                );
-                let base_name = match generate_run_report(
-                    run_ctx,
-                    &config,
-                    &range,
-                    head_at_startup,
-                    &peer_health_local,
-                    &summary,
-                )
-                .await
-                {
-                    Ok(name) => name,
-                    Err(err) => {
-                        warn!(error = %err, "failed to generate run report");
-                        // Fallback base name
-                        run_ctx.timestamp_utc.clone()
-                    }
-                };
-                finalize_log_files(
-                    run_ctx,
-                    &base_name,
-                    events.as_deref(),
-                    tracing_guards.log_writer.as_deref(),
-                    tracing_guards.resources_writer.as_deref(),
-                    &mut tracing_guards.chrome_guard,
-                );
-            }
-            flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
-            return Ok(());
+    if let Some(tracker) = progress.as_ref() {
+        tracker.finish();
+    }
+
+    let logs_total = match outcome {
+        sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
+        sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+    };
+    let storage_stats = match storage.disk_usage() {
+        Ok(stats) => Some(stats),
+        Err(err) => {
+            warn!(error = %err, "failed to collect storage disk stats");
+            None
         }
-
-        if let Some(tracker) = progress.as_ref() {
-            tracker.finish();
-        }
-
-        let logs_total = match outcome {
-            sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
-            sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
-        };
-        let storage_stats = match storage.disk_usage() {
-            Ok(stats) => Some(stats),
-            Err(err) => {
-                warn!(error = %err, "failed to collect storage disk stats");
-                None
-            }
-        };
-        let summary = bench.summary(
-            *range.start(),
-            *range.end(),
-            head_at_startup,
-            config.rollback_window > 0,
-            session.pool.len() as u64,
-            logs_total,
-            storage_stats,
-        );
+    };
+    let summary = bench.summary(
+        *range.start(),
+        *range.end(),
+        head_at_startup,
+        config.rollback_window > 0,
+        session.pool.len() as u64,
+        logs_total,
+        storage_stats,
+    );
     // Generate report (if --log-report) and finalize log files.
     if let Some(run_ctx) = run_ctx {
         let base_name = match generate_run_report(
@@ -1575,13 +1532,14 @@ fn init_tracing(
     });
 
     // Resources log file writer (separate file for resource metrics).
-    let resources_writer = resources_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
-        Ok(writer) => Some(Arc::new(writer)),
-        Err(err) => {
-            warn!(error = %err, "failed to initialize resources log writer");
-            None
-        }
-    });
+    let resources_writer =
+        resources_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+            Ok(writer) => Some(Arc::new(writer)),
+            Err(err) => {
+                warn!(error = %err, "failed to initialize resources log writer");
+                None
+            }
+        });
 
     // Determine JSON log filter mode: exclude resources if we have a separate resources file.
     let json_filter_mode = if resources_writer.is_some() {
@@ -1599,12 +1557,14 @@ fn init_tracing(
             .include_args(config.log_trace_include_args)
             .include_locations(config.log_trace_include_locations)
             .build();
-        let log_layer = log_writer
-            .as_ref()
-            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode).with_filter(json_log_filter.clone()));
-        let resources_layer = resources_writer
-            .as_ref()
-            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly).with_filter(json_log_filter));
+        let log_layer = log_writer.as_ref().map(|writer| {
+            JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode)
+                .with_filter(json_log_filter.clone())
+        });
+        let resources_layer = resources_writer.as_ref().map(|writer| {
+            JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly)
+                .with_filter(json_log_filter)
+        });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(log_layer)
@@ -1612,12 +1572,14 @@ fn init_tracing(
         registry.with(chrome_layer.with_filter(trace_filter)).init();
         chrome_guard = Some(guard);
     } else {
-        let log_layer = log_writer
-            .as_ref()
-            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode).with_filter(json_log_filter.clone()));
-        let resources_layer = resources_writer
-            .as_ref()
-            .map(|writer| JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly).with_filter(json_log_filter));
+        let log_layer = log_writer.as_ref().map(|writer| {
+            JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode)
+                .with_filter(json_log_filter.clone())
+        });
+        let resources_layer = resources_writer.as_ref().map(|writer| {
+            JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly)
+                .with_filter(json_log_filter)
+        });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(log_layer)
@@ -2173,7 +2135,7 @@ fn spawn_usr1_state_logger(
     });
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn total_blocks_to_head(start_from: u64, head: u64) -> u64 {
     if head >= start_from {
         head.saturating_sub(start_from).saturating_add(1)

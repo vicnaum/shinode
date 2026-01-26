@@ -1,13 +1,9 @@
 //! Processing stage for historical sync.
 
-use crate::storage::{
-    BlockBundle, StoredBlockSize, StoredLogs, StoredReceipts, StoredTransaction,
-    StoredTransactions, StoredTxHashes, StoredWithdrawals,
-};
+use crate::storage::{BlockBundle, StoredBlockSize, StoredReceipts, StoredTxHashes};
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
 use crate::sync::BlockPayload;
-use alloy_consensus::{SignableTransaction, Transaction as _};
-use alloy_primitives::{Keccak256, TxKind, B256};
+use alloy_primitives::{Keccak256, B256};
 use bytes::buf::UninitSlice;
 use eyre::{eyre, Result};
 use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
@@ -71,18 +67,6 @@ fn tx_hash_fast(buf: &mut KeccakBuf, tx: &TransactionSigned) -> B256 {
     buf.finalize_reset()
 }
 
-fn signing_hash_fast(buf: &mut KeccakBuf, tx: &TransactionSigned) -> B256 {
-    buf.reset();
-    match tx {
-        TransactionSigned::Legacy(signed) => signed.tx().encode_for_signing(buf),
-        TransactionSigned::Eip2930(signed) => signed.tx().encode_for_signing(buf),
-        TransactionSigned::Eip1559(signed) => signed.tx().encode_for_signing(buf),
-        TransactionSigned::Eip4844(signed) => signed.tx().encode_for_signing(buf),
-        TransactionSigned::Eip7702(signed) => signed.tx().encode_for_signing(buf),
-    }
-    buf.finalize_reset()
-}
-
 /// Process a full payload into a storage bundle (ingest mode).
 pub fn process_ingest(
     payload: BlockPayload,
@@ -117,31 +101,8 @@ pub fn process_ingest(
         ));
     }
 
-    let txs_start = Instant::now();
-    let mut signing_hasher = KeccakBuf::new();
-    let mut stored_transactions = Vec::with_capacity(body.transactions.len());
-    for (tx, tx_hash) in body.transactions.iter().zip(tx_hashes.iter()) {
-        let value = tx.value();
-        let signature = tx.signature().clone();
-        let signing_hash = signing_hash_fast(&mut signing_hasher, tx);
-        let to = match tx.kind() {
-            TxKind::Call(address) => Some(address),
-            TxKind::Create => None,
-        };
-        stored_transactions.push(StoredTransaction {
-            hash: *tx_hash,
-            from: None,
-            to,
-            value,
-            nonce: tx.nonce(),
-            signature: Some(signature),
-            signing_hash: Some(signing_hash),
-        });
-    }
-    let transactions_us = txs_start.elapsed().as_micros() as u64;
-
-    let stored_withdrawals = StoredWithdrawals { withdrawals: None };
     let withdrawals_us = 0;
+    let transactions_us = 0;
 
     let block_size_start = Instant::now();
     let block_size = block_rlp_size(&header, &body);
@@ -160,13 +121,8 @@ pub fn process_ingest(
         number: header.number,
         header: stored_header,
         tx_hashes: StoredTxHashes { hashes: tx_hashes },
-        transactions: StoredTransactions {
-            txs: stored_transactions,
-        },
-        withdrawals: stored_withdrawals,
         size: StoredBlockSize { size: block_size },
         receipts: StoredReceipts { receipts },
-        logs: StoredLogs { logs: Vec::new() },
     };
 
     if let Some(bench) = bench {

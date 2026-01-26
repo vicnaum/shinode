@@ -36,19 +36,7 @@ async fn flush_fast_sync_buffer(
         None
     };
     if let Some(events) = events.as_ref() {
-        let bytes_total = bytes
-            .as_ref()
-            .map(|totals| {
-                totals
-                    .headers
-                    .saturating_add(totals.tx_hashes)
-                    .saturating_add(totals.transactions)
-                    .saturating_add(totals.withdrawals)
-                    .saturating_add(totals.sizes)
-                    .saturating_add(totals.receipts)
-                    .saturating_add(totals.logs)
-            })
-            .unwrap_or(0);
+        let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
         events.record(BenchEvent::DbFlushStart {
             blocks: buffer.len() as u64,
             bytes_total,
@@ -65,19 +53,7 @@ async fn flush_fast_sync_buffer(
     }
     if let Some(events) = events.as_ref() {
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let bytes_total = bytes
-            .as_ref()
-            .map(|totals| {
-                totals
-                    .headers
-                    .saturating_add(totals.tx_hashes)
-                    .saturating_add(totals.transactions)
-                    .saturating_add(totals.withdrawals)
-                    .saturating_add(totals.sizes)
-                    .saturating_add(totals.receipts)
-                    .saturating_add(totals.logs)
-            })
-            .unwrap_or(0);
+        let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
         events.record(BenchEvent::DbFlushEnd {
             blocks: buffer.len() as u64,
             bytes_total,
@@ -150,8 +126,6 @@ impl DbWriteConfig {
 
 pub enum DbWriterMessage {
     Block(BlockBundle),
-    #[allow(dead_code)]
-    Flush,
     Finalize,
 }
 
@@ -209,19 +183,7 @@ pub async fn run_db_writer(
             None
         };
         if let Some(events) = events.as_ref() {
-            let bytes_total = bytes
-                .as_ref()
-                .map(|totals| {
-                    totals
-                        .headers
-                        .saturating_add(totals.tx_hashes)
-                        .saturating_add(totals.transactions)
-                        .saturating_add(totals.withdrawals)
-                        .saturating_add(totals.sizes)
-                        .saturating_add(totals.receipts)
-                        .saturating_add(totals.logs)
-                })
-                .unwrap_or(0);
+            let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
             events.record(BenchEvent::DbFlushStart {
                 blocks: 1,
                 bytes_total,
@@ -237,19 +199,7 @@ pub async fn run_db_writer(
         }
         if let Some(events) = events.as_ref() {
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            let bytes_total = bytes
-                .as_ref()
-                .map(|totals| {
-                    totals
-                        .headers
-                        .saturating_add(totals.tx_hashes)
-                        .saturating_add(totals.transactions)
-                        .saturating_add(totals.withdrawals)
-                        .saturating_add(totals.sizes)
-                        .saturating_add(totals.receipts)
-                        .saturating_add(totals.logs)
-                })
-                .unwrap_or(0);
+            let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
             events.record(BenchEvent::DbFlushEnd {
                 blocks: 1,
                 bytes_total,
@@ -285,26 +235,6 @@ pub async fn run_db_writer(
                                 continue;
                             }
                             follow_buffer.insert(number, block);
-                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
-                                write_follow_bundle(bundle)?;
-                                follow_expected = follow_expected.saturating_add(1);
-                            }
-                        }
-                    }
-                    Some(DbWriterMessage::Flush) => {
-                        if mode == DbWriteMode::FastSync {
-                            flush_fast_sync_buffer(
-                                &storage,
-                                &mut buffer,
-                                bench.as_ref(),
-                                events.as_ref(),
-                                remaining_per_shard.as_ref(),
-                                progress_stats.as_ref(),
-                                &mut compactions,
-                                &semaphore,
-                            )
-                            .await?;
-                        } else {
                             while let Some(bundle) = follow_buffer.remove(&follow_expected) {
                                 write_follow_bundle(bundle)?;
                                 follow_expected = follow_expected.saturating_add(1);
@@ -488,9 +418,6 @@ fn db_bytes_for_bundles(bundles: &[BlockBundle]) -> Result<DbWriteByteTotals> {
         totals.tx_hashes = totals
             .tx_hashes
             .saturating_add(encoded_len(&bundle.tx_hashes)?);
-        totals.transactions = totals
-            .transactions
-            .saturating_add(encoded_len(&bundle.transactions)?);
         totals.sizes = totals.sizes.saturating_add(8);
         totals.receipts = totals
             .receipts
@@ -502,76 +429,9 @@ fn db_bytes_for_bundles(bundles: &[BlockBundle]) -> Result<DbWriteByteTotals> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
-    use crate::storage::{
-        StoredBlockSize, StoredLogs, StoredReceipts, StoredTransaction, StoredTransactions,
-        StoredTxHashes, StoredWithdrawals,
-    };
-    use alloy_primitives::{Address, B256, U256};
+    use crate::storage::{StoredBlockSize, StoredReceipts, StoredTxHashes};
+    use crate::test_utils::{base_config, temp_dir};
     use reth_ethereum_primitives::Receipt;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> std::path::PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time moves forward")
-            .as_nanos();
-        let suffix = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "stateless-history-node-db-writer-test-{now}-{}-{suffix}",
-            std::process::id()
-        ));
-        path
-    }
-
-    fn base_config(data_dir: std::path::PathBuf) -> NodeConfig {
-        NodeConfig {
-            chain_id: 1,
-            data_dir,
-            peer_cache_dir: None,
-            rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
-            start_block: 0,
-            shard_size: crate::cli::DEFAULT_SHARD_SIZE,
-            end_block: None,
-            rollback_window: 64,
-            retention_mode: RetentionMode::Full,
-            head_source: HeadSource::P2p,
-            reorg_strategy: ReorgStrategy::Delete,
-            verbosity: 0,
-            run_name: None,
-            log: false,
-            log_output_dir: PathBuf::from(crate::cli::DEFAULT_LOG_OUTPUT_DIR),
-            log_trace: false,
-            log_trace_filter: crate::cli::DEFAULT_LOG_TRACE_FILTER.to_string(),
-            log_trace_include_args: false,
-            log_trace_include_locations: false,
-            log_events: false,
-            log_json: false,
-            log_json_filter: crate::cli::DEFAULT_LOG_JSON_FILTER.to_string(),
-            log_report: false,
-            log_resources: false,
-            min_peers: 1,
-            command: None,
-            rpc_max_request_body_bytes: 0,
-            rpc_max_response_body_bytes: 0,
-            rpc_max_connections: 0,
-            rpc_max_batch_requests: 0,
-            rpc_max_blocks_per_filter: 0,
-            rpc_max_logs_per_response: 0,
-            fast_sync_chunk_size: 16,
-            fast_sync_chunk_max: None,
-            fast_sync_max_inflight: 2,
-            fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
-            fast_sync_max_buffered_blocks: 64,
-            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
-            db_write_batch_blocks: 1,
-            db_write_flush_interval_ms: None,
-        }
-    }
 
     fn header_with_number(number: u64) -> reth_primitives_traits::Header {
         let mut header = reth_primitives_traits::Header::default();
@@ -580,34 +440,20 @@ mod tests {
     }
 
     fn bundle_with_number(number: u64) -> BlockBundle {
-        let hash = B256::from([number as u8; 32]);
         BlockBundle {
             number,
             header: header_with_number(number),
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
-            transactions: StoredTransactions {
-                txs: vec![StoredTransaction {
-                    hash,
-                    from: Some(Address::from([0x0au8; 20])),
-                    to: None,
-                    value: U256::from(number),
-                    nonce: number,
-                    signature: None,
-                    signing_hash: None,
-                }],
-            },
-            withdrawals: StoredWithdrawals { withdrawals: None },
             size: StoredBlockSize { size: 0 },
             receipts: StoredReceipts {
                 receipts: Vec::<Receipt>::new(),
             },
-            logs: StoredLogs { logs: Vec::new() },
         }
     }
 
     #[tokio::test]
     async fn db_writer_writes_out_of_order_blocks() {
-        let dir = temp_dir();
+        let dir = temp_dir("db-writer");
         let config = base_config(dir.clone());
         let storage = Arc::new(Storage::open(&config).expect("open storage"));
 

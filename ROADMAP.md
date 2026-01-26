@@ -150,6 +150,9 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Follow mode: long-lived ingest epoch with tail scheduling + in-order DB appends + reorg rollback (within `--rollback-window`).
 - [ ] Deep reorg recovery: optional auto-rebootstrap (policy B)
 - [ ] Tests: sync loop + reorg handling + retry/escalation
+  - [ ] Implement currently-ignored integration tests in `node/tests/test_strategy.rs`
+    - [ ] `reorg_rollback_integration` (reorg rollback integration after sync/storage)
+    - [ ] `rpc_contract_probe` (RPC contract probe once RPC surface grows)
 - [ ] Metrics export (Prometheus/OTel)
 - [ ] Optional correctness hardening:
   - receipts root validation (header `receiptsRoot`)

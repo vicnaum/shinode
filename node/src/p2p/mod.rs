@@ -36,25 +36,25 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 use tracing::{info, warn};
 
 /// Identifier for a peer in the selection pool.
-#[allow(dead_code)]
+#[cfg(test)]
 pub type SelectorPeerId = String;
 
 /// Peer selector abstraction.
-#[allow(dead_code)]
+#[cfg(test)]
 pub trait PeerSelector: Send + Sync {
     fn next_peer(&mut self) -> Option<SelectorPeerId>;
 }
 
 /// Round-robin peer selector for test scaffolding.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct RoundRobinPeerSelector {
     peers: Vec<SelectorPeerId>,
     next_index: usize,
 }
 
+#[cfg(test)]
 impl RoundRobinPeerSelector {
-    #[allow(dead_code)]
     pub fn new(peers: Vec<SelectorPeerId>) -> Self {
         Self {
             peers,
@@ -63,6 +63,7 @@ impl RoundRobinPeerSelector {
     }
 }
 
+#[cfg(test)]
 impl PeerSelector for RoundRobinPeerSelector {
     fn next_peer(&mut self) -> Option<SelectorPeerId> {
         if self.peers.is_empty() {
@@ -887,16 +888,6 @@ pub(crate) async fn request_receipts(
         EthVersion::Eth69 => request_receipts69(peer, hashes).await,
         _ => request_receipts_legacy(peer, hashes).await,
     }
-}
-
-#[cfg(test)]
-async fn request_receipts_chunked_partial(
-    peer: &NetworkPeer,
-    hashes: &[B256],
-) -> Result<Vec<Option<Vec<Receipt>>>> {
-    Ok(request_receipts_chunked_partial_with_stats(peer, hashes)
-        .await?
-        .results)
 }
 
 async fn request_receipts_chunked_partial_with_stats(

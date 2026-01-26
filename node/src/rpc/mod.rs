@@ -6,9 +6,9 @@ use crate::{
         DEFAULT_RPC_MAX_CONNECTIONS, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
         DEFAULT_RPC_MAX_REQUEST_BODY_BYTES, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
     },
-    storage::{Storage, StoredLog},
+    storage::Storage,
 };
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, Bytes, B256};
 use eyre::{Result, WrapErr};
 use jsonrpsee::{
     server::{BatchRequestConfig, ServerBuilder, ServerConfig, ServerHandle},
@@ -344,7 +344,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                         for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
                             let alloy_primitives::Log { address, data } = log;
                             let (topics, data) = data.split();
-                            let stored_log = StoredLog {
+                            let derived_log = DerivedLog {
                                 address,
                                 topics,
                                 data,
@@ -356,11 +356,11 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                                 removed: false,
                             };
                             if log_matches(
-                                &stored_log,
+                                &derived_log,
                                 address_filter.as_deref(),
                                 topics_filter.as_deref(),
                             ) {
-                                out.push(format_log(&stored_log));
+                                out.push(format_log(&derived_log));
                                 if ctx.config.max_logs_per_response != 0
                                     && out.len() > ctx.config.max_logs_per_response as usize
                                 {
@@ -519,8 +519,21 @@ fn parse_b256(value: &Value) -> Result<B256, ErrorObjectOwned> {
     B256::from_str(raw).map_err(|_| invalid_params("invalid topic hash"))
 }
 
+#[derive(Debug)]
+struct DerivedLog {
+    address: Address,
+    topics: Vec<B256>,
+    data: Bytes,
+    block_number: u64,
+    block_hash: B256,
+    transaction_hash: B256,
+    transaction_index: u64,
+    log_index: u64,
+    removed: bool,
+}
+
 fn log_matches(
-    log: &StoredLog,
+    log: &DerivedLog,
     addresses: Option<&[Address]>,
     topics: Option<&[Option<Vec<B256>>]>,
 ) -> bool {
@@ -547,7 +560,7 @@ fn log_matches(
     true
 }
 
-fn format_log(log: &StoredLog) -> RpcLog {
+fn format_log(log: &DerivedLog) -> RpcLog {
     RpcLog {
         address: format!("{:#x}", log.address),
         topics: log
@@ -590,19 +603,11 @@ struct RpcBlock {
     mix_hash: String,
     base_fee_per_gas: Option<String>,
     withdrawals_root: Option<String>,
-    withdrawals: Option<Vec<RpcWithdrawal>>,
+    /// Withdrawals are not supported yet; we currently always return `null`.
+    withdrawals: Option<Vec<Value>>,
     blob_gas_used: Option<String>,
     excess_blob_gas: Option<String>,
     parent_beacon_block_root: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RpcWithdrawal {
-    index: String,
-    validator_index: String,
-    address: String,
-    amount: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -622,76 +627,13 @@ struct RpcLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
     use crate::storage::BlockBundle;
+    use crate::test_utils::{base_config, temp_dir};
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
     use reth_ethereum_primitives::{Receipt, TxType};
     use reth_primitives_traits::Header;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time moves forward")
-            .as_nanos();
-        let suffix = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "stateless-history-node-test-{now}-{}-{suffix}",
-            std::process::id()
-        ));
-        path
-    }
-
-    fn base_config(data_dir: PathBuf) -> NodeConfig {
-        NodeConfig {
-            chain_id: 1,
-            data_dir,
-            peer_cache_dir: None,
-            rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
-            start_block: 0,
-            shard_size: crate::cli::DEFAULT_SHARD_SIZE,
-            end_block: None,
-            rollback_window: 64,
-            retention_mode: RetentionMode::Full,
-            head_source: HeadSource::P2p,
-            reorg_strategy: ReorgStrategy::Delete,
-            verbosity: 0,
-            run_name: None,
-            log: false,
-            log_output_dir: PathBuf::from(crate::cli::DEFAULT_LOG_OUTPUT_DIR),
-            log_trace: false,
-            log_trace_filter: crate::cli::DEFAULT_LOG_TRACE_FILTER.to_string(),
-            log_trace_include_args: false,
-            log_trace_include_locations: false,
-            log_events: false,
-            log_json: false,
-            log_json_filter: crate::cli::DEFAULT_LOG_JSON_FILTER.to_string(),
-            log_report: false,
-            log_resources: false,
-            min_peers: 1,
-            command: None,
-            rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
-            rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
-            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
-            rpc_max_batch_requests: DEFAULT_RPC_MAX_BATCH_REQUESTS,
-            rpc_max_blocks_per_filter: DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
-            rpc_max_logs_per_response: DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
-            fast_sync_chunk_size: crate::cli::DEFAULT_FAST_SYNC_CHUNK_SIZE,
-            fast_sync_chunk_max: None,
-            fast_sync_max_inflight: crate::cli::DEFAULT_FAST_SYNC_MAX_INFLIGHT,
-            fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
-            fast_sync_max_buffered_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
-            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
-            db_write_batch_blocks: crate::cli::DEFAULT_DB_WRITE_BATCH_BLOCKS,
-            db_write_flush_interval_ms: None,
-        }
-    }
 
     fn header_with_number(number: u64) -> Header {
         let mut header = Header::default();
@@ -716,11 +658,8 @@ mod tests {
             number,
             header,
             tx_hashes: crate::storage::StoredTxHashes { hashes: tx_hashes },
-            transactions: crate::storage::StoredTransactions { txs: Vec::new() },
-            withdrawals: crate::storage::StoredWithdrawals { withdrawals: None },
             size: crate::storage::StoredBlockSize { size },
             receipts: crate::storage::StoredReceipts { receipts },
-            logs: crate::storage::StoredLogs { logs: Vec::new() },
         }
     }
 
@@ -758,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_chain_id_success() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Arc::new(Storage::open(&config).expect("storage"));
         let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
@@ -778,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_chain_id_rejects_params() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Arc::new(Storage::open(&config).expect("storage"));
         let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
@@ -803,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_shutdown_stops_server() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Arc::new(Storage::open(&config).expect("storage"));
         let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
@@ -828,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Arc::new(Storage::open(&config).expect("storage"));
         let (addr, handle) = start_test_server(1, storage, RpcConfig::from(&config)).await;
@@ -853,7 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_block_number_returns_last_indexed() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
         storage
@@ -878,7 +817,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_block_by_number_returns_header() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
@@ -926,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_block_by_number_rejects_include_transactions() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
         write_bundle(
@@ -958,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_block_by_number_includes_withdrawals() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
@@ -992,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_logs_filters_address_and_topic0() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
@@ -1042,7 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_logs_rejects_large_range() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
         let (addr, handle) =
@@ -1075,7 +1014,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_logs_errors_on_missing_block() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("storage");
 
@@ -1114,7 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_logs_allows_unlimited_limits() {
-        let dir = temp_dir();
+        let dir = temp_dir("rpc");
         let mut config = base_config(dir.clone());
         config.rpc_max_blocks_per_filter = 0;
         config.rpc_max_logs_per_response = 0;

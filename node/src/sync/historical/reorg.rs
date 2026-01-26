@@ -194,7 +194,6 @@ mod tests {
             fast_sync_max_inflight: 2,
             fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
-            fast_sync_max_lookahead_blocks: crate::cli::DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,
         }
@@ -212,13 +211,10 @@ mod tests {
             number: header.number,
             header,
             tx_hashes: crate::storage::StoredTxHashes { hashes: Vec::new() },
-            transactions: crate::storage::StoredTransactions { txs: Vec::new() },
-            withdrawals: crate::storage::StoredWithdrawals { withdrawals: None },
             size: crate::storage::StoredBlockSize { size: 0 },
             receipts: crate::storage::StoredReceipts {
                 receipts: Vec::new(),
             },
-            logs: crate::storage::StoredLogs { logs: Vec::new() },
         };
         storage
             .write_block_bundle_follow(&bundle)

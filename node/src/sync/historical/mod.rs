@@ -203,8 +203,6 @@ pub async fn run_ingest_pipeline(
         stats.set_inflight(0);
     }
 
-    let start_block = *range.start();
-    let low_watermark = Arc::new(AtomicU64::new(start_block));
     let max_blocks = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -213,7 +211,6 @@ pub async fn run_ingest_pipeline(
     let mut scheduler_config = SchedulerConfig {
         blocks_per_assignment: max_blocks,
         initial_blocks_per_assignment: initial_blocks,
-        max_lookahead_blocks: config.fast_sync_max_lookahead_blocks,
         ..SchedulerConfig::default()
     };
     let mut stop_rx = stop_rx;
@@ -255,7 +252,6 @@ pub async fn run_ingest_pipeline(
         scheduler_config,
         blocks,
         Arc::clone(&peer_health),
-        Arc::clone(&low_watermark),
     ));
     if !ranges.is_empty() {
         for range in ranges.drain(..) {

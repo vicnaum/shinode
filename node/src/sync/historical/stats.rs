@@ -1,5 +1,6 @@
 //! Ingest statistics aggregation.
 
+use crate::metrics::{percentile_triplet, rate_per_sec};
 use crate::storage::StorageDiskStats;
 use serde::Serialize;
 use std::fs;
@@ -23,37 +24,6 @@ pub struct RangeSummary {
 pub struct PeerSummary {
     pub peers_used: u64,
     pub peer_failures_total: u64,
-}
-
-fn rate_per_sec(value: u64, elapsed_ms: u64) -> f64 {
-    if elapsed_ms == 0 {
-        return 0.0;
-    }
-    value as f64 / (elapsed_ms as f64 / 1000.0)
-}
-
-fn percentile_triplet(values: &Mutex<Vec<u64>>) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let mut data = match values.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => Vec::new(),
-    };
-    if data.is_empty() {
-        return (None, None, None);
-    }
-    data.sort_unstable();
-    let p50 = percentile(&data, 0.50);
-    let p95 = percentile(&data, 0.95);
-    let p99 = percentile(&data, 0.99);
-    (p50, p95, p99)
-}
-
-fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let clamped = p.clamp(0.0, 1.0);
-    let idx = ((sorted.len() - 1) as f64 * clamped).round() as usize;
-    sorted.get(idx).copied()
 }
 
 const SAMPLE_LIMIT: usize = 100_000;
@@ -270,11 +240,6 @@ impl IngestBenchStats {
 
     pub fn record_logs(&self, count: u64) {
         self.logs_total.fetch_add(count, Ordering::SeqCst);
-    }
-
-    #[allow(dead_code)]
-    pub fn logs_total(&self) -> u64 {
-        self.logs_total.load(Ordering::SeqCst)
     }
 
     pub fn summary(
@@ -634,15 +599,14 @@ pub struct DbWriteByteTotals {
 }
 
 impl DbWriteByteTotals {
-    #[allow(dead_code)]
-    pub fn add(&mut self, other: DbWriteByteTotals) {
-        self.headers = self.headers.saturating_add(other.headers);
-        self.tx_hashes = self.tx_hashes.saturating_add(other.tx_hashes);
-        self.transactions = self.transactions.saturating_add(other.transactions);
-        self.withdrawals = self.withdrawals.saturating_add(other.withdrawals);
-        self.sizes = self.sizes.saturating_add(other.sizes);
-        self.receipts = self.receipts.saturating_add(other.receipts);
-        self.logs = self.logs.saturating_add(other.logs);
+    pub fn total(&self) -> u64 {
+        self.headers
+            .saturating_add(self.tx_hashes)
+            .saturating_add(self.transactions)
+            .saturating_add(self.withdrawals)
+            .saturating_add(self.sizes)
+            .saturating_add(self.receipts)
+            .saturating_add(self.logs)
     }
 }
 

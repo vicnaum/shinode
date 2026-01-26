@@ -1,48 +1,46 @@
 //! Lightweight metrics helpers.
 
 use std::ops::RangeInclusive;
-use std::time::Duration;
-
-#[allow(dead_code)]
-pub fn lag_to_head(head_seen: Option<u64>, last_indexed: Option<u64>) -> Option<u64> {
-    match (head_seen, last_indexed) {
-        (Some(head), Some(indexed)) => Some(head.saturating_sub(indexed)),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-pub fn rate_per_sec(count: u64, elapsed: Duration) -> Option<f64> {
-    let secs = elapsed.as_secs_f64();
-    if secs > 0.0 {
-        Some(count as f64 / secs)
-    } else {
-        None
-    }
-}
+use std::sync::Mutex;
 
 pub fn range_len(range: &RangeInclusive<u64>) -> u64 {
     range.end().saturating_sub(*range.start()).saturating_add(1)
 }
 
+pub fn rate_per_sec(value: u64, elapsed_ms: u64) -> f64 {
+    if elapsed_ms == 0 {
+        return 0.0;
+    }
+    value as f64 / (elapsed_ms as f64 / 1000.0)
+}
+
+pub fn percentile_triplet(values: &Mutex<Vec<u64>>) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut data = match values.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => Vec::new(),
+    };
+    if data.is_empty() {
+        return (None, None, None);
+    }
+    data.sort_unstable();
+    let p50 = percentile(&data, 0.50);
+    let p95 = percentile(&data, 0.95);
+    let p99 = percentile(&data, 0.99);
+    (p50, p95, p99)
+}
+
+pub fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let clamped = p.clamp(0.0, 1.0);
+    let idx = ((sorted.len() - 1) as f64 * clamped).round() as usize;
+    sorted.get(idx).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lag_to_head_handles_missing_values() {
-        assert_eq!(lag_to_head(None, Some(1)), None);
-        assert_eq!(lag_to_head(Some(2), None), None);
-        assert_eq!(lag_to_head(Some(10), Some(7)), Some(3));
-        assert_eq!(lag_to_head(Some(7), Some(10)), Some(0));
-    }
-
-    #[test]
-    fn rate_per_sec_handles_zero_duration() {
-        assert_eq!(rate_per_sec(10, Duration::from_secs(0)), None);
-        let rate = rate_per_sec(10, Duration::from_secs(2)).expect("rate");
-        assert!((rate - 5.0).abs() < 1e-6);
-    }
 
     #[test]
     fn range_len_counts_inclusive() {

@@ -1,7 +1,7 @@
 //! Storage types and helpers. The sharded backend lives in `sharded`.
 
 use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
-use alloy_primitives::{Address, Bytes, Signature, B256, U256};
+use alloy_primitives::B256;
 use eyre::{Result, WrapErr};
 use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::{
@@ -15,38 +15,6 @@ pub(crate) const ZSTD_DICT_MAX_SIZE: usize = 5000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTxHashes {
     pub hashes: Vec<B256>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredTransaction {
-    pub hash: B256,
-    #[serde(default)]
-    pub from: Option<Address>,
-    pub to: Option<Address>,
-    pub value: U256,
-    pub nonce: u64,
-    #[serde(default)]
-    pub signature: Option<Signature>,
-    #[serde(default)]
-    pub signing_hash: Option<B256>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredTransactions {
-    pub txs: Vec<StoredTransaction>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredWithdrawal {
-    pub index: u64,
-    pub validator_index: u64,
-    pub address: Address,
-    pub amount: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredWithdrawals {
-    pub withdrawals: Option<Vec<StoredWithdrawal>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,41 +48,13 @@ impl SerdeBincodeCompat for StoredReceipts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredLog {
-    pub address: Address,
-    pub topics: Vec<B256>,
-    pub block_number: u64,
-    pub block_hash: B256,
-    pub transaction_hash: B256,
-    pub transaction_index: u64,
-    pub log_index: u64,
-    pub removed: bool,
-    pub data: Bytes,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredLogs {
-    pub logs: Vec<StoredLog>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogIndexEntry {
-    pub block_number: u64,
-    pub log_index: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBundle {
     pub number: u64,
     pub header: Header,
     pub tx_hashes: StoredTxHashes,
-    pub transactions: StoredTransactions,
-    pub withdrawals: StoredWithdrawals,
     pub size: StoredBlockSize,
     pub receipts: StoredReceipts,
-    pub logs: StoredLogs,
 }
 
 #[derive(Debug, Clone, Serialize)]

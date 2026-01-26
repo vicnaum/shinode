@@ -15,12 +15,6 @@ pub struct WalRecord {
 #[derive(Debug, Clone, Copy)]
 pub struct WalIndexEntry {
     pub block_number: u64,
-    /// Offset of the record start (block_number field) within the WAL file.
-    #[allow(dead_code)]
-    pub record_offset: u64,
-    /// Length of the record payload (not including the header or CRC trailer).
-    #[allow(dead_code)]
-    pub payload_len: u32,
 }
 
 pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
@@ -53,7 +47,7 @@ pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn read_records(path: &Path) -> Result<Vec<WalRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -112,7 +106,7 @@ pub fn read_records(path: &Path) -> Result<Vec<WalRecord>> {
     Ok(records)
 }
 
-/// Scans the WAL and returns record offsets + payload sizes without loading payloads into memory.
+/// Scans the WAL and returns block numbers without loading payloads into memory.
 ///
 /// This also truncates an invalid / partial tail (same behavior as [`read_records`]), but it does
 /// NOT validate per-record CRCs.
@@ -158,11 +152,7 @@ pub fn build_index(path: &Path) -> Result<Vec<WalIndexEntry>> {
             break;
         }
 
-        entries.push(WalIndexEntry {
-            block_number,
-            record_offset,
-            payload_len,
-        });
+        entries.push(WalIndexEntry { block_number });
 
         file.seek(SeekFrom::Start(next_offset))?;
         last_good_offset = next_offset;

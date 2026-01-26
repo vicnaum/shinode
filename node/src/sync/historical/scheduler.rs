@@ -3,7 +3,7 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
-    sync::{atomic::AtomicU64, Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,9 +18,6 @@ pub struct SchedulerConfig {
     pub blocks_per_assignment: usize,
     /// Initial blocks per peer batch (before AIMD adjusts).
     pub initial_blocks_per_assignment: usize,
-    /// Max blocks ahead of the DB writer low watermark to assign (0 = unlimited).
-    #[allow(dead_code)]
-    pub max_lookahead_blocks: u64,
     pub max_attempts_per_block: u32,
     pub peer_failure_threshold: u32,
     pub peer_ban_duration: Duration,
@@ -31,7 +28,6 @@ impl Default for SchedulerConfig {
         Self {
             blocks_per_assignment: 32,
             initial_blocks_per_assignment: 32,
-            max_lookahead_blocks: 0,
             max_attempts_per_block: 3,
             peer_failure_threshold: 5,
             peer_ban_duration: Duration::from_secs(120),
@@ -43,10 +39,6 @@ impl Default for SchedulerConfig {
 pub(crate) struct PeerHealthConfig {
     peer_failure_threshold: u32,
     peer_ban_duration: Duration,
-    #[allow(dead_code)]
-    partial_threshold_multiplier: u32,
-    #[allow(dead_code)]
-    partial_ban_duration: Duration,
     aimd_increase_after: u32,
     aimd_partial_decrease: f64,
     aimd_failure_decrease: f64,
@@ -65,8 +57,6 @@ impl PeerHealthConfig {
         Self {
             peer_failure_threshold: config.peer_failure_threshold,
             peer_ban_duration: config.peer_ban_duration,
-            partial_threshold_multiplier: 3,
-            partial_ban_duration: Duration::from_secs(30),
             aimd_increase_after: 5,
             aimd_partial_decrease: 0.7,
             aimd_failure_decrease: 0.5,
@@ -110,18 +100,6 @@ impl PeerHealth {
         self.banned_until
             .map(|until| Instant::now() < until)
             .unwrap_or(false)
-    }
-
-    #[allow(dead_code)]
-    fn ban_remaining(&self) -> Option<Duration> {
-        self.banned_until.and_then(|until| {
-            let now = Instant::now();
-            if now < until {
-                Some(until - now)
-            } else {
-                None
-            }
-        })
     }
 }
 
@@ -449,8 +427,6 @@ pub struct PeerWorkScheduler {
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
     escalation: Mutex<EscalationState>,
-    #[allow(dead_code)]
-    low_watermark: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -462,8 +438,7 @@ mod tests {
         let peer_health = Arc::new(PeerHealthTracker::new(
             PeerHealthConfig::from_scheduler_config(&config),
         ));
-        let low_watermark = Arc::new(AtomicU64::new(start));
-        PeerWorkScheduler::new_with_health(config, blocks, peer_health, low_watermark)
+        PeerWorkScheduler::new_with_health(config, blocks, peer_health)
     }
 
     #[tokio::test]
@@ -544,7 +519,6 @@ impl PeerWorkScheduler {
         config: SchedulerConfig,
         blocks: Vec<u64>,
         peer_health: Arc<PeerHealthTracker>,
-        low_watermark: Arc<AtomicU64>,
     ) -> Self {
         let queued: HashSet<u64> = blocks.iter().copied().collect();
         let pending = blocks.into_iter().map(Reverse).collect::<BinaryHeap<_>>();
@@ -558,7 +532,6 @@ impl PeerWorkScheduler {
             attempts: Mutex::new(HashMap::new()),
             peer_health,
             escalation: Mutex::new(EscalationState::default()),
-            low_watermark,
         }
     }
 
