@@ -1,7 +1,5 @@
 //! Sync and ingest orchestration.
 
-use async_trait::async_trait;
-use eyre::Result;
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives_traits::Header;
 
@@ -13,12 +11,6 @@ pub struct BlockPayload {
     pub header: Header,
     pub body: BlockBody,
     pub receipts: Vec<Receipt>,
-}
-
-/// Source of block payloads for ingestion.
-#[async_trait]
-pub trait BlockPayloadSource: Send + Sync {
-    async fn head(&self) -> Result<u64>;
 }
 
 pub trait ProgressReporter: Send + Sync {

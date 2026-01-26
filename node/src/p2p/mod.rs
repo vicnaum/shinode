@@ -1,9 +1,8 @@
 //! P2P subsystem.
 
 use crate::storage::{Storage, StoredPeer};
-use crate::sync::{BlockPayload, BlockPayloadSource};
+use crate::sync::BlockPayload;
 use alloy_primitives::B256;
-use async_trait::async_trait;
 use eyre::{eyre, Result, WrapErr};
 use futures::StreamExt;
 use reth_chainspec::MAINNET;
@@ -264,11 +263,6 @@ impl PeerPool {
         }
     }
 
-    fn best_head(&self) -> Option<u64> {
-        let peers = self.peers.read().expect("peer pool lock");
-        peers.iter().map(|peer| peer.head_number).max()
-    }
-
     pub fn len(&self) -> usize {
         let peers = self.peers.read().expect("peer pool lock");
         peers.len()
@@ -310,27 +304,6 @@ pub(crate) fn peer_pool_for_tests(peers: Vec<NetworkPeer>) -> PeerPool {
         pool.add_peer(peer);
     }
     pool
-}
-
-/// P2P-backed block payload source with multi-peer retries.
-#[derive(Clone, Debug)]
-pub struct MultiPeerBlockPayloadSource {
-    pool: Arc<PeerPool>,
-}
-
-impl MultiPeerBlockPayloadSource {
-    pub fn new(pool: Arc<PeerPool>) -> Self {
-        Self { pool }
-    }
-}
-
-#[async_trait]
-impl BlockPayloadSource for MultiPeerBlockPayloadSource {
-    async fn head(&self) -> Result<u64> {
-        self.pool
-            .best_head()
-            .ok_or_else(|| eyre!("no peers available for head"))
-    }
 }
 
 fn spawn_peer_watcher(
@@ -914,73 +887,6 @@ pub(crate) async fn request_receipts(
         EthVersion::Eth69 => request_receipts69(peer, hashes).await,
         _ => request_receipts_legacy(peer, hashes).await,
     }
-}
-
-pub(crate) async fn request_receipt_counts(
-    peer: &NetworkPeer,
-    hashes: &[B256],
-) -> Result<Vec<usize>> {
-    match peer.eth_version {
-        EthVersion::Eth70 => request_receipt_counts70(peer, hashes).await,
-        EthVersion::Eth69 => request_receipt_counts69(peer, hashes).await,
-        _ => request_receipt_counts_legacy(peer, hashes).await,
-    }
-}
-
-async fn request_receipt_counts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
-    let request = GetReceipts(hashes.to_vec());
-    let (tx, rx) = oneshot::channel();
-    peer.messages
-        .try_send(PeerRequest::GetReceipts {
-            request,
-            response: tx,
-        })
-        .map_err(|err| eyre!("failed to send receipts request: {err:?}"))?;
-    let response = timeout(REQUEST_TIMEOUT, rx)
-        .await
-        .map_err(|_| eyre!("receipts request to {:?} timed out", peer.peer_id))??;
-    let receipts = response
-        .map_err(|err| eyre!("receipts response error from {:?}: {err:?}", peer.peer_id))?;
-    Ok(receipts.0.iter().map(|block| block.len()).collect())
-}
-
-async fn request_receipt_counts69(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
-    let request = GetReceipts(hashes.to_vec());
-    let (tx, rx) = oneshot::channel();
-    peer.messages
-        .try_send(PeerRequest::GetReceipts69 {
-            request,
-            response: tx,
-        })
-        .map_err(|err| eyre!("failed to send receipts69 request: {err:?}"))?;
-    let response = timeout(REQUEST_TIMEOUT, rx)
-        .await
-        .map_err(|_| eyre!("receipts69 request to {:?} timed out", peer.peer_id))??;
-    let receipts = response
-        .map_err(|err| eyre!("receipts69 response error from {:?}: {err:?}", peer.peer_id))?;
-    Ok(receipts.0.iter().map(|block| block.len()).collect())
-}
-
-async fn request_receipt_counts70(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<usize>> {
-    let request = GetReceipts70 {
-        first_block_receipt_index: 0,
-        block_hashes: hashes.to_vec(),
-    };
-    let (tx, rx) = oneshot::channel();
-    peer.messages
-        .try_send(PeerRequest::GetReceipts70 {
-            request,
-            response: tx,
-        })
-        .map_err(|err| eyre!("failed to send receipts70 request: {err:?}"))?;
-    let response = timeout(REQUEST_TIMEOUT, rx)
-        .await
-        .map_err(|_| eyre!("receipts70 request to {:?} timed out", peer.peer_id))??;
-    let receipts = response
-        .map_err(|err| eyre!("receipts70 response error from {:?}: {err:?}", peer.peer_id))?;
-    // Note: eth/70 can flag `last_block_incomplete` (partial). Harness treats this as a partial
-    // response and requeues the missing block(s), rather than failing the whole batch.
-    Ok(receipts.receipts.iter().map(|block| block.len()).collect())
 }
 
 #[cfg(test)]

@@ -84,7 +84,7 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 - [x] Graceful shutdown + safe flushing
 - [x] Minimal structured logs + counters (throughput, lag to head, reorg count, peer health)
 - [x] Verbosity levels (-v/-vv/-vvv) + progress UI (harness-style)
-- [x] Ingest benchmark mode with per-stage timing (fetch/process/static write)
+- [x] Optional log artifacts (`--log-trace`, `--log-events`) for per-stage timing analysis (fetch/process/static write)
 - [x] DB stats CLI for static-file storage sizes
 - [x] Defer sender recovery by storing signature + signing hash
 - Verified: `cargo test --manifest-path node/Cargo.toml` (graceful shutdown behavior)
@@ -134,18 +134,18 @@ This MVP is intentionally **stateless**: no EVM execution, no state trie, no arc
 
 ## ✅ Next (Functional): Reliability for long-running operation (v0.2)
 - [x] Persist peer cache (warm start; `peers.json` with TTL + cap)
-- [x] Benchmark peer warmup gate: `--benchmark-min-peers` (default: 5)
+- [x] Peer warmup gate: `--min-peers` (default: 1)
 - [x] Peer pool warmup: avoid blocking the peer event loop on head probes
 - [ ] **Adaptive concurrency control** (avoid throughput dropping when peers increase)
   - Observed: 10 peers → 1150 b/s, 20 peers → 800 b/s, 50 peers → 500 b/s
 - [ ] Peer scoring/backoff beyond simple rotation (timeouts, slow peers, disconnect reasons)
 - [x] Fast-sync WAL batch writes (out-of-order) + reduced syscall overhead
-- [x] Benchmark events: compaction + sealing duration instrumentation
+- [x] Log events (`--log-events`): compaction + sealing duration instrumentation
 - [x] Compaction memory hardening: stream WAL during compaction, avoid large payload clones, and serialize compactions (queue).
-- [x] Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) and `--features jemalloc` build.
+- [x] Optional allocator knobs: `MALLOC_ARENA_MAX=2` (Linux/glibc) and `--features jemalloc` build (enabled by default).
 - [x] Backpressure + memory caps for queues (bounded lookahead + max buffered blocks)
 - [x] Safe boundary switch to slow path near the reorg window (historical head = head - rollback_window)
-- [x] Unify ingest pipelines: default ingest uses the benchmark ingest pipeline; artifacts gated by `--benchmark-*` flags.
+- [x] Unified ingest pipeline with optional log artifacts gated by `--log-*` flags.
 - [x] Resume without redownload: skip already-present blocks in range; recompact dirty shards (WAL/unsorted) on finalize/start.
 - [x] Follow mode: long-lived ingest epoch with tail scheduling + in-order DB appends + reorg rollback (within `--rollback-window`).
 - [ ] Deep reorg recovery: optional auto-rebootstrap (policy B)

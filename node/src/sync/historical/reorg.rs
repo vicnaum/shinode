@@ -122,7 +122,7 @@ async fn fetch_single_header(
 #[cfg(test)]
 mod tests {
     use super::{find_common_ancestor_number, preflight_reorg, ReorgCheck};
-    use crate::cli::{BenchmarkMode, HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+    use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
     use crate::p2p::{peer_pool_for_tests, NetworkPeer};
     use crate::storage::Storage;
     use alloy_primitives::B256;
@@ -169,15 +169,18 @@ mod tests {
             head_source: HeadSource::P2p,
             reorg_strategy: ReorgStrategy::Delete,
             verbosity: 0,
-            benchmark: BenchmarkMode::Disabled,
-            benchmark_name: None,
-            benchmark_output_dir: PathBuf::from(crate::cli::DEFAULT_BENCHMARK_OUTPUT_DIR),
-            benchmark_trace: false,
-            benchmark_trace_filter: crate::cli::DEFAULT_BENCHMARK_TRACE_FILTER.to_string(),
-            benchmark_trace_include_args: false,
-            benchmark_trace_include_locations: false,
-            benchmark_events: false,
-            benchmark_min_peers: None,
+            run_name: None,
+            log: false,
+            log_output_dir: PathBuf::from(crate::cli::DEFAULT_LOG_OUTPUT_DIR),
+            log_trace: false,
+            log_trace_filter: crate::cli::DEFAULT_LOG_TRACE_FILTER.to_string(),
+            log_trace_include_args: false,
+            log_trace_include_locations: false,
+            log_events: false,
+            log_json: false,
+            log_json_filter: crate::cli::DEFAULT_LOG_JSON_FILTER.to_string(),
+            log_report: false,
+            min_peers: 1,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,

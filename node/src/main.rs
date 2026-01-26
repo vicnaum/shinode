@@ -9,7 +9,7 @@ mod sync;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use cli::{compute_target_range, BenchmarkMode, NodeConfig, DEFAULT_BENCHMARK_TRACE_FILTER};
+use cli::{compute_target_range, NodeConfig, DEFAULT_LOG_JSON_FILTER, DEFAULT_LOG_TRACE_FILTER};
 use eyre::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use metrics::range_len;
@@ -32,10 +32,8 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use sync::historical::{
-    BenchEvent, BenchEventLogger, IngestBenchStats, PeerHealthTracker, ProbeStats,
-};
-use sync::{BlockPayloadSource, ProgressReporter, SyncProgressStats, SyncStatus};
+use sync::historical::{BenchEvent, BenchEventLogger, IngestBenchStats, PeerHealthTracker};
+use sync::{ProgressReporter, SyncProgressStats, SyncStatus};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn, Event};
@@ -44,8 +42,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 
-const DEFAULT_BENCHMARK_MIN_PEERS: u64 = 5;
-const BENCHMARK_LOG_BUFFER: usize = 10_000;
+const LOG_BUFFER: usize = 10_000;
 
 async fn apply_cached_peer_limits(storage: &storage::Storage, peer_health: &PeerHealthTracker) {
     let peers = storage.peer_cache_snapshot();
@@ -130,25 +127,24 @@ impl sync::ProgressReporter for IngestProgress {
 }
 
 #[derive(Debug, Serialize)]
-struct BenchmarkRunReport {
-    meta: BenchmarkMeta,
+struct RunReport {
+    meta: RunMeta,
     argv: Vec<String>,
     config: NodeConfig,
-    derived: BenchmarkDerived,
+    derived: RunDerived,
     results: sync::historical::IngestBenchSummary,
     peer_health_all: Vec<PeerHealthSummary>,
     peer_health_top: Vec<PeerHealthSummary>,
     peer_health_worst: Vec<PeerHealthSummary>,
-    events: Option<BenchmarkEventsSummary>,
-    logs: Option<BenchmarkLogsSummary>,
+    events: Option<EventsSummary>,
+    logs: Option<LogsSummary>,
 }
 
 #[derive(Debug, Serialize)]
-struct BenchmarkMeta {
+struct RunMeta {
     timestamp_utc: String,
     run_id: String,
-    benchmark_name: String,
-    benchmark_mode: String,
+    run_name: String,
     build: BuildInfo,
     env: EnvInfo,
 }
@@ -170,7 +166,7 @@ struct EnvInfo {
 }
 
 #[derive(Debug, Serialize)]
-struct BenchmarkDerived {
+struct RunDerived {
     range_start: u64,
     range_end: u64,
     head_at_startup: u64,
@@ -219,24 +215,24 @@ struct PeerHealthSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct BenchmarkEventsSummary {
+struct EventsSummary {
     total_events: usize,
     dropped_events: u64,
     path: String,
 }
 
 #[derive(Debug, Serialize)]
-struct BenchmarkLogsSummary {
+struct LogsSummary {
     total_events: usize,
     dropped_events: u64,
     path: String,
 }
 
 #[derive(Debug)]
-struct BenchmarkRunContext {
+struct RunContext {
     timestamp_utc: String,
     run_id: String,
-    benchmark_name: String,
+    run_name: String,
     output_dir: PathBuf,
     argv: Vec<String>,
     trace_tmp_path: Option<PathBuf>,
@@ -245,7 +241,7 @@ struct BenchmarkRunContext {
 }
 
 #[derive(Debug, Serialize)]
-struct BenchmarkLogRecord {
+struct LogRecord {
     t_ms: u64,
     level: String,
     target: String,
@@ -299,22 +295,22 @@ impl tracing::field::Visit for JsonLogVisitor {
 }
 
 #[derive(Debug)]
-struct BenchmarkLogWriter {
+struct JsonLogWriter {
     started_at: Instant,
-    sender: Mutex<Option<SyncSender<BenchmarkLogRecord>>>,
+    sender: Mutex<Option<SyncSender<LogRecord>>>,
     handle: Mutex<Option<JoinHandle<eyre::Result<()>>>>,
     dropped_events: AtomicU64,
     total_events: AtomicU64,
 }
 
-impl BenchmarkLogWriter {
+impl JsonLogWriter {
     fn new(path: PathBuf, capacity: usize) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let file = fs::File::create(&path)?;
         let mut writer = BufWriter::new(file);
-        let (tx, rx) = mpsc::sync_channel::<BenchmarkLogRecord>(capacity);
+        let (tx, rx) = mpsc::sync_channel::<LogRecord>(capacity);
         let handle = std::thread::spawn(move || -> eyre::Result<()> {
             let mut since_flush = 0usize;
             for record in rx {
@@ -339,7 +335,7 @@ impl BenchmarkLogWriter {
         })
     }
 
-    fn record(&self, record: BenchmarkLogRecord) {
+    fn record(&self, record: LogRecord) {
         let sender = self
             .sender
             .lock()
@@ -372,7 +368,7 @@ impl BenchmarkLogWriter {
         if let Some(handle) = handle {
             match handle.join() {
                 Ok(res) => res?,
-                Err(_) => return Err(eyre::eyre!("benchmark log writer thread panicked")),
+                Err(_) => return Err(eyre::eyre!("json log writer thread panicked")),
             }
         }
         Ok(())
@@ -388,17 +384,17 @@ impl BenchmarkLogWriter {
 }
 
 #[derive(Clone)]
-struct BenchmarkLogLayer {
-    writer: Arc<BenchmarkLogWriter>,
+struct JsonLogLayer {
+    writer: Arc<JsonLogWriter>,
 }
 
-impl BenchmarkLogLayer {
-    fn new(writer: Arc<BenchmarkLogWriter>) -> Self {
+impl JsonLogLayer {
+    fn new(writer: Arc<JsonLogWriter>) -> Self {
         Self { writer }
     }
 }
 
-impl<S> tracing_subscriber::Layer<S> for BenchmarkLogLayer
+impl<S> tracing_subscriber::Layer<S> for JsonLogLayer
 where
     S: tracing::Subscriber,
 {
@@ -412,7 +408,7 @@ where
             Some(value) => Some(value.to_string()),
             None => None,
         };
-        let record = BenchmarkLogRecord {
+        let record = LogRecord {
             t_ms: self.writer.started_at.elapsed().as_millis() as u64,
             level: meta.level().as_str().to_string(),
             target: meta.target().to_string(),
@@ -425,7 +421,7 @@ where
     }
 }
 
-fn bench_timestamp_utc(now: SystemTime) -> String {
+fn run_timestamp_utc(now: SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let days = secs / 86_400;
     let rem = secs % 86_400;
@@ -458,12 +454,6 @@ fn sanitize_label(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
-}
-
-fn arg_present(args: &[String], flag: &str) -> bool {
-    let flag_eq = format!("{flag}=");
-    args.iter()
-        .any(|arg| arg == flag || arg.starts_with(&flag_eq))
 }
 
 fn default_peer_cache_dir() -> Option<PathBuf> {
@@ -499,15 +489,7 @@ fn env_info() -> EnvInfo {
     }
 }
 
-fn benchmark_mode_str(mode: BenchmarkMode) -> &'static str {
-    match mode {
-        BenchmarkMode::Disabled => "disabled",
-        BenchmarkMode::Probe => "probe",
-        BenchmarkMode::Ingest => "ingest",
-    }
-}
-
-async fn wait_for_benchmark_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
+async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
     if min_peers == 0 {
         return;
     }
@@ -527,14 +509,14 @@ async fn wait_for_benchmark_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
     }
 }
 
-fn benchmark_base_name(
-    benchmark_name: &str,
+fn run_base_name(
+    run_name: &str,
     timestamp: &str,
     range: &std::ops::RangeInclusive<u64>,
     config: &NodeConfig,
     build: &BuildInfo,
 ) -> String {
-    let base = sanitize_label(benchmark_name);
+    let base = sanitize_label(run_name);
     let profile = sanitize_label(&build.profile);
     let alloc = if build.features.iter().any(|feat| feat == "jemalloc") {
         "jemalloc"
@@ -560,11 +542,7 @@ fn benchmark_base_name(
     )
 }
 
-fn write_benchmark_report(
-    output_dir: &Path,
-    base_name: &str,
-    report: &BenchmarkRunReport,
-) -> Result<PathBuf> {
+fn write_run_report(output_dir: &Path, base_name: &str, report: &RunReport) -> Result<PathBuf> {
     fs::create_dir_all(output_dir)?;
     let path = output_dir.join(format!("{base_name}.json"));
     let file = fs::File::create(&path)?;
@@ -572,28 +550,86 @@ fn write_benchmark_report(
     Ok(path)
 }
 
-async fn emit_benchmark_artifacts(
-    bench_context: &BenchmarkRunContext,
+/// Finalize log artifacts on shutdown (rename tmp files to final names).
+/// Called when sync is interrupted by Ctrl-C.
+fn finalize_logs_on_shutdown(
+    run_context: &RunContext,
+    events: Option<&BenchEventLogger>,
+    log_writer: Option<&JsonLogWriter>,
+    chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
+) {
+    let base_name = format!("{}__interrupted", run_context.timestamp_utc);
+
+    // Finalize events log
+    if let Some(logger) = events {
+        if let Err(err) = logger.finish() {
+            warn!(error = %err, "failed to finalize event log on shutdown");
+        }
+        if let Some(tmp_path) = run_context.events_tmp_path.as_ref() {
+            let final_path = run_context
+                .output_dir
+                .join(format!("{base_name}.events.jsonl"));
+            if let Err(err) = fs::rename(tmp_path, &final_path) {
+                warn!(error = %err, "failed to rename event log on shutdown");
+            } else {
+                info!(path = %final_path.display(), "event log written (interrupted)");
+            }
+        }
+    }
+
+    // Finalize JSON logs
+    if let Some(logger) = log_writer {
+        if let Err(err) = logger.finish() {
+            warn!(error = %err, "failed to finalize json logs on shutdown");
+        }
+        if let Some(tmp_path) = run_context.logs_tmp_path.as_ref() {
+            let final_path = run_context
+                .output_dir
+                .join(format!("{base_name}.logs.jsonl"));
+            if let Err(err) = fs::rename(tmp_path, &final_path) {
+                warn!(error = %err, "failed to rename json log on shutdown");
+            } else {
+                info!(path = %final_path.display(), "json log written (interrupted)");
+            }
+        }
+    }
+
+    // Finalize Chrome trace
+    if let Some(tmp_path) = run_context.trace_tmp_path.as_ref() {
+        let final_path = run_context
+            .output_dir
+            .join(format!("{base_name}.trace.json"));
+        drop(chrome_guard.take());
+        if let Err(err) = fs::rename(tmp_path, &final_path) {
+            warn!(error = %err, "failed to rename trace on shutdown");
+        } else {
+            info!(path = %final_path.display(), "trace written (interrupted)");
+        }
+    }
+}
+
+async fn emit_run_artifacts(
+    run_context: &RunContext,
     config: &NodeConfig,
     range: &std::ops::RangeInclusive<u64>,
     head_at_startup: u64,
     peer_health: &PeerHealthTracker,
     summary: sync::historical::IngestBenchSummary,
     events: Option<&BenchEventLogger>,
-    log_writer: Option<&BenchmarkLogWriter>,
+    log_writer: Option<&JsonLogWriter>,
     chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
 ) -> Result<()> {
     let build = build_info();
     let env = env_info();
-    let base_name = benchmark_base_name(
-        &bench_context.benchmark_name,
-        &bench_context.timestamp_utc,
+    let base_name = run_base_name(
+        &run_context.run_name,
+        &run_context.timestamp_utc,
         range,
         config,
         &build,
     );
     let limits = p2p_limits();
-    let derived = BenchmarkDerived {
+    let derived = RunDerived {
         range_start: *range.start(),
         range_end: *range.end(),
         head_at_startup,
@@ -713,8 +749,8 @@ async fn emit_benchmark_artifacts(
         .collect();
 
     let events_summary = if let Some(logger) = events {
-        let tmp_path = bench_context.events_tmp_path.as_ref();
-        let final_path = bench_context
+        let tmp_path = run_context.events_tmp_path.as_ref();
+        let final_path = run_context
             .output_dir
             .join(format!("{base_name}.events.jsonl"));
         if let Err(err) = logger.finish() {
@@ -737,7 +773,7 @@ async fn emit_benchmark_artifacts(
         } else {
             warn!("event logger present but no tmp path configured");
         }
-        Some(BenchmarkEventsSummary {
+        Some(EventsSummary {
             total_events: logger.total_events() as usize,
             dropped_events: logger.dropped_events(),
             path: path_str,
@@ -747,12 +783,12 @@ async fn emit_benchmark_artifacts(
     };
 
     let logs_summary = if let Some(logger) = log_writer {
-        let tmp_path = bench_context.logs_tmp_path.as_ref();
-        let final_path = bench_context
+        let tmp_path = run_context.logs_tmp_path.as_ref();
+        let final_path = run_context
             .output_dir
             .join(format!("{base_name}.logs.jsonl"));
         if let Err(err) = logger.finish() {
-            warn!(error = %err, "failed to finalize benchmark logs");
+            warn!(error = %err, "failed to finalize json logs");
         }
         let mut path_str = final_path.display().to_string();
         if let Some(tmp_path) = tmp_path {
@@ -763,15 +799,15 @@ async fn emit_benchmark_artifacts(
                         error = %err,
                         tmp = %tmp_path.display(),
                         final_path = %final_path.display(),
-                        "failed to rename benchmark log output"
+                        "failed to rename json log output"
                     );
                     path_str = tmp_path.display().to_string();
                 }
             }
         } else {
-            warn!("benchmark log writer present but no tmp path configured");
+            warn!("json log writer present but no tmp path configured");
         }
-        Some(BenchmarkLogsSummary {
+        Some(LogsSummary {
             total_events: logger.total_events() as usize,
             dropped_events: logger.dropped_events(),
             path: path_str,
@@ -780,36 +816,38 @@ async fn emit_benchmark_artifacts(
         None
     };
 
-    let report = BenchmarkRunReport {
-        meta: BenchmarkMeta {
-            timestamp_utc: bench_context.timestamp_utc.clone(),
-            run_id: bench_context.run_id.clone(),
-            benchmark_name: bench_context.benchmark_name.clone(),
-            benchmark_mode: benchmark_mode_str(config.benchmark).to_string(),
-            build,
-            env,
-        },
-        argv: bench_context.argv.clone(),
-        config: config.clone(),
-        derived,
-        results: summary,
-        peer_health_all,
-        peer_health_top: top,
-        peer_health_worst: worst,
-        events: events_summary,
-        logs: logs_summary,
-    };
-    let report_path = write_benchmark_report(&bench_context.output_dir, &base_name, &report)?;
-    info!(path = %report_path.display(), "benchmark summary written");
+    // Write report JSON only if --log-report is enabled.
+    if config.log_report {
+        let report = RunReport {
+            meta: RunMeta {
+                timestamp_utc: run_context.timestamp_utc.clone(),
+                run_id: run_context.run_id.clone(),
+                run_name: run_context.run_name.clone(),
+                build,
+                env,
+            },
+            argv: run_context.argv.clone(),
+            config: config.clone(),
+            derived,
+            results: summary,
+            peer_health_all,
+            peer_health_top: top,
+            peer_health_worst: worst,
+            events: events_summary,
+            logs: logs_summary,
+        };
+        let report_path = write_run_report(&run_context.output_dir, &base_name, &report)?;
+        info!(path = %report_path.display(), "run summary written");
+    }
 
-    if let Some(tmp_path) = bench_context.trace_tmp_path.as_ref() {
-        let final_path = bench_context
+    if let Some(tmp_path) = run_context.trace_tmp_path.as_ref() {
+        let final_path = run_context
             .output_dir
             .join(format!("{base_name}.trace.json"));
         drop(chrome_guard.take());
         match fs::rename(tmp_path, &final_path) {
             Ok(()) => {
-                info!(path = %final_path.display(), "benchmark trace written");
+                info!(path = %final_path.display(), "trace written");
             }
             Err(err) => {
                 warn!(error = %err, tmp = %tmp_path.display(), "failed to rename trace output");
@@ -823,14 +861,9 @@ async fn emit_benchmark_artifacts(
 async fn main() -> Result<()> {
     let mut config = NodeConfig::from_args();
     let argv: Vec<String> = env::args().collect();
-    let data_dir_specified = arg_present(&argv, "--data-dir");
-    let is_benchmark = matches!(
-        config.benchmark,
-        BenchmarkMode::Probe | BenchmarkMode::Ingest
-    );
-    let benchmark_min_peers = config
-        .benchmark_min_peers
-        .unwrap_or(DEFAULT_BENCHMARK_MIN_PEERS);
+    // Check if any log artifacts are enabled
+    let log_artifacts_enabled =
+        config.log_trace || config.log_events || config.log_json || config.log_report;
     let chunk_max = config
         .fast_sync_chunk_max
         .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
@@ -844,30 +877,34 @@ async fn main() -> Result<()> {
         config.fast_sync_chunk_size = chunk_max;
     }
     config.fast_sync_chunk_max = Some(chunk_max);
-    let bench_context = if is_benchmark {
-        let timestamp_utc = bench_timestamp_utc(SystemTime::now());
+    let run_context = if log_artifacts_enabled {
+        let timestamp_utc = run_timestamp_utc(SystemTime::now());
         let run_id = format!("{}-{}", timestamp_utc, process::id());
-        let benchmark_name = config
-            .benchmark_name
+        let run_name = config
+            .run_name
             .clone()
-            .unwrap_or_else(|| format!("{}-bench", benchmark_mode_str(config.benchmark)));
-        let output_dir = config.benchmark_output_dir.clone();
-        let trace_tmp_path = if config.benchmark_trace {
+            .unwrap_or_else(|| "sync".to_string());
+        let output_dir = config.log_output_dir.clone();
+        let trace_tmp_path = if config.log_trace {
             Some(output_dir.join(format!("trace__{}__tmp.json", timestamp_utc)))
         } else {
             None
         };
-        let events_tmp_path = if config.benchmark_events {
+        let events_tmp_path = if config.log_events {
             Some(output_dir.join(format!("events__{}__tmp.jsonl", timestamp_utc)))
         } else {
             None
         };
-        let logs_tmp_path = Some(output_dir.join(format!("logs__{}__tmp.jsonl", timestamp_utc)));
+        let logs_tmp_path = if config.log_json {
+            Some(output_dir.join(format!("logs__{}__tmp.jsonl", timestamp_utc)))
+        } else {
+            None
+        };
         fs::create_dir_all(&output_dir)?;
-        Some(BenchmarkRunContext {
+        Some(RunContext {
             timestamp_utc,
             run_id,
-            benchmark_name,
+            run_name,
             output_dir,
             argv,
             trace_tmp_path,
@@ -877,20 +914,15 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    if is_benchmark && !data_dir_specified {
-        if let Some(ctx) = &bench_context {
-            config.data_dir = ctx.output_dir.join("data").join(&ctx.run_id);
-        }
-    }
     if config.peer_cache_dir.is_none() {
         config.peer_cache_dir = default_peer_cache_dir();
     }
     let mut tracing_guards = init_tracing(
         &config,
-        bench_context
+        run_context
             .as_ref()
             .and_then(|ctx| ctx.trace_tmp_path.clone()),
-        bench_context
+        run_context
             .as_ref()
             .and_then(|ctx| ctx.logs_tmp_path.clone()),
     );
@@ -909,241 +941,161 @@ async fn main() -> Result<()> {
         }
     }
 
-    if matches!(config.benchmark, BenchmarkMode::Probe) {
-        info!(
-            chain_id = config.chain_id,
-            data_dir = %config.data_dir.display(),
-            "starting stateless history node (benchmark probe)"
-        );
-        if !matches!(config.head_source, cli::HeadSource::P2p) {
-            return Err(eyre::eyre!("benchmark probe requires --head-source p2p"));
-        }
-        spawn_benchmark_resource_logger(None, None);
-        let peer_cache = storage::Storage::open_existing(&config)?.map(Arc::new);
-        info!("starting p2p network");
-        let session = p2p::connect_mainnet_peers(peer_cache).await?;
-        info!(peers = session.pool.len(), "p2p peers connected");
-        wait_for_benchmark_min_peers(&session.pool, benchmark_min_peers as usize).await;
-        info!(peers = session.pool.len(), "benchmark peer warmup complete");
-        let source = p2p::MultiPeerBlockPayloadSource::new(session.pool.clone());
-        let head_at_startup = source.head().await?;
-        let range = compute_target_range(
-            config.start_block,
-            config.end_block,
-            head_at_startup,
-            config.rollback_window,
-        );
-        let blocks_total = range_len(&range);
-        if blocks_total == 0 {
-            return Err(eyre::eyre!("benchmark range is empty"));
-        }
-        let stats = Arc::new(ProbeStats::new(blocks_total));
-        let probe_future = sync::historical::run_benchmark_probe(
-            &config,
-            Arc::clone(&session.pool),
-            range.clone(),
-            head_at_startup,
-            Arc::clone(&stats),
-        );
-        tokio::pin!(probe_future);
-        tokio::select! {
-            res = &mut probe_future => {
-                res?;
-            }
-            _ = tokio::signal::ctrl_c() => {
-                let summary = stats.summary(
-                    *range.start(),
-                    *range.end(),
-                    head_at_startup,
-                    config.rollback_window > 0,
-                    session.pool.len() as u64,
-                );
-                let summary_json = serde_json::to_string_pretty(&summary)?;
-                println!("{summary_json}");
-                if let Err(err) = session.flush_peer_cache() {
-                    warn!(error = %err, "failed to flush peer cache");
-                }
-                return Ok(());
-            }
-        }
-        if let Err(err) = session.flush_peer_cache() {
-            warn!(error = %err, "failed to flush peer cache");
-        }
-        return Ok(());
+    // Main ingest path
+    info!(
+        chain_id = config.chain_id,
+        data_dir = %config.data_dir.display(),
+        "starting stateless history node"
+    );
+    if !matches!(config.head_source, cli::HeadSource::P2p) {
+        return Err(eyre::eyre!("ingest requires --head-source p2p"));
     }
 
-    // Temporary refactor (see REFACTOR_PLAN.md):
-    // Run the benchmark ingest pipeline by default, and only emit JSON artifacts when
-    // `--benchmark ingest` is explicitly enabled.
-    if matches!(config.benchmark, BenchmarkMode::Ingest)
-        || matches!(config.benchmark, BenchmarkMode::Disabled)
-    {
-        let write_benchmark_artifacts = matches!(config.benchmark, BenchmarkMode::Ingest);
-        let start_msg = if write_benchmark_artifacts {
-            "starting stateless history node (benchmark ingest)"
-        } else {
-            "starting stateless history node (ingest)"
-        };
-        info!(
-            chain_id = config.chain_id,
-            data_dir = %config.data_dir.display(),
-            "{}", start_msg
-        );
-        if !matches!(config.head_source, cli::HeadSource::P2p) {
-            return Err(eyre::eyre!("ingest requires --head-source p2p"));
-        }
+    let storage = Arc::new(storage::Storage::open(&config)?);
 
-        let storage = Arc::new(storage::Storage::open(&config)?);
-
-        // Resume behavior: if the previous run exited before compaction finished, ensure we
-        // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
-        // across restarts.
-        let dirty_shards = storage.dirty_complete_shards()?;
-        if !dirty_shards.is_empty() {
-            let storage = Arc::clone(&storage);
-            let shard_count = dirty_shards.len();
-            info!(shard_count, "startup: compacting completed dirty shards");
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                for shard_start in dirty_shards {
-                    storage.compact_shard(shard_start)?;
-                }
-                Ok(())
-            })
-            .await??;
-            info!(shard_count, "startup: completed shard compaction done");
-        }
-
-        info!("starting p2p network");
-        let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
-        info!(peers = session.pool.len(), "p2p peers connected");
-        let min_peers = if write_benchmark_artifacts {
-            benchmark_min_peers as usize
-        } else {
-            1
-        };
-        wait_for_benchmark_min_peers(&session.pool, min_peers).await;
-        info!(
-            peers = session.pool.len(),
-            min_peers, "peer warmup complete"
-        );
-        let follow_after =
-            matches!(config.benchmark, BenchmarkMode::Disabled) && config.end_block.is_none();
-
-        let head_at_startup = wait_for_peer_head(
-            &session.pool,
-            config.start_block,
-            config.end_block,
-            config.rollback_window,
-        )
-        .await;
-        let range = compute_target_range(
-            config.start_block,
-            config.end_block,
-            head_at_startup,
-            config.rollback_window,
-        );
-        let bench_context = bench_context.as_ref();
-        let missing_started = Instant::now();
-        let (missing_ranges, missing_total) = storage.missing_ranges_in_range(range.clone())?;
-        let missing_elapsed_ms = missing_started.elapsed().as_millis() as u64;
-        let requested_total = range_len(&range);
-        let already_present = requested_total.saturating_sub(missing_total);
-        if already_present > 0 {
-            info!(
-                range_start = *range.start(),
-                range_end = *range.end(),
-                requested_total,
-                already_present,
-                missing_total,
-                elapsed_ms = missing_elapsed_ms,
-                "resume: found existing blocks in range; skipping already present blocks"
-            );
-        } else {
-            info!(
-                range_start = *range.start(),
-                range_end = *range.end(),
-                requested_total,
-                missing_total,
-                elapsed_ms = missing_elapsed_ms,
-                "resume: no existing blocks in range"
-            );
-        }
-        let total_len = missing_total;
-        let blocks = sync::historical::MissingBlocks::Ranges {
-            ranges: missing_ranges,
-            total: missing_total,
-        };
-
-        let progress_stats = if std::io::stderr().is_terminal() {
-            Some(Arc::new(SyncProgressStats::default()))
-        } else {
-            None
-        };
-        if let Some(stats) = progress_stats.as_ref() {
-            // In benchmark ingest, the head we target is fixed at startup.
-            stats.set_head_seen(head_at_startup);
-        }
-        let events = if write_benchmark_artifacts && config.benchmark_events {
-            let bench_context = bench_context.expect("benchmark context");
-            let tmp_path = bench_context
-                .events_tmp_path
-                .clone()
-                .expect("benchmark events tmp path");
-            Some(Arc::new(BenchEventLogger::new(tmp_path)?))
-        } else {
-            None
-        };
-        spawn_benchmark_resource_logger(progress_stats.clone(), events.clone());
-        let peer_health_local = sync::historical::build_peer_health_tracker(&config);
-        apply_cached_peer_limits(&storage, &peer_health_local).await;
-        #[cfg(unix)]
-        spawn_usr1_state_logger(
-            progress_stats.clone(),
-            Some(Arc::clone(&session.pool)),
-            Some(Arc::clone(&peer_health_local)),
-        );
-        let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
-            let bar = ProgressBar::new(total_len);
-            bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-            let style = ProgressStyle::with_template(
-                "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
-            )
-            .expect("progress style");
-            bar.set_style(style.progress_chars("█▉░"));
-            bar.set_message(format_progress_message(
-                SyncStatus::LookingForPeers,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0.0,
-                "--",
-            ));
-            if let Some(stats) = progress_stats.as_ref() {
-                stats.set_peers_active(0);
-                stats.set_peers_total(session.pool.len() as u64);
-                spawn_progress_updater(
-                    bar.clone(),
-                    Arc::clone(stats),
-                    total_len,
-                    Arc::clone(&session.pool),
-                    Some(Arc::clone(&peer_health_local)),
-                );
+    // Resume behavior: if the previous run exited before compaction finished, ensure we
+    // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
+    // across restarts.
+    let dirty_shards = storage.dirty_complete_shards()?;
+    if !dirty_shards.is_empty() {
+        let storage = Arc::clone(&storage);
+        let shard_count = dirty_shards.len();
+        info!(shard_count, "startup: compacting completed dirty shards");
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            for shard_start in dirty_shards {
+                storage.compact_shard(shard_start)?;
             }
-            Some(Arc::new(IngestProgress::new(bar, total_len)))
-        } else {
-            None
-        };
+            Ok(())
+        })
+        .await??;
+        info!(shard_count, "startup: completed shard compaction done");
+    }
 
-        let mut head_tracker_handle = None;
-        let mut tail_feeder_handle = None;
-        let mut head_stop_tx = None;
-        let mut tail_stop_tx = None;
-        let mut tail_config = None;
-        if follow_after {
+    info!("starting p2p network");
+    let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
+    info!(peers = session.pool.len(), "p2p peers connected");
+    let min_peers = config.min_peers as usize;
+    wait_for_min_peers(&session.pool, min_peers).await;
+    info!(
+        peers = session.pool.len(),
+        min_peers, "peer warmup complete"
+    );
+    let follow_after = config.end_block.is_none();
+
+    let head_at_startup = wait_for_peer_head(
+        &session.pool,
+        config.start_block,
+        config.end_block,
+        config.rollback_window,
+    )
+    .await;
+    let range = compute_target_range(
+        config.start_block,
+        config.end_block,
+        head_at_startup,
+        config.rollback_window,
+    );
+    let run_ctx = run_context.as_ref();
+    let missing_started = Instant::now();
+    let (missing_ranges, missing_total) = storage.missing_ranges_in_range(range.clone())?;
+    let missing_elapsed_ms = missing_started.elapsed().as_millis() as u64;
+    let requested_total = range_len(&range);
+    let already_present = requested_total.saturating_sub(missing_total);
+    if already_present > 0 {
+        info!(
+            range_start = *range.start(),
+            range_end = *range.end(),
+            requested_total,
+            already_present,
+            missing_total,
+            elapsed_ms = missing_elapsed_ms,
+            "resume: found existing blocks in range; skipping already present blocks"
+        );
+    } else {
+        info!(
+            range_start = *range.start(),
+            range_end = *range.end(),
+            requested_total,
+            missing_total,
+            elapsed_ms = missing_elapsed_ms,
+            "resume: no existing blocks in range"
+        );
+    }
+    let total_len = missing_total;
+    let blocks = sync::historical::MissingBlocks::Ranges {
+        ranges: missing_ranges,
+        total: missing_total,
+    };
+
+    let progress_stats = if std::io::stderr().is_terminal() {
+        Some(Arc::new(SyncProgressStats::default()))
+    } else {
+        None
+    };
+    if let Some(stats) = progress_stats.as_ref() {
+        stats.set_head_seen(head_at_startup);
+    }
+    let events = if config.log_events {
+        let run_ctx = run_ctx.expect("run context required for log_events");
+        let tmp_path = run_ctx
+            .events_tmp_path
+            .clone()
+            .expect("events tmp path");
+        Some(Arc::new(BenchEventLogger::new(tmp_path)?))
+    } else {
+        None
+    };
+    spawn_resource_logger(progress_stats.clone(), events.clone());
+    let peer_health_local = sync::historical::build_peer_health_tracker(&config);
+    apply_cached_peer_limits(&storage, &peer_health_local).await;
+    #[cfg(unix)]
+    spawn_usr1_state_logger(
+        progress_stats.clone(),
+        Some(Arc::clone(&session.pool)),
+        Some(Arc::clone(&peer_health_local)),
+    );
+    let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
+        let bar = ProgressBar::new(total_len);
+        bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+        let style = ProgressStyle::with_template(
+            "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
+        )
+        .expect("progress style");
+        bar.set_style(style.progress_chars("█▉░"));
+        bar.set_message(format_progress_message(
+            SyncStatus::LookingForPeers,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            "--",
+        ));
+        if let Some(stats) = progress_stats.as_ref() {
+            stats.set_peers_active(0);
+            stats.set_peers_total(session.pool.len() as u64);
+            spawn_progress_updater(
+                bar.clone(),
+                Arc::clone(stats),
+                total_len,
+                Arc::clone(&session.pool),
+                Some(Arc::clone(&peer_health_local)),
+            );
+        }
+        Some(Arc::new(IngestProgress::new(bar, total_len)))
+    } else {
+        None
+    };
+
+    let mut head_tracker_handle = None;
+    let mut tail_feeder_handle = None;
+    let mut head_stop_tx = None;
+    let mut tail_stop_tx = None;
+    let mut tail_config = None;
+    if follow_after {
             let (head_stop, head_stop_rx) = tokio::sync::watch::channel(false);
             let (tail_stop, tail_stop_rx) = tokio::sync::watch::channel(false);
             head_stop_tx = Some(head_stop.clone());
@@ -1312,6 +1264,47 @@ async fn main() -> Result<()> {
 
             info!("fast-sync complete; switching to follow mode");
 
+            // Generate report at fast-sync completion (before follow mode).
+            let logs_total = match &outcome {
+                sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+                sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+            };
+            let storage_stats = match storage.disk_usage() {
+                Ok(stats) => Some(stats),
+                Err(err) => {
+                    warn!(error = %err, "failed to collect storage disk stats");
+                    None
+                }
+            };
+            let summary = bench.summary(
+                *range.start(),
+                *range.end(),
+                head_at_startup,
+                config.rollback_window > 0,
+                session.pool.len() as u64,
+                logs_total,
+                storage_stats,
+            );
+            let summary_json = serde_json::to_string_pretty(&summary)?;
+            println!("{summary_json}");
+            if let Some(run_ctx) = run_context.as_ref() {
+                if let Err(err) = emit_run_artifacts(
+                    run_ctx,
+                    &config,
+                    &range,
+                    head_at_startup,
+                    &peer_health_local,
+                    summary,
+                    events.as_deref(),
+                    tracing_guards.log_writer.as_deref(),
+                    &mut tracing_guards.chrome_guard,
+                )
+                .await
+                {
+                    warn!(error = %err, "failed to write run artifacts");
+                }
+            }
+
             let progress_ref = progress
                 .as_ref()
                 .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
@@ -1377,6 +1370,15 @@ async fn main() -> Result<()> {
             if let Some(handle) = head_tracker_handle.take() {
                 let _ = handle.await;
             }
+            // Finalize log artifacts on shutdown
+            if let Some(run_ctx) = run_context.as_ref() {
+                finalize_logs_on_shutdown(
+                    run_ctx,
+                    events.as_deref(),
+                    tracing_guards.log_writer.as_deref(),
+                    &mut tracing_guards.chrome_guard,
+                );
+            }
             flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
             return Ok(());
         }
@@ -1396,6 +1398,15 @@ async fn main() -> Result<()> {
             }
             if let Some(tracker) = progress.as_ref() {
                 tracker.finish();
+            }
+            // Finalize log artifacts on shutdown
+            if let Some(run_ctx) = run_context.as_ref() {
+                finalize_logs_on_shutdown(
+                    run_ctx,
+                    events.as_deref(),
+                    tracing_guards.log_writer.as_deref(),
+                    &mut tracing_guards.chrome_guard,
+                );
             }
             flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
             return Ok(());
@@ -1425,183 +1436,27 @@ async fn main() -> Result<()> {
             logs_total,
             storage_stats,
         );
-        let summary_json = serde_json::to_string_pretty(&summary)?;
-        println!("{summary_json}");
-        if write_benchmark_artifacts {
-            let bench_context = bench_context.expect("benchmark context");
-            if let Err(err) = emit_benchmark_artifacts(
-                bench_context,
-                &config,
-                &range,
-                head_at_startup,
-                &peer_health_local,
-                summary,
-                events.as_deref(),
-                tracing_guards.log_writer.as_deref(),
-                &mut tracing_guards.chrome_guard,
-            )
-            .await
-            {
-                warn!(error = %err, "failed to write benchmark artifacts");
-            }
-        }
-        flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
-        return Ok(());
-    }
-
-    info!(
-        chain_id = config.chain_id,
-        rpc_bind = %config.rpc_bind,
-        data_dir = %config.data_dir.display(),
-        "starting stateless history node"
-    );
-
-    let storage = Arc::new(storage::Storage::open(&config)?);
-    let head_seen = storage.head_seen()?;
-    let last_indexed = storage.last_indexed_block()?;
-    info!(
-        head_seen = ?head_seen,
-        last_indexed = ?last_indexed,
-        "sync checkpoints loaded"
-    );
-
-    let rpc_handle = rpc::start(
-        config.rpc_bind,
-        rpc::RpcConfig::from(&config),
-        Arc::clone(&storage),
-    )
-    .await?;
-    info!(rpc_bind = %config.rpc_bind, "rpc server started");
-
-    let mut _network_session = None;
-    let mut peer_health: Option<Arc<PeerHealthTracker>> = None;
-    let mut follow_error: Option<eyre::Report> = None;
-    let mut progress: Option<Arc<IngestProgress>> = None;
-    if matches!(config.head_source, cli::HeadSource::P2p) {
-        info!("starting p2p network");
-        let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
-        info!(peers = session.pool.len(), "p2p peers connected");
-        let last_indexed = storage.last_indexed_block()?;
-        let start_from = select_start_from(config.start_block, last_indexed);
-        let initial_head = wait_for_peer_head(
-            &session.pool,
-            start_from,
-            config.end_block,
-            config.rollback_window,
-        )
-        .await;
-        let initial_range = compute_target_range(
-            start_from,
-            config.end_block,
-            initial_head,
-            config.rollback_window,
-        );
-        let total_len = range_len(&initial_range);
-
-        let progress_stats = if std::io::stderr().is_terminal() {
-            Some(Arc::new(SyncProgressStats::default()))
-        } else {
-            None
-        };
-        let peer_health_local = sync::historical::build_peer_health_tracker(&config);
-        apply_cached_peer_limits(&storage, &peer_health_local).await;
-        peer_health = Some(Arc::clone(&peer_health_local));
-        #[cfg(unix)]
-        spawn_usr1_state_logger(
-            progress_stats.clone(),
-            Some(Arc::clone(&session.pool)),
-            Some(Arc::clone(&peer_health_local)),
-        );
-
-        progress = if std::io::stderr().is_terminal() {
-            let bar = ProgressBar::new(total_len);
-            bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-            let style = ProgressStyle::with_template(
-                "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
-            )
-            .expect("progress style");
-            bar.set_style(style.progress_chars("█▉░"));
-            bar.set_message(format_progress_message(
-                SyncStatus::LookingForPeers,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0.0,
-                "--",
-            ));
-            if let Some(stats) = progress_stats.as_ref() {
-                stats.set_peers_active(0);
-                stats.set_peers_total(session.pool.len() as u64);
-                spawn_progress_updater(
-                    bar.clone(),
-                    Arc::clone(stats),
-                    total_len,
-                    Arc::clone(&session.pool),
-                    Some(Arc::clone(&peer_health_local)),
-                );
-            }
-            Some(Arc::new(IngestProgress::new(bar, total_len)))
-        } else {
-            None
-        };
-
-        let progress_ref = progress
-            .as_ref()
-            .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-        let follow_future = sync::historical::run_follow_loop(
-            Arc::clone(&storage),
-            Arc::clone(&session.pool),
+    let summary_json = serde_json::to_string_pretty(&summary)?;
+    println!("{summary_json}");
+    // Finalize log artifacts (rename tmp files, write report if enabled).
+    if let Some(run_ctx) = run_ctx {
+        if let Err(err) = emit_run_artifacts(
+            run_ctx,
             &config,
-            progress_ref,
-            progress_stats.clone(),
-            peer_health_local,
-            None,
-        );
-
-        _network_session = Some(session);
-        tokio::pin!(follow_future);
-        tokio::select! {
-            res = &mut follow_future => {
-                if let Err(err) = res {
-                    follow_error = Some(err);
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                warn!("shutdown signal received");
-            }
-        }
-    } else {
-        tokio::signal::ctrl_c().await?;
-        warn!("shutdown signal received");
-    }
-
-    if let Some(tracker) = progress.as_ref() {
-        tracker.finish();
-    }
-    if let Err(err) = rpc_handle.stop() {
-        warn!(error = %err, "failed to stop rpc server");
-    }
-    rpc_handle.stopped().await;
-    if let Some(session) = _network_session.as_ref() {
-        flush_peer_cache_with_limits(
-            session,
-            &storage,
-            peer_health.as_ref().map(|health| health.as_ref()),
+            &range,
+            head_at_startup,
+            &peer_health_local,
+            summary,
+            events.as_deref(),
+            tracing_guards.log_writer.as_deref(),
+            &mut tracing_guards.chrome_guard,
         )
-        .await;
+        .await
+        {
+            warn!(error = %err, "failed to write run artifacts");
+        }
     }
-    drop(_network_session);
-    drop(storage);
-    warn!("shutdown complete");
-
-    if let Some(err) = follow_error {
-        return Err(err);
-    }
-
+    flush_peer_cache_with_limits(&session, &storage, Some(&peer_health_local)).await;
     Ok(())
 }
 
@@ -1638,7 +1493,7 @@ async fn wait_for_peer_head(
 
 struct TracingGuards {
     chrome_guard: Option<tracing_chrome::FlushGuard>,
-    log_writer: Option<Arc<BenchmarkLogWriter>>,
+    log_writer: Option<Arc<JsonLogWriter>>,
 }
 
 fn init_tracing(
@@ -1660,40 +1515,41 @@ fn init_tracing(
     };
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
-        .with_filter(log_filter.clone());
+        .with_filter(log_filter);
 
-    let log_writer =
-        log_path.and_then(
-            |path| match BenchmarkLogWriter::new(path, BENCHMARK_LOG_BUFFER) {
-                Ok(writer) => Some(Arc::new(writer)),
-                Err(err) => {
-                    warn!(error = %err, "failed to initialize benchmark log writer");
-                    None
-                }
-            },
-        );
+    // JSON log file uses its own filter (defaults to DEBUG level).
+    let json_log_filter = EnvFilter::try_new(&config.log_json_filter)
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_JSON_FILTER));
+
+    let log_writer = log_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+        Ok(writer) => Some(Arc::new(writer)),
+        Err(err) => {
+            warn!(error = %err, "failed to initialize json log writer");
+            None
+        }
+    });
 
     let mut chrome_guard = None;
     if let Some(path) = chrome_trace_path {
-        let trace_filter = EnvFilter::try_new(&config.benchmark_trace_filter)
-            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_BENCHMARK_TRACE_FILTER));
+        let trace_filter = EnvFilter::try_new(&config.log_trace_filter)
+            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_TRACE_FILTER));
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(path)
-            .include_args(config.benchmark_trace_include_args)
-            .include_locations(config.benchmark_trace_include_locations)
+            .include_args(config.log_trace_include_args)
+            .include_locations(config.log_trace_include_locations)
             .build();
-        let log_layer = log_writer.as_ref().map(|writer| {
-            BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone())
-        });
+        let log_layer = log_writer
+            .as_ref()
+            .map(|writer| JsonLogLayer::new(Arc::clone(writer)).with_filter(json_log_filter));
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(log_layer);
         registry.with(chrome_layer.with_filter(trace_filter)).init();
         chrome_guard = Some(guard);
     } else {
-        let log_layer = log_writer.as_ref().map(|writer| {
-            BenchmarkLogLayer::new(Arc::clone(writer)).with_filter(log_filter.clone())
-        });
+        let log_layer = log_writer
+            .as_ref()
+            .map(|writer| JsonLogLayer::new(Arc::clone(writer)).with_filter(json_log_filter));
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(log_layer);
@@ -1876,7 +1732,7 @@ fn read_proc_disk_sample() -> Option<DiskSample> {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_benchmark_resource_logger(
+fn spawn_resource_logger(
     stats: Option<Arc<SyncProgressStats>>,
     events: Option<Arc<BenchEventLogger>>,
 ) {
@@ -1986,7 +1842,7 @@ fn spawn_benchmark_resource_logger(
                     peers_total = snapshot.peers_total,
                     head_block = snapshot.head_block,
                     head_seen = snapshot.head_seen,
-                    "benchmark resources"
+                    "resources"
                 );
             } else {
                 if let Some(events) = events.as_ref() {
@@ -2021,7 +1877,7 @@ fn spawn_benchmark_resource_logger(
                     cpu_iowait_pct,
                     disk_read_mib_s,
                     disk_write_mib_s,
-                    "benchmark resources"
+                    "resources"
                 );
             }
         }
@@ -2029,7 +1885,7 @@ fn spawn_benchmark_resource_logger(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_benchmark_resource_logger(
+fn spawn_resource_logger(
     stats: Option<Arc<SyncProgressStats>>,
     events: Option<Arc<BenchEventLogger>>,
 ) {
@@ -2125,7 +1981,7 @@ fn spawn_benchmark_resource_logger(
                     peers_total = snapshot.peers_total,
                     head_block = snapshot.head_block,
                     head_seen = snapshot.head_seen,
-                    "benchmark resources"
+                    "resources"
                 );
             } else {
                 if let Some(events) = events.as_ref() {
@@ -2160,7 +2016,7 @@ fn spawn_benchmark_resource_logger(
                     cpu_iowait_pct,
                     disk_read_mib_s,
                     disk_write_mib_s,
-                    "benchmark resources"
+                    "resources"
                 );
             }
         }
@@ -2245,13 +2101,6 @@ fn spawn_usr1_state_logger(
             }
         }
     });
-}
-
-fn select_start_from(start_block: u64, last_indexed: Option<u64>) -> u64 {
-    last_indexed
-        .map(|block| block.saturating_add(1))
-        .unwrap_or(start_block)
-        .max(start_block)
 }
 
 #[allow(dead_code)]
@@ -2543,15 +2392,7 @@ fn spawn_progress_updater(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_progress_message, select_start_from, total_blocks_to_head, SyncStatus};
-
-    #[test]
-    fn start_from_respects_start_block() {
-        assert_eq!(select_start_from(100, None), 100);
-        assert_eq!(select_start_from(100, Some(50)), 100);
-        assert_eq!(select_start_from(100, Some(100)), 101);
-        assert_eq!(select_start_from(100, Some(150)), 151);
-    }
+    use super::{format_progress_message, total_blocks_to_head, SyncStatus};
 
     #[test]
     fn total_blocks_handles_empty_range() {

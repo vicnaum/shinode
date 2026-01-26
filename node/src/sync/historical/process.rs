@@ -5,7 +5,6 @@ use crate::storage::{
     StoredTransactions, StoredTxHashes, StoredWithdrawals,
 };
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
-use crate::sync::historical::types::{FetchedBlock, ProbeRecord};
 use crate::sync::BlockPayload;
 use alloy_consensus::{SignableTransaction, Transaction as _};
 use alloy_primitives::{Keccak256, TxKind, B256};
@@ -15,18 +14,6 @@ use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
 use reth_primitives_traits::SealedHeader;
 use std::mem::MaybeUninit;
 use std::time::Instant;
-
-/// Process a fetched block in probe mode.
-#[allow(dead_code)]
-pub fn process_probe(block: FetchedBlock) -> ProbeRecord {
-    let receipts = block.receipts.len() as u64;
-    ProbeRecord {
-        number: block.number,
-        peer_id: block.peer_id,
-        receipts,
-        timing: block.timing,
-    }
-}
 
 const KECCAK_SCRATCH_LEN: usize = 4096;
 

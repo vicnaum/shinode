@@ -18,9 +18,11 @@ pub const DEFAULT_FAST_SYNC_MAX_LOOKAHEAD_BLOCKS: u64 = 100_000;
 pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 pub const DEFAULT_SHARD_SIZE: u64 = 10_000;
-pub const DEFAULT_BENCHMARK_OUTPUT_DIR: &str = "benchmarks";
-pub const DEFAULT_BENCHMARK_TRACE_FILTER: &str =
+pub const DEFAULT_LOG_OUTPUT_DIR: &str = "logs";
+pub const DEFAULT_LOG_TRACE_FILTER: &str =
     "off,stateless_history_node=trace,reth_eth_wire::p2pstream=trace";
+/// Default filter for JSON log output (DEBUG level for node, WARN for externals).
+pub const DEFAULT_LOG_JSON_FILTER: &str = "warn,stateless_history_node=debug";
 
 /// Retention mode for stored history.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,18 +46,6 @@ pub enum HeadSource {
 pub enum ReorgStrategy {
     /// Delete data above the common ancestor.
     Delete,
-}
-
-/// Benchmark mode for probe runs.
-#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BenchmarkMode {
-    /// Normal operation (no benchmark).
-    Disabled,
-    /// Harness-like probe mode (headers + receipts only, no DB, no RPC).
-    Probe,
-    /// Full ingest benchmark (full processing + DB writes, exits after range).
-    Ingest,
 }
 
 /// Top-level CLI commands.
@@ -124,37 +114,46 @@ pub struct NodeConfig {
     /// Increase log verbosity (-v, -vv, -vvv).
     #[arg(short = 'v', action = ArgAction::Count)]
     pub verbosity: u8,
-    /// Benchmark mode (probe only, exits after range).
-    #[arg(long, value_enum, default_value_t = BenchmarkMode::Disabled)]
-    pub benchmark: BenchmarkMode,
-    /// Optional benchmark run name (used in output filenames).
+    /// Optional run name (used in log artifact filenames).
     #[arg(long)]
-    pub benchmark_name: Option<String>,
-    /// Benchmark output directory (summary JSON, traces, events).
-    #[arg(long, default_value = DEFAULT_BENCHMARK_OUTPUT_DIR)]
-    pub benchmark_output_dir: PathBuf,
-    /// Emit a Chrome trace during benchmark runs.
+    pub run_name: Option<String>,
+    /// Output directory for log artifacts (summary JSON, traces, events).
+    #[arg(long, default_value = DEFAULT_LOG_OUTPUT_DIR)]
+    pub log_output_dir: PathBuf,
+    /// Enable all log outputs (trace, events, json, report).
     #[arg(long, default_value_t = false)]
-    pub benchmark_trace: bool,
-    /// EnvFilter-style trace filter used only for the benchmark trace layer.
+    pub log: bool,
+    /// Emit a Chrome trace file during sync.
+    #[arg(long, default_value_t = false)]
+    pub log_trace: bool,
+    /// EnvFilter-style filter for the trace layer.
     ///
     /// Defaults to a minimal filter that excludes `net::*` targets.
-    #[arg(long, default_value = DEFAULT_BENCHMARK_TRACE_FILTER)]
-    pub benchmark_trace_filter: String,
-    /// Include span/event args in benchmark traces.
+    #[arg(long, default_value = DEFAULT_LOG_TRACE_FILTER)]
+    pub log_trace_filter: String,
+    /// Include span/event args in trace output.
     #[arg(long, default_value_t = true)]
-    pub benchmark_trace_include_args: bool,
-    /// Include file+line in benchmark traces.
+    pub log_trace_include_args: bool,
+    /// Include file+line in trace output.
     #[arg(long, default_value_t = true)]
-    pub benchmark_trace_include_locations: bool,
-    /// Emit a JSONL event log during benchmark runs.
+    pub log_trace_include_locations: bool,
+    /// Emit a JSONL event log during sync.
     #[arg(long, default_value_t = false)]
-    pub benchmark_events: bool,
-    /// Minimum peers to wait for before starting benchmark ingest/probe.
+    pub log_events: bool,
+    /// Emit a JSONL log file (tracing output) during sync.
+    #[arg(long, default_value_t = false)]
+    pub log_json: bool,
+    /// EnvFilter-style filter for the JSON log layer.
     ///
-    /// If unset, benchmark runs will default to 5 peers. Non-benchmark runs ignore this.
-    #[arg(long)]
-    pub benchmark_min_peers: Option<u64>,
+    /// Defaults to DEBUG for the node, WARN for external crates.
+    #[arg(long, default_value = DEFAULT_LOG_JSON_FILTER)]
+    pub log_json_filter: String,
+    /// Emit a JSON run report after sync completes.
+    #[arg(long, default_value_t = false)]
+    pub log_report: bool,
+    /// Minimum peers to wait for before starting sync.
+    #[arg(long, default_value_t = 1)]
+    pub min_peers: u64,
     /// Optional command.
     #[command(subcommand)]
     #[serde(skip)]
@@ -210,7 +209,21 @@ pub struct NodeConfig {
 impl NodeConfig {
     /// Parse configuration from CLI args.
     pub fn from_args() -> Self {
-        Self::parse()
+        let mut config = Self::parse();
+        config.normalize();
+        config
+    }
+
+    /// Normalize config by propagating convenience flags.
+    ///
+    /// If `--log` is set, enables all log outputs.
+    pub fn normalize(&mut self) {
+        if self.log {
+            self.log_trace = true;
+            self.log_events = true;
+            self.log_json = true;
+            self.log_report = true;
+        }
     }
 }
 
@@ -247,21 +260,21 @@ mod tests {
         assert_eq!(config.head_source, HeadSource::P2p);
         assert_eq!(config.reorg_strategy, ReorgStrategy::Delete);
         assert_eq!(config.verbosity, 0);
-        assert_eq!(config.benchmark, BenchmarkMode::Disabled);
-        assert_eq!(config.benchmark_name, None);
+        assert_eq!(config.run_name, None);
+        assert!(!config.log);
         assert_eq!(
-            config.benchmark_output_dir,
-            PathBuf::from(DEFAULT_BENCHMARK_OUTPUT_DIR)
+            config.log_output_dir,
+            PathBuf::from(DEFAULT_LOG_OUTPUT_DIR)
         );
-        assert!(!config.benchmark_trace);
-        assert_eq!(
-            config.benchmark_trace_filter,
-            DEFAULT_BENCHMARK_TRACE_FILTER
-        );
-        assert!(config.benchmark_trace_include_args);
-        assert!(config.benchmark_trace_include_locations);
-        assert!(!config.benchmark_events);
-        assert_eq!(config.benchmark_min_peers, None);
+        assert!(!config.log_trace);
+        assert_eq!(config.log_trace_filter, DEFAULT_LOG_TRACE_FILTER);
+        assert!(config.log_trace_include_args);
+        assert!(config.log_trace_include_locations);
+        assert!(!config.log_events);
+        assert!(!config.log_json);
+        assert_eq!(config.log_json_filter, DEFAULT_LOG_JSON_FILTER);
+        assert!(!config.log_report);
+        assert_eq!(config.min_peers, 1);
         assert!(config.command.is_none());
         assert_eq!(
             config.rpc_max_request_body_bytes,
@@ -313,5 +326,16 @@ mod tests {
             config.command,
             Some(Command::Db(DbCommand::Stats(_)))
         ));
+    }
+
+    #[test]
+    fn log_flag_enables_all_log_outputs() {
+        let mut config = NodeConfig::parse_from(["stateless-history-node", "--log"]);
+        config.normalize();
+        assert!(config.log);
+        assert!(config.log_trace);
+        assert!(config.log_events);
+        assert!(config.log_json);
+        assert!(config.log_report);
     }
 }

@@ -17,8 +17,8 @@ What works:
 - Graceful shutdown, restart-safe checkpoints, and basic ingest stats (resume skips already-present blocks; finalize recompacts dirty shards).
 - Peer health tracking (bans/quality scoring), bounded per-batch timeouts, and partial response handling.
 - Verbosity flags and progress bars (TTY only).
-- Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
-- Fast-sync WAL batching (out-of-order) + benchmark events for compaction/sealing timings.
+- Peer warmup gating: `--min-peers` (default: 1).
+- Fast-sync WAL batching (out-of-order) with optional event logging for compaction/sealing timings.
 
 What does not yet:
 - Additional RPC methods (`eth_getBlockByHash`, receipts endpoints, WS).
@@ -49,6 +49,11 @@ cargo build --manifest-path node/Cargo.toml --release
 
 ```bash
 cargo run --manifest-path node/Cargo.toml
+```
+
+Release-optimized usage:
+```bash
+cargo run --release --manifest-path node/Cargo.toml
 ```
 
 Stop with Ctrl+C. The node persists checkpoints and resumes on restart.
@@ -82,25 +87,16 @@ Core:
 - `-vvv`: trace for node internals.
 - Default without `-v` is errors only. `RUST_LOG` overrides all defaults.
 
-Benchmark/probe:
-- `--benchmark probe`: harness-like probe mode (headers + receipts only).
-  - No DB writes, no chain tracking, no RPC server.
-  - Exits after finishing the configured range.
-  - If `--start-block` is above the peer-reported safe head, waits for more peers/head updates.
-  - Range selection uses the same flags as normal sync:
-    - `--start-block` sets the start (default 0).
-    - `--end-block` limits the end.
-    - If `--end-block` is not set, the end is the head at startup (with rollback window applied).
-- `--benchmark ingest`: full ingest benchmark (fetch + process + DB writes).
-  - No RPC server; exits after finishing the configured range.
-  - If `--start-block` is above the peer-reported safe head, waits for more peers/head updates.
-  - Prints a per-stage timing summary (fetch/process/db) as JSON.
-  - Writes a summary JSON file to `--benchmark-output-dir` (default: `benchmarks`).
-  - Optional artifacts:
-    - `--benchmark-name <string>`: label used in output filenames.
-    - `--benchmark-trace`: Chrome trace (`.trace.json`) for timeline inspection.
-    - `--benchmark-events`: JSONL event log (`.events.jsonl`) for post-analysis (capped; default: 10,000,000 events).
-    - `--benchmark-min-peers <u64>`: wait for at least N connected peers before starting the benchmark (default: 5).
+Logging artifacts:
+- `--log`: convenience flag to enable all log outputs (trace, events, json, report).
+- `--run-name <string>`: label used in output filenames (default: timestamp-based).
+- `--log-output-dir <path>`: output directory for log artifacts (default: `logs`).
+- `--log-trace`: emit Chrome trace (`.trace.json`) for timeline inspection.
+- `--log-events`: emit JSONL event log (`.events.jsonl`) for post-analysis.
+- `--log-json`: emit JSON structured logs (`.logs.jsonl`). Uses DEBUG level by default (independent of console `-v` flags).
+- `--log-json-filter <filter>`: customize JSON log filter (default: `warn,stateless_history_node=debug`).
+- `--log-report`: emit run summary report (`.report.json`).
+- `--min-peers <u64>`: wait for at least N connected peers before starting sync (default: 1).
 
 RPC safety limits:
 - `--rpc-max-request-body-bytes <u32>` (default: 10_485_760).
@@ -124,6 +120,16 @@ DB stats:
 - `stateless-history-node db stats --data-dir <path>`: print static-file storage sizes.
 - `stateless-history-node db stats --data-dir <path> --json`: JSON output for tooling.
 
+## Analysis scripts
+
+Visualize shard bitset (shows which blocks are fetched):
+
+```bash
+uv run scripts/draw_bitset.py 24310000           # default data dir
+uv run scripts/draw_bitset.py 24310000 -d /path  # custom data dir
+uv run scripts/draw_bitset.py 24310000 -w 50     # narrower display
+```
+
 ## Profiling
 
 CPU sampling (Linux):
@@ -131,7 +137,7 @@ CPU sampling (Linux):
 ```bash
 samply record -- \
   cargo run --manifest-path node/Cargo.toml --release -- \
-  --benchmark ingest --start-block 10_000_000 --end-block 10_010_000
+  --start-block 10_000_000 --end-block 10_010_000
 ```
 
 CPU sampling (macOS):
@@ -141,13 +147,13 @@ CPU sampling (macOS):
 
 ```bash
 cargo run --manifest-path node/Cargo.toml --release -- \
-  --benchmark ingest --start-block 10_000_000 --end-block 10_010_000
+  --start-block 10_000_000 --end-block 10_010_000
 ```
 
-Benchmark timeline artifacts:
+Timeline artifacts:
 
-- Add `--benchmark-trace` to emit a Chrome trace file alongside the summary JSON.
-- See `PERFORMANCE.md` for saved benchmark run summaries + bottleneck notes.
+- Add `--log-trace` to emit a Chrome trace file for timeline inspection.
+- See `PERFORMANCE.md` for saved run summaries + bottleneck notes.
 
 Notes:
 
@@ -157,16 +163,16 @@ Notes:
 
 ## Allocator tuning (Linux)
 
-Some benchmark workloads are allocation-heavy (WAL replay/compaction, decompression, etc.). On Linux/glibc you can reduce RSS fragmentation by limiting malloc arenas:
+Some workloads are allocation-heavy (WAL replay/compaction, decompression, etc.). On Linux/glibc you can reduce RSS fragmentation by limiting malloc arenas:
 
 ```bash
-MALLOC_ARENA_MAX=2 cargo run --manifest-path node/Cargo.toml --release -- --benchmark ingest ...
+MALLOC_ARENA_MAX=2 cargo run --manifest-path node/Cargo.toml --release -- --start-block 10_000_000 --end-block 10_010_000
 ```
 
-Alternatively, build/run with jemalloc (compile-time):
+Alternatively, build/run with jemalloc (compile-time, enabled by default):
 
 ```bash
-cargo run --manifest-path node/Cargo.toml --release -- --benchmark ingest ...
+cargo run --manifest-path node/Cargo.toml --release -- --start-block 10_000_000 --end-block 10_010_000
 ```
 
 ## Configuration and storage
@@ -204,7 +210,6 @@ All other methods are unimplemented and return `-32601`.
 ## Project layout
 
 - `node/`: stateless history node implementation.
-- `harness/`: receipt availability harness (see `harness/README.md`).
 - `SPEC.md`: current system spec (“what exists / doesn’t exist”).
 - `PRD.md`: v0.1 product contract (RPC semantics + constraints).
 - `ROADMAP.md`: milestones and what’s next.

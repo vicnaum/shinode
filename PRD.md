@@ -2,13 +2,13 @@
 
 ## Status update (v0.2)
 The v0.1 product contract is implemented. v0.2 focuses on reliability/performance hardening:
-- Benchmark warmup gating: `--benchmark-min-peers` (default: 5).
+- Peer warmup gating: `--min-peers` (default: 1).
 - Peer pool warmup: head probes performed asynchronously (avoid blocking peer session watcher).
 - Fast-sync WAL batching (out-of-order) to reduce per-block WAL syscall overhead.
-- Benchmark events include compaction + sealing duration instrumentation for attribution.
+- Optional log artifacts (`--log-trace`, `--log-events`, `--log-json`, `--log-report`) for compaction + sealing duration instrumentation and analysis.
 - Compaction memory hardening: stream WAL during compaction + serialize compactions to avoid OOM-scale peaks.
-- Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) or `--features jemalloc` build.
-- Pipeline parity and resume: default ingest uses the benchmark ingest pipeline; resume skips already-present blocks and recompacts dirty shards before follow.
+- Optional allocator knobs: `MALLOC_ARENA_MAX=2` (Linux/glibc) or `--features jemalloc` build (enabled by default).
+- Resume without redownload: skip already-present blocks and recompact dirty shards before follow.
 
 ## Context
 We already have a working **receipt availability harness** (`harness/`) that uses Reth as a library to do devp2p discovery, dialing, `eth` handshake, and `GetBlockHeaders`/`GetReceipts*` probing. The next product is a **long-running stateless history node**: it ingests history artifacts and serves an indexer-compatible RPC subset.
@@ -341,7 +341,7 @@ Test gate (must pass):
 Deliverables:
 - structured logs/metrics (lag to head, throughput, reorg count)
 - stable config file format (optional)
-- ingest benchmark mode with per-stage timing (fetch/process/db)
+- optional log artifacts (`--log-trace`, `--log-events`) for per-stage timing analysis (fetch/process/db)
 
 Verification:
 - unattended run for N hours with stable memory and bounded queues
