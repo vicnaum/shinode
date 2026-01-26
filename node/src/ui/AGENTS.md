@@ -12,7 +12,7 @@ and failed block recovery.
 - `state.rs` - UI state machine types for tracking current display phase.
   - **Key items**: `UIState`, `StartupPhase`
 - `bars.rs` - Progress bar creation helpers and color definitions.
-  - **Key items**: `colors`, `create_sync_bar()`, `create_finalizing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `format_colored_segment()`
+  - **Key items**: `colors`, `create_sync_bar()`, `create_finalizing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `create_recovery_bar()`, `format_colored_segment()`, `format_recovery_segment()`
 - `progress.rs` - Main progress tracking logic and background updater.
   - **Key items**: `ProgressUI`, `format_progress_message()`, `spawn_progress_updater()`
 
@@ -25,6 +25,7 @@ and failed block recovery.
 | Phase | Color | Description |
 |-------|-------|-------------|
 | Startup | Yellow (255,200,0) | Opening storage, connecting, waiting for peers |
+| Recovery | Orange (255,140,0) | Recovering shards from interrupted compaction |
 | Syncing | Cyan/Blue | Actively downloading blocks |
 | Finalizing | Teal (0,200,200) | Compacting database shards |
 | Following | Green (0,128,0) | Synced and following chain head |

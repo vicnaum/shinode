@@ -33,3 +33,23 @@ RPC limits, fast-sync scheduling, storage sharding, and log output.
 - Apply defaults for missing flags (RPC limits, fast-sync scheduling, log outputs).
 - Derive the "safe" historical range via `compute_target_range()`.
 - Pass config into storage opening (`data_dir`, `shard_size`), P2P startup, RPC server limits, and sync pipeline knobs.
+
+## Special Modes
+
+### `--repair` Flag
+Runs storage repair/recovery without starting sync:
+- Scans all shards for interrupted compactions (based on `compaction_phase` in `shard.json`)
+- Recovers from interrupted write/swap/cleanup phases
+- Cleans up orphan tmp/old files
+- Prints a summary and exits
+
+Example output:
+```
+Checking storage integrity...
+
+Shard 24280000: recovered from interrupted swap phase (phase: swapping)
+Shard 24290000: OK
+Shard 24300000: cleaned orphan files
+
+Repair complete. 2 shards repaired, 1 shards OK.
+```

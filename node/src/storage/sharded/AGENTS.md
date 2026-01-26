@@ -48,8 +48,8 @@ presence bitset, a staging WAL for out-of-order writes, and compacted "sorted" s
 ### `bitset.rs`
 - **Role**: Tracks per-shard block presence with a fixed-size byte vector persisted as `present.bitset`.
 - **Key items**: `Bitset { bytes, size_bits }`, `is_set()`, `set()`, `clear()`, `count_ones()`
-- **Interactions**: Used by `Storage::has_block()` / `missing_blocks_in_range()` and updated during WAL writes/rollback.
-- **Knobs / invariants**: On-disk size must match `shard_size` bits; mismatches are treated as corruption.
+- **Interactions**: Used by `Storage::has_block()` / `missing_blocks_in_range()`. Only updated during compaction (rebuilt from actual segment data) and rollback.
+- **Knobs / invariants**: On-disk size must match `shard_size` bits; mismatches are treated as corruption. Bitset only reflects what's in sorted segment, NOT WAL data.
 
 ### `wal.rs`
 - **Role**: Implements `staging.wal` append-only records with CRC32 validation and optional mmap slice indexing for compaction.
@@ -69,11 +69,56 @@ presence bitset, a staging WAL for out-of-order writes, and compacted "sorted" s
 - **Interactions**: Called by `Storage::seal_shard_locked()` to populate `ShardMeta.content_hash`.
 - **Knobs / invariants**: Hash input includes shard_start/shard_size/tail_block; changes to layout require bumping the version header string.
 
+## Atomic Compaction Model
+
+The storage uses a phase-based atomic compaction model to prevent data corruption:
+
+### Key Invariant
+The **bitset only reflects what's in the sorted segment**, never WAL data. WAL writes do NOT update the bitset. The bitset is rebuilt during compaction from actual segment data.
+
+### Compaction Phases
+Tracked in `shard.json.compaction_phase`:
+1. **"writing"**: Creating `sorted.tmp/` segments and `bitset.tmp`
+2. **"swapping"**: Atomic renames: `sorted/` → `sorted.old/`, `sorted.tmp/` → `sorted/`, then bitset swap
+3. **"cleanup"**: Deleting `sorted.old/`, `bitset.old`, and `staging.wal`
+4. **null**: Idle, clean state
+
+### Recovery on Startup
+`recover_shard()` checks `compaction_phase` and performs appropriate recovery:
+- **"writing"**: Discard partial `sorted.tmp/` and `bitset.tmp`, reset phase
+- **"swapping"**: Restore from backups if needed, reset to pre-swap state
+- **"cleanup"**: Complete pending deletes
+- **null**: Check for orphan `.tmp`/`.old` files from hard crashes
+
+### Partial Data Detection
+During compaction, the code verifies ALL segment files (headers, tx_hashes, tx_meta, receipts, sizes) have data for each row before considering existing data valid. This handles corrupt shards where some segments have data but others don't. Blocks with partial data are skipped with a warning and will be re-downloaded.
+
+### File Layout During Compaction
+```
+shards/<shard_start>/
+├── shard.json           # metadata + compaction_phase
+├── present.bitset       # live bitset (only reflects sorted segment)
+├── bitset.tmp           # new bitset during compaction
+├── bitset.old           # backup during swap
+├── state/
+│   └── staging.wal      # pending blocks (NOT in bitset)
+├── sorted/              # live segment files
+├── sorted.tmp/          # new segments during compaction
+└── sorted.old/          # backup during swap
+```
+
 ## End-to-end flow (high level)
-- Open: load `meta.json`, validate against `NodeConfig`, discover shard dirs, load `shard.json` + `present.bitset`, and repair any shard WAL state.
-- Write (fast sync): serialize block bundles into per-shard `staging.wal` records and mark offsets present in the bitset.
-- Compact: build a WAL slice index (mmap), merge existing sorted segments with WAL rows, and atomically swap in rebuilt segment files.
-- Seal: when a shard becomes complete and sorted, compute and persist a content hash in `shard.json`.
-- Read: check the bitset, then read rows from sorted segments (headers/tx hashes/receipts/sizes) by block number.
-- Rollback: prune sorted segments, clear bitset entries above an ancestor, and recompute `max_present_block` for the store.
-- Peer cache: load/update/persist `peers.json` for the P2P static peer seeding path.
+- **Open**: load `meta.json`, validate against `NodeConfig`, discover shard dirs, load `shard.json` + `present.bitset`, run phase-aware `recover_shard()`, and mark `sorted=false` if WAL exists.
+- **Write (fast sync)**: serialize block bundles into per-shard `staging.wal` records. Bitset is NOT updated here.
+- **Compact**:
+  1. Set `compaction_phase="writing"`, persist
+  2. Build `sorted.tmp/` segments and `bitset.tmp` from sorted + WAL data
+  3. Set `compaction_phase="swapping"`, persist
+  4. Atomic swaps with `.old` backups
+  5. Set `compaction_phase="cleanup"`, persist
+  6. Delete backups and WAL
+  7. Update `sorted=true`, clear `compaction_phase`
+- **Seal**: when a shard becomes complete and sorted, compute and persist a content hash in `shard.json`.
+- **Read**: check the bitset, then read rows from sorted segments (headers/tx hashes/receipts/sizes) by block number.
+- **Rollback**: prune sorted segments, clear bitset entries above an ancestor, and recompute `max_present_block` for the store.
+- **Peer cache**: load/update/persist `peers.json` for the P2P static peer seeding path.
