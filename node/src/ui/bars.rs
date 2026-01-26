@@ -27,13 +27,27 @@ pub fn create_sync_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
     bar
 }
 
-/// Create the compacting/sealing progress bar (teal themed).
+/// Create the compacting progress bar (magenta themed).
 /// Format: [████░░] 80% 8/10 | Compacting: 2 shards left
-pub fn create_finalizing_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
+pub fn create_compacting_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
     let bar = multi.add(ProgressBar::new(total.max(1)));
     bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
     let style = ProgressStyle::with_template(
-        "{bar:40.bright.cyan/black} {percent:>3}% {pos}/{len} | {msg}",
+        "{bar:40.magenta/black} {percent:>3}% {pos}/{len} | {msg}",
+    )
+    .expect("progress style")
+    .progress_chars("█▓░");
+    bar.set_style(style);
+    bar
+}
+
+/// Create the sealing progress bar (bright green themed).
+/// Format: [████░░] 80% 8/10 | Sealing: 2 shards left
+pub fn create_sealing_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
+    let bar = multi.add(ProgressBar::new(total.max(1)));
+    bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
+    let style = ProgressStyle::with_template(
+        "{bar:40.bright.green/black} {percent:>3}% {pos}/{len} | {msg}",
     )
     .expect("progress style")
     .progress_chars("█▓░");

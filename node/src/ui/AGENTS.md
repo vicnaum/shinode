@@ -12,14 +12,14 @@ following, and failed block recovery.
 - `state.rs` - UI state machine types for tracking current display phase.
   - **Key items**: `UIState`
 - `bars.rs` - Progress bar creation helpers and color definitions.
-  - **Key items**: `colors`, `create_sync_bar()`, `create_finalizing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `format_colored_segment()`
+  - **Key items**: `colors`, `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `format_colored_segment()`
 - `progress.rs` - Main progress tracking logic with UIController and background updater.
   - **Key items**: `UIController`, `format_progress_message()`, `spawn_progress_updater()`
 
 ## Key APIs (no snippets)
 - **Types**: `UIState`, `UIController`
 - **Functions**: `print_status_bar()`, `clear_status_bar()`, `format_progress_message()`, `spawn_progress_updater()`
-- **Bar creators**: `create_sync_bar()`, `create_finalizing_bar()`, `create_follow_bar()`, `create_failed_bar()`
+- **Bar creators**: `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`
 
 ## UIController State Machine
 The `UIController` manages all progress bars and handles state transitions automatically based on
@@ -27,10 +27,10 @@ The `UIController` manages all progress bars and handles state transitions autom
 
 | State | Color | Bar Type | Format |
 |-------|-------|----------|--------|
-| Startup | Yellow | Text status | `Opening storage...` |
+| Startup | Yellow | Text status | `Opening storage...` or `P2P connected \| N peers` |
 | Syncing | Cyan/Blue | Progress bar | `[████░░] 45% 4500/10000 \| status \| peers \| ...` |
-| Compacting | Teal | Progress bar | `[████░░] 80% 8/10 \| Compacting: 2 shards left` |
-| Sealing | Teal | Progress bar | `[████░░] 80% 8/10 \| Sealing: 2 shards left` |
+| Compacting | Magenta | Progress bar | `[████░░] 80% 8/10 \| Compacting: 2 shards left` |
+| Sealing | Bright Green | Progress bar | `[████░░] 80% 8/10 \| Sealing: 2 shards left` |
 | Following | Green | Status segment | `[ 12345678 ] Synced \| head N \| peers N/M \| ...` |
 | Recovery | Red | Overlay bar | `[████░░] 40% 4/10 \| Recovering failed blocks` |
 
@@ -39,8 +39,8 @@ The `UIController` manages all progress bars and handles state transitions autom
 |-------|-------|-------------|
 | Startup | Yellow (255,200,0) | Opening storage, connecting, waiting for peers |
 | Syncing | Cyan/Blue | Actively downloading blocks (shows "retry N" for escalation count) |
-| Compacting | Teal (bright cyan) | Compacting database shards |
-| Sealing | Teal (bright cyan) | Sealing completed shards |
+| Compacting | Magenta | Compacting database shards |
+| Sealing | Bright Green | Sealing completed shards |
 | Following | Green (0,128,0) | Synced and following chain head |
 | Recovery | Red | Recovering difficult blocks (overlay bar) |
 

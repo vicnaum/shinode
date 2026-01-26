@@ -936,7 +936,9 @@ async fn main() -> Result<()> {
     ui::print_status_bar("Connecting to P2P network...");
     info!("starting p2p network");
     let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
-    info!(peers = session.pool.len(), "p2p peers connected");
+    let initial_peers = session.pool.len();
+    info!(peers = initial_peers, "p2p peers connected");
+    ui::print_status_bar(&format!("P2P connected | {} peers", initial_peers));
     let min_peers = config.min_peers as usize;
     wait_for_min_peers(&session.pool, min_peers).await;
     info!(
@@ -1483,7 +1485,11 @@ async fn wait_for_peer_head(
             ui::clear_status_bar();
             return best_head;
         }
-        ui::print_status_bar(&format!("Discovering chain head... {}", best_head));
+        ui::print_status_bar(&format!(
+            "Discovering chain head... {} | peers {}",
+            best_head,
+            peers.len()
+        ));
         if last_log.elapsed() >= Duration::from_secs(5) {
             info!(
                 peers = peers.len(),

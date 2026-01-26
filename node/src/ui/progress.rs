@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::bars::{
-    create_failed_bar, create_finalizing_bar, create_follow_bar, create_sync_bar,
-    format_follow_segment,
+    create_compacting_bar, create_failed_bar, create_follow_bar, create_sealing_bar,
+    create_sync_bar, format_follow_segment,
 };
 use super::state::UIState;
 
@@ -69,7 +69,7 @@ impl UIController {
         self.state = UIState::Syncing;
     }
 
-    /// Transition to compacting state.
+    /// Transition to compacting state (magenta bar).
     pub fn show_compacting(&mut self, total_shards: u64) {
         if !self.is_tty {
             self.state = UIState::Compacting;
@@ -79,14 +79,14 @@ impl UIController {
         if let Some(bar) = self.current_bar.take() {
             bar.finish_and_clear();
         }
-        let bar = create_finalizing_bar(&self.multi, total_shards);
+        let bar = create_compacting_bar(&self.multi, total_shards);
         let left = total_shards;
         bar.set_message(format!("Compacting: {} shards left", left));
         self.current_bar = Some(bar);
         self.state = UIState::Compacting;
     }
 
-    /// Transition to sealing state.
+    /// Transition to sealing state (bright green bar).
     pub fn show_sealing(&mut self, total_shards: u64) {
         if !self.is_tty {
             self.state = UIState::Sealing;
@@ -96,7 +96,7 @@ impl UIController {
         if let Some(bar) = self.current_bar.take() {
             bar.finish_and_clear();
         }
-        let bar = create_finalizing_bar(&self.multi, total_shards);
+        let bar = create_sealing_bar(&self.multi, total_shards);
         let left = total_shards;
         bar.set_message(format!("Sealing: {} shards left", left));
         self.current_bar = Some(bar);
