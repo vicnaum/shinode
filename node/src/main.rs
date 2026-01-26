@@ -1264,45 +1264,31 @@ async fn main() -> Result<()> {
 
             info!("fast-sync complete; switching to follow mode");
 
-            // Generate report at fast-sync completion (before follow mode).
-            let logs_total = match &outcome {
-                sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
-                sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
-            };
-            let storage_stats = match storage.disk_usage() {
-                Ok(stats) => Some(stats),
-                Err(err) => {
-                    warn!(error = %err, "failed to collect storage disk stats");
-                    None
-                }
-            };
-            let summary = bench.summary(
-                *range.start(),
-                *range.end(),
-                head_at_startup,
-                config.rollback_window > 0,
-                session.pool.len() as u64,
-                logs_total,
-                storage_stats,
-            );
-            let summary_json = serde_json::to_string_pretty(&summary)?;
-            println!("{summary_json}");
-            if let Some(run_ctx) = run_context.as_ref() {
-                if let Err(err) = emit_run_artifacts(
-                    run_ctx,
-                    &config,
-                    &range,
+            // Print summary at fast-sync completion (only if verbose).
+            // Note: we don't finalize log artifacts here - they continue into follow mode.
+            if config.verbosity >= 1 {
+                let logs_total = match &outcome {
+                    sync::historical::IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+                    sync::historical::IngestPipelineOutcome::UpToDate { .. } => 0,
+                };
+                let storage_stats = match storage.disk_usage() {
+                    Ok(stats) => Some(stats),
+                    Err(err) => {
+                        warn!(error = %err, "failed to collect storage disk stats");
+                        None
+                    }
+                };
+                let summary = bench.summary(
+                    *range.start(),
+                    *range.end(),
                     head_at_startup,
-                    &peer_health_local,
-                    summary,
-                    events.as_deref(),
-                    tracing_guards.log_writer.as_deref(),
-                    &mut tracing_guards.chrome_guard,
-                )
-                .await
-                {
-                    warn!(error = %err, "failed to write run artifacts");
-                }
+                    config.rollback_window > 0,
+                    session.pool.len() as u64,
+                    logs_total,
+                    storage_stats,
+                );
+                let summary_json = serde_json::to_string_pretty(&summary)?;
+                println!("{summary_json}");
             }
 
             let progress_ref = progress
@@ -1436,8 +1422,11 @@ async fn main() -> Result<()> {
             logs_total,
             storage_stats,
         );
-    let summary_json = serde_json::to_string_pretty(&summary)?;
-    println!("{summary_json}");
+    // Print summary to stdout only if verbose.
+    if config.verbosity >= 1 {
+        let summary_json = serde_json::to_string_pretty(&summary)?;
+        println!("{summary_json}");
+    }
     // Finalize log artifacts (rename tmp files, write report if enabled).
     if let Some(run_ctx) = run_ctx {
         if let Err(err) = emit_run_artifacts(

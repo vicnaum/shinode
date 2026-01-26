@@ -6,3 +6,4 @@ data*/
 harness/output/
 /repomix*.*
 benchmarks/
+logs/
