@@ -1,5 +1,11 @@
 # PRD: Stateless History Node (v0.1 MVP)
 
+> **HISTORICAL DOCUMENT** - This PRD guided the v0.1 MVP development which shipped successfully.
+> For current architecture, see [ARCHITECTURE.md](../../ARCHITECTURE.md).
+> For current roadmap, see [ROADMAP.md](../../ROADMAP.md).
+
+---
+
 ## Status update (v0.2)
 The v0.1 product contract is implemented. v0.2 focuses on reliability/performance hardening:
 - Peer warmup gating: `--min-peers` (default: 1).
@@ -28,7 +34,7 @@ Ship **v0.1** as soon as possible:
 ## Non-goals (v0.1)
 - EVM execution / state / archive state.
 - Traces (`debug_*/trace_*`) and stateful methods (`eth_call`, balances, storage).
-- “Full node” canonicality guarantees: v0.1 uses a pragmatic trust model with reorg rollback.
+- "Full node" canonicality guarantees: v0.1 uses a pragmatic trust model with reorg rollback.
 
 ## MVP user stories
 - As an indexer operator, I can point Ponder/rindexer to `http://127.0.0.1:<port>` and index Uniswap contracts end-to-end.
@@ -62,7 +68,7 @@ Required (v0.1 target: rindexer event indexing):
 - `eth_getLogs` (must include standard log fields: `blockHash`, `blockNumber`, `transactionHash`, `transactionIndex`, `logIndex`; `blockTimestamp` is optional)
 
 #### v0.1 RPC contract (rindexer-minimum)
-This section is the concrete “contract” we implement for v0.1. It is intentionally minimal and chosen to satisfy rindexer’s default event indexing mode (polling).
+This section is the concrete "contract" we implement for v0.1. It is intentionally minimal and chosen to satisfy rindexer's default event indexing mode (polling).
 
 **1) `eth_chainId`**
 - **Params**: `[]`
@@ -78,7 +84,7 @@ This section is the concrete “contract” we implement for v0.1. It is intenti
 - **Params**: `[block: "latest" | hex_quantity, full_transactions: boolean]`
 - **Supported in v0.1**:
   - `block`: `"latest"` and explicit hex block numbers
-  - `full_transactions`: **false only** (if `true`, return a clear “not supported” error)
+  - `full_transactions`: **false only** (if `true`, return a clear "not supported" error)
 - **Result (minimum fields guaranteed)**:
   - `number`, `hash`, `parentHash`, `timestamp`, `logsBloom`
   - `transactions`: array of **tx hashes** (since `full_transactions=false`)
@@ -130,7 +136,7 @@ Optional / deferred (v0.2+):
 
 ### Head tracking / trust model (v0.1)
 Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we start pragmatic:
-- Track head from the P2P view (peer status / header announcements) and treat it as “unsafe head”.
+- Track head from the P2P view (peer status / header announcements) and treat it as "unsafe head".
 - Design the head source behind an interface so we can add a CL/beacon mode later (v0.2+).
 
 ## Architecture (v0.1)
@@ -145,7 +151,7 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
 
 2. **Sync / ingest orchestrator**
    - Responsibilities:
-     - decide “what to fetch next” (backfill, catch-up, follow)
+     - decide "what to fetch next" (backfill, catch-up, follow)
      - manage concurrency / retries / backpressure
    - Informed by: reth engine download coordination patterns (Q034) and peer management (Q015/Q016).
 
@@ -153,7 +159,7 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
    - Responsibilities:
      - canonical header chain representation
      - reorg detection + common ancestor computation
-     - checkpoint: “last fully indexed block”
+     - checkpoint: "last fully indexed block"
 
 4. **Storage**
    - Baseline: sharded static-file storage (schema v2) built on per-shard NippyJar segments, with
@@ -165,7 +171,7 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
 
 5. **RPC server**
    - Minimal JSON-RPC server with safe defaults (localhost bind, request limits).
-   - Query limits should mirror reth’s intent (Q022/Q023): max blocks per filter, max logs per response.
+   - Query limits should mirror reth's intent (Q022/Q023): max blocks per filter, max logs per response.
 
 ### Suggested crate/module layout (in this repo)
 - `harness/` (keep as a separate tool)
@@ -176,14 +182,14 @@ Reth uses an external CL for canonical head/finalization (Q039). For v0.1, we st
   - `rpc/`
   - `cli/`
 
-This mirrors reth’s internal boundaries and keeps later refactors small.
+This mirrors reth's internal boundaries and keeps later refactors small.
 
 ## Storage design (v0.1)
 
 ### Storage requirements
 - Fast `eth_getLogs` over large ranges (indexer workloads).
 - Deterministic rollback for reorgs.
-- Easy “what do we have?” introspection (progress, head, retention settings).
+- Easy "what do we have?" introspection (progress, head, retention settings).
 - Versioning/migrations.
 
 ### Proposed logical schema (implementation-agnostic)
@@ -220,7 +226,7 @@ Recommendation:
 ## Sync / ingest algorithm (v0.1)
 
 ### Backfill
-- Determine a moving “head” block number (best-effort) and sync `start_block..=head`.
+- Determine a moving "head" block number (best-effort) and sync `start_block..=head`.
 - For each block:
   1. fetch header
   2. fetch body (or at least tx hashes)
@@ -238,44 +244,44 @@ Recommendation:
 
 ### Follow (live)
 - Listen for peer sessions and head updates (peer status head, announcements).
-- Maintain a “target head” and keep indexing forward.
+- Maintain a "target head" and keep indexing forward.
 - On parent mismatch with our canonical head:
   - treat as reorg, find common ancestor, rollback, then re-sync forward.
 
 ### Concurrency & peer selection
-- Reuse reth’s peer/session management and reputation/backoff behavior (Q015/Q016).
+- Reuse reth's peer/session management and reputation/backoff behavior (Q015/Q016).
 - Keep concurrency bounded (global and per-peer).
-- Prefer “pipeline overlap” as a later optimization (Q022/Q034 style separation of fast path vs disk path).
+- Prefer "pipeline overlap" as a later optimization (Q022/Q034 style separation of fast path vs disk path).
 
 ## Testing plan (v0.1)
 
 ### Approach (parallel + contract-first)
-- Write tests **in parallel** with implementation. Treat the PRD “v0.1 RPC contract” as **executable acceptance criteria**.
+- Write tests **in parallel** with implementation. Treat the PRD "v0.1 RPC contract" as **executable acceptance criteria**.
 - Use **TDD where the spec is crisp** (RPC response shape/errors, log ordering, storage idempotency, rollback semantics).
-- For evolving areas (P2P heuristics, peer selection/orchestration), prefer **invariants + regression tests**: codify “must never happen” and add a test whenever we fix a bug/edge case.
+- For evolving areas (P2P heuristics, peer selection/orchestration), prefer **invariants + regression tests**: codify "must never happen" and add a test whenever we fix a bug/edge case.
 - Keep fixtures **small and deterministic** so `cargo test` is fast and reliable.
 
 ### Unit tests
 - receipt decoding + eth version variants (`eth/68`, `eth/69`, `eth/70`)
 - receipt→log derivation correctness (tx index/log index; `removed` is always `false` in v0.1)
 - reorg common ancestor + rollback math
-- storage idempotency: “write same block twice” yields same DB state
+- storage idempotency: "write same block twice" yields same DB state
 
 ### Integration tests (local)
 - spin up the service, ingest a short range, then query via RPC and compare against known fixtures
 - simulate a reorg by injecting an alternate header chain and assert rollback behavior
 
 ### RPC conformance checks (contract tests)
-- Implement a small “indexer probe” integration test that validates:
+- Implement a small "indexer probe" integration test that validates:
   - `eth_chainId` returns the configured chain id
-  - `eth_blockNumber` returns “last fully indexed block”
+  - `eth_blockNumber` returns "last fully indexed block"
   - `eth_getBlockByNumber("latest", false)` returns minimum fields: `number`, `hash`, `parentHash`, `timestamp`, `logsBloom`, `transactions` (hashes)
-  - `eth_getBlockByNumber(_, true)` returns a clear “not supported” error
+  - `eth_getBlockByNumber(_, true)` returns a clear "not supported" error
   - `eth_getLogs` returns:
     - required fields and **ascending** ordering by `(blockNumber, transactionIndex, logIndex)`
     - topic/address filter semantics used by indexers (address as single or array; topic wildcards)
     - limit errors as `-32602` with deterministic reth-style messages (see RPC contract section)
-- Where possible, reuse/refer to reth’s `eth_getLogs` compatibility vectors as test inputs:
+- Where possible, reuse/refer to reth's `eth_getLogs` compatibility vectors as test inputs:
   - `reth/crates/rpc/rpc-e2e-tests/testdata/rpc-compat/eth_getLogs/` (if you have a local `reth/` checkout)
 - Acceptance test (manual or automated later): run `rindexer` against the node for a small range and confirm end-to-end indexing works.
 
@@ -286,10 +292,10 @@ Deliverables:
 - CLI/config scaffolding for: chain, start block, retention, DB path, RPC bind
 - storage schema draft + migrations/versioning approach
 - basic process lifecycle (shutdown, logs)
-- explicit “unsupported RPC list”
+- explicit "unsupported RPC list"
 
 Verification:
-- service starts/stops, creates DB, exposes a minimal “identity” RPC (e.g., `eth_chainId`)
+- service starts/stops, creates DB, exposes a minimal "identity" RPC (e.g., `eth_chainId`)
 
 Test gate (must pass):
 - `cargo test` passes
@@ -319,7 +325,7 @@ Verification:
 - induce reorg and ensure DB returns to consistent canonical chain
 
 Test gate (must pass):
-- Idempotency: “write same block twice” yields same DB state
+- Idempotency: "write same block twice" yields same DB state
 - Restart: resume from checkpoint without duplicates
 - Reorg: rollback deletes data above common ancestor (v0.1 delete-on-rollback)
 
@@ -333,7 +339,7 @@ Verification:
 - run an indexer against it for a small range
 
 Test gate (must pass):
-- RPC contract tests (“indexer probe”) for v0.1 RPC surface:
+- RPC contract tests ("indexer probe") for v0.1 RPC surface:
   - response shapes, log ordering, and `-32602` limit errors/messages
 - Compatibility vectors: reth `eth_getLogs` topic/address wildcard fixtures (where applicable)
 
@@ -369,5 +375,5 @@ Deliverables:
 - live reorg handling with rollback window
 
 ## Open questions (for you)
-These don’t block writing code, but they affect the “default” product contract:
+These don't block writing code, but they affect the "default" product contract:
 1. If/when Ponder support becomes a goal: decide the `eth_call` strategy (proxy to upstream vs. stateless execution via RESS vs. running execution/state).
