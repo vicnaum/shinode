@@ -14,13 +14,13 @@ feed the historical sync pipeline.
   - **Key items**: `connect_mainnet_peers()`, `PeerPool`, `NetworkSession`, `fetch_payloads_for_peer()`, `discover_head_p2p()`, `FetchStageStats`
 
 ## Key APIs (no snippets)
-- **Types / Traits**: `PeerSelector`, `RoundRobinPeerSelector`, `NetworkPeer`, `NetworkSession`, `PeerPool`, `MultiPeerBlockPayloadSource`, `P2pLimits`
-- **Functions**: `connect_mainnet_peers()`, `p2p_limits()`, `request_headers_batch()`, `discover_head_p2p()`, `fetch_payloads_for_peer()`, `request_receipt_counts()`
+- **Types**: `NetworkPeer`, `NetworkSession`, `PeerPool`, `P2pLimits`, `PayloadFetchOutcome`, `HeadersChunkedResponse`, `ChunkedResponse<T>`, `FetchStageStats`, `HeaderCountMismatch`
+- **Functions**: `connect_mainnet_peers()`, `p2p_limits()`, `request_headers_batch()`, `discover_head_p2p()`, `fetch_payloads_for_peer()`, `request_headers_chunked_with_stats()`, `request_headers_chunked_strict()`
 
 ## Relationships
 - **Depends on**: `reth_network` / `reth_network_api` (peer sessions + requests), `reth_eth_wire_types` (message structs), `tokio` (timeouts/tasks).
 - **Uses**: `node/src/storage` for persisted peer cache (`StoredPeer`, `Storage::load_peers()` / `flush_peer_cache()`).
-- **Used by**: `node/src/sync/historical` for both probe (header+receipt counts) and ingest (full payload fetch).
+- **Used by**: `node/src/sync/historical` for ingest (full payload fetch).
 
 ## Files (detailed)
 
@@ -39,4 +39,3 @@ feed the historical sync pipeline.
 - Optionally seed and persist peer addresses via the storage-backed peer cache.
 - For a requested range, fetch headers (chunked) then concurrently fetch bodies and receipts.
 - Align responses by block number and return `(payloads, missing_blocks, fetch_stats)` to the caller.
-
