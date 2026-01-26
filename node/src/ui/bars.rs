@@ -6,10 +6,6 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 pub mod colors {
     /// Yellow for startup phases (black text on yellow background).
     pub const YELLOW: (u8, u8, u8) = (255, 200, 0);
-    /// Orange for recovery phases (black text on orange background).
-    pub const ORANGE: (u8, u8, u8) = (255, 140, 0);
-    /// Teal for finalizing phase (white text on teal background).
-    pub const TEAL: (u8, u8, u8) = (0, 200, 200);
     /// Green for synced/following phase (white text on green background).
     pub const GREEN: (u8, u8, u8) = (0, 128, 0);
 }
@@ -17,24 +13,13 @@ pub mod colors {
 /// Bar width constant used across all bars.
 pub const BAR_WIDTH: usize = 40;
 
-/// Create a startup spinner bar (yellow themed).
-pub fn create_startup_bar(multi: &MultiProgress) -> ProgressBar {
-    let bar = multi.add(ProgressBar::new_spinner());
-    bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-    let style = ProgressStyle::with_template("{spinner:.yellow} {msg}")
-        .expect("progress style")
-        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
-    bar.set_style(style);
-    bar.enable_steady_tick(std::time::Duration::from_millis(100));
-    bar
-}
-
 /// Create the main sync progress bar (cyan/blue themed).
+/// Format: [████░░] 45% 4500/10000 | status | peers | queue | inflight | retry | speed | eta
 pub fn create_sync_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
     let bar = multi.add(ProgressBar::new(total));
     bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
     let style = ProgressStyle::with_template(
-        "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
+        "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {msg}",
     )
     .expect("progress style")
     .progress_chars("█▉░");
@@ -42,13 +27,13 @@ pub fn create_sync_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
     bar
 }
 
-/// Create the finalizing progress bar (teal themed).
+/// Create the compacting/sealing progress bar (teal themed).
+/// Format: [████░░] 80% 8/10 | Compacting: 2 shards left
 pub fn create_finalizing_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
-    let bar = multi.add(ProgressBar::new(total));
+    let bar = multi.add(ProgressBar::new(total.max(1)));
     bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
-    // Use bright cyan (closest to teal in indicatif's color palette)
     let style = ProgressStyle::with_template(
-        "{bar:40.bright.cyan/black} {pos}/{len} | {msg}",
+        "{bar:40.bright.cyan/black} {percent:>3}% {pos}/{len} | {msg}",
     )
     .expect("progress style")
     .progress_chars("█▓░");
@@ -57,6 +42,7 @@ pub fn create_finalizing_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
 }
 
 /// Create the follow mode status bar (green themed, custom colored segment).
+/// Format: [ 12345678 ] Synced | head N | peers N/M | ...
 pub fn create_follow_bar(multi: &MultiProgress) -> ProgressBar {
     let bar = multi.add(ProgressBar::new(100));
     bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
@@ -65,11 +51,12 @@ pub fn create_follow_bar(multi: &MultiProgress) -> ProgressBar {
     bar
 }
 
-/// Create the failed recovery progress bar (red themed).
+/// Create the failed/recovery progress bar (red themed).
+/// Format: [████░░] 40% 4/10 | Recovering failed blocks
 pub fn create_failed_bar(multi: &MultiProgress, total: u64) -> ProgressBar {
-    let bar = multi.add(ProgressBar::new(total));
+    let bar = multi.add(ProgressBar::new(total.max(1)));
     bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
-    let style = ProgressStyle::with_template("{bar:40.red/black} {pos}/{len} | {msg}")
+    let style = ProgressStyle::with_template("{bar:40.red/black} {percent:>3}% {pos}/{len} | {msg}")
         .expect("progress style")
         .progress_chars("▓▒░");
     bar.set_style(style);
@@ -106,33 +93,8 @@ pub fn format_follow_segment(block_number: u64) -> String {
     format_colored_segment(&content, (255, 255, 255), colors::GREEN)
 }
 
-/// Format the teal finalizing bar segment.
-pub fn format_finalizing_segment(message: &str) -> String {
-    // White text on teal background
-    format_colored_segment(message, (255, 255, 255), colors::TEAL)
-}
-
 /// Format the yellow startup bar segment.
 pub fn format_startup_segment(message: &str) -> String {
     // Black text on yellow background
     format_colored_segment(message, (0, 0, 0), colors::YELLOW)
-}
-
-/// Format the orange recovery bar segment.
-pub fn format_recovery_segment(message: &str) -> String {
-    // Black text on orange background
-    format_colored_segment(message, (0, 0, 0), colors::ORANGE)
-}
-
-/// Create a recovery spinner bar (orange themed).
-pub fn create_recovery_bar(multi: &MultiProgress) -> ProgressBar {
-    let bar = multi.add(ProgressBar::new_spinner());
-    bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-    // Use yellow as closest approximation since indicatif doesn't have orange
-    let style = ProgressStyle::with_template("{spinner:.yellow} {msg}")
-        .expect("progress style")
-        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
-    bar.set_style(style);
-    bar.enable_steady_tick(std::time::Duration::from_millis(100));
-    bar
 }

@@ -1,8 +1,8 @@
-//! Main progress tracking and updater logic.
+//! Main progress tracking and UIController.
 
 use crate::p2p::PeerPool;
 use crate::sync::historical::PeerHealthTracker;
-use crate::sync::{format_eta_seconds, FinalizePhase, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
+use crate::sync::{format_eta_seconds, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
 use indicatif::{MultiProgress, ProgressBar};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -14,64 +14,328 @@ use super::bars::{
 };
 use super::state::UIState;
 
-/// Delay before showing the recovery bar (to avoid flicker).
-const RECOVERY_BAR_DELAY: Duration = Duration::from_secs(2);
-
-/// Main UI controller that manages all progress bars.
-pub struct ProgressUI {
+/// Main UI controller that manages all progress bars and state transitions.
+pub struct UIController {
     multi: MultiProgress,
-    sync_bar: Option<ProgressBar>,
-    finalizing_bar: Option<ProgressBar>,
-    follow_bar: Option<ProgressBar>,
-    failed_bar: Option<ProgressBar>,
-    total_len: u64,
+    current_bar: Option<ProgressBar>,
+    recovery_bar: Option<ProgressBar>,
+    state: UIState,
     is_tty: bool,
+    total_blocks: u64,
+    speed_window: VecDeque<(Instant, u64)>,
+    /// Total failed blocks when recovery started (for progress tracking).
+    recovery_total: u64,
 }
 
-impl ProgressUI {
-    /// Create a new ProgressUI.
-    pub fn new(total_len: u64, is_tty: bool) -> Self {
-        let multi = MultiProgress::new();
+impl UIController {
+    /// Create a new UIController.
+    pub fn new(is_tty: bool) -> Self {
         Self {
-            multi,
-            sync_bar: None,
-            finalizing_bar: None,
-            follow_bar: None,
-            failed_bar: None,
-            total_len,
+            multi: MultiProgress::new(),
+            current_bar: None,
+            recovery_bar: None,
+            state: UIState::Startup,
             is_tty,
+            total_blocks: 0,
+            speed_window: VecDeque::new(),
+            recovery_total: 0,
         }
     }
 
-    /// Get a reference to the MultiProgress for adding bars.
-    pub fn multi(&self) -> &MultiProgress {
-        &self.multi
+    /// Get the current bar (for external progress updates).
+    pub fn current_bar(&self) -> Option<&ProgressBar> {
+        self.current_bar.as_ref()
     }
 
-    /// Initialize the sync bar (cyan progress bar).
-    pub fn init_sync_bar(&mut self) -> Option<ProgressBar> {
+    /// Transition to syncing state.
+    pub fn show_syncing(&mut self, total_blocks: u64) {
         if !self.is_tty {
-            return None;
+            self.state = UIState::Syncing;
+            self.total_blocks = total_blocks;
+            return;
         }
-        let bar = create_sync_bar(&self.multi, self.total_len);
-        self.sync_bar = Some(bar.clone());
-        Some(bar)
+        // Clear any existing bar
+        if let Some(bar) = self.current_bar.take() {
+            bar.finish_and_clear();
+        }
+        // Clear startup line
+        eprint!("\r\x1b[K");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+
+        self.total_blocks = total_blocks;
+        self.speed_window.clear();
+        let bar = create_sync_bar(&self.multi, total_blocks);
+        self.current_bar = Some(bar);
+        self.state = UIState::Syncing;
     }
 
-    /// Get the sync bar if it exists.
-    pub fn sync_bar(&self) -> Option<&ProgressBar> {
-        self.sync_bar.as_ref()
+    /// Transition to compacting state.
+    pub fn show_compacting(&mut self, total_shards: u64) {
+        if !self.is_tty {
+            self.state = UIState::Compacting;
+            return;
+        }
+        // Clear any existing bar
+        if let Some(bar) = self.current_bar.take() {
+            bar.finish_and_clear();
+        }
+        let bar = create_finalizing_bar(&self.multi, total_shards);
+        let left = total_shards;
+        bar.set_message(format!("Compacting: {} shards left", left));
+        self.current_bar = Some(bar);
+        self.state = UIState::Compacting;
     }
 
-    /// Check if this is a TTY.
-    pub fn is_tty(&self) -> bool {
-        self.is_tty
+    /// Transition to sealing state.
+    pub fn show_sealing(&mut self, total_shards: u64) {
+        if !self.is_tty {
+            self.state = UIState::Sealing;
+            return;
+        }
+        // Clear any existing bar
+        if let Some(bar) = self.current_bar.take() {
+            bar.finish_and_clear();
+        }
+        let bar = create_finalizing_bar(&self.multi, total_shards);
+        let left = total_shards;
+        bar.set_message(format!("Sealing: {} shards left", left));
+        self.current_bar = Some(bar);
+        self.state = UIState::Sealing;
     }
 
-    /// Get total length.
-    pub fn total_len(&self) -> u64 {
-        self.total_len
+    /// Transition to following state.
+    pub fn show_following(&mut self) {
+        if !self.is_tty {
+            self.state = UIState::Following;
+            return;
+        }
+        // Clear any existing bar
+        if let Some(bar) = self.current_bar.take() {
+            bar.finish_and_clear();
+        }
+        let bar = create_follow_bar(&self.multi);
+        self.current_bar = Some(bar);
+        self.state = UIState::Following;
     }
+
+    /// Update the UI based on current snapshot.
+    /// This handles state transitions and bar updates.
+    pub fn update(&mut self, snapshot: &SyncProgressSnapshot, peers_connected: u64) {
+        let now = Instant::now();
+
+        // Determine expected state from snapshot
+        let expected_state = UIState::from_sync_snapshot(
+            snapshot.status,
+            snapshot.finalize_phase,
+            snapshot.fetch_complete,
+            snapshot.processed,
+            self.total_blocks,
+        );
+
+        // Handle state transitions
+        if self.state != expected_state {
+            match expected_state {
+                UIState::Startup => {
+                    // Shouldn't normally transition back to startup
+                }
+                UIState::Syncing => {
+                    self.show_syncing(self.total_blocks);
+                }
+                UIState::Compacting => {
+                    self.show_compacting(snapshot.compactions_total);
+                }
+                UIState::Sealing => {
+                    self.show_sealing(snapshot.compactions_total);
+                }
+                UIState::Following => {
+                    self.show_following();
+                }
+            }
+        }
+
+        // Update recovery bar (instant show/hide, no delay)
+        self.update_recovery_bar(snapshot);
+
+        // Update the appropriate bar based on current state
+        match self.state {
+            UIState::Startup => {
+                // Startup doesn't use progress bars
+            }
+            UIState::Syncing => {
+                self.update_sync_bar(snapshot, peers_connected, now);
+            }
+            UIState::Compacting => {
+                self.update_compacting_bar(snapshot);
+            }
+            UIState::Sealing => {
+                self.update_sealing_bar(snapshot);
+            }
+            UIState::Following => {
+                self.update_follow_bar(snapshot, peers_connected);
+            }
+        }
+    }
+
+    /// Update the sync progress bar.
+    fn update_sync_bar(&mut self, snapshot: &SyncProgressSnapshot, _peers_connected: u64, now: Instant) {
+        let Some(bar) = self.current_bar.as_ref() else {
+            return;
+        };
+
+        let processed = snapshot.processed.min(self.total_blocks);
+
+        // Update speed window
+        self.speed_window.push_back((now, processed));
+        while let Some((t, _)) = self.speed_window.front() {
+            if now.duration_since(*t) > Duration::from_secs(1) && self.speed_window.len() > 1 {
+                self.speed_window.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Calculate speed
+        let speed = if let (Some((t0, v0)), Some((t1, v1))) =
+            (self.speed_window.front(), self.speed_window.back())
+        {
+            let dt = t1.duration_since(*t0).as_secs_f64();
+            if dt > 0.0 && v1 >= v0 {
+                (v1 - v0) as f64 / dt
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // Calculate ETA
+        let remaining = self.total_blocks.saturating_sub(processed) as f64;
+        let eta = if speed > 0.0 {
+            format_eta_seconds(remaining / speed)
+        } else {
+            "--".to_string()
+        };
+
+        let peers_active = snapshot.peers_active.min(snapshot.peers_total);
+        let msg = format_progress_message(
+            snapshot.status,
+            peers_active,
+            snapshot.peers_total,
+            snapshot.queue,
+            snapshot.inflight,
+            snapshot.escalation,
+            snapshot.compactions_done,
+            snapshot.compactions_total,
+            speed,
+            &eta,
+        );
+        bar.set_message(msg);
+        bar.set_position(processed);
+    }
+
+    /// Update the compacting progress bar.
+    fn update_compacting_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+        let Some(bar) = self.current_bar.as_ref() else {
+            return;
+        };
+
+        let done = snapshot.compactions_done;
+        let total = snapshot.compactions_total;
+        let left = total.saturating_sub(done);
+
+        bar.set_length(total.max(1));
+        bar.set_position(done);
+        bar.set_message(format!("Compacting: {} shards left", left));
+    }
+
+    /// Update the sealing progress bar.
+    fn update_sealing_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+        let Some(bar) = self.current_bar.as_ref() else {
+            return;
+        };
+
+        let done = snapshot.compactions_done;
+        let total = snapshot.compactions_total;
+        let left = total.saturating_sub(done);
+
+        bar.set_length(total.max(1));
+        bar.set_position(done);
+        bar.set_message(format!("Sealing: {} shards left", left));
+    }
+
+    /// Update the follow mode bar.
+    fn update_follow_bar(&mut self, snapshot: &SyncProgressSnapshot, peers_connected: u64) {
+        let Some(bar) = self.current_bar.as_ref() else {
+            return;
+        };
+
+        let head_block = snapshot.head_block;
+        let head_seen = snapshot.head_seen;
+        let peers_available = snapshot.peers_total.min(peers_connected);
+        let active_fetch = snapshot.peers_active;
+
+        let (status_str, status_detail) = match snapshot.status {
+            SyncStatus::Following | SyncStatus::UpToDate => ("Synced", String::new()),
+            SyncStatus::Fetching => (
+                "Catching up",
+                format!(" ({} blocks left)", head_seen.saturating_sub(head_block)),
+            ),
+            SyncStatus::Finalizing => ("Finalizing", " (flushing/compacting...)".to_string()),
+            SyncStatus::LookingForPeers => ("Waiting for peers", String::new()),
+        };
+
+        let bar_segment = format_follow_segment(head_block);
+
+        let msg = format!(
+            "{} {}{} | head {} | peers {}/{} | fetch {} | retry {}",
+            bar_segment,
+            status_str,
+            status_detail,
+            head_seen,
+            peers_available,
+            peers_connected,
+            active_fetch,
+            snapshot.escalation,
+        );
+        bar.set_message(msg);
+    }
+
+    /// Update the recovery bar (show/hide instantly based on current state).
+    fn update_recovery_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+        if !self.is_tty {
+            return;
+        }
+
+        // Recovery-only mode: queue empty AND has escalation AND not finished
+        let only_recovery_left =
+            snapshot.queue == 0 && snapshot.escalation > 0 && !snapshot.fetch_complete;
+
+        if only_recovery_left {
+            // Show or update recovery bar
+            if self.recovery_bar.is_none() {
+                // Capture total when starting recovery
+                self.recovery_total = snapshot.escalation;
+                let bar = create_failed_bar(&self.multi, self.recovery_total);
+                bar.set_message("Recovering failed blocks");
+                self.recovery_bar = Some(bar);
+            }
+
+            if let Some(bar) = self.recovery_bar.as_ref() {
+                let remaining = snapshot.escalation;
+                let recovered = self.recovery_total.saturating_sub(remaining);
+                bar.set_length(self.recovery_total.max(1));
+                bar.set_position(recovered);
+                bar.set_message(format!("Recovering failed blocks: {}/{}", recovered, self.recovery_total));
+            }
+        } else {
+            // Hide recovery bar
+            if let Some(bar) = self.recovery_bar.take() {
+                bar.finish_and_clear();
+            }
+            self.recovery_total = 0;
+        }
+    }
+
 }
 
 /// Format the progress message shown in the sync bar.
@@ -108,22 +372,13 @@ pub fn format_progress_message(
 
 /// Spawn the background task that updates progress bars.
 pub fn spawn_progress_updater(
-    bar: ProgressBar,
+    ui: Arc<std::sync::Mutex<UIController>>,
     stats: Arc<SyncProgressStats>,
-    total_len: u64,
     peer_pool: Arc<PeerPool>,
     peer_health: Option<Arc<PeerHealthTracker>>,
-    multi: MultiProgress,
 ) {
     tokio::spawn(async move {
-        let mut window: VecDeque<(Instant, u64)> = VecDeque::new();
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
-        let mut ui_state = UIState::Syncing;
-        let mut follow_bar: Option<ProgressBar> = None;
-        let mut failed_bar: Option<ProgressBar> = None;
-        let mut finalizing_bar: Option<ProgressBar> = None;
-        let mut failed_total = 0u64;
-        let mut failed_first_seen: Option<Instant> = None;
         let mut last_peer_update = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
@@ -148,235 +403,13 @@ pub fn spawn_progress_updater(
             }
 
             let snapshot = stats.snapshot();
+            let peers_connected = peer_pool.len() as u64;
 
-            // Determine if we're in "recovery-only" mode:
-            // Normal queue empty AND has escalation blocks AND not finished
-            let normal_queue_empty = snapshot.queue == 0;
-            let has_escalation = snapshot.escalation > 0;
-            let only_recovery_left =
-                normal_queue_empty && has_escalation && !snapshot.fetch_complete;
-
-            // Track when recovery-only mode starts for delay
-            if only_recovery_left {
-                if failed_first_seen.is_none() {
-                    failed_first_seen = Some(now);
-                }
-                if snapshot.escalation > failed_total {
-                    failed_total = snapshot.escalation;
-                }
-            } else {
-                // Reset tracking when we exit recovery-only mode
-                if failed_bar.is_none() {
-                    failed_first_seen = None;
-                    failed_total = 0;
-                }
-            }
-
-            // Show recovery bar only in recovery-only mode (after delay to avoid flicker)
-            if only_recovery_left
-                && failed_bar.is_none()
-                && failed_first_seen
-                    .map(|t| now.duration_since(t) >= RECOVERY_BAR_DELAY)
-                    .unwrap_or(false)
-            {
-                let fb = create_failed_bar(&multi, failed_total);
-                fb.set_message(format!("Recovering {} blocks...", snapshot.escalation));
-                failed_bar = Some(fb);
-            }
-
-            // Update recovery bar
-            if let Some(ref fb) = failed_bar {
-                if only_recovery_left {
-                    // Still in recovery mode - update progress
-                    let remaining = snapshot.escalation;
-                    let recovered = failed_total.saturating_sub(remaining);
-                    fb.set_length(failed_total.max(1));
-                    fb.set_position(recovered);
-                    fb.set_message(format!(
-                        "Recovering blocks: {}/{}",
-                        recovered, failed_total
-                    ));
-                } else {
-                    // Exited recovery mode - close bar
-                    fb.finish_and_clear();
-                    failed_bar = None;
-                    failed_total = 0;
-                    failed_first_seen = None;
-                }
-            }
-
-            // Determine current UI state
-            let processed = snapshot.processed.min(total_len);
-            let new_ui_state = if processed >= total_len {
-                match snapshot.status {
-                    SyncStatus::Finalizing => UIState::Finalizing,
-                    _ => UIState::Following,
-                }
-            } else {
-                UIState::Syncing
-            };
-
-            // Handle state transitions
-            if new_ui_state != ui_state {
-                match (&ui_state, &new_ui_state) {
-                    // Syncing -> Finalizing: finish sync bar, show finalizing bar
-                    (UIState::Syncing, UIState::Finalizing) => {
-                        bar.finish_and_clear();
-                        if snapshot.compactions_total > 0 {
-                            let fb = create_finalizing_bar(&multi, snapshot.compactions_total);
-                            fb.set_message("Finalizing: compacting shards...");
-                            finalizing_bar = Some(fb);
-                        }
-                    }
-                    // Syncing -> Following: finish sync bar, show follow bar
-                    (UIState::Syncing, UIState::Following) => {
-                        bar.finish_and_clear();
-                        let fb = create_follow_bar(&multi);
-                        follow_bar = Some(fb);
-                    }
-                    // Finalizing -> Following: finish finalizing bar, show follow bar
-                    (UIState::Finalizing, UIState::Following) => {
-                        if let Some(ref fb) = finalizing_bar {
-                            fb.finish_and_clear();
-                        }
-                        finalizing_bar = None;
-                        let fb = create_follow_bar(&multi);
-                        follow_bar = Some(fb);
-                    }
-                    _ => {}
-                }
-                ui_state = new_ui_state;
-            }
-
-            // Update the appropriate bar based on current state
-            match ui_state {
-                UIState::Syncing => {
-                    // Update sync bar
-                    window.push_back((now, processed));
-                    while let Some((t, _)) = window.front() {
-                        if now.duration_since(*t) > Duration::from_secs(1) && window.len() > 1 {
-                            window.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    let speed = if let (Some((t0, v0)), Some((t1, v1))) =
-                        (window.front(), window.back())
-                    {
-                        let dt = t1.duration_since(*t0).as_secs_f64();
-                        if dt > 0.0 && v1 >= v0 {
-                            (v1 - v0) as f64 / dt
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-                    let remaining = total_len.saturating_sub(processed) as f64;
-                    let eta = if speed > 0.0 {
-                        format_eta_seconds(remaining / speed)
-                    } else {
-                        "--".to_string()
-                    };
-                    let peers_active = snapshot.peers_active.min(snapshot.peers_total);
-                    let msg = format_progress_message(
-                        snapshot.status,
-                        peers_active,
-                        snapshot.peers_total,
-                        snapshot.queue,
-                        snapshot.inflight,
-                        snapshot.escalation,
-                        snapshot.compactions_done,
-                        snapshot.compactions_total,
-                        speed,
-                        &eta,
-                    );
-                    bar.set_message(msg);
-                    bar.set_position(processed);
-                }
-                UIState::Finalizing => {
-                    // Update finalizing bar
-                    if let Some(ref fb) = finalizing_bar {
-                        let done = snapshot.compactions_done;
-                        let total = snapshot.compactions_total;
-                        fb.set_position(done);
-                        match snapshot.finalize_phase {
-                            FinalizePhase::Compacting if total > 0 => {
-                                fb.set_message(format!(
-                                    "Finalizing: compacting shards {}/{}",
-                                    done.min(total), total
-                                ));
-                            }
-                            FinalizePhase::Compacting => {
-                                fb.set_message("Finalizing: compacting...");
-                            }
-                            FinalizePhase::Sealing if done > 0 => {
-                                fb.set_message(format!("Finalizing: sealed {} shards", done));
-                            }
-                            FinalizePhase::Sealing => {
-                                fb.set_message("Finalizing: sealing...");
-                            }
-                        }
-
-                        // Check if finalizing is done
-                        if done >= snapshot.compactions_total && snapshot.compactions_total > 0 {
-                            fb.finish_and_clear();
-                        }
-                    }
-                }
-                UIState::Following => {
-                    // Update follow bar
-                    if let Some(ref fb) = follow_bar {
-                        let head_block = snapshot.head_block;
-                        let head_seen = snapshot.head_seen;
-                        let peers_connected = peer_pool.len() as u64;
-                        let peers_available = snapshot.peers_total.min(peers_connected);
-                        let active_fetch = snapshot.peers_active;
-
-                        let (status_str, status_detail) = match snapshot.status {
-                            SyncStatus::Following | SyncStatus::UpToDate => {
-                                ("Synced", String::new())
-                            }
-                            SyncStatus::Fetching => (
-                                "Catching up",
-                                format!(" ({} blocks left)", head_seen.saturating_sub(head_block)),
-                            ),
-                            SyncStatus::Finalizing => {
-                                ("Finalizing", " (flushing/compacting...)".to_string())
-                            }
-                            SyncStatus::LookingForPeers => ("Waiting for peers", String::new()),
-                        };
-
-                        let bar_segment = format_follow_segment(head_block);
-
-                        let compact = if snapshot.status == SyncStatus::Finalizing
-                            && snapshot.compactions_total > 0
-                        {
-                            let done = snapshot.compactions_done.min(snapshot.compactions_total);
-                            format!(" | compact {done}/{}", snapshot.compactions_total)
-                        } else {
-                            String::new()
-                        };
-
-                        let msg = format!(
-                            "{} {}{}{} | head {} | peers {}/{} | fetch {} | retry {}",
-                            bar_segment,
-                            status_str,
-                            status_detail,
-                            compact,
-                            head_seen,
-                            peers_available,
-                            peers_connected,
-                            active_fetch,
-                            snapshot.escalation,
-                        );
-                        fb.set_message(msg);
-                    }
-                }
-                UIState::Startup(_) => {
-                    // Startup is handled separately
-                }
+            // Update UI
+            if let Ok(mut ui) = ui.lock() {
+                ui.update(&snapshot, peers_connected);
             }
         }
     });
 }
+

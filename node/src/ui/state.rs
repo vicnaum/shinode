@@ -1,77 +1,47 @@
 //! UI state machine types.
 
-use crate::sync::SyncStatus;
+use crate::sync::{FinalizePhase, SyncStatus};
 
 /// High-level UI state representing the current phase of operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UIState {
     /// Startup phase - initializing storage, connecting to peers, etc.
-    Startup(StartupPhase),
+    /// The String is the status message to display.
+    Startup,
     /// Actively syncing blocks from peers.
     Syncing,
-    /// Fetch complete, finalizing DB (flushing WAL, compacting shards).
-    Finalizing,
+    /// Compacting shards (during finalize).
+    Compacting,
+    /// Sealing completed shards (during finalize).
+    Sealing,
     /// Synced and following the chain head.
     Following,
 }
 
-/// Sub-states during the startup phase.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StartupPhase {
-    /// Opening the storage database.
-    OpeningStorage,
-    /// Recovering a shard from interrupted compaction.
-    RecoveringShard { shard: u64, phase: String },
-    /// Compacting dirty shards from previous run.
-    CompactingShards(usize),
-    /// Connecting to the P2P network.
-    ConnectingP2P,
-    /// Waiting for minimum peer count.
-    WaitingForPeers { current: usize, min: usize },
-    /// Discovering the chain head from peers.
-    DiscoveringHead(u64),
-}
-
 impl UIState {
-    /// Derive UIState from SyncStatus and other signals.
-    pub fn from_sync_status(status: SyncStatus, fetch_complete: bool) -> Self {
+    /// Derive UIState from SyncProgressSnapshot.
+    pub fn from_sync_snapshot(
+        status: SyncStatus,
+        finalize_phase: FinalizePhase,
+        fetch_complete: bool,
+        processed: u64,
+        total_blocks: u64,
+    ) -> Self {
         match status {
-            SyncStatus::LookingForPeers => UIState::Startup(StartupPhase::WaitingForPeers {
-                current: 0,
-                min: 0,
-            }),
-            SyncStatus::Fetching => UIState::Syncing,
-            SyncStatus::Finalizing => UIState::Finalizing,
-            SyncStatus::UpToDate | SyncStatus::Following => {
-                if fetch_complete {
-                    UIState::Following
-                } else {
+            SyncStatus::LookingForPeers => UIState::Startup,
+            SyncStatus::Fetching => {
+                // Still syncing if we haven't reached target
+                if processed < total_blocks && !fetch_complete {
                     UIState::Syncing
+                } else {
+                    UIState::Following
                 }
             }
+            SyncStatus::Finalizing => match finalize_phase {
+                FinalizePhase::Compacting => UIState::Compacting,
+                FinalizePhase::Sealing => UIState::Sealing,
+            },
+            SyncStatus::UpToDate | SyncStatus::Following => UIState::Following,
         }
-    }
-}
-
-impl StartupPhase {
-    /// Get the display message for this startup phase.
-    pub fn message(&self) -> String {
-        match self {
-            StartupPhase::OpeningStorage => "Opening storage...".to_string(),
-            StartupPhase::RecoveringShard { shard, phase } => {
-                format!("Recovering shard {}: {}", shard, phase)
-            }
-            StartupPhase::CompactingShards(count) => format!("Compacting {} shards...", count),
-            StartupPhase::ConnectingP2P => "Connecting to P2P network...".to_string(),
-            StartupPhase::WaitingForPeers { current, min } => {
-                format!("Waiting for peers... {}/{}", current, min)
-            }
-            StartupPhase::DiscoveringHead(head) => format!("Discovering chain head... {}", head),
-        }
-    }
-
-    /// Returns true if this phase should be displayed with orange (recovery) color.
-    pub fn is_recovery(&self) -> bool {
-        matches!(self, StartupPhase::RecoveringShard { .. })
     }
 }

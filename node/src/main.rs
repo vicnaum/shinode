@@ -14,14 +14,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use cli::{compute_target_range, NodeConfig, DEFAULT_LOG_JSON_FILTER, DEFAULT_LOG_TRACE_FILTER};
 use eyre::Result;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::ProgressBar;
 use metrics::range_len;
 use p2p::{p2p_limits, PeerPool};
 use reth_network_api::PeerId;
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
-    collections::VecDeque,
     env, fs,
     io::{BufWriter, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -36,7 +35,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sync::historical::{BenchEvent, BenchEventLogger, IngestBenchStats, PeerHealthTracker};
-use sync::{FinalizePhase, ProgressReporter, SyncProgressStats, SyncStatus};
+use sync::{ProgressReporter, SyncProgressStats};
+#[cfg(test)]
+use sync::SyncStatus;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn, Event};
@@ -1013,40 +1014,32 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&session.pool)),
         Some(Arc::clone(&peer_health_local)),
     );
-    let progress: Option<Arc<IngestProgress>> = if std::io::stderr().is_terminal() {
-        // Create MultiProgress coordinator for all progress bars
-        let multi = indicatif::MultiProgress::new();
-        let bar = multi.add(ProgressBar::new(total_len));
-        bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-        let style = ProgressStyle::with_template(
-            "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
-        )
-        .expect("progress style");
-        bar.set_style(style.progress_chars("█▉░"));
-        bar.set_message(ui::format_progress_message(
-            SyncStatus::LookingForPeers,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0.0,
-            "--",
-        ));
+    // Create UI controller and progress bar
+    let is_tty = std::io::stderr().is_terminal();
+    let ui_controller = Arc::new(Mutex::new(ui::UIController::new(is_tty)));
+    let progress: Option<Arc<IngestProgress>> = if is_tty {
+        // Initialize syncing state with progress bar
+        {
+            let mut ui = ui_controller.lock().expect("ui lock");
+            ui.show_syncing(total_len);
+        }
         if let Some(stats) = progress_stats.as_ref() {
             stats.set_peers_active(0);
             stats.set_peers_total(session.pool.len() as u64);
-            spawn_progress_updater(
-                bar.clone(),
+            ui::spawn_progress_updater(
+                Arc::clone(&ui_controller),
                 Arc::clone(stats),
-                total_len,
                 Arc::clone(&session.pool),
                 Some(Arc::clone(&peer_health_local)),
-                multi,
             );
         }
+        // Get the bar from the controller for IngestProgress
+        let bar = ui_controller
+            .lock()
+            .expect("ui lock")
+            .current_bar()
+            .cloned()
+            .expect("sync bar should exist");
         Some(Arc::new(IngestProgress::new(bar, total_len)))
     } else {
         None
@@ -2212,283 +2205,6 @@ fn human_bytes(bytes: u64) -> String {
         idx += 1;
     }
     format!("{value:.2} {}", UNITS[idx])
-}
-
-fn spawn_progress_updater(
-    bar: ProgressBar,
-    stats: Arc<SyncProgressStats>,
-    total_len: u64,
-    peer_pool: Arc<PeerPool>,
-    peer_health: Option<Arc<PeerHealthTracker>>,
-    multi: indicatif::MultiProgress,
-) {
-    tokio::spawn(async move {
-        let mut window: VecDeque<(Instant, u64)> = VecDeque::new();
-        let mut ticker = tokio::time::interval(Duration::from_millis(100));
-        let mut initial_sync_done = false;
-        let mut follow_bar: Option<ProgressBar> = None;
-        let mut failed_bar: Option<ProgressBar> = None;
-        let mut finalizing_bar: Option<ProgressBar> = None;
-        let mut failed_total = 0u64;
-        let mut failed_first_seen: Option<Instant> = None;
-        let mut last_peer_update = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .unwrap_or_else(Instant::now);
-
-        loop {
-            ticker.tick().await;
-            let now = Instant::now();
-            if now.duration_since(last_peer_update) >= Duration::from_millis(500) {
-                last_peer_update = now;
-                let connected = peer_pool.len() as u64;
-                let available = if let Some(peer_health) = peer_health.as_ref() {
-                    let peers = peer_pool.snapshot();
-                    let peer_ids: Vec<_> = peers.iter().map(|peer| peer.peer_id).collect();
-                    let banned = peer_health.count_banned_peers(&peer_ids).await;
-                    connected.saturating_sub(banned)
-                } else {
-                    connected
-                };
-                stats.set_peers_total(available);
-            }
-            let snapshot = stats.snapshot();
-
-            // Determine if we're in "recovery-only" mode:
-            // Normal queue empty AND has escalation blocks AND not finished
-            let normal_queue_empty = snapshot.queue == 0;
-            let has_escalation = snapshot.escalation > 0;
-            let only_recovery_left =
-                normal_queue_empty && has_escalation && !snapshot.fetch_complete;
-
-            // Track when recovery-only mode starts for delay
-            if only_recovery_left {
-                if failed_first_seen.is_none() {
-                    failed_first_seen = Some(now);
-                }
-                if snapshot.escalation > failed_total {
-                    failed_total = snapshot.escalation;
-                }
-            } else {
-                // Reset tracking when we exit recovery-only mode
-                if failed_bar.is_none() {
-                    failed_first_seen = None;
-                    failed_total = 0;
-                }
-            }
-
-            // Show recovery bar only in recovery-only mode (after delay to avoid flicker)
-            if only_recovery_left
-                && failed_bar.is_none()
-                && failed_first_seen
-                    .map(|t| now.duration_since(t) >= Duration::from_secs(2))
-                    .unwrap_or(false)
-            {
-                let fb = multi.add(ProgressBar::new(failed_total.max(1)));
-                fb.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
-                let style = ProgressStyle::with_template("{bar:40.red/black} {pos}/{len} | {msg}")
-                    .expect("progress style")
-                    .progress_chars("▓▒░");
-                fb.set_style(style);
-                fb.set_message(format!("Recovering {} blocks...", snapshot.escalation));
-                failed_bar = Some(fb);
-            }
-
-            // Update recovery bar
-            if let Some(ref fb) = failed_bar {
-                if only_recovery_left {
-                    // Still in recovery mode - update progress
-                    let remaining = snapshot.escalation;
-                    let recovered = failed_total.saturating_sub(remaining);
-                    fb.set_length(failed_total.max(1));
-                    fb.set_position(recovered);
-                    fb.set_message(format!(
-                        "Recovering blocks: {recovered}/{failed_total}"
-                    ));
-                } else {
-                    // Exited recovery mode - close bar
-                    fb.finish_and_clear();
-                    failed_bar = None;
-                    failed_total = 0;
-                    failed_first_seen = None;
-                }
-            }
-
-            // Check if initial sync is complete and we're now in follow mode
-            if !initial_sync_done {
-                let processed = snapshot.processed.min(total_len);
-                window.push_back((now, processed));
-                while let Some((t, _)) = window.front() {
-                    if now.duration_since(*t) > Duration::from_secs(1) && window.len() > 1 {
-                        window.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                let speed =
-                    if let (Some((t0, v0)), Some((t1, v1))) = (window.front(), window.back()) {
-                        let dt = t1.duration_since(*t0).as_secs_f64();
-                        if dt > 0.0 && v1 >= v0 {
-                            (v1 - v0) as f64 / dt
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
-                let remaining = total_len.saturating_sub(processed) as f64;
-                let eta = if speed > 0.0 {
-                    sync::format_eta_seconds(remaining / speed)
-                } else {
-                    "--".to_string()
-                };
-                let peers_active = snapshot.peers_active.min(snapshot.peers_total);
-                let msg = ui::format_progress_message(
-                    snapshot.status,
-                    peers_active,
-                    snapshot.peers_total,
-                    snapshot.queue,
-                    snapshot.inflight,
-                    snapshot.escalation,
-                    snapshot.compactions_done,
-                    snapshot.compactions_total,
-                    speed,
-                    &eta,
-                );
-                bar.set_message(msg);
-                bar.set_position(processed);
-
-                // Transition when initial sync completes.
-                // Use fetch_complete flag to handle the case where processed < total_len
-                // due to processing failures (blocks fetched but failed processing).
-                let should_transition = processed >= total_len || snapshot.fetch_complete;
-                if should_transition {
-                    initial_sync_done = true;
-                    bar.finish_and_clear();
-
-                    // If we're still finalizing, show the teal finalizing bar
-                    // Note: compactions_total may be 0 initially, it gets set later by db_writer
-                    if snapshot.status == SyncStatus::Finalizing {
-                        // Start with a spinner-style bar, will update with progress later
-                        let fb = multi.add(ProgressBar::new(100));
-                        fb.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
-                        // Use bright cyan (teal-like) for finalizing
-                        let style = ProgressStyle::with_template(
-                            "{spinner:.cyan} {msg}",
-                        )
-                        .expect("progress style")
-                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
-                        fb.set_style(style);
-                        fb.enable_steady_tick(std::time::Duration::from_millis(100));
-                        fb.set_message("Finalizing: flushing and compacting...");
-                        finalizing_bar = Some(fb);
-                    } else {
-                        // Go directly to follow bar
-                        let fb = multi.add(ProgressBar::new(100));
-                        fb.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
-                        let style = ProgressStyle::with_template("{msg}").expect("progress style");
-                        fb.set_style(style);
-                        follow_bar = Some(fb);
-                    }
-                }
-            } else if let Some(ref fb) = finalizing_bar {
-                // Update the finalizing bar
-                let done = snapshot.compactions_done;
-                let total = snapshot.compactions_total;
-                match snapshot.finalize_phase {
-                    FinalizePhase::Compacting if total > 0 => {
-                        fb.set_message(format!(
-                            "Finalizing: compacting shards {}/{}",
-                            done.min(total), total
-                        ));
-                    }
-                    FinalizePhase::Compacting => {
-                        fb.set_message("Finalizing: compacting...");
-                    }
-                    FinalizePhase::Sealing if done > 0 => {
-                        fb.set_message(format!("Finalizing: sealed {} shards", done));
-                    }
-                    FinalizePhase::Sealing => {
-                        fb.set_message("Finalizing: sealing...");
-                    }
-                }
-
-                // Transition to follow bar when finalizing is done
-                let compactions_done = snapshot.compactions_total > 0
-                    && snapshot.compactions_done >= snapshot.compactions_total;
-                if snapshot.status != SyncStatus::Finalizing || compactions_done {
-                    fb.finish_and_clear();
-                    finalizing_bar = None;
-
-                    // Create the follow bar
-                    let new_fb = multi.add(ProgressBar::new(100));
-                    new_fb.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
-                    let style = ProgressStyle::with_template("{msg}").expect("progress style");
-                    new_fb.set_style(style);
-                    follow_bar = Some(new_fb);
-                }
-            } else if let Some(ref fb) = follow_bar {
-                // Live follow mode - show synced status with block number in a colored bar
-                let head_block = snapshot.head_block;
-                let head_seen = snapshot.head_seen;
-                let peers_connected = peer_pool.len() as u64;
-                let peers_available = snapshot.peers_total.min(peers_connected);
-                let active_fetch = snapshot.peers_active;
-
-                let (status_str, status_detail) = match snapshot.status {
-                    SyncStatus::Following | SyncStatus::UpToDate => ("Synced", String::new()),
-                    SyncStatus::Fetching => (
-                        "Catching up",
-                        format!(" ({} blocks left)", head_seen.saturating_sub(head_block)),
-                    ),
-                    SyncStatus::Finalizing => {
-                        ("Finalizing", " (flushing/compacting...)".to_string())
-                    }
-                    SyncStatus::LookingForPeers => ("Waiting for peers", String::new()),
-                };
-
-                // Format block number centered in a fixed-width field
-                let content = format!("[ {} ]", head_block);
-                let bar_width: usize = 40; // Match main progress bar width
-                let padding = bar_width.saturating_sub(content.len());
-                let left_pad = padding / 2;
-                let right_pad = padding - left_pad;
-
-                // ANSI: force truecolor white text on truecolor green background, then reset.
-                // (Some terminals/themes remap ANSI "white" to a dark color; truecolor avoids that.)
-                let bar_segment = format!(
-                    "\x1b[38;2;255;255;255;48;2;0;128;0m{:>width_l$}{}{:<width_r$}\x1b[0m",
-                    "",
-                    content,
-                    "",
-                    width_l = left_pad,
-                    width_r = right_pad,
-                );
-
-                let compact = if snapshot.status == SyncStatus::Finalizing
-                    && snapshot.compactions_total > 0
-                {
-                    let done = snapshot.compactions_done.min(snapshot.compactions_total);
-                    format!(" | compact {done}/{}", snapshot.compactions_total)
-                } else {
-                    String::new()
-                };
-
-                let msg = format!(
-                    "{} {}{}{} | head {} | peers {}/{} | fetch {} | retry {}",
-                    bar_segment,
-                    status_str,
-                    status_detail,
-                    compact,
-                    head_seen,
-                    peers_available,
-                    peers_connected,
-                    active_fetch,
-                    snapshot.escalation,
-                );
-                fb.set_message(msg);
-            }
-        }
-    });
 }
 
 #[cfg(test)]

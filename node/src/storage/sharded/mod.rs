@@ -1212,6 +1212,24 @@ impl Storage {
         Ok(())
     }
 
+    /// Count shards that are ready to be sealed (complete, sorted, not sealed).
+    pub fn count_shards_to_seal(&self) -> Result<u64> {
+        let shard_starts: Vec<u64> = {
+            let shards = self.shards.lock().expect("shards lock");
+            shards.keys().copied().collect()
+        };
+        let mut count = 0u64;
+        for shard_start in shard_starts {
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else { continue };
+            let state = shard.lock().expect("shard lock");
+            if state.meta.complete && state.meta.sorted && !state.meta.sealed {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
         let shard_size = self.shard_size();
         let shard_starts: Vec<u64> = {
