@@ -1,26 +1,50 @@
 # Stateless History Node SPEC
 
-This repo contains a working **receipt availability harness** (see Appendix A) and a **stateless history node**: a long-running service that ingests history artifacts from the Ethereum Execution Layer (EL) P2P network and serves an indexer-compatible RPC subset.
+A **stateless history node** that ingests history artifacts from the Ethereum Execution Layer (EL) P2P network and serves an indexer-compatible RPC subset.
 
-## Current status (v0.2)
-- Range backfill and continuous follow mode using P2P headers/bodies/receipts.
-- Live reorg handling within a configurable rollback window (v0.1 default: delete-on-rollback).
-- Sharded static-file persistence (Storage v2): per-`--shard-size` shard directories with
-  per-shard presence bitsets + WAL staging + compaction into canonical sorted segments.
-- Logs are derived on demand; withdrawals are not stored.
-- Minimal RPC subset with query limits (`eth_chainId`, `eth_blockNumber`,
-  `eth_getBlockByNumber`, `eth_getLogs`).
-- `eth_getBlockByNumber` returns full block shape; `totalDifficulty` is mocked to `0x0`.
-- Operator basics: CLI config, verbosity flags, progress bar, graceful shutdown.
-- Resume without redownload: skip already-present blocks in range; recompact dirty shards (WAL/unsorted) before switching to follow.
-- DB stats CLI for on-disk static-file sizes.
-- Peer warmup gating: `--min-peers` (default: 1).
-- Optional log artifacts: Chrome trace (`--log-trace`), JSONL events (`--log-events`), JSON logs (`--log-json`), and run reports (`--log-report`).
-- Fast-sync WAL batching (out-of-order) with optional event logging for compaction/sealing timings.
-- Compaction memory hardening: stream WAL during compaction, avoid large payload clones, and serialize compactions (queue).
-- Optional allocator knobs for benchmarking: `MALLOC_ARENA_MAX=2` (Linux/glibc) or `--features jemalloc` build.
-- Peer pool warmup: head probes performed asynchronously (avoid blocking peer session watcher).
-- Not yet: extra RPC methods, metrics export, stronger head/finalization signals (safe/finalized).
+> **Note**: The v0.1 MVP PRD is archived at [spec/archive/PRD_v0.1.md](spec/archive/PRD_v0.1.md).
+> For architecture overview, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Current status (v0.2.0)
+
+### Core functionality
+- Range backfill from `start_block..head` and continuous follow mode.
+- Live reorg handling within `--rollback-window` (delete-on-rollback).
+- Sharded static-file persistence (Storage v2) with per-shard WAL staging and compaction.
+- Logs derived on-demand from receipts; withdrawals not stored.
+
+### RPC
+- `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`, `eth_getLogs`
+- Configurable query limits and safety defaults (localhost bind).
+- `totalDifficulty` mocked to `0x0`.
+
+### Operator experience
+- UI with colored stage indicators and compaction/sealing progress.
+- Priority escalation queue for difficult blocks.
+- `--repair` command for storage recovery.
+- Resume without redownload (skip present blocks, recompact dirty shards).
+- DB stats CLI for on-disk storage sizes.
+- Graceful shutdown with checkpoint persistence.
+
+### Reliability
+- Peer warmup gating (`--min-peers`).
+- Fast-sync WAL batching (out-of-order ingestion).
+- Atomic compaction with crash recovery.
+- Compaction memory hardening (streaming WAL, serialized compactions).
+- Optional jemalloc allocator (default) or glibc arena tuning.
+- Backpressure and memory caps for queues.
+
+### Observability
+- Verbosity flags (`-v`/`-vv`/`-vvv`) and progress bars (TTY only).
+- Optional log artifacts: Chrome trace, JSONL events, JSON logs, run reports.
+- `--log-resources` for CPU/memory/disk metrics.
+- `SIGUSR1` debug dump for sync + peer health.
+
+### Not yet implemented
+- Additional RPC methods (`eth_getBlockByHash`, receipts endpoints, WS).
+- Stateful calls (`eth_call`) or traces.
+- Metrics export (Prometheus/OTel).
+- Stronger head/finalization signals (safe/finalized).
 
 ## Goals
 - **Ship a usable v0.1 MVP quickly**: backfill → follow head → persist → serve RPC.
@@ -101,151 +125,4 @@ Storage format details (schema v2): `spec/worklogs/sharding_refactor/SHARDED_STO
 
 ## References
 - Reth knowledge base index: `spec/reth_kb/INDEX.md`
-- Reth “what lives where” map: `spec/reth_kb/agents-export/reth/crates/**/AGENTS.md`
-
----
-
-## Appendix A: Receipt Availability Harness Spec (Updated)
-
-### Goal
-Measure the availability and latency of Ethereum L1 block headers and receipts served over devp2p `eth` without executing transactions or maintaining state. Persist only what is needed for receipts availability analysis and indexing.
-
-### Non-goals
-- Full execution / state verification.
-- Archive-style state or EVM traces.
-- Receipts root validation (explicitly skipped in v1).
-
-### High-level architecture
-1. **P2P network layer (Reth as library)**
-   - Discovery, dialing, and `eth` handshake.
-   - `PeerRequestSender` for headers/receipts.
-2. **Scheduler**
-   - Shared work queue of target blocks.
-   - Per-peer assignment and batching.
-   - Soft ban on peers with repeated failures.
-3. **Probing pipeline**
-   - Header batch → receipt batch per block hash.
-   - Eth protocol version-aware receipts requests (`eth/68` and below, `eth/69`, `eth/70`).
-4. **Persistence**
-   - JSONL logs for requests, probes, stats, and known blocks.
-
-### Fetch flow
-
-#### Peer head resolution
-When a peer connects, their `status` message includes their head block hash. We send `GetBlockHeaders` for that hash (limit=1) to resolve the head block number. This determines the maximum block number we can request from that peer.
-
-#### Block batch probing
-For each assigned batch of blocks (default 32 contiguous):
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  1. Request Headers                                             │
-│     GetBlockHeaders { start: Number(N), limit: 32, skip: 0 }    │
-│     → Vec<Header>                                               │
-│                                                                 │
-│  2. Compute Block Hashes                                        │
-│     For each header: blockHash = keccak256(RLP(header))         │
-│     (via SealedHeader::seal_slow)                               │
-│                                                                 │
-│  3. Request Receipts (in chunks of 16)                          │
-│     GetReceipts([blockHash1, blockHash2, ...])                  │
-│     → Vec<Vec<Receipt>>  (all receipts for each block)          │
-│                                                                 │
-│  4. Mark Success                                                │
-│     If receipts returned for block → mark_known_block()         │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### What we fetch
-| Request           | Input                | Output                          |
-|-------------------|----------------------|---------------------------------|
-| GetBlockHeaders   | block number + limit | Vec\<Header\>                   |
-| GetReceipts       | Vec\<blockHash\>     | Vec\<Vec\<Receipt\>\> per block |
-
-#### What we DON'T fetch
-- **Block bodies** (transactions, uncles) — not needed for receipts.
-- **State** — no execution.
-- We do NOT verify `receipts_root` — we only count receipts received.
-
-#### Protocol variants
-- **Legacy (eth/68 and below)**: `GetReceipts(Vec<B256>)` → `Receipts(Vec<Vec<Receipt>>)`
-- **Eth69**: Same request, different response encoding (`Receipts69`)
-- **Eth70**: `GetReceipts70 { first_block_receipt_index, block_hashes }` → `Receipts70`
-
-#### Why block hash is required
-The `GetReceipts` message requires **block hashes**, not block numbers. The only way to obtain a block's hash is to fetch its header and compute `keccak256(RLP(header))`. This is why we must fetch headers first.
-
-#### Definition of "known"
-A block is marked "known" **only when receipts are successfully received**:
-- Header fetch fails → block stays in queue (or escalation)
-- Header OK but receipts fail → block stays pending
-- Both succeed → entry written to `known_blocks.jsonl`
-
-### Target selection
-Targets are constructed from a fixed set of DeFi deployment anchors plus a contiguous window:
-- Uniswap V2: 10000835
-- Aave V2: 11362579
-- Uniswap V3: 12369621
-- Aave V3: 16291127
-- Uniswap V4: 21688329
-
-The default window is 10,000 blocks per anchor. Set with `--anchor-window`.
-
-### Data stored
-Minimal data to enable downstream analysis:
-- **Headers:** only for probing (not persisted as canonical chain state).
-- **Receipts:** only counts and timing in probe logs.
-- **JSONL output:**
-  - `requests.jsonl`: request events + timing.
-  - `probes.jsonl`: per-block probe results.
-  - `known_blocks.jsonl`: blocks proven available.
-  - `missing_blocks.jsonl`: blocks not fetched (written on shutdown if any remain).
-  - `stats.jsonl`: window stats + summary.
-
-### Retry and error handling
-Two-tier retry strategy:
-1. **Normal retries**
-   - Failed blocks are requeued up to `--max-attempts`.
-2. **Escalation pass**
-   - Once the main queue is drained, blocks that failed all retries are tried again across distinct peers (one attempt per peer).
-   - If every known peer fails, the block is marked unavailable.
-
-All failures are recorded with reason tags (`header_timeout`, `receipts_batch`, `escalation_*`, etc).
-
-### Peer handling
-- Track peer health and ban temporarily after consecutive failures.
-- Ban duration and failure threshold are configurable.
-- Sessions are counted; peer assignment is based on availability and queue.
-
-### Completion criteria
-The harness exits when:
-1. All targets are completed or failed, and
-2. Both normal and escalation queues are empty, and
-3. No in-flight work remains.
-
-`--run-secs` provides a hard time limit override.
-
-### CLI behavior
-Console output is a real-time progress bar (10Hz) showing:
-- % complete and processed/total
-- elapsed time, ETA (1-second rolling window)
-- speed (blocks/sec, 1-second rolling window)
-- peer status (active/total sessions)
-- queue length, in-flight count
-- failed blocks count
-
-During escalation, a separate red progress bar shows:
-- failed remaining/total
-- peers tried/total
-- escalation queue length
-
-Verbose levels:
-- (default): progress bar only, no log output
-- `-v`: progress + periodic stats to logs
-- `-vv`: adds WARN-level logs (peer failures, timeouts)
-- `-vvv`: includes per-request and per-probe JSON logs
-
-### Known limitations
-- No receipts root validation.
-- Network-only data availability is impacted by EIP-4444 pruning.
-- No L2 support yet (Base/Optimism planned).
+- Reth "what lives where" map: `spec/reth_kb/agents-export/reth/crates/**/AGENTS.md`
