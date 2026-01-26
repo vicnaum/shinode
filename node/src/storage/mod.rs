@@ -12,13 +12,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub(crate) const ZSTD_DICT_MAX_SIZE: usize = 5000;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTxHashes {
     pub hashes: Vec<B256>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTransaction {
     pub hash: B256,
@@ -33,13 +31,11 @@ pub struct StoredTransaction {
     pub signing_hash: Option<B256>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTransactions {
     pub txs: Vec<StoredTransaction>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredWithdrawal {
     pub index: u64,
@@ -48,19 +44,16 @@ pub struct StoredWithdrawal {
     pub amount: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredWithdrawals {
     pub withdrawals: Option<Vec<StoredWithdrawal>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredBlockSize {
     pub size: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredReceipts {
     pub receipts: Vec<Receipt>,
@@ -87,7 +80,6 @@ impl SerdeBincodeCompat for StoredReceipts {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredLog {
     pub address: Address,
@@ -101,7 +93,6 @@ pub struct StoredLog {
     pub data: Bytes,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredLogs {
     pub logs: Vec<StoredLog>,
@@ -114,7 +105,6 @@ pub struct LogIndexEntry {
     pub log_index: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBundle {
     pub number: u64,
@@ -142,7 +132,6 @@ pub struct StorageDiskStats {
     pub segments: Vec<SegmentDiskStats>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredPeer {
     pub peer_id: String,

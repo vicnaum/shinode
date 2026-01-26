@@ -53,8 +53,8 @@ pub struct RoundRobinPeerSelector {
     next_index: usize,
 }
 
-#[allow(dead_code)]
 impl RoundRobinPeerSelector {
+    #[allow(dead_code)]
     pub fn new(peers: Vec<SelectorPeerId>) -> Self {
         Self {
             peers,
@@ -890,7 +890,6 @@ pub(crate) async fn request_receipts(
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 async fn request_receipts_chunked_partial(
     peer: &NetworkPeer,
     hashes: &[B256],

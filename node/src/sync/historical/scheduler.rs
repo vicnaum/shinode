@@ -144,18 +144,14 @@ pub(crate) struct PeerHealthDump {
     pub assignments: u64,
     pub assigned_blocks: u64,
     pub inflight_blocks: u64,
-    #[allow(dead_code)]
     pub last_assigned_age_ms: Option<u64>,
     pub quality_score: f64,
     pub quality_samples: u64,
     pub batch_limit: usize,
     pub batch_limit_max: usize,
     pub batch_limit_avg: Option<f64>,
-    #[allow(dead_code)]
     pub last_success_age_ms: Option<u64>,
-    #[allow(dead_code)]
     pub last_failure_age_ms: Option<u64>,
-    #[allow(dead_code)]
     pub last_partial_age_ms: Option<u64>,
     pub last_error: Option<String>,
     pub last_error_age_ms: Option<u64>,
@@ -835,7 +831,6 @@ impl PeerWorkScheduler {
     }
 
     /// Number of completed blocks.
-    #[allow(dead_code)]
     pub async fn completed_count(&self) -> usize {
         let completed = self.completed.lock().await;
         completed.len()
@@ -875,7 +870,6 @@ impl PeerWorkScheduler {
     }
 
     /// Number of failed blocks.
-    #[allow(dead_code)]
     pub async fn failed_count(&self) -> usize {
         let failed = self.failed.lock().await;
         failed.len()

@@ -986,7 +986,6 @@ impl Storage {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn compact_all_dirty(&self) -> Result<()> {
         let shard_starts: Vec<u64> = {
             let shards = self.shards.lock().expect("shards lock");
@@ -1730,8 +1729,8 @@ struct WalPayloadCrcReader<'a> {
     remaining: u64,
 }
 
-#[allow(dead_code)]
 impl<'a> WalPayloadCrcReader<'a> {
+    #[allow(dead_code)]
     fn new(file: &'a mut fs::File, block_number: u64, payload_len: u32) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(&block_number.to_le_bytes());
@@ -1743,6 +1742,7 @@ impl<'a> WalPayloadCrcReader<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn finish(mut self) -> Result<Hasher> {
         let mut buf = [0u8; 64 * 1024];
         while self.remaining > 0 {
@@ -1755,7 +1755,6 @@ impl<'a> WalPayloadCrcReader<'a> {
     }
 }
 
-#[allow(dead_code)]
 impl<'a> Read for WalPayloadCrcReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
