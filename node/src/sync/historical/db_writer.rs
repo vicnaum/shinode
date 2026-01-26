@@ -367,12 +367,19 @@ pub async fn run_db_writer(
                     "finalizing: compacting dirty shards (WAL present or unsorted)"
                 );
                 if let Some(stats) = progress_stats.as_ref() {
+                    // Reset progress for finalize phase - show only dirty shards
+                    stats.set_compactions_done(0);
                     stats.set_compactions_total(dirty.len() as u64);
                 }
             }
         }
         let compact_started = Instant::now();
-        storage.compact_all_dirty()?;
+        let stats_for_callback = progress_stats.clone();
+        storage.compact_all_dirty_with_progress(|_shard_start| {
+            if let Some(stats) = stats_for_callback.as_ref() {
+                stats.inc_compactions_done(1);
+            }
+        })?;
         finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
     }
     if mode == DbWriteMode::FastSync {

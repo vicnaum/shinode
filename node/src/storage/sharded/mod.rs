@@ -1111,13 +1111,23 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)] // Convenience wrapper for cases without progress tracking
     pub fn compact_all_dirty(&self) -> Result<()> {
-        let shard_starts: Vec<u64> = {
-            let shards = self.shards.lock().expect("shards lock");
-            shards.keys().copied().collect()
-        };
-        for shard_start in shard_starts {
-            self.compact_shard(shard_start)?;
+        self.compact_all_dirty_with_progress(|_| {})
+    }
+
+    /// Compact all dirty shards, calling the progress callback after each shard is compacted.
+    /// The callback receives the shard_start of the just-compacted shard.
+    /// Only actually dirty shards (WAL present or not sorted) are processed and reported.
+    pub fn compact_all_dirty_with_progress<F>(&self, mut on_shard_done: F) -> Result<()>
+    where
+        F: FnMut(u64),
+    {
+        // Get only dirty shards (WAL present or not sorted)
+        let dirty = self.dirty_shards()?;
+        for info in dirty {
+            self.compact_shard(info.shard_start)?;
+            on_shard_done(info.shard_start);
         }
         Ok(())
     }

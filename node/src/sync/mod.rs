@@ -203,6 +203,11 @@ impl SyncProgressStats {
             .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub fn set_compactions_done(&self, done: u64) {
+        self.compactions_done
+            .store(done, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn set_peers_active(&self, active: u64) {
         self.peers_active
             .store(active, std::sync::atomic::Ordering::SeqCst);
