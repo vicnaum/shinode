@@ -523,22 +523,45 @@ fn env_info() -> EnvInfo {
     }
 }
 
+/// Print a yellow status bar to stderr (used during startup phases).
+fn print_status_bar(message: &str) {
+    use std::io::Write;
+    let bar_width: usize = 50;
+    let padding = bar_width.saturating_sub(message.len());
+    let left_pad = padding / 2;
+    let right_pad = padding - left_pad;
+    // ANSI: black text on yellow background (truecolor)
+    let bar = format!(
+        "\x1b[38;2;0;0;0;48;2;255;200;0m{:>width_l$}{}{:<width_r$}\x1b[0m",
+        "",
+        message,
+        "",
+        width_l = left_pad,
+        width_r = right_pad,
+    );
+    // Use \r to overwrite the line, no newline
+    eprint!("\r{}", bar);
+    let _ = std::io::stderr().flush();
+}
+
+/// Clear the status bar line.
+fn clear_status_bar() {
+    use std::io::Write;
+    eprint!("\r{:50}\r", ""); // Clear the line
+    let _ = std::io::stderr().flush();
+}
+
 async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
     if min_peers == 0 {
         return;
     }
-    let mut last_log = Instant::now()
-        .checked_sub(Duration::from_secs(10))
-        .unwrap_or_else(Instant::now);
     loop {
         let peers = pool.len();
         if peers >= min_peers {
+            clear_status_bar();
             return;
         }
-        if last_log.elapsed() >= Duration::from_secs(5) {
-            info!(peers, min_peers, "waiting for peer warmup");
-            last_log = Instant::now();
-        }
+        print_status_bar(&format!("Waiting for peers... {}/{}", peers, min_peers));
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -913,6 +936,7 @@ async fn main() -> Result<()> {
         return Err(eyre::eyre!("ingest requires --head-source p2p"));
     }
 
+    print_status_bar("Opening storage...");
     let storage = Arc::new(storage::Storage::open(&config)?);
 
     // Resume behavior: if the previous run exited before compaction finished, ensure we
@@ -920,12 +944,13 @@ async fn main() -> Result<()> {
     // across restarts.
     let dirty_shards = storage.dirty_complete_shards()?;
     if !dirty_shards.is_empty() {
-        let storage = Arc::clone(&storage);
         let shard_count = dirty_shards.len();
+        print_status_bar(&format!("Compacting {} shards...", shard_count));
         info!(shard_count, "startup: compacting completed dirty shards");
+        let storage_clone = Arc::clone(&storage);
         tokio::task::spawn_blocking(move || -> Result<()> {
             for shard_start in dirty_shards {
-                storage.compact_shard(shard_start)?;
+                storage_clone.compact_shard(shard_start)?;
             }
             Ok(())
         })
@@ -933,6 +958,7 @@ async fn main() -> Result<()> {
         info!(shard_count, "startup: completed shard compaction done");
     }
 
+    print_status_bar("Connecting to P2P network...");
     info!("starting p2p network");
     let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
     info!(peers = session.pool.len(), "p2p peers connected");
@@ -1489,8 +1515,10 @@ async fn wait_for_peer_head(
         let requested_end = end_block.unwrap_or(safe_head);
         let end = requested_end.min(safe_head);
         if start_block <= end {
+            clear_status_bar();
             return best_head;
         }
+        print_status_bar(&format!("Discovering chain head... {}", best_head));
         if last_log.elapsed() >= Duration::from_secs(5) {
             info!(
                 peers = peers.len(),
