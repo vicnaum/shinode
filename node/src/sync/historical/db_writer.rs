@@ -403,28 +403,25 @@ pub async fn run_db_writer(
         }
         let started = Instant::now();
 
-        // Set up sealing progress tracking
-        // Set counters BEFORE phase to ensure UI sees consistent values
-        let to_seal = storage.shards_to_seal_count().unwrap_or(0);
-        if to_seal > 0 {
-            tracing::info!(shards_to_seal = to_seal, "finalizing: sealing shards");
-        }
+        // Sealing phase - track actual progress without prediction
         if let Some(stats) = progress_stats.as_ref() {
             stats.set_compactions_done(0);
-            stats.set_compactions_total(to_seal as u64);
+            stats.set_compactions_total(0); // Will increment as we seal
             stats.set_finalize_phase(FinalizePhase::Sealing);
         }
 
-        let mut sealed_count = 0usize;
+        let mut sealed_count = 0u64;
         let stats_for_seal = progress_stats.clone();
         storage.seal_completed_shards_with_progress(|_shard_start| {
             sealed_count += 1;
             if let Some(stats) = stats_for_seal.as_ref() {
+                // Increment both done and total together - shows "Sealed N shards"
                 stats.inc_compactions_done(1);
+                stats.set_compactions_total(sealed_count);
             }
         })?;
-        if to_seal > 0 || sealed_count > 0 {
-            tracing::info!(expected = to_seal, actual = sealed_count, "finalizing: sealing complete");
+        if sealed_count > 0 {
+            tracing::info!(sealed = sealed_count, "finalizing: sealed shards");
         }
 
         if let Some(events) = events.as_ref() {

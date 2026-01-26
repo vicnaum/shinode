@@ -2392,20 +2392,21 @@ fn spawn_progress_updater(
                 }
             } else if let Some(ref fb) = finalizing_bar {
                 // Update the finalizing bar
-                if snapshot.compactions_total > 0 {
-                    // We have compaction/sealing progress to show
-                    let done = snapshot.compactions_done.min(snapshot.compactions_total);
-                    let phase_name = match snapshot.finalize_phase {
-                        FinalizePhase::Compacting => "compacting",
-                        FinalizePhase::Sealing => "sealing",
-                    };
-                    fb.set_message(format!(
-                        "Finalizing: {} shards {}/{}",
-                        phase_name, done, snapshot.compactions_total
-                    ));
-                } else {
-                    // Still waiting for compaction info, just show spinner
-                    fb.set_message("Finalizing: flushing and compacting...");
+                let done = snapshot.compactions_done;
+                let total = snapshot.compactions_total;
+                match snapshot.finalize_phase {
+                    FinalizePhase::Compacting if total > 0 => {
+                        fb.set_message(format!(
+                            "Finalizing: compacting shards {}/{}",
+                            done.min(total), total
+                        ));
+                    }
+                    FinalizePhase::Sealing if done > 0 => {
+                        fb.set_message(format!("Finalizing: sealed {} shards", done));
+                    }
+                    _ => {
+                        fb.set_message("Finalizing...");
+                    }
                 }
 
                 // Transition to follow bar when finalizing is done

@@ -297,16 +297,23 @@ pub fn spawn_progress_updater(
                 UIState::Finalizing => {
                     // Update finalizing bar
                     if let Some(ref fb) = finalizing_bar {
-                        let done = snapshot.compactions_done.min(snapshot.compactions_total);
+                        let done = snapshot.compactions_done;
+                        let total = snapshot.compactions_total;
                         fb.set_position(done);
-                        let phase_name = match snapshot.finalize_phase {
-                            FinalizePhase::Compacting => "compacting",
-                            FinalizePhase::Sealing => "sealing",
-                        };
-                        fb.set_message(format!(
-                            "Finalizing: {} shards {}/{}",
-                            phase_name, done, snapshot.compactions_total
-                        ));
+                        match snapshot.finalize_phase {
+                            FinalizePhase::Compacting if total > 0 => {
+                                fb.set_message(format!(
+                                    "Finalizing: compacting shards {}/{}",
+                                    done.min(total), total
+                                ));
+                            }
+                            FinalizePhase::Sealing if done > 0 => {
+                                fb.set_message(format!("Finalizing: sealed {} shards", done));
+                            }
+                            _ => {
+                                fb.set_message("Finalizing...");
+                            }
+                        }
 
                         // Check if finalizing is done
                         if done >= snapshot.compactions_total && snapshot.compactions_total > 0 {
