@@ -892,16 +892,13 @@ pub async fn run_ingest_pipeline(
                         }
                         match batch.mode {
                             FetchMode::Normal => {
-                                let newly_failed = scheduler.requeue_failed(&missing_blocks).await;
-                                if let Some(stats) = stats.as_ref() {
-                                    stats.inc_failed(newly_failed.len() as u64);
-                                }
+                                // Blocks that exceed max attempts are promoted to escalation
+                                let _ = scheduler.requeue_failed(&missing_blocks).await;
                             }
                             FetchMode::Escalation => {
+                                // Escalation blocks are re-added for indefinite retry
                                 for block in &missing_blocks {
-                                    scheduler
-                                        .requeue_escalation_block(*block, active_peers)
-                                        .await;
+                                    scheduler.requeue_escalation_block(*block).await;
                                 }
                             }
                         }
@@ -927,9 +924,7 @@ pub async fn run_ingest_pipeline(
                         }
                         FetchMode::Escalation => {
                             for block in &batch.blocks {
-                                scheduler
-                                    .requeue_escalation_block(*block, active_peers)
-                                    .await;
+                                scheduler.requeue_escalation_block(*block).await;
                             }
                         }
                     }
@@ -942,8 +937,10 @@ pub async fn run_ingest_pipeline(
             if let Some(stats) = stats.as_ref() {
                 let pending = scheduler.pending_count().await as u64;
                 let inflight = scheduler.inflight_count().await as u64;
+                let escalation = scheduler.escalation_len().await as u64;
                 stats.set_queue(pending);
                 stats.set_inflight(inflight);
+                stats.set_escalation(escalation);
             }
             let _ = ready_tx.send(peer);
         });

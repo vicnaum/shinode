@@ -26,10 +26,19 @@ and failed block recovery.
 |-------|-------|-------------|
 | Startup | Yellow (255,200,0) | Opening storage, connecting, waiting for peers |
 | Recovery | Orange (255,140,0) | Recovering shards from interrupted compaction |
-| Syncing | Cyan/Blue | Actively downloading blocks |
+| Syncing | Cyan/Blue | Actively downloading blocks (shows "retry N" for escalation count) |
 | Finalizing | Teal (0,200,200) | Compacting database shards |
 | Following | Green (0,128,0) | Synced and following chain head |
-| Failed Recovery | Red | Recovering failed blocks (overlay bar) |
+| Block Recovery | Red | Recovering difficult blocks (only shown when normal queue is empty and only escalation blocks remain) |
+
+## Recovery Bar Behavior
+The red recovery bar only appears when:
+1. Normal queue is empty (queue == 0)
+2. Escalation queue has blocks (escalation > 0)
+3. Fetch is not complete (fetch_complete == false)
+4. Condition persists for 2+ seconds (to avoid flicker)
+
+During normal sync, escalation count is shown as "retry N" in the status message (not a separate bar).
 
 ## Relationships
 - **Used by**: `node/src/main.rs` for all terminal progress display.

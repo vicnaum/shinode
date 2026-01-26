@@ -57,10 +57,11 @@ benchmark stats/event logging.
   - Tail ingestion (when enabled) tracks `head_seen_rx` and stops scheduling once the safe head is caught up (or continues in follow epochs).
 
 ### `scheduler.rs`
-- **Role**: Maintains the global work queue and per-peer health/quality model so scheduling adapts to real-world peer behavior.
-- **Key items**: `SchedulerConfig`, `PeerWorkScheduler::next_batch_for_peer()`, `PeerWorkScheduler::enqueue_range()`, `PeerHealthTracker::record_success()`, `PeerHealthDump`, `completed_count()`, `failed_count()`
+- **Role**: Maintains the global work queue, priority escalation queue, and per-peer health/quality model so scheduling adapts to real-world peer behavior.
+- **Key items**: `SchedulerConfig`, `PeerWorkScheduler::next_batch_for_peer()`, `PeerWorkScheduler::enqueue_range()`, `PeerHealthTracker::record_success()`, `PeerHealthDump`, `EscalationState`, `completed_count()`, `escalation_len()`
 - **Interactions**: Called from `mod.rs` for batch assignment, requeue, and peer health updates; consulted for "best peer" selection via quality scores.
-- **Knobs / invariants**: AIMD batch limit clamps between `aimd_min_batch` and `aimd_max_batch`; bans trigger after `peer_failure_threshold`.
+- **Escalation queue**: Blocks that fail N attempts (default: 5) are promoted to a priority escalation queue. Escalation blocks are checked FIRST before the normal queue, ensuring difficult blocks don't starve. Uses shard-aware prioritization (shards with fewer missing blocks get priority for faster compaction) and peer cooldown tracking (30-second cooldown before same peer retries same block). Blocks in escalation retry indefinitely until fetched.
+- **Knobs / invariants**: AIMD batch limit clamps between `aimd_min_batch` and `aimd_max_batch`; bans trigger after `peer_failure_threshold`; `ESCALATION_THRESHOLD` (default: 5) controls promotion; `ESCALATION_PEER_COOLDOWN` (30s) prevents hammering same peer.
 
 ### `fetch.rs`
 - **Role**: Wraps P2P requests into stage-friendly outcomes for ingest mode.

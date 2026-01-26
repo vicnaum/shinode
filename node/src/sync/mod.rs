@@ -90,6 +90,8 @@ pub struct SyncProgressStats {
     head_seen: std::sync::atomic::AtomicU64,
     /// True when all fetch tasks have completed (blocks downloaded from peers).
     fetch_complete: std::sync::atomic::AtomicBool,
+    /// Blocks in escalation queue (priority retry for difficult blocks).
+    escalation: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +109,8 @@ pub struct SyncProgressSnapshot {
     pub head_seen: u64,
     /// True when all fetch tasks have completed (blocks downloaded from peers).
     pub fetch_complete: bool,
+    /// Blocks in escalation queue (priority retry for difficult blocks).
+    pub escalation: u64,
 }
 
 impl SyncProgressStats {
@@ -136,6 +140,7 @@ impl SyncProgressStats {
             fetch_complete: self
                 .fetch_complete
                 .load(std::sync::atomic::Ordering::SeqCst),
+            escalation: self.escalation.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -156,11 +161,15 @@ impl SyncProgressStats {
             .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Increment failed count (kept for backwards compatibility).
+    #[allow(dead_code)]
     pub fn inc_failed(&self, delta: u64) {
         self.failed
             .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Record blocks recovered (kept for backwards compatibility).
+    #[allow(dead_code)]
     pub fn record_block_recovered(&self, count: u64) {
         if count == 0 {
             return;
@@ -225,5 +234,10 @@ impl SyncProgressStats {
     pub fn set_fetch_complete(&self, complete: bool) {
         self.fetch_complete
             .store(complete, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_escalation(&self, count: u64) {
+        self.escalation
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 }

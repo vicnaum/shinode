@@ -14,8 +14,8 @@ use super::bars::{
 };
 use super::state::UIState;
 
-/// Delay before showing the failed recovery bar (to avoid flicker).
-const FAILED_BAR_DELAY: Duration = Duration::from_secs(2);
+/// Delay before showing the recovery bar (to avoid flicker).
+const RECOVERY_BAR_DELAY: Duration = Duration::from_secs(2);
 
 /// Main UI controller that manages all progress bars.
 pub struct ProgressUI {
@@ -81,7 +81,7 @@ pub fn format_progress_message(
     peers_total: u64,
     queue: u64,
     inflight: u64,
-    failed: u64,
+    escalation: u64,
     compactions_done: u64,
     compactions_total: u64,
     speed: f64,
@@ -93,13 +93,13 @@ pub fn format_progress_message(
         String::new()
     };
     format!(
-        "status {} | peers {}/{} | queue {} | inflight {} | failed {}{} | speed {:.1}/s | eta {}",
+        "status {} | peers {}/{} | queue {} | inflight {} | retry {}{} | speed {:.1}/s | eta {}",
         status.as_str(),
         peers_active,
         peers_total,
         queue,
         inflight,
-        failed,
+        escalation,
         compact,
         speed,
         eta
@@ -148,39 +148,56 @@ pub fn spawn_progress_updater(
             }
 
             let snapshot = stats.snapshot();
-            let failed = snapshot.failed;
 
-            // Track failed blocks for the red recovery bar
-            if failed > 0 {
+            // Determine if we're in "recovery-only" mode:
+            // Normal queue empty AND has escalation blocks AND not finished
+            let normal_queue_empty = snapshot.queue == 0;
+            let has_escalation = snapshot.escalation > 0;
+            let only_recovery_left =
+                normal_queue_empty && has_escalation && !snapshot.fetch_complete;
+
+            // Track when recovery-only mode starts for delay
+            if only_recovery_left {
                 if failed_first_seen.is_none() {
                     failed_first_seen = Some(now);
                 }
-                if failed > failed_total {
-                    failed_total = failed;
+                if snapshot.escalation > failed_total {
+                    failed_total = snapshot.escalation;
+                }
+            } else {
+                // Reset tracking when we exit recovery-only mode
+                if failed_bar.is_none() {
+                    failed_first_seen = None;
+                    failed_total = 0;
                 }
             }
 
-            // Show failed bar after delay (to avoid flicker for quick recoveries)
-            if failed_total > 0
+            // Show recovery bar only in recovery-only mode (after delay to avoid flicker)
+            if only_recovery_left
                 && failed_bar.is_none()
                 && failed_first_seen
-                    .map(|t| now.duration_since(t) >= FAILED_BAR_DELAY)
+                    .map(|t| now.duration_since(t) >= RECOVERY_BAR_DELAY)
                     .unwrap_or(false)
             {
                 let fb = create_failed_bar(&multi, failed_total);
+                fb.set_message(format!("Recovering {} blocks...", snapshot.escalation));
                 failed_bar = Some(fb);
             }
 
-            // Update failed bar progress
+            // Update recovery bar
             if let Some(ref fb) = failed_bar {
-                let recovered = failed_total.saturating_sub(failed);
-                fb.set_length(failed_total.max(1));
-                fb.set_position(recovered);
-                fb.set_message(format!(
-                    "Recovering failed blocks: {}/{}",
-                    recovered, failed_total
-                ));
-                if failed == 0 {
+                if only_recovery_left {
+                    // Still in recovery mode - update progress
+                    let remaining = snapshot.escalation;
+                    let recovered = failed_total.saturating_sub(remaining);
+                    fb.set_length(failed_total.max(1));
+                    fb.set_position(recovered);
+                    fb.set_message(format!(
+                        "Recovering blocks: {}/{}",
+                        recovered, failed_total
+                    ));
+                } else {
+                    // Exited recovery mode - close bar
                     fb.finish_and_clear();
                     failed_bar = None;
                     failed_total = 0;
@@ -268,7 +285,7 @@ pub fn spawn_progress_updater(
                         snapshot.peers_total,
                         snapshot.queue,
                         snapshot.inflight,
-                        snapshot.failed,
+                        snapshot.escalation,
                         snapshot.compactions_done,
                         snapshot.compactions_total,
                         speed,
@@ -328,7 +345,7 @@ pub fn spawn_progress_updater(
                         };
 
                         let msg = format!(
-                            "{} {}{}{} | head {} | peers {}/{} | fetch {} | failed {}",
+                            "{} {}{}{} | head {} | peers {}/{} | fetch {} | retry {}",
                             bar_segment,
                             status_str,
                             status_detail,
@@ -337,7 +354,7 @@ pub fn spawn_progress_updater(
                             peers_available,
                             peers_connected,
                             active_fetch,
-                            failed,
+                            snapshot.escalation,
                         );
                         fb.set_message(msg);
                     }

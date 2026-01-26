@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -11,6 +11,61 @@ use crate::sync::historical::types::{FetchBatch, FetchMode};
 use reth_network_api::PeerId;
 use tokio::sync::Mutex;
 
+/// How long to wait before allowing a peer to retry the same escalation block.
+const ESCALATION_PEER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Default number of attempts before a block is promoted to escalation queue.
+const DEFAULT_ESCALATION_THRESHOLD: u32 = 5;
+
+/// Shard-aware escalation state for priority retry of difficult blocks.
+///
+/// Blocks that fail N attempts in the normal queue are promoted here and get
+/// priority handling (checked before normal queue). The shard grouping enables
+/// prioritizing blocks from nearly-complete shards to enable faster compaction.
+#[derive(Debug, Default)]
+struct EscalationState {
+    /// Blocks awaiting retry, grouped by shard for prioritization.
+    /// Key: shard_start, Value: blocks in that shard needing retry.
+    shards: HashMap<u64, HashSet<u64>>,
+
+    /// Total count for quick access.
+    total_count: usize,
+
+    /// Track which peers tried each block and when (for cooldown).
+    /// Key: block_number, Value: map of peer_id -> last_attempt_timestamp.
+    peer_attempts: HashMap<u64, HashMap<PeerId, Instant>>,
+}
+
+impl EscalationState {
+    fn add_block(&mut self, block: u64, shard_size: u64) {
+        let shard_start = (block / shard_size) * shard_size;
+        if self.shards.entry(shard_start).or_default().insert(block) {
+            self.total_count += 1;
+        }
+    }
+
+    fn remove_block(&mut self, block: u64, shard_size: u64) {
+        let shard_start = (block / shard_size) * shard_size;
+        if let Some(shard_blocks) = self.shards.get_mut(&shard_start) {
+            if shard_blocks.remove(&block) {
+                self.total_count = self.total_count.saturating_sub(1);
+                if shard_blocks.is_empty() {
+                    self.shards.remove(&shard_start);
+                }
+            }
+        }
+        self.peer_attempts.remove(&block);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total_count == 0
+    }
+
+    fn len(&self) -> usize {
+        self.total_count
+    }
+}
+
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -18,9 +73,12 @@ pub struct SchedulerConfig {
     pub blocks_per_assignment: usize,
     /// Initial blocks per peer batch (before AIMD adjusts).
     pub initial_blocks_per_assignment: usize,
+    /// Number of attempts before a block is promoted to escalation queue.
     pub max_attempts_per_block: u32,
     pub peer_failure_threshold: u32,
     pub peer_ban_duration: Duration,
+    /// Shard size for shard-aware escalation prioritization.
+    pub shard_size: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -28,9 +86,10 @@ impl Default for SchedulerConfig {
         Self {
             blocks_per_assignment: 32,
             initial_blocks_per_assignment: 32,
-            max_attempts_per_block: 3,
+            max_attempts_per_block: DEFAULT_ESCALATION_THRESHOLD,
             peer_failure_threshold: 5,
             peer_ban_duration: Duration::from_secs(120),
+            shard_size: 10_000,
         }
     }
 }
@@ -407,14 +466,6 @@ impl PeerHealthTracker {
     }
 }
 
-#[derive(Debug, Default)]
-struct EscalationState {
-    active: bool,
-    queue: VecDeque<u64>,
-    queued: HashSet<u64>,
-    attempts: HashMap<u64, HashSet<PeerId>>,
-}
-
 /// Peer-driven scheduler state.
 #[derive(Debug)]
 pub struct PeerWorkScheduler {
@@ -461,20 +512,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_marks_failed_after_max_attempts() {
+    async fn requeue_promotes_to_escalation_after_max_attempts() {
         let mut config = SchedulerConfig::default();
         config.max_attempts_per_block = 2;
         let scheduler = scheduler_with_blocks(config, 1, 1);
         let block = 1;
 
+        // First two attempts stay in normal queue
         scheduler.requeue_failed(&[block]).await;
-        assert_eq!(scheduler.failed_count().await, 0);
+        assert_eq!(scheduler.escalation_len().await, 0);
 
         scheduler.requeue_failed(&[block]).await;
-        assert_eq!(scheduler.failed_count().await, 0);
+        assert_eq!(scheduler.escalation_len().await, 0);
 
-        scheduler.requeue_failed(&[block]).await;
-        assert_eq!(scheduler.failed_count().await, 1);
+        // Third attempt promotes to escalation
+        let escalated = scheduler.requeue_failed(&[block]).await;
+        assert_eq!(escalated, vec![1]);
+        assert_eq!(scheduler.escalation_len().await, 1);
     }
 
     #[tokio::test]
@@ -535,12 +589,15 @@ impl PeerWorkScheduler {
         }
     }
 
-    /// Returns the next batch for a peer (normal or escalation).
+    /// Returns the next batch for a peer (escalation first, then normal).
+    ///
+    /// Escalation blocks get priority - they are checked FIRST before the normal queue.
+    /// This ensures difficult blocks don't get starved while new blocks keep arriving.
     pub async fn next_batch_for_peer(
         &self,
         peer_id: PeerId,
         peer_head: u64,
-        active_peers: usize,
+        _active_peers: usize,
     ) -> FetchBatch {
         if self.is_peer_banned(peer_id).await {
             return FetchBatch {
@@ -550,7 +607,7 @@ impl PeerWorkScheduler {
         }
         if self
             .peer_health
-            .should_defer_peer(peer_id, active_peers)
+            .should_defer_peer(peer_id, _active_peers)
             .await
         {
             return FetchBatch {
@@ -559,6 +616,16 @@ impl PeerWorkScheduler {
             };
         }
 
+        // ESCALATION FIRST (priority queue)
+        // Returns single block for more granular retry control
+        if let Some(block) = self.pop_escalation_for_peer(peer_id).await {
+            return FetchBatch {
+                blocks: vec![block],
+                mode: FetchMode::Escalation,
+            };
+        }
+
+        // Normal queue second
         let max_blocks = self.peer_health.batch_limit(peer_id).await;
         let normal = self.pop_next_batch_for_head(peer_head, max_blocks).await;
         if !normal.is_empty() {
@@ -568,11 +635,9 @@ impl PeerWorkScheduler {
             };
         }
 
-        self.maybe_start_escalation().await;
-        let escalation = self.pop_escalation_for_peer(peer_id, active_peers).await;
         FetchBatch {
-            blocks: escalation,
-            mode: FetchMode::Escalation,
+            blocks: Vec::new(),
+            mode: FetchMode::Normal,
         }
     }
 
@@ -634,141 +699,179 @@ impl PeerWorkScheduler {
         batch
     }
 
-    async fn maybe_start_escalation(&self) {
-        let pending_len = self.pending.lock().await.len();
-        if pending_len > 0 {
-            return;
-        }
-        let failed_blocks: Vec<u64> = {
-            let failed = self.failed.lock().await;
-            failed.iter().copied().collect()
-        };
-        if failed_blocks.is_empty() {
-            return;
-        }
-
-        let mut escalation = self.escalation.lock().await;
-        if escalation.active {
-            return;
-        }
-        for block in failed_blocks {
-            if escalation.queued.insert(block) {
-                escalation.queue.push_back(block);
-            }
-        }
-        escalation.active = true;
-    }
-
-    async fn pop_escalation_for_peer(&self, peer_id: PeerId, active_peers: usize) -> Vec<u64> {
+    /// Pop a block from the escalation queue for this peer.
+    ///
+    /// Uses shard-aware prioritization: shards with fewer missing blocks (closer to
+    /// complete) get priority to enable faster compaction. Within a shard, prefers
+    /// blocks this peer hasn't tried recently (cooldown tracking).
+    async fn pop_escalation_for_peer(&self, peer_id: PeerId) -> Option<u64> {
         let mut escalation = self.escalation.lock().await;
         let completed = self.completed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
+        let now = Instant::now();
 
-        let mut iterations = escalation.queue.len();
-        while iterations > 0 {
-            iterations -= 1;
-            if let Some(block) = escalation.queue.pop_front() {
-                escalation.queued.remove(&block);
+        if escalation.is_empty() {
+            return None;
+        }
+
+        // Get shard priorities sorted by "closest to complete" (fewest blocks = highest priority)
+        let mut shard_priorities: Vec<_> = escalation
+            .shards
+            .iter()
+            .map(|(shard_start, blocks)| (*shard_start, blocks.len()))
+            .collect();
+        shard_priorities.sort_by_key(|(_, missing)| *missing);
+
+        // Try shards in priority order
+        for (shard_start, _) in shard_priorities {
+            let Some(shard_blocks) = escalation.shards.get(&shard_start) else {
+                continue;
+            };
+
+            // Find a block this peer hasn't tried recently
+            let mut best_block: Option<u64> = None;
+            let mut best_staleness: Option<Duration> = None;
+
+            for &block in shard_blocks.iter() {
+                // Skip completed blocks (will be cleaned up on success)
                 if completed.contains(&block) {
-                    escalation.attempts.remove(&block);
                     continue;
                 }
-                let entry = escalation.attempts.entry(block).or_default();
-                if entry.contains(&peer_id) {
-                    escalation.queue.push_back(block);
-                    escalation.queued.insert(block);
-                    continue;
+
+                let peer_attempts = escalation.peer_attempts.get(&block);
+                let staleness = peer_attempts
+                    .and_then(|attempts| attempts.get(&peer_id))
+                    .map(|last| now.duration_since(*last));
+
+                match staleness {
+                    None => {
+                        // Peer never tried this block - best choice
+                        best_block = Some(block);
+                        break;
+                    }
+                    Some(duration) if duration >= ESCALATION_PEER_COOLDOWN => {
+                        // Peer tried but cooldown passed - acceptable
+                        if best_staleness.map(|b| duration > b).unwrap_or(true) {
+                            best_block = Some(block);
+                            best_staleness = Some(duration);
+                        }
+                    }
+                    Some(_) => {
+                        // Too recent, skip
+                    }
                 }
-                if active_peers > 0 && entry.len() >= active_peers {
-                    escalation.attempts.remove(&block);
-                    continue;
+            }
+
+            if let Some(block) = best_block {
+                // Remove from shard set (will be re-added on failure)
+                escalation
+                    .shards
+                    .get_mut(&shard_start)
+                    .unwrap()
+                    .remove(&block);
+                escalation.total_count = escalation.total_count.saturating_sub(1);
+                if escalation
+                    .shards
+                    .get(&shard_start)
+                    .map(|s| s.is_empty())
+                    .unwrap_or(false)
+                {
+                    escalation.shards.remove(&shard_start);
                 }
-                entry.insert(peer_id);
+
+                // Record this attempt
+                escalation
+                    .peer_attempts
+                    .entry(block)
+                    .or_default()
+                    .insert(peer_id, now);
+
+                // Add to in_flight
                 in_flight.insert(block);
-                return vec![block];
+
+                return Some(block);
             }
         }
-        Vec::new()
+
+        None // All blocks recently tried by this peer
     }
 
-    /// Mark blocks as completed and remove from in-flight.
+    /// Mark blocks as completed and remove from in-flight and escalation.
+    ///
+    /// Returns the count of blocks that were in escalation (recovered from retry).
     pub async fn mark_completed(&self, blocks: &[u64]) -> u64 {
         let mut recovered = 0u64;
         let mut escalation = self.escalation.lock().await;
         let mut completed = self.completed.lock().await;
-        let mut failed = self.failed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
+        let shard_size = self.config.shard_size;
 
         for block in blocks {
             in_flight.remove(block);
             completed.insert(*block);
-            if failed.remove(block) {
+
+            // Check if this block was in escalation (for recovery stats)
+            if escalation.peer_attempts.contains_key(block) {
                 recovered = recovered.saturating_add(1);
             }
-        }
 
-        if !blocks.is_empty() {
-            let removal: HashSet<u64> = blocks.iter().copied().collect();
-            escalation.queue.retain(|block| !removal.contains(block));
-            for block in &removal {
-                escalation.queued.remove(block);
-                escalation.attempts.remove(block);
-            }
+            // Remove from escalation if present
+            escalation.remove_block(*block, shard_size);
         }
 
         recovered
     }
 
-    /// Requeue failed blocks or mark them failed after max attempts.
+    /// Requeue failed blocks or promote to escalation after max attempts.
+    ///
+    /// Returns list of blocks that were newly promoted to escalation.
     pub async fn requeue_failed(&self, blocks: &[u64]) -> Vec<u64> {
         let mut pending = self.pending.lock().await;
         let mut queued = self.queued.lock().await;
         let mut attempts = self.attempts.lock().await;
-        let mut failed = self.failed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
-        let mut newly_failed = Vec::new();
+        let mut escalation = self.escalation.lock().await;
+        let mut newly_escalated = Vec::new();
+        let shard_size = self.config.shard_size;
 
         for block in blocks {
             in_flight.remove(block);
             let count = attempts.entry(*block).or_insert(0);
             *count = count.saturating_add(1);
             if *count <= self.config.max_attempts_per_block {
+                // Normal retry
                 if !queued.contains(block) {
                     queued.insert(*block);
                     pending.push(Reverse(*block));
                 }
             } else {
-                if failed.insert(*block) {
-                    newly_failed.push(*block);
-                }
+                // Promote to escalation (priority queue)
+                escalation.add_block(*block, shard_size);
+                newly_escalated.push(*block);
             }
         }
-        newly_failed
+        newly_escalated
     }
 
-    /// Requeue a failed escalation block if more peers remain to try.
-    pub async fn requeue_escalation_block(&self, block: u64, active_peers: usize) {
+    /// Requeue a failed escalation block for indefinite retry.
+    ///
+    /// Unlike the old behavior, this always re-adds the block to the escalation queue.
+    /// Blocks keep retrying forever until successfully fetched. The peer_attempts
+    /// tracking with cooldown ensures peers aren't hammered with the same block.
+    pub async fn requeue_escalation_block(&self, block: u64) {
         let mut escalation = self.escalation.lock().await;
         let completed = self.completed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
+        let shard_size = self.config.shard_size;
 
         in_flight.remove(&block);
         if completed.contains(&block) {
-            escalation.attempts.remove(&block);
+            escalation.remove_block(block, shard_size);
             return;
         }
 
-        let tried = escalation
-            .attempts
-            .get(&block)
-            .map(|s| s.len())
-            .unwrap_or(0);
-        if active_peers == 0 || tried >= active_peers {
-            return;
-        }
-        if escalation.queued.insert(block) {
-            escalation.queue.push_back(block);
-        }
+        // Re-add to escalation queue (peer_attempts is preserved for cooldown tracking)
+        escalation.add_block(block, shard_size);
     }
 
     /// Record a successful peer batch.
@@ -799,7 +902,7 @@ impl PeerWorkScheduler {
         // fetch tasks that also take these locks in different orders.
         let pending_empty = self.pending.lock().await.is_empty();
         let inflight_empty = self.in_flight.lock().await.is_empty();
-        let escalation_empty = self.escalation.lock().await.queue.is_empty();
+        let escalation_empty = self.escalation.lock().await.is_empty();
         pending_empty && inflight_empty && escalation_empty
     }
 
@@ -809,11 +912,11 @@ impl PeerWorkScheduler {
         completed.len()
     }
 
-    /// Number of pending blocks.
+    /// Number of pending blocks (normal queue + escalation).
     pub async fn pending_count(&self) -> usize {
         let pending = self.pending.lock().await;
         let escalation = self.escalation.lock().await;
-        pending.len() + escalation.queue.len()
+        pending.len() + escalation.len()
     }
 
     pub async fn pending_main_count(&self) -> usize {
@@ -823,12 +926,12 @@ impl PeerWorkScheduler {
 
     pub async fn escalation_len(&self) -> usize {
         let escalation = self.escalation.lock().await;
-        escalation.queue.len()
+        escalation.len()
     }
 
     pub async fn escalation_attempted_count(&self) -> usize {
         let escalation = self.escalation.lock().await;
-        escalation.attempts.len()
+        escalation.peer_attempts.len()
     }
 
     pub async fn attempts_len(&self) -> usize {
