@@ -26,10 +26,11 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+use parking_lot::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -88,7 +89,7 @@ const PEER_CACHE_MAX: usize = 5000;
 static HEAD_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct P2pLimits {
+pub struct P2pLimits {
     pub max_outbound: usize,
     pub max_concurrent_dials: usize,
     pub peer_refill_interval_ms: u64,
@@ -98,7 +99,7 @@ pub(crate) struct P2pLimits {
     pub peer_cache_max: usize,
 }
 
-pub(crate) fn p2p_limits() -> P2pLimits {
+pub const fn p2p_limits() -> P2pLimits {
     P2pLimits {
         max_outbound: MAX_OUTBOUND,
         max_concurrent_dials: MAX_CONCURRENT_DIALS,
@@ -128,7 +129,7 @@ impl PeerCacheBuffer {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        let mut peers = self.peers.write().expect("peer cache lock");
+        let mut peers = self.peers.write();
         match peers.get_mut(&peer.peer_id) {
             Some(existing) => {
                 existing.last_seen_ms = existing.last_seen_ms.max(peer.last_seen_ms);
@@ -145,7 +146,7 @@ impl PeerCacheBuffer {
 
     fn close_and_drain(&self) -> Vec<StoredPeer> {
         self.closed.store(true, Ordering::SeqCst);
-        let mut peers = self.peers.write().expect("peer cache lock");
+        let mut peers = self.peers.write();
         peers.drain().map(|(_, peer)| peer).collect()
     }
 }
@@ -212,8 +213,8 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
     if PEER_START_WARMUP_SECS > 0 {
         let min = Duration::from_secs(PEER_START_WARMUP_SECS);
         let elapsed = warmup_started.elapsed();
-        if elapsed < min {
-            sleep(min - elapsed).await;
+        if let Some(remaining) = min.checked_sub(elapsed) {
+            sleep(remaining).await;
         }
     }
     Ok(NetworkSession {
@@ -224,6 +225,7 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
 }
 
 impl NetworkSession {
+    #[expect(clippy::cognitive_complexity, reason = "cache flush with error handling for each peer")]
     pub fn flush_peer_cache(&self) -> Result<()> {
         let Some(cache) = self.peer_cache.as_ref() else {
             return Ok(());
@@ -234,7 +236,7 @@ impl NetworkSession {
             return Ok(());
         }
         let mut failed = 0usize;
-        for peer in peers.iter() {
+        for peer in &peers {
             if let Err(err) = cache.storage.upsert_peer(peer.clone()) {
                 failed += 1;
                 warn!(peer_id = peer.peer_id, error = %err, "failed to persist cached peer");
@@ -258,24 +260,24 @@ pub struct PeerPool {
 }
 
 impl PeerPool {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             peers: RwLock::new(Vec::new()),
         }
     }
 
     pub fn len(&self) -> usize {
-        let peers = self.peers.read().expect("peer pool lock");
+        let peers = self.peers.read();
         peers.len()
     }
 
     pub fn snapshot(&self) -> Vec<NetworkPeer> {
-        let peers = self.peers.read().expect("peer pool lock");
+        let peers = self.peers.read();
         peers.clone()
     }
 
     fn add_peer(&self, peer: NetworkPeer) {
-        let mut peers = self.peers.write().expect("peer pool lock");
+        let mut peers = self.peers.write();
         if peers
             .iter()
             .any(|existing| existing.peer_id == peer.peer_id)
@@ -286,14 +288,14 @@ impl PeerPool {
     }
 
     fn update_peer_head(&self, peer_id: PeerId, head_number: u64) {
-        let mut peers = self.peers.write().expect("peer pool lock");
+        let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
             peer.head_number = head_number;
         }
     }
 
     fn remove_peer(&self, peer_id: PeerId) {
-        let mut peers = self.peers.write().expect("peer pool lock");
+        let mut peers = self.peers.write();
         peers.retain(|peer| peer.peer_id != peer_id);
     }
 }
@@ -361,11 +363,12 @@ fn spawn_peer_watcher(
                         peer_cache.upsert(peer);
                     }
                 }
-                NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. })
-                | NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
+                NetworkEvent::Peer(
+                    PeerEvent::SessionClosed { peer_id, .. } | PeerEvent::PeerRemoved(peer_id),
+                ) => {
                     pool.remove_peer(peer_id);
                 }
-                _ => {}
+                NetworkEvent::Peer(_) => {}
             }
         }
     });
@@ -394,6 +397,7 @@ fn spawn_peer_discovery_watcher(
     });
 }
 
+#[expect(clippy::cognitive_complexity, reason = "cache seeding with validation for each peer")]
 fn seed_peer_cache(handle: &NetworkHandle<EthNetworkPrimitives>, storage: &Storage) -> Result<()> {
     let ttl_ms = Duration::from_secs(PEER_CACHE_TTL_DAYS * 24 * 60 * 60).as_millis() as u64;
     let expire_before_ms = now_ms().saturating_sub(ttl_ms);
@@ -470,12 +474,12 @@ async fn request_head_number(
 ) -> Result<u64> {
     let headers = request_headers_by_hash(peer_id, head_hash, messages).await?;
     let header = headers
-        .get(0)
+        .first()
         .ok_or_else(|| eyre!("empty header response for head"))?;
     Ok(header.number)
 }
 
-pub(crate) async fn request_headers_batch(
+pub async fn request_headers_batch(
     peer: &NetworkPeer,
     start_block: u64,
     limit: usize,
@@ -483,7 +487,7 @@ pub(crate) async fn request_headers_batch(
     request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages).await
 }
 
-pub(crate) async fn discover_head_p2p(
+pub async fn discover_head_p2p(
     pool: &PeerPool,
     baseline: u64,
     probe_peers: usize,
@@ -503,18 +507,16 @@ pub(crate) async fn discover_head_p2p(
     // Instead, only advance the observed head if we can actually fetch headers above `baseline`.
     let mut best = baseline;
     let probe_peers = probe_peers.max(1);
-    let probe_limit = probe_limit.max(1).min(MAX_HEADERS_PER_REQUEST);
+    let probe_limit = probe_limit.clamp(1, MAX_HEADERS_PER_REQUEST);
     let start = baseline.saturating_add(1);
 
-    let mut probed = 0usize;
     let len = peers.len();
     let start_idx = HEAD_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) % len;
-    for offset in 0..len {
+    for (probed, offset) in (0..len).enumerate() {
         if probed >= probe_peers {
             break;
         }
         let peer = &peers[(start_idx + offset) % len];
-        probed += 1;
         match request_headers_batch(peer, start, probe_limit).await {
             Ok(headers) => {
                 if let Some(last) = headers.last() {
@@ -535,7 +537,7 @@ pub(crate) async fn discover_head_p2p(
 }
 
 #[derive(Debug)]
-pub(crate) struct HeaderCountMismatch {
+pub struct HeaderCountMismatch {
     expected: usize,
     got: usize,
 }
@@ -553,7 +555,7 @@ impl std::fmt::Display for HeaderCountMismatch {
 impl std::error::Error for HeaderCountMismatch {}
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FetchStageStats {
+pub struct FetchStageStats {
     pub headers_ms: u64,
     pub bodies_ms: u64,
     pub receipts_ms: u64,
@@ -563,7 +565,7 @@ pub(crate) struct FetchStageStats {
 }
 
 #[derive(Debug)]
-pub(crate) struct HeadersChunkedResponse {
+pub struct HeadersChunkedResponse {
     pub headers: Vec<Header>,
     pub requests: u64,
 }
@@ -579,7 +581,7 @@ pub(crate) async fn request_headers_chunked(
         .headers)
 }
 
-pub(crate) async fn request_headers_chunked_with_stats(
+pub async fn request_headers_chunked_with_stats(
     peer: &NetworkPeer,
     start_block: u64,
     count: usize,
@@ -612,7 +614,7 @@ pub(crate) async fn request_headers_chunked_with_stats(
     Ok(HeadersChunkedResponse { headers, requests })
 }
 
-pub(crate) async fn request_headers_chunked_strict(
+pub async fn request_headers_chunked_strict(
     peer: &NetworkPeer,
     start_block: u64,
     count: usize,
@@ -641,13 +643,13 @@ pub(crate) async fn request_headers_chunked_strict(
 }
 
 #[derive(Debug)]
-pub(crate) struct PayloadFetchOutcome {
+pub struct PayloadFetchOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
     pub fetch_stats: FetchStageStats,
 }
 
-pub(crate) async fn fetch_payloads_for_peer(
+pub async fn fetch_payloads_for_peer(
     peer: &NetworkPeer,
     range: std::ops::RangeInclusive<u64>,
 ) -> Result<PayloadFetchOutcome> {
@@ -713,8 +715,8 @@ pub(crate) async fn fetch_payloads_for_peer(
     let mut payloads = Vec::with_capacity(ordered_headers.len());
     for (idx, header) in ordered_headers.into_iter().enumerate() {
         let number = header.number;
-        let body = bodies.get_mut(idx).and_then(|body| body.take());
-        let receipts = receipts.get_mut(idx).and_then(|receipts| receipts.take());
+        let body = bodies.get_mut(idx).and_then(Option::take);
+        let receipts = receipts.get_mut(idx).and_then(Option::take);
 
         match (body, receipts) {
             (Some(body), Some(receipts)) => {
@@ -822,7 +824,7 @@ async fn request_bodies(
 }
 
 #[derive(Debug)]
-pub(crate) struct ChunkedResponse<T> {
+pub struct ChunkedResponse<T> {
     pub results: Vec<Option<T>>,
     pub requests: u64,
 }
@@ -879,7 +881,7 @@ async fn request_bodies_chunked_partial_with_stats(
     Ok(ChunkedResponse { results, requests })
 }
 
-pub(crate) async fn request_receipts(
+pub async fn request_receipts(
     peer: &NetworkPeer,
     hashes: &[B256],
 ) -> Result<Vec<Vec<Receipt>>> {

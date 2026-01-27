@@ -20,7 +20,7 @@ pub enum UIState {
 
 impl UIState {
     /// Derive UIState from SyncProgressSnapshot.
-    pub fn from_sync_snapshot(
+    pub const fn from_sync_snapshot(
         status: SyncStatus,
         finalize_phase: FinalizePhase,
         fetch_complete: bool,
@@ -28,20 +28,20 @@ impl UIState {
         total_blocks: u64,
     ) -> Self {
         match status {
-            SyncStatus::LookingForPeers => UIState::Startup,
+            SyncStatus::LookingForPeers => Self::Startup,
             SyncStatus::Fetching => {
                 // Still syncing if we haven't reached target
                 if processed < total_blocks && !fetch_complete {
-                    UIState::Syncing
+                    Self::Syncing
                 } else {
-                    UIState::Following
+                    Self::Following
                 }
             }
             SyncStatus::Finalizing => match finalize_phase {
-                FinalizePhase::Compacting => UIState::Compacting,
-                FinalizePhase::Sealing => UIState::Sealing,
+                FinalizePhase::Compacting => Self::Compacting,
+                FinalizePhase::Sealing => Self::Sealing,
             },
-            SyncStatus::UpToDate | SyncStatus::Following => UIState::Following,
+            SyncStatus::UpToDate | SyncStatus::Following => Self::Following,
         }
     }
 }

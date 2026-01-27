@@ -12,7 +12,10 @@ use tokio::time::{sleep, Duration};
 
 use super::db_writer::DbWriteMode;
 use super::reorg::{find_common_ancestor, preflight_reorg, ReorgCheck};
-use super::{run_ingest_pipeline, IngestPipelineOutcome, PeerHealthTracker, TailIngestConfig};
+use super::{
+    run_ingest_pipeline, IngestPipelineConfig, IngestPipelineOutcome, IngestPipelineTrackers,
+    PeerHealthTracker, TailIngestConfig,
+};
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -24,6 +27,221 @@ const HEAD_PROBE_PEERS: usize = 3;
 const HEAD_PROBE_LIMIT: usize = 1024;
 const REORG_PROBE_PEERS: usize = 3;
 
+/// Spawn a task that notifies once the node becomes synced.
+fn spawn_synced_watcher(
+    storage: Arc<Storage>,
+    stats: Option<Arc<SyncProgressStats>>,
+    synced_sender: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let synced = stats.as_ref().map_or_else(
+                || {
+                    match (
+                        storage.last_indexed_block().ok().flatten(),
+                        storage.head_seen().ok().flatten(),
+                    ) {
+                        (Some(last), Some(head)) => last >= head,
+                        _ => false,
+                    }
+                },
+                |stats| {
+                    matches!(
+                        stats.snapshot().status,
+                        SyncStatus::UpToDate | SyncStatus::Following
+                    )
+                },
+            );
+            if synced {
+                let tx = synced_sender.lock().await.take();
+                if let Some(tx) = tx {
+                    let _ = tx.send(());
+                }
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    });
+}
+
+/// Context for the head tracker task.
+struct HeadTrackerContext {
+    storage: Arc<Storage>,
+    pool: Arc<PeerPool>,
+    stats: Option<Arc<SyncProgressStats>>,
+    start_block: u64,
+    end_block: Option<u64>,
+    poll: Duration,
+}
+
+/// Run the head tracker that discovers new chain head and broadcasts updates.
+#[expect(clippy::cognitive_complexity, reason = "head tracker with discovery loop and error handling")]
+async fn run_head_tracker(
+    ctx: HeadTrackerContext,
+    head_seen_tx: watch::Sender<u64>,
+    mut stop_rx: watch::Receiver<bool>,
+    initial_head: u64,
+) {
+    let mut last_head = initial_head;
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
+        let baseline = ctx
+            .storage
+            .last_indexed_block()
+            .ok()
+            .flatten()
+            .unwrap_or(ctx.start_block)
+            .max(ctx.start_block);
+        let head = match discover_head_p2p(&ctx.pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT)
+            .await
+        {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                sleep(ctx.poll).await;
+                continue;
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "follow head probe failed");
+                sleep(ctx.poll).await;
+                continue;
+            }
+        };
+        let capped = ctx.end_block.map_or(head, |end| head.min(end));
+        if capped > last_head {
+            last_head = capped;
+            let _ = head_seen_tx.send(capped);
+            if let Err(err) = ctx.storage.set_head_seen(capped) {
+                tracing::debug!(error = %err, "follow head tracker: failed to persist head_seen");
+            }
+            if let Some(stats) = ctx.stats.as_ref() {
+                stats.set_head_seen(capped);
+            }
+        }
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    break;
+                }
+            }
+            () = sleep(ctx.poll) => {}
+        }
+    }
+}
+
+/// Run the tail scheduler that feeds new block ranges to the ingest pipeline.
+async fn run_tail_scheduler(
+    tail_tx: mpsc::UnboundedSender<std::ops::RangeInclusive<u64>>,
+    mut head_seen_rx: watch::Receiver<u64>,
+    mut stop_rx: watch::Receiver<bool>,
+    initial_next: u64,
+) {
+    let mut next_to_schedule = initial_next;
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
+        let head_seen = *head_seen_rx.borrow();
+        if head_seen >= next_to_schedule {
+            let _ = tail_tx.send(next_to_schedule..=head_seen);
+            next_to_schedule = head_seen.saturating_add(1);
+        }
+        tokio::select! {
+            _ = head_seen_rx.changed() => {}
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    break;
+                }
+            }
+            () = sleep(Duration::from_millis(200)) => {}
+        }
+    }
+}
+
+/// Context for the reorg detector task.
+struct ReorgDetectorContext {
+    storage: Arc<Storage>,
+    pool: Arc<PeerPool>,
+    rollback_window: u64,
+    start_block: u64,
+    poll: Duration,
+}
+
+/// Run the reorg detector that watches for chain reorganizations.
+#[expect(clippy::cognitive_complexity, reason = "reorg detection with ancestor search and error handling")]
+async fn run_reorg_detector(
+    ctx: ReorgDetectorContext,
+    reorg_tx: mpsc::UnboundedSender<Result<u64>>,
+    stop_tx: watch::Sender<bool>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
+        let Ok(Some(last_indexed)) = ctx.storage.last_indexed_block() else {
+            sleep(ctx.poll).await;
+            continue;
+        };
+        let start = last_indexed.saturating_add(1).max(ctx.start_block);
+        match preflight_reorg(
+            ctx.storage.as_ref(),
+            ctx.pool.as_ref(),
+            last_indexed,
+            start,
+            REORG_PROBE_PEERS,
+        )
+        .await
+        {
+            Ok(ReorgCheck::NoReorg) => {}
+            Ok(ReorgCheck::Inconclusive) => {
+                sleep(ctx.poll).await;
+                continue;
+            }
+            Ok(ReorgCheck::ReorgDetected { anchor }) => {
+                let low = last_indexed
+                    .saturating_sub(ctx.rollback_window)
+                    .max(ctx.start_block);
+                tracing::warn!(
+                    last_indexed,
+                    low,
+                    peer_id = ?anchor.peer_id,
+                    "reorg detected during follow; searching for common ancestor"
+                );
+                let ancestor =
+                    find_common_ancestor(ctx.storage.as_ref(), &anchor, low, last_indexed)
+                        .await
+                        .ok()
+                        .flatten();
+                if let Some(ancestor) = ancestor {
+                    let _ = reorg_tx.send(Ok(ancestor));
+                } else {
+                    let _ = reorg_tx.send(Err(eyre!(
+                        "reorg exceeds rollback_window: last_indexed={}, low={}",
+                        last_indexed,
+                        low
+                    )));
+                }
+                let _ = stop_tx.send(true);
+                break;
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "reorg check failed");
+            }
+        }
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    break;
+                }
+            }
+            () = sleep(ctx.poll) => {}
+        }
+    }
+}
+
+#[expect(clippy::cognitive_complexity, reason = "debug dump logs multiple subsystems")]
 async fn dump_follow_debug(
     storage: &Storage,
     pool: &PeerPool,
@@ -34,7 +252,7 @@ async fn dump_follow_debug(
     let head_seen = storage.head_seen().ok().flatten();
     let peers = pool.snapshot();
     let peers_len = peers.len();
-    let snapshot = stats.map(|s| s.snapshot());
+    let snapshot = stats.map(SyncProgressStats::snapshot);
     let health = peer_health.snapshot().await;
 
     tracing::info!(
@@ -73,6 +291,11 @@ async fn dump_follow_debug(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "follow loop coordinates reorg detection, head tracking, and ingest pipeline"
+)]
 pub async fn run_follow_loop(
     storage: Arc<Storage>,
     pool: Arc<PeerPool>,
@@ -86,39 +309,9 @@ pub async fn run_follow_loop(
     let mut synced_once = false;
 
     // Notify the caller (main) when we become synced for the first time.
-    //
-    // `run_ingest_pipeline()` can run indefinitely in follow mode, so we can't rely on the
-    // outer loop's "start > head" check to trigger this signal.
     let synced_sender = Arc::new(tokio::sync::Mutex::new(synced_once_tx.take()));
     if synced_sender.lock().await.is_some() {
-        let synced_sender = Arc::clone(&synced_sender);
-        let storage = Arc::clone(&storage);
-        let stats = stats.clone();
-        tokio::spawn(async move {
-            loop {
-                let synced = if let Some(stats) = stats.as_ref() {
-                    matches!(
-                        stats.snapshot().status,
-                        SyncStatus::UpToDate | SyncStatus::Following
-                    )
-                } else {
-                    match (
-                        storage.last_indexed_block().ok().flatten(),
-                        storage.head_seen().ok().flatten(),
-                    ) {
-                        (Some(last), Some(head)) => last >= head,
-                        _ => false,
-                    }
-                };
-                if synced {
-                    if let Some(tx) = synced_sender.lock().await.take() {
-                        let _ = tx.send(());
-                    }
-                    break;
-                }
-                sleep(Duration::from_millis(200)).await;
-            }
-        });
+        spawn_synced_watcher(Arc::clone(&storage), stats.clone(), Arc::clone(&synced_sender));
     }
 
     #[cfg(unix)]
@@ -153,17 +346,15 @@ pub async fn run_follow_loop(
             .unwrap_or(config.start_block)
             .max(config.start_block);
 
-        let observed_head =
-            match discover_head_p2p(&pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT).await? {
-                Some(head) => head,
-                None => {
-                    if let Some(stats) = stats.as_ref() {
-                        stats.set_status(SyncStatus::LookingForPeers);
-                    }
-                    sleep(poll).await;
-                    continue;
-                }
-            };
+        let Some(observed_head) =
+            discover_head_p2p(&pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT).await?
+        else {
+            if let Some(stats) = stats.as_ref() {
+                stats.set_status(SyncStatus::LookingForPeers);
+            }
+            sleep(poll).await;
+            continue;
+        };
 
         storage.set_head_seen(observed_head)?;
         if let Some(stats) = stats.as_ref() {
@@ -171,8 +362,7 @@ pub async fn run_follow_loop(
         }
 
         let start = last_indexed
-            .map(|block| block.saturating_add(1))
-            .unwrap_or(config.start_block)
+            .map_or(config.start_block, |block| block.saturating_add(1))
             .max(config.start_block);
         let mut target_head = observed_head;
         if let Some(end) = config.end_block {
@@ -267,170 +457,41 @@ pub async fn run_follow_loop(
         let (head_seen_tx, head_seen_rx) = watch::channel(observed_head);
         let (tail_tx, tail_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = watch::channel(false);
-        let stop_tx_reorg = stop_tx.clone();
-        let mut stop_rx_head = stop_rx.clone();
-        let mut stop_rx_tail = stop_rx.clone();
-        let mut stop_rx_reorg = stop_rx.clone();
 
-        let storage_head = Arc::clone(&storage);
-        let pool_head = Arc::clone(&pool);
-        let stats_head = stats.clone();
-        let start_block = config.start_block;
-        let end_block = config.end_block;
-        let head_task = tokio::spawn(async move {
-            let mut last_head = observed_head;
-            loop {
-                if *stop_rx_head.borrow() {
-                    break;
-                }
-                let baseline = storage_head
-                    .last_indexed_block()
-                    .ok()
-                    .flatten()
-                    .unwrap_or(start_block)
-                    .max(start_block);
-                let head = match discover_head_p2p(
-                    &pool_head,
-                    baseline,
-                    HEAD_PROBE_PEERS,
-                    HEAD_PROBE_LIMIT,
-                )
-                .await
-                {
-                    Ok(Some(head)) => head,
-                    Ok(None) => {
-                        sleep(poll).await;
-                        continue;
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "follow head probe failed");
-                        sleep(poll).await;
-                        continue;
-                    }
-                };
-                let capped = end_block.map(|end| head.min(end)).unwrap_or(head);
-                if capped > last_head {
-                    last_head = capped;
-                    let _ = head_seen_tx.send(capped);
-                    if let Err(err) = storage_head.set_head_seen(capped) {
-                        tracing::debug!(error = %err, "follow head tracker: failed to persist head_seen");
-                    }
-                    if let Some(stats) = stats_head.as_ref() {
-                        stats.set_head_seen(capped);
-                    }
-                }
-                tokio::select! {
-                    _ = stop_rx_head.changed() => {
-                        if *stop_rx_head.borrow() {
-                            break;
-                        }
-                    }
-                    _ = sleep(poll) => {}
-                }
-            }
-        });
+        let head_task = tokio::spawn(run_head_tracker(
+            HeadTrackerContext {
+                storage: Arc::clone(&storage),
+                pool: Arc::clone(&pool),
+                stats: stats.clone(),
+                start_block: config.start_block,
+                end_block: config.end_block,
+                poll,
+            },
+            head_seen_tx,
+            stop_rx.clone(),
+            observed_head,
+        ));
 
-        let mut head_seen_rx_tail = head_seen_rx.clone();
-        let mut next_to_schedule = target_head.saturating_add(1);
-        let tail_task = tokio::spawn(async move {
-            loop {
-                if *stop_rx_tail.borrow() {
-                    break;
-                }
-                let head_seen = *head_seen_rx_tail.borrow();
-                if head_seen >= next_to_schedule {
-                    let _ = tail_tx.send(next_to_schedule..=head_seen);
-                    next_to_schedule = head_seen.saturating_add(1);
-                }
-                tokio::select! {
-                    _ = head_seen_rx_tail.changed() => {}
-                    _ = stop_rx_tail.changed() => {
-                        if *stop_rx_tail.borrow() {
-                            break;
-                        }
-                    }
-                    _ = sleep(Duration::from_millis(200)) => {}
-                }
-            }
-        });
+        let tail_task = tokio::spawn(run_tail_scheduler(
+            tail_tx,
+            head_seen_rx.clone(),
+            stop_rx.clone(),
+            target_head.saturating_add(1),
+        ));
 
         let (reorg_tx, mut reorg_rx) = mpsc::unbounded_channel();
-        let storage_reorg = Arc::clone(&storage);
-        let pool_reorg = Arc::clone(&pool);
-        let rollback_window = config.rollback_window;
-        let start_block = config.start_block;
-        let reorg_task = tokio::spawn(async move {
-            loop {
-                if *stop_rx_reorg.borrow() {
-                    break;
-                }
-                let last_indexed = match storage_reorg.last_indexed_block() {
-                    Ok(Some(block)) => block,
-                    _ => {
-                        sleep(poll).await;
-                        continue;
-                    }
-                };
-                let start = last_indexed.saturating_add(1).max(start_block);
-                match preflight_reorg(
-                    storage_reorg.as_ref(),
-                    pool_reorg.as_ref(),
-                    last_indexed,
-                    start,
-                    REORG_PROBE_PEERS,
-                )
-                .await
-                {
-                    Ok(ReorgCheck::NoReorg) => {}
-                    Ok(ReorgCheck::Inconclusive) => {
-                        sleep(poll).await;
-                        continue;
-                    }
-                    Ok(ReorgCheck::ReorgDetected { anchor }) => {
-                        let low = last_indexed
-                            .saturating_sub(rollback_window)
-                            .max(start_block);
-                        tracing::warn!(
-                            last_indexed,
-                            low,
-                            peer_id = ?anchor.peer_id,
-                            "reorg detected during follow; searching for common ancestor"
-                        );
-                        let ancestor = find_common_ancestor(
-                            storage_reorg.as_ref(),
-                            &anchor,
-                            low,
-                            last_indexed,
-                        )
-                        .await
-                        .ok()
-                        .flatten();
-                        if let Some(ancestor) = ancestor {
-                            let _ = reorg_tx.send(Ok(ancestor));
-                        } else {
-                            let _ = reorg_tx.send(Err(eyre!(
-                                "reorg exceeds rollback_window: last_indexed={}, low={}",
-                                last_indexed,
-                                low
-                            )));
-                        }
-                        let _ = stop_tx_reorg.send(true);
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "reorg check failed");
-                    }
-                }
-                tokio::select! {
-                    _ = stop_rx_reorg.changed() => {
-                        if *stop_rx_reorg.borrow() {
-                            break;
-                        }
-                    }
-                    _ = sleep(poll) => {}
-                }
-            }
-        });
+        let reorg_task = tokio::spawn(run_reorg_detector(
+            ReorgDetectorContext {
+                storage: Arc::clone(&storage),
+                pool: Arc::clone(&pool),
+                rollback_window: config.rollback_window,
+                start_block: config.start_block,
+                poll,
+            },
+            reorg_tx,
+            stop_tx.clone(),
+            stop_rx.clone(),
+        ));
 
         let tail = TailIngestConfig {
             ranges_rx: tail_rx,
@@ -443,19 +504,23 @@ pub async fn run_follow_loop(
         let outcome = run_ingest_pipeline(
             Arc::clone(&storage),
             Arc::clone(&pool),
-            config,
-            range,
+            IngestPipelineConfig {
+                config,
+                range,
+                head_at_startup: observed_head,
+                db_mode_override: Some(DbWriteMode::Follow),
+                head_cap_override: None,
+                stop_rx: Some(stop_rx),
+                tail: Some(tail),
+            },
             super::MissingBlocks::Precomputed(blocks),
-            observed_head,
-            progress_ref,
-            stats.clone(),
-            None,
-            Some(DbWriteMode::Follow),
-            None,
+            IngestPipelineTrackers {
+                progress: progress_ref,
+                stats: stats.clone(),
+                bench: None,
+                events: None,
+            },
             Arc::clone(&peer_health),
-            None,
-            Some(stop_rx),
-            Some(tail),
         )
         .await?;
         let _ = stop_tx.send(true);

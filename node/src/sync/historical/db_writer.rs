@@ -16,27 +16,46 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+/// Tracks remaining blocks per shard for compaction scheduling.
+pub type ShardRemainingTracker = Arc<Mutex<HashMap<u64, usize>>>;
+
+/// Full configuration for the DB writer task.
+pub struct DbWriterParams {
+    pub config: DbWriteConfig,
+    pub mode: DbWriteMode,
+    pub bench: Option<Arc<IngestBenchStats>>,
+    pub events: Option<Arc<BenchEventLogger>>,
+    pub progress_stats: Option<Arc<SyncProgressStats>>,
+    pub remaining_per_shard: Option<ShardRemainingTracker>,
+    pub follow_expected_start: Option<u64>,
+}
+
+/// Shared context for fast-sync flush operations (immutable parts).
+struct FlushContext<'a> {
+    storage: &'a Arc<Storage>,
+    bench: Option<&'a Arc<IngestBenchStats>>,
+    events: Option<&'a Arc<BenchEventLogger>>,
+    remaining_per_shard: Option<&'a ShardRemainingTracker>,
+    progress_stats: Option<&'a Arc<SyncProgressStats>>,
+    semaphore: &'a Arc<Semaphore>,
+}
+
 async fn flush_fast_sync_buffer(
-    storage: &Arc<Storage>,
+    ctx: &FlushContext<'_>,
     buffer: &mut Vec<BlockBundle>,
-    bench: Option<&Arc<IngestBenchStats>>,
-    events: Option<&Arc<BenchEventLogger>>,
-    remaining_per_shard: Option<&Arc<Mutex<HashMap<u64, usize>>>>,
-    progress_stats: Option<&Arc<SyncProgressStats>>,
     compactions: &mut Vec<JoinHandle<Result<()>>>,
-    semaphore: &Arc<Semaphore>,
 ) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
     }
 
-    let bytes = if bench.is_some() || events.is_some() {
+    let bytes = if ctx.bench.is_some() || ctx.events.is_some() {
         Some(db_bytes_for_bundles(buffer)?)
     } else {
         None
     };
-    if let Some(events) = events.as_ref() {
-        let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+    if let Some(events) = ctx.events.as_ref() {
+        let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
         events.record(BenchEvent::DbFlushStart {
             blocks: buffer.len() as u64,
             bytes_total,
@@ -44,16 +63,16 @@ async fn flush_fast_sync_buffer(
     }
 
     let started = Instant::now();
-    let written_blocks = storage.write_block_bundles_wal(buffer)?;
-    if let Some(bench) = bench.as_ref() {
+    let written_blocks = ctx.storage.write_block_bundles_wal(buffer)?;
+    if let Some(bench) = ctx.bench.as_ref() {
         bench.record_db_write(buffer.len() as u64, started.elapsed());
         if let Some(bytes) = bytes.as_ref() {
             bench.record_db_write_bytes(*bytes);
         }
     }
-    if let Some(events) = events.as_ref() {
+    if let Some(events) = ctx.events.as_ref() {
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+        let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
         events.record(BenchEvent::DbFlushEnd {
             blocks: buffer.len() as u64,
             bytes_total,
@@ -61,11 +80,11 @@ async fn flush_fast_sync_buffer(
         });
     }
 
-    if let Some(remaining) = remaining_per_shard.as_ref() {
+    if let Some(remaining) = ctx.remaining_per_shard.as_ref() {
         let mut shards_to_compact = Vec::new();
         let mut guard = remaining.lock().await;
         for number in written_blocks {
-            let shard_start = (number / storage.shard_size()) * storage.shard_size();
+            let shard_start = (number / ctx.storage.shard_size()) * ctx.storage.shard_size();
             if let Some(count) = guard.get_mut(&shard_start) {
                 if *count > 0 {
                     *count -= 1;
@@ -78,10 +97,10 @@ async fn flush_fast_sync_buffer(
         drop(guard);
 
         for shard_start in shards_to_compact {
-            let storage = Arc::clone(storage);
-            let semaphore = Arc::clone(semaphore);
-            let events = events.cloned();
-            let progress_stats = progress_stats.cloned();
+            let storage = Arc::clone(ctx.storage);
+            let semaphore = Arc::clone(ctx.semaphore);
+            let events = ctx.events.cloned();
+            let progress_stats = ctx.progress_stats.cloned();
             compactions.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
                 if let Some(events) = events.as_ref() {
@@ -124,6 +143,7 @@ impl DbWriteConfig {
     }
 }
 
+#[expect(clippy::large_enum_variant, reason = "Block variant is the hot path, boxing adds overhead")]
 pub enum DbWriterMessage {
     Block(BlockBundle),
     Finalize,
@@ -142,17 +162,26 @@ pub struct DbWriterFinalizeStats {
     pub seal_completed_ms: u64,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "async select loop with mode branching and finalization logic"
+)]
 pub async fn run_db_writer(
     storage: Arc<Storage>,
-    mut rx: mpsc::Receiver<DbWriterMessage>,
-    config: DbWriteConfig,
-    bench: Option<Arc<IngestBenchStats>>,
-    events: Option<Arc<BenchEventLogger>>,
-    mode: DbWriteMode,
-    progress_stats: Option<Arc<SyncProgressStats>>,
-    remaining_per_shard: Option<Arc<Mutex<HashMap<u64, usize>>>>,
-    follow_expected_start: Option<u64>,
+    rx: mpsc::Receiver<DbWriterMessage>,
+    params: DbWriterParams,
 ) -> Result<DbWriterFinalizeStats> {
+    let DbWriterParams {
+        config,
+        mode,
+        bench,
+        events,
+        progress_stats,
+        remaining_per_shard,
+        follow_expected_start,
+    } = params;
+    let mut rx = rx;
     let mut interval = config.flush_interval.map(tokio::time::interval);
     // Compaction is a large, bursty workload (reads WAL + writes new segment files).
     // Serializing it avoids compaction fan-out doubling peak memory/IO.
@@ -178,12 +207,12 @@ pub async fn run_db_writer(
 
     let write_follow_bundle = |bundle: BlockBundle| -> Result<()> {
         let bytes = if bench.is_some() || events.is_some() {
-            Some(db_bytes_for_bundles(&[bundle.clone()])?)
+            Some(db_bytes_for_bundles(std::slice::from_ref(&bundle))?)
         } else {
             None
         };
         if let Some(events) = events.as_ref() {
-            let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+            let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
             events.record(BenchEvent::DbFlushStart {
                 blocks: 1,
                 bytes_total,
@@ -199,7 +228,7 @@ pub async fn run_db_writer(
         }
         if let Some(events) = events.as_ref() {
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+            let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
             events.record(BenchEvent::DbFlushEnd {
                 blocks: 1,
                 bytes_total,
@@ -207,6 +236,15 @@ pub async fn run_db_writer(
             });
         }
         Ok(())
+    };
+
+    let flush_ctx = FlushContext {
+        storage: &storage,
+        bench: bench.as_ref(),
+        events: events.as_ref(),
+        remaining_per_shard: remaining_per_shard.as_ref(),
+        progress_stats: progress_stats.as_ref(),
+        semaphore: &semaphore,
     };
 
     loop {
@@ -217,17 +255,7 @@ pub async fn run_db_writer(
                         if mode == DbWriteMode::FastSync {
                             buffer.push(block);
                             if buffer.len() >= config.batch_blocks {
-                                flush_fast_sync_buffer(
-                                    &storage,
-                                    &mut buffer,
-                                    bench.as_ref(),
-                                    events.as_ref(),
-                                    remaining_per_shard.as_ref(),
-                                    progress_stats.as_ref(),
-                                    &mut compactions,
-                                    &semaphore,
-                                )
-                                .await?;
+                                flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                             }
                         } else {
                             let number = block.number;
@@ -241,40 +269,9 @@ pub async fn run_db_writer(
                             }
                         }
                     }
-                    Some(DbWriterMessage::Finalize) => {
+                    Some(DbWriterMessage::Finalize) | None => {
                         if mode == DbWriteMode::FastSync {
-                            flush_fast_sync_buffer(
-                                &storage,
-                                &mut buffer,
-                                bench.as_ref(),
-                                events.as_ref(),
-                                remaining_per_shard.as_ref(),
-                                progress_stats.as_ref(),
-                                &mut compactions,
-                                &semaphore,
-                            )
-                            .await?;
-                        } else {
-                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
-                                write_follow_bundle(bundle)?;
-                                follow_expected = follow_expected.saturating_add(1);
-                            }
-                        }
-                        break;
-                    }
-                    None => {
-                        if mode == DbWriteMode::FastSync {
-                            flush_fast_sync_buffer(
-                                &storage,
-                                &mut buffer,
-                                bench.as_ref(),
-                                events.as_ref(),
-                                remaining_per_shard.as_ref(),
-                                progress_stats.as_ref(),
-                                &mut compactions,
-                                &semaphore,
-                            )
-                            .await?;
+                            flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                         } else {
                             while let Some(bundle) = follow_buffer.remove(&follow_expected) {
                                 write_follow_bundle(bundle)?;
@@ -285,23 +282,13 @@ pub async fn run_db_writer(
                     }
                 }
             }
-            _ = async {
+            () = async {
                 if let Some(interval) = interval.as_mut() {
                     interval.tick().await;
                 }
             }, if interval.is_some() => {
                 if mode == DbWriteMode::FastSync {
-                    flush_fast_sync_buffer(
-                        &storage,
-                        &mut buffer,
-                    bench.as_ref(),
-                    events.as_ref(),
-                    remaining_per_shard.as_ref(),
-                    progress_stats.as_ref(),
-                    &mut compactions,
-                    &semaphore,
-                )
-                .await?;
+                    flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                 }
             }
             _ = gauge_tick.tick() => {
@@ -341,97 +328,111 @@ pub async fn run_db_writer(
         );
     }
 
+    // Wait for in-flight compactions
     let compaction_started = Instant::now();
     let mut finalize_stats = DbWriterFinalizeStats::default();
-    if mode == DbWriteMode::FastSync {
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::CompactAllDirtyStart);
-        }
-    }
     for handle in compactions {
         handle.await??;
     }
     finalize_stats.compactions_wait_ms = compaction_started.elapsed().as_millis() as u64;
-    // Safety net: if shard completion tracking isn't provided (or we have a partial tail shard),
-    // compact whatever is still in WAL so reads work after finalize.
+
+    // Finalize fast-sync: compact dirty shards and seal completed ones
     if mode == DbWriteMode::FastSync {
-        // Reset compaction progress counters for finalize phase
-        // Set counters BEFORE phase to ensure UI sees consistent values
-        if let Some(stats) = progress_stats.as_ref() {
-            stats.set_compactions_done(0);
-            stats.set_compactions_total(0);
-            stats.set_finalize_phase(FinalizePhase::Compacting);
-        }
-
-        if let Ok(mut dirty) = storage.dirty_shards() {
-            if !dirty.is_empty() {
-                let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
-                dirty.sort_by_key(|info| std::cmp::Reverse(info.wal_bytes));
-                let top = dirty.iter().take(5).collect::<Vec<_>>();
-                tracing::info!(
-                    dirty_shards = dirty.len(),
-                    total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round(),
-                    top_shards = ?top,
-                    "finalizing: compacting dirty shards (WAL present or unsorted)"
-                );
-                if let Some(stats) = progress_stats.as_ref() {
-                    stats.set_compactions_total(dirty.len() as u64);
-                }
-            }
-        }
-        let compact_started = Instant::now();
-        let stats_for_callback = progress_stats.clone();
-        storage.compact_all_dirty_with_progress(|_shard_start| {
-            if let Some(stats) = stats_for_callback.as_ref() {
-                stats.inc_compactions_done(1);
-            }
-        })?;
-        finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
-    }
-    if mode == DbWriteMode::FastSync {
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::CompactAllDirtyEnd {
-                duration_ms: compaction_started.elapsed().as_millis() as u64,
-            });
-        }
-    }
-
-    // Seal shards after all queued compactions are done.
-    if mode == DbWriteMode::FastSync {
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::SealCompletedStart);
-        }
-        let started = Instant::now();
-
-        // Sealing phase - get count UPFRONT so UI shows "N/M left" format
-        if let Some(stats) = progress_stats.as_ref() {
-            stats.set_compactions_done(0);
-            let to_seal = storage.count_shards_to_seal().unwrap_or(0);
-            stats.set_compactions_total(to_seal);
-            stats.set_finalize_phase(FinalizePhase::Sealing);
-        }
-
-        let mut sealed_count = 0u64;
-        let stats_for_seal = progress_stats.clone();
-        storage.seal_completed_shards_with_progress(|_shard_start| {
-            sealed_count += 1;
-            if let Some(stats) = stats_for_seal.as_ref() {
-                stats.inc_compactions_done(1);
-            }
-        })?;
-        if sealed_count > 0 {
-            tracing::info!(sealed = sealed_count, "finalizing: sealed shards");
-        }
-
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::SealCompletedEnd {
-                duration_ms: started.elapsed().as_millis() as u64,
-            });
-        }
-        finalize_stats.seal_completed_ms = started.elapsed().as_millis() as u64;
+        finalize_fast_sync(
+            &storage,
+            events.as_ref(),
+            progress_stats.as_ref(),
+            &mut finalize_stats,
+        )?;
     }
 
     Ok(finalize_stats)
+}
+
+/// Finalize fast-sync mode: compact all dirty shards and seal completed ones.
+#[expect(clippy::cognitive_complexity, reason = "finalization with compaction and sealing phases")]
+fn finalize_fast_sync(
+    storage: &Storage,
+    events: Option<&Arc<BenchEventLogger>>,
+    progress_stats: Option<&Arc<SyncProgressStats>>,
+    finalize_stats: &mut DbWriterFinalizeStats,
+) -> Result<()> {
+    if let Some(events) = events {
+        events.record(BenchEvent::CompactAllDirtyStart);
+    }
+
+    // Reset compaction progress counters for finalize phase
+    if let Some(stats) = progress_stats {
+        stats.set_compactions_done(0);
+        stats.set_compactions_total(0);
+        stats.set_finalize_phase(FinalizePhase::Compacting);
+    }
+
+    if let Ok(mut dirty) = storage.dirty_shards() {
+        if !dirty.is_empty() {
+            let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
+            dirty.sort_by_key(|info| std::cmp::Reverse(info.wal_bytes));
+            let top = dirty.iter().take(5).collect::<Vec<_>>();
+            tracing::info!(
+                dirty_shards = dirty.len(),
+                total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round(),
+                top_shards = ?top,
+                "finalizing: compacting dirty shards (WAL present or unsorted)"
+            );
+            if let Some(stats) = progress_stats {
+                stats.set_compactions_total(dirty.len() as u64);
+            }
+        }
+    }
+
+    let compact_started = Instant::now();
+    let stats_for_callback = progress_stats.cloned();
+    storage.compact_all_dirty_with_progress(|_shard_start| {
+        if let Some(stats) = stats_for_callback.as_ref() {
+            stats.inc_compactions_done(1);
+        }
+    })?;
+    finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
+
+    if let Some(events) = events {
+        events.record(BenchEvent::CompactAllDirtyEnd {
+            duration_ms: compact_started.elapsed().as_millis() as u64,
+        });
+    }
+
+    // Sealing phase
+    if let Some(events) = events {
+        events.record(BenchEvent::SealCompletedStart);
+    }
+    let seal_started = Instant::now();
+
+    if let Some(stats) = progress_stats {
+        stats.set_compactions_done(0);
+        let to_seal = storage.count_shards_to_seal().unwrap_or(0);
+        stats.set_compactions_total(to_seal);
+        stats.set_finalize_phase(FinalizePhase::Sealing);
+    }
+
+    let mut sealed_count = 0u64;
+    let stats_for_seal = progress_stats.cloned();
+    storage.seal_completed_shards_with_progress(|_shard_start| {
+        sealed_count += 1;
+        if let Some(stats) = stats_for_seal.as_ref() {
+            stats.inc_compactions_done(1);
+        }
+    })?;
+    if sealed_count > 0 {
+        tracing::info!(sealed = sealed_count, "finalizing: sealed shards");
+    }
+
+    if let Some(events) = events {
+        events.record(BenchEvent::SealCompletedEnd {
+            duration_ms: seal_started.elapsed().as_millis() as u64,
+        });
+    }
+    finalize_stats.seal_completed_ms = seal_started.elapsed().as_millis() as u64;
+
+    Ok(())
 }
 
 fn encoded_len<T: Serialize>(value: &T) -> Result<u64> {
@@ -495,13 +496,15 @@ mod tests {
         let handle = tokio::spawn(run_db_writer(
             Arc::clone(&storage),
             rx,
-            DbWriteConfig::new(1, None),
-            None,
-            None,
-            DbWriteMode::FastSync,
-            None,
-            None,
-            None,
+            DbWriterParams {
+                config: DbWriteConfig::new(1, None),
+                mode: DbWriteMode::FastSync,
+                bench: None,
+                events: None,
+                progress_stats: None,
+                remaining_per_shard: None,
+                follow_expected_start: None,
+            },
         ));
 
         tx.send(DbWriterMessage::Block(bundle_with_number(2)))

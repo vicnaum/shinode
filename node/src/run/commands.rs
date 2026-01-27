@@ -1,5 +1,8 @@
 //! Subcommand handlers for db stats and repair.
 
+// CLI commands output directly to stdout for user feedback
+#![expect(clippy::print_stdout, reason = "CLI commands require stdout output")]
+
 use crate::cli::{DbStatsArgs, NodeConfig};
 use crate::storage::Storage;
 use crate::ui;
@@ -31,7 +34,7 @@ pub fn handle_repair(config: &NodeConfig) -> Result<()> {
             let phase_info = info
                 .original_phase
                 .as_ref()
-                .map(|p| format!(" (phase: {})", p))
+                .map(|p| format!(" (phase: {p})"))
                 .unwrap_or_default();
             println!(
                 "Shard {}: {}{}",

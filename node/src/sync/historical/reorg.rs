@@ -33,12 +33,7 @@ pub async fn preflight_reorg(
 
     let mut mismatch_anchor: Option<NetworkPeer> = None;
     let probe_peers = probe_peers.max(1);
-    let mut probed = 0usize;
-    for peer in peers.iter() {
-        if probed >= probe_peers {
-            break;
-        }
-        probed += 1;
+    for peer in peers.iter().take(probe_peers) {
 
         if let Some(header) = fetch_single_header(peer, last_indexed).await? {
             let network_hash = SealedHeader::seal_slow(header).hash();

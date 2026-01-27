@@ -39,18 +39,15 @@ pub fn init_tracing(
     log_path: Option<PathBuf>,
     resources_path: Option<PathBuf>,
 ) -> TracingGuards {
-    let log_filter = match EnvFilter::try_from_default_env() {
-        Ok(filter) => filter,
-        Err(_) => {
-            let (global, local) = match config.verbosity {
-                0 => ("error", "error"),
-                1 => ("warn", "info"),
-                2 => ("warn", "debug"),
-                _ => ("warn", "trace"),
-            };
-            EnvFilter::new(format!("{global},stateless_history_node={local}"))
-        }
-    };
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let (global, local) = match config.verbosity {
+            0 => ("error", "error"),
+            1 => ("warn", "info"),
+            2 => ("warn", "debug"),
+            _ => ("warn", "trace"),
+        };
+        EnvFilter::new(format!("{global},stateless_history_node={local}"))
+    });
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
         .with_filter(log_filter);
@@ -59,7 +56,7 @@ pub fn init_tracing(
     let json_log_filter = EnvFilter::try_new(&config.log_json_filter)
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_JSON_FILTER));
 
-    let log_writer = log_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+    let log_writer = log_path.and_then(|path| match JsonLogWriter::new(&path, LOG_BUFFER) {
         Ok(writer) => Some(Arc::new(writer)),
         Err(err) => {
             warn!(error = %err, "failed to initialize json log writer");
@@ -69,7 +66,7 @@ pub fn init_tracing(
 
     // Resources log file writer (separate file for resource metrics).
     let resources_writer =
-        resources_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+        resources_path.and_then(|path| match JsonLogWriter::new(&path, LOG_BUFFER) {
             Ok(writer) => Some(Arc::new(writer)),
             Err(err) => {
                 warn!(error = %err, "failed to initialize resources log writer");

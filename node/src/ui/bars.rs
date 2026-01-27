@@ -1,5 +1,8 @@
 //! Progress bar rendering helpers and color definitions.
 
+// Progress style templates are compile-time constants that cannot fail
+#![expect(clippy::expect_used, reason = "style templates are compile-time constants")]
+
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 /// Color definitions for different UI states (RGB values).
@@ -102,7 +105,7 @@ pub fn format_colored_segment(content: &str, fg: (u8, u8, u8), bg: (u8, u8, u8))
 
 /// Format the green follow bar segment with block number.
 pub fn format_follow_segment(block_number: u64) -> String {
-    let content = format!("[ {} ]", block_number);
+    let content = format!("[ {block_number} ]");
     // White text on green background
     format_colored_segment(&content, (255, 255, 255), colors::GREEN)
 }

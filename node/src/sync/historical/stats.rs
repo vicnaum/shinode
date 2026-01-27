@@ -5,10 +5,9 @@ use crate::storage::StorageDiskStats;
 use serde::Serialize;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -26,13 +25,24 @@ pub struct PeerSummary {
     pub peer_failures_total: u64,
 }
 
+/// Input parameters for generating a summary.
+#[derive(Debug, Clone)]
+pub struct SummaryInput {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub head_at_startup: u64,
+    pub rollback_window_applied: bool,
+    pub peers_used: u64,
+    pub logs_total: u64,
+    pub storage_stats: Option<StorageDiskStats>,
+}
+
 const SAMPLE_LIMIT: usize = 100_000;
 
 fn push_sample(samples: &Mutex<Vec<u64>>, value: u64) {
-    if let Ok(mut guard) = samples.lock() {
-        if guard.len() < SAMPLE_LIMIT {
-            guard.push(value);
-        }
+    let mut guard = samples.lock();
+    if guard.len() < SAMPLE_LIMIT {
+        guard.push(value);
     }
 }
 
@@ -242,16 +252,20 @@ impl IngestBenchStats {
         self.logs_total.fetch_add(count, Ordering::SeqCst);
     }
 
-    pub fn summary(
-        &self,
-        range_start: u64,
-        range_end: u64,
-        head_at_startup: u64,
-        rollback_window_applied: bool,
-        peers_used: u64,
-        logs_total: u64,
-        storage_stats: Option<StorageDiskStats>,
-    ) -> IngestBenchSummary {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "summary builds multiple nested structs with computed statistics"
+    )]
+    pub fn summary(&self, input: SummaryInput) -> IngestBenchSummary {
+        let SummaryInput {
+            range_start,
+            range_end,
+            head_at_startup,
+            rollback_window_applied,
+            peers_used,
+            logs_total,
+            storage_stats,
+        } = input;
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         let fetch_blocks = self.fetch_blocks.load(Ordering::SeqCst);
         let fetch_failed_blocks = self.fetch_failed_blocks.load(Ordering::SeqCst);
@@ -554,7 +568,7 @@ pub struct IngestDbWriteSummary {
     pub write_mib_per_sec_avg: f64,
 }
 
-fn avg_us(total_us: u64, count: u64) -> u64 {
+const fn avg_us(total_us: u64, count: u64) -> u64 {
     if count == 0 {
         0
     } else {
@@ -562,7 +576,7 @@ fn avg_us(total_us: u64, count: u64) -> u64 {
     }
 }
 
-fn avg_u64(total: u64, count: u64) -> u64 {
+const fn avg_u64(total: u64, count: u64) -> u64 {
     if count == 0 {
         0
     } else {
@@ -579,7 +593,7 @@ pub struct FetchByteTotals {
 }
 
 impl FetchByteTotals {
-    pub fn add(&mut self, other: FetchByteTotals) {
+    pub const fn add(&mut self, other: Self) {
         self.headers = self.headers.saturating_add(other.headers);
         self.bodies = self.bodies.saturating_add(other.bodies);
         self.receipts = self.receipts.saturating_add(other.receipts);
@@ -599,7 +613,7 @@ pub struct DbWriteByteTotals {
 }
 
 impl DbWriteByteTotals {
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.headers
             .saturating_add(self.tx_hashes)
             .saturating_add(self.transactions)
@@ -757,11 +771,11 @@ pub struct BenchEventLogger {
 }
 
 impl BenchEventLogger {
-    pub fn new(path: PathBuf) -> eyre::Result<Self> {
+    pub fn new(path: &std::path::Path) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = fs::File::create(&path)?;
+        let file = fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
 
         let (tx, rx) = mpsc::channel::<BenchEventMessage>();
@@ -798,11 +812,7 @@ impl BenchEventLogger {
             t_ms: self.started_at.elapsed().as_millis() as u64,
             event,
         };
-        let sender = self
-            .sender
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
+        let sender = self.sender.lock().as_ref().cloned();
         if let Some(sender) = sender {
             match sender.send(BenchEventMessage::Record(record)) {
                 Ok(()) => {
@@ -818,16 +828,10 @@ impl BenchEventLogger {
     }
 
     pub fn finish(&self) -> eyre::Result<()> {
-        let sender = match self.sender.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
+        let sender = self.sender.lock().take();
         drop(sender);
 
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
+        let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             match handle.join() {
                 Ok(res) => res?,
@@ -837,12 +841,12 @@ impl BenchEventLogger {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for diagnostics, used in tests")]
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::SeqCst)
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for diagnostics, used in tests")]
     pub fn total_events(&self) -> u64 {
         self.total_events.load(Ordering::SeqCst)
     }
@@ -850,9 +854,9 @@ impl BenchEventLogger {
 
 impl Drop for BenchEventLogger {
     fn drop(&mut self) {
-        let sender = self.sender.lock().ok().and_then(|mut g| g.take());
+        let sender = self.sender.lock().take();
         drop(sender);
-        let handle = self.handle.lock().ok().and_then(|mut g| g.take());
+        let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             let _ = handle.join();
         }

@@ -2,13 +2,12 @@
 
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use parking_lot::Mutex;
 use std::{
     io::{BufWriter, Write},
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
-        Mutex,
     },
     thread::JoinHandle,
     time::Instant,
@@ -55,8 +54,7 @@ impl tracing::field::Visit for JsonLogVisitor {
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         let number = serde_json::Number::from_f64(value)
-            .map(JsonValue::Number)
-            .unwrap_or_else(|| JsonValue::String(value.to_string()));
+            .map_or_else(|| JsonValue::String(value.to_string()), JsonValue::Number);
         self.fields.insert(field.name().to_string(), number);
     }
 
@@ -87,11 +85,11 @@ pub struct JsonLogWriter {
 
 impl JsonLogWriter {
     /// Create a new JSON log writer that writes to the specified path.
-    pub fn new(path: PathBuf, capacity: usize) -> eyre::Result<Self> {
+    pub fn new(path: &std::path::Path, capacity: usize) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
         let (tx, rx) = mpsc::sync_channel::<LogRecord>(capacity);
         let handle = std::thread::spawn(move || -> eyre::Result<()> {
@@ -120,17 +118,13 @@ impl JsonLogWriter {
 
     /// Record a log entry, dropping it if the channel is full.
     pub fn record(&self, record: LogRecord) {
-        let sender = self
-            .sender
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
+        let sender = self.sender.lock().as_ref().cloned();
         if let Some(sender) = sender {
             match sender.try_send(record) {
                 Ok(()) => {
                     self.total_events.fetch_add(1, Ordering::SeqCst);
                 }
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                     self.dropped_events.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -141,15 +135,9 @@ impl JsonLogWriter {
 
     /// Finish writing and flush all pending records.
     pub fn finish(&self) -> eyre::Result<()> {
-        let sender = match self.sender.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
+        let sender = self.sender.lock().take();
         drop(sender);
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
+        let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             match handle.join() {
                 Ok(res) => res?,
@@ -160,13 +148,13 @@ impl JsonLogWriter {
     }
 
     /// Get the number of dropped events.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for diagnostics, used in tests")]
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::SeqCst)
     }
 
     /// Get the total number of events written.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for diagnostics, used in tests")]
     pub fn total_events(&self) -> u64 {
         self.total_events.load(Ordering::SeqCst)
     }
@@ -197,8 +185,8 @@ pub struct JsonLogLayer {
 
 impl JsonLogLayer {
     /// Create a new JSON log layer that accepts all events.
-    #[allow(dead_code)]
-    pub fn new(writer: std::sync::Arc<JsonLogWriter>) -> Self {
+    #[expect(dead_code, reason = "convenience constructor for unfiltered logging")]
+    pub const fn new(writer: std::sync::Arc<JsonLogWriter>) -> Self {
         Self {
             writer,
             filter: JsonLogFilter::All,
@@ -206,7 +194,7 @@ impl JsonLogLayer {
     }
 
     /// Create a new JSON log layer with a specific filter.
-    pub fn with_filter(writer: std::sync::Arc<JsonLogWriter>, filter: JsonLogFilter) -> Self {
+    pub const fn with_filter(writer: std::sync::Arc<JsonLogWriter>, filter: JsonLogFilter) -> Self {
         Self { writer, filter }
     }
 }
@@ -229,17 +217,17 @@ where
         // Apply filter based on message content
         let is_resources = message.as_deref() == Some("resources");
         match self.filter {
-            JsonLogFilter::All => {}
             JsonLogFilter::ResourcesOnly if !is_resources => return,
             JsonLogFilter::ExcludeResources if is_resources => return,
-            _ => {}
+            JsonLogFilter::All | JsonLogFilter::ResourcesOnly | JsonLogFilter::ExcludeResources => {
+            }
         }
 
         let record = LogRecord {
             t_ms: self.writer.elapsed().as_millis() as u64,
             level: meta.level().as_str().to_string(),
             target: meta.target().to_string(),
-            file: meta.file().map(|file| file.to_string()),
+            file: meta.file().map(ToString::to_string),
             line: meta.line(),
             message,
             fields,

@@ -42,7 +42,7 @@ impl ProgressReporter for IngestProgress {
 }
 
 /// Resources specific to follow mode that need explicit cleanup.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "fields accessed via destructuring and method calls")]
 pub struct FollowModeResources {
     pub head_tracker: Option<JoinHandle<()>>,
     pub tail_feeder: Option<JoinHandle<()>>,
@@ -53,7 +53,7 @@ pub struct FollowModeResources {
 
 impl FollowModeResources {
     /// Create empty resources (for non-follow mode).
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             head_tracker: None,
             tail_feeder: None,
@@ -83,8 +83,8 @@ impl FollowModeResources {
     }
 
     /// Check if follow mode is enabled.
-    #[allow(dead_code)]
-    pub fn is_enabled(&self) -> bool {
+    #[expect(dead_code, reason = "API for checking follow mode state")]
+    pub const fn is_enabled(&self) -> bool {
         self.head_tracker.is_some()
     }
 }

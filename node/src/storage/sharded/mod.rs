@@ -27,7 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use wal::{append_records, build_slice_index, WalRecord};
 use zstd::bulk::Compressor;
 
@@ -46,6 +47,105 @@ const WAL_NAME: &str = "staging.wal";
 const PHASE_WRITING: &str = "writing";
 const PHASE_SWAPPING: &str = "swapping";
 const PHASE_CLEANUP: &str = "cleanup";
+
+/// Container for raw segment readers used during compaction.
+struct ShardRawSegments {
+    headers: SegmentRawSource<SegmentHeader>,
+    tx_hashes: SegmentRawSource<SegmentHeader>,
+    tx_meta: SegmentRawSource<SegmentHeader>,
+    receipts: SegmentRawSource<SegmentHeader>,
+    sizes: SegmentRawSource<SegmentHeader>,
+}
+
+/// Container for raw segment writers used during compaction.
+struct ShardRawWriters {
+    headers: SegmentRawWriter<SegmentHeader>,
+    tx_hashes: SegmentRawWriter<SegmentHeader>,
+    tx_meta: SegmentRawWriter<SegmentHeader>,
+    receipts: SegmentRawWriter<SegmentHeader>,
+    sizes: SegmentRawWriter<SegmentHeader>,
+}
+
+impl ShardRawWriters {
+    fn finish(self) -> Result<()> {
+        self.headers.finish()?;
+        self.tx_hashes.finish()?;
+        self.tx_meta.finish()?;
+        self.receipts.finish()?;
+        self.sizes.finish()?;
+        Ok(())
+    }
+
+    fn push_empty(&mut self) -> Result<()> {
+        self.headers.push_empty()?;
+        self.tx_hashes.push_empty()?;
+        self.tx_meta.push_empty()?;
+        self.receipts.push_empty()?;
+        self.sizes.push_empty()?;
+        Ok(())
+    }
+}
+
+const fn create_segment_config(
+    shard_start: u64,
+    compression: SegmentCompression,
+    existing_max_row_size: usize,
+) -> NippyJarConfig<SegmentHeader> {
+    NippyJarConfig {
+        version: 1,
+        user_header: SegmentHeader { start_block: shard_start },
+        columns: 1,
+        rows: 0,
+        compressor: segment_compressor(compression),
+        max_row_size: existing_max_row_size,
+    }
+}
+
+fn create_compaction_writers(
+    temp_dir: &Path,
+    shard_start: u64,
+    existing: Option<&ShardRawSegments>,
+) -> Result<ShardRawWriters> {
+    let headers_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::None,
+        existing.map_or(0, |s| s.headers.config().max_row_size),
+    );
+    let tx_hashes_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::None,
+        existing.map_or(0, |s| s.tx_hashes.config().max_row_size),
+    );
+    let tx_meta_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::Zstd {
+            use_dict: false,
+            max_dict_size: ZSTD_DICT_MAX_SIZE,
+        },
+        existing.map_or(0, |s| s.tx_meta.config().max_row_size),
+    );
+    let receipts_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::Zstd {
+            use_dict: false,
+            max_dict_size: ZSTD_DICT_MAX_SIZE,
+        },
+        existing.map_or(0, |s| s.receipts.config().max_row_size),
+    );
+    let sizes_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::None,
+        existing.map_or(0, |s| s.sizes.config().max_row_size),
+    );
+
+    Ok(ShardRawWriters {
+        headers: SegmentRawWriter::create(&temp_dir.join("headers"), headers_cfg)?,
+        tx_hashes: SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?,
+        tx_meta: SegmentRawWriter::create(&temp_dir.join("tx_meta"), tx_meta_cfg)?,
+        receipts: SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?,
+        sizes: SegmentRawWriter::create(&temp_dir.join("block_sizes"), sizes_cfg)?,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
@@ -107,7 +207,7 @@ enum SegmentCompression {
     },
 }
 
-fn segment_compressor(compression: SegmentCompression) -> Option<Compressors> {
+const fn segment_compressor(compression: SegmentCompression) -> Option<Compressors> {
     match compression {
         SegmentCompression::None => None,
         SegmentCompression::Zstd {
@@ -177,7 +277,7 @@ impl SegmentWriter {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self.state.lock();
         if start_block < state.next_block {
             return Err(eyre!(
                 "segment {} expected block {}, got {}",
@@ -218,7 +318,7 @@ impl SegmentWriter {
     }
 
     fn prune_to(&self, ancestor_number: u64) -> Result<()> {
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self.state.lock();
         if ancestor_number < self.start_block {
             let prune_rows = state.next_block.saturating_sub(self.start_block);
             if prune_rows > 0 {
@@ -267,7 +367,7 @@ impl SegmentWriter {
             return Ok(None);
         };
         let bytes = row_vals
-            .get(0)
+            .first()
             .ok_or_else(|| eyre!("missing column data"))?;
         if bytes.is_empty() {
             return Ok(None);
@@ -315,6 +415,7 @@ pub struct DirtyShardInfo {
     pub wal_bytes: u64,
 }
 
+#[expect(clippy::missing_fields_in_debug, reason = "intentionally show only data_dir")]
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Storage")
@@ -324,6 +425,7 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
+    #[expect(clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
     pub fn open(config: &NodeConfig) -> Result<Self> {
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
         let peer_cache_dir = config
@@ -369,9 +471,8 @@ impl Storage {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let shard_start = match name.parse::<u64>() {
-                Ok(value) => value,
-                Err(_) => continue,
+            let Ok(shard_start) = name.parse::<u64>() else {
+                continue;
             };
             let shard_dir = entry.path();
 
@@ -448,7 +549,7 @@ impl Storage {
 
         // Scan all shard directories
         let mut shard_dirs: Vec<_> = fs::read_dir(&shards_root)?
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.metadata().map(|m| m.is_dir()).unwrap_or(false))
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
@@ -513,29 +614,29 @@ impl Storage {
     }
 
     pub fn shard_size(&self) -> u64 {
-        let meta = self.meta.lock().expect("meta lock");
+        let meta = self.meta.lock();
         meta.shard_size
     }
 
     pub fn last_indexed_block(&self) -> Result<Option<u64>> {
-        let meta = self.meta.lock().expect("meta lock");
+        let meta = self.meta.lock();
         Ok(meta.max_present_block)
     }
 
     #[cfg(test)]
     pub fn set_last_indexed_block(&self, value: u64) -> Result<()> {
-        let mut meta = self.meta.lock().expect("meta lock");
+        let mut meta = self.meta.lock();
         meta.max_present_block = Some(value);
         persist_meta(&meta_path(&self.data_dir), &meta)
     }
 
     pub fn head_seen(&self) -> Result<Option<u64>> {
-        let meta = self.meta.lock().expect("meta lock");
+        let meta = self.meta.lock();
         Ok(meta.head_seen)
     }
 
     pub fn set_head_seen(&self, value: u64) -> Result<()> {
-        let mut meta = self.meta.lock().expect("meta lock");
+        let mut meta = self.meta.lock();
         meta.head_seen = Some(value);
         persist_meta(&meta_path(&self.data_dir), &meta)
     }
@@ -546,7 +647,7 @@ impl Storage {
         let Some(shard) = shard else {
             return Ok(false);
         };
-        let state = shard.lock().expect("shard lock");
+        let state = shard.lock();
         let offset = (number - shard_start) as usize;
         Ok(state.bitset.is_set(offset))
     }
@@ -582,7 +683,7 @@ impl Storage {
                 shard_start = shard_start.saturating_add(shard_size);
                 continue;
             };
-            let state = shard.lock().expect("shard lock");
+            let state = shard.lock();
             if state.meta.complete {
                 shard_start = shard_start.saturating_add(shard_size);
                 continue;
@@ -654,7 +755,7 @@ impl Storage {
                 shard_start = shard_start.saturating_add(shard_size);
                 continue;
             };
-            let state = shard.lock().expect("shard lock");
+            let state = shard.lock();
             if state.meta.complete {
                 shard_start = shard_start.saturating_add(shard_size);
                 continue;
@@ -717,13 +818,13 @@ impl Storage {
         }
 
         let mut written_blocks = Vec::new();
-        for (shard_start, mut records) in per_shard {
+        for (shard_start, records) in per_shard {
             let shard = self.get_or_create_shard(shard_start)?;
-            let mut state = shard.lock().expect("shard lock");
+            let mut state = shard.lock();
             let mut to_append: Vec<WalRecord> = Vec::new();
             let mut seen_offsets: HashSet<usize> = HashSet::new();
 
-            for record in records.drain(..) {
+            for record in records {
                 let offset = (record.block_number - shard_start) as usize;
                 if state.bitset.is_set(offset) || !seen_offsets.insert(offset) {
                     continue;
@@ -768,7 +869,7 @@ impl Storage {
     pub fn write_block_bundle_follow(&self, bundle: &BlockBundle) -> Result<()> {
         let shard_start = shard_start(bundle.number, self.shard_size());
         let shard = self.get_or_create_shard(shard_start)?;
-        let mut state = shard.lock().expect("shard lock");
+        let mut state = shard.lock();
         let offset = (bundle.number - shard_start) as usize;
         if state.bitset.is_set(offset) {
             return Ok(());
@@ -797,7 +898,7 @@ impl Storage {
 
         if state.bitset.set(offset) {
             state.meta.present_count = state.meta.present_count.saturating_add(1);
-            state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
+            state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         }
         state.meta.sorted = true;
         state.meta.sealed = false;
@@ -815,12 +916,17 @@ impl Storage {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "compaction has atomic phases (write/swap/cleanup) that must stay in sync"
+    )]
     pub fn compact_shard(&self, shard_start: u64) -> Result<()> {
         let shard = self.get_shard(shard_start)?;
         let Some(shard) = shard else {
             return Ok(());
         };
-        let mut state = shard.lock().expect("shard lock");
+        let mut state = shard.lock();
         let wal_p = wal_path(&state.dir);
         let wal_slices = build_slice_index(&wal_p, shard_start, state.meta.shard_size as usize)?;
         let has_wal = wal_slices.is_some();
@@ -870,17 +976,14 @@ impl Storage {
         let mut actual_tail_block: Option<u64> = None;
 
         // Determine the range to iterate: max of WAL entries and existing segment rows
-        let wal_max_offset = wal_slices
-            .as_ref()
-            .map(|w| {
-                w.entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, e)| e.map(|_| i))
-                    .max()
-            })
-            .flatten();
-        let existing_rows = existing.as_ref().map(|e| e.headers.config().rows).unwrap_or(0);
+        let wal_max_offset = wal_slices.as_ref().and_then(|w| {
+            w.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| e.map(|_| i))
+                .max()
+        });
+        let existing_rows = existing.as_ref().map_or(0, |e| e.headers.config().rows);
         let max_offset = wal_max_offset
             .unwrap_or(0)
             .max(existing_rows.saturating_sub(1));
@@ -899,59 +1002,8 @@ impl Storage {
 
         let total_rows = max_offset.saturating_add(1);
 
-        // Create segment configs
-        let headers_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing.as_ref().map(|s| s.headers.config().max_row_size).unwrap_or(0),
-        };
-        let tx_hashes_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing.as_ref().map(|s| s.tx_hashes.config().max_row_size).unwrap_or(0),
-        };
-        let tx_meta_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::Zstd {
-                use_dict: false,
-                max_dict_size: ZSTD_DICT_MAX_SIZE,
-            }),
-            max_row_size: existing.as_ref().map(|s| s.tx_meta.config().max_row_size).unwrap_or(0),
-        };
-        let receipts_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::Zstd {
-                use_dict: false,
-                max_dict_size: ZSTD_DICT_MAX_SIZE,
-            }),
-            max_row_size: existing.as_ref().map(|s| s.receipts.config().max_row_size).unwrap_or(0),
-        };
-        let sizes_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing.as_ref().map(|s| s.sizes.config().max_row_size).unwrap_or(0),
-        };
-
-        let mut headers_out = SegmentRawWriter::create(&temp_dir.join("headers"), headers_cfg)?;
-        let mut tx_hashes_out = SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?;
-        let mut tx_meta_out = SegmentRawWriter::create(&temp_dir.join("tx_meta"), tx_meta_cfg)?;
-        let mut receipts_out = SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?;
-        let mut sizes_out = SegmentRawWriter::create(&temp_dir.join("block_sizes"), sizes_cfg)?;
+        // Create segment writers
+        let mut writers = create_compaction_writers(&temp_dir, shard_start, existing.as_ref())?;
 
         // Iterate over all rows, checking WAL and existing segment for actual data
         // DO NOT use the old bitset - it may be out of sync
@@ -985,11 +1037,7 @@ impl Storage {
 
             if wal_data.is_none() && !has_existing_data {
                 // No data for this row - write empty
-                headers_out.push_empty()?;
-                tx_hashes_out.push_empty()?;
-                tx_meta_out.push_empty()?;
-                receipts_out.push_empty()?;
-                sizes_out.push_empty()?;
+                writers.push_empty()?;
                 continue;
             }
 
@@ -1000,22 +1048,30 @@ impl Storage {
 
             // Prefer WAL data over existing segment data
             if let Some(slices) = wal_data {
-                let wal = wal_slices.as_ref().unwrap();
+                // SAFETY: wal_slices is always Some when we have wal_data
+                let wal = wal_slices
+                    .as_ref()
+                    .ok_or_else(|| eyre!("wal_slices missing when wal_data present"))?;
                 let header_bytes = &wal.mmap[slices.header.as_range()];
                 let tx_hash_bytes = &wal.mmap[slices.tx_hashes.as_range()];
                 let tx_meta_bytes = &wal.mmap[slices.tx_meta.as_range()];
                 let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
                 let size_bytes = &wal.mmap[slices.size.as_range()];
 
-                headers_out.push_bytes(header_bytes, slices.header.len())?;
-                tx_hashes_out.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
-                tx_meta_out.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
-                receipts_out.push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
-                sizes_out.push_bytes(size_bytes, slices.size.len())?;
+                writers.headers.push_bytes(header_bytes, slices.header.len())?;
+                writers.tx_hashes.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
+                writers.tx_meta.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
+                writers.receipts.push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
+                writers.sizes.push_bytes(size_bytes, slices.size.len())?;
             } else {
                 // Copy from existing segment (we verified all fields exist above)
-                let ex = existing.as_ref().unwrap();
-                let header_bytes = ex.headers.row_bytes(local_offset)?.unwrap();
+                let ex = existing
+                    .as_ref()
+                    .ok_or_else(|| eyre!("existing segment missing for non-WAL block"))?;
+                let header_bytes = ex
+                    .headers
+                    .row_bytes(local_offset)?
+                    .ok_or_else(|| eyre!("missing header for block {}", block_number))?;
                 let tx_hash_bytes = ex.tx_hashes.row_bytes(local_offset)?
                     .ok_or_else(|| eyre!("missing tx_hashes for block {}", block_number))?;
                 let tx_meta_bytes = ex.tx_meta.row_bytes(local_offset)?
@@ -1025,20 +1081,16 @@ impl Storage {
                 let size_bytes = ex.sizes.row_bytes(local_offset)?
                     .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
 
-                headers_out.push_bytes(header_bytes, header_bytes.len())?;
-                tx_hashes_out.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
+                writers.headers.push_bytes(header_bytes, header_bytes.len())?;
+                writers.tx_hashes.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
                 // For zstd segments, the bytes are already compressed
-                tx_meta_out.push_bytes(tx_meta_bytes, 0)?;
-                receipts_out.push_bytes(receipt_bytes, 0)?;
-                sizes_out.push_bytes(size_bytes, size_bytes.len())?;
+                writers.tx_meta.push_bytes(tx_meta_bytes, 0)?;
+                writers.receipts.push_bytes(receipt_bytes, 0)?;
+                writers.sizes.push_bytes(size_bytes, size_bytes.len())?;
             }
         }
 
-        headers_out.finish()?;
-        tx_hashes_out.finish()?;
-        tx_meta_out.finish()?;
-        receipts_out.finish()?;
-        sizes_out.finish()?;
+        writers.finish()?;
 
         // Write new bitset to tmp file
         new_bitset.flush(&bitset_tmp)?;
@@ -1096,7 +1148,7 @@ impl Storage {
         // Update in-memory state with the new bitset
         state.bitset = new_bitset;
         state.meta.present_count = state.bitset.count_ones();
-        state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
+        state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         state.meta.sorted = true;
         state.meta.sealed = false;
         state.meta.content_hash = None;
@@ -1111,7 +1163,7 @@ impl Storage {
         Ok(())
     }
 
-    #[allow(dead_code)] // Convenience wrapper for cases without progress tracking
+    #[expect(dead_code, reason = "convenience wrapper for cases without progress tracking")]
     pub fn compact_all_dirty(&self) -> Result<()> {
         self.compact_all_dirty_with_progress(|_| {})
     }
@@ -1135,7 +1187,7 @@ impl Storage {
     /// Returns shard starts that are complete but still have WAL data and/or are not compacted.
     pub fn dirty_complete_shards(&self) -> Result<Vec<u64>> {
         let shard_starts: Vec<u64> = {
-            let shards = self.shards.lock().expect("shards lock");
+            let shards = self.shards.lock();
             shards.keys().copied().collect()
         };
         let mut out = Vec::new();
@@ -1144,7 +1196,7 @@ impl Storage {
             let Some(shard) = shard else {
                 continue;
             };
-            let state = shard.lock().expect("shard lock");
+            let state = shard.lock();
             if !state.meta.complete {
                 continue;
             }
@@ -1159,7 +1211,7 @@ impl Storage {
 
     pub fn dirty_shards(&self) -> Result<Vec<DirtyShardInfo>> {
         let shard_starts: Vec<u64> = {
-            let shards = self.shards.lock().expect("shards lock");
+            let shards = self.shards.lock();
             shards.keys().copied().collect()
         };
         let mut out = Vec::new();
@@ -1168,7 +1220,7 @@ impl Storage {
             let Some(shard) = shard else {
                 continue;
             };
-            let state = shard.lock().expect("shard lock");
+            let state = shard.lock();
             let wal_path = wal_path(&state.dir);
             let wal_bytes = wal_path.metadata().map(|meta| meta.len()).unwrap_or(0);
             let is_dirty = wal_bytes > 0 || !state.meta.sorted;
@@ -1183,7 +1235,7 @@ impl Storage {
         Ok(out)
     }
 
-    #[allow(dead_code)] // Convenience wrapper
+    #[expect(dead_code, reason = "convenience wrapper for progress-less sealing")]
     pub fn seal_completed_shards(&self) -> Result<()> {
         self.seal_completed_shards_with_progress(|_| {})
     }
@@ -1194,7 +1246,7 @@ impl Storage {
         F: FnMut(u64),
     {
         let shard_starts: Vec<u64> = {
-            let shards = self.shards.lock().expect("shards lock");
+            let shards = self.shards.lock();
             shards.keys().copied().collect()
         };
         for shard_start in shard_starts {
@@ -1202,7 +1254,7 @@ impl Storage {
             let Some(shard) = shard else {
                 continue;
             };
-            let mut state = shard.lock().expect("shard lock");
+            let mut state = shard.lock();
             if state.meta.complete && state.meta.sorted && !state.meta.sealed {
                 self.seal_shard_locked(&mut state)?;
                 persist_shard_meta(&state.dir, &state.meta)?;
@@ -1215,14 +1267,14 @@ impl Storage {
     /// Count shards that are ready to be sealed (complete, sorted, not sealed).
     pub fn count_shards_to_seal(&self) -> Result<u64> {
         let shard_starts: Vec<u64> = {
-            let shards = self.shards.lock().expect("shards lock");
+            let shards = self.shards.lock();
             shards.keys().copied().collect()
         };
         let mut count = 0u64;
         for shard_start in shard_starts {
             let shard = self.get_shard(shard_start)?;
             let Some(shard) = shard else { continue };
-            let state = shard.lock().expect("shard lock");
+            let state = shard.lock();
             if state.meta.complete && state.meta.sorted && !state.meta.sealed {
                 count += 1;
             }
@@ -1233,7 +1285,7 @@ impl Storage {
     pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
         let shard_size = self.shard_size();
         let shard_starts: Vec<u64> = {
-            let shards = self.shards.lock().expect("shards lock");
+            let shards = self.shards.lock();
             shards.keys().copied().collect()
         };
         for shard_start in shard_starts {
@@ -1242,7 +1294,7 @@ impl Storage {
                 continue;
             }
             let shard = self.get_or_create_shard(shard_start)?;
-            let mut state = shard.lock().expect("shard lock");
+            let mut state = shard.lock();
             let sorted_dir = sorted_dir(&state.dir);
             if sorted_dir.exists() {
                 let segments = shard_segment_writers(&sorted_dir, shard_start)?;
@@ -1264,7 +1316,7 @@ impl Storage {
                     state.meta.present_count = state.meta.present_count.saturating_sub(1);
                 }
             }
-            state.meta.complete = state.meta.present_count as u64 >= state.meta.shard_size;
+            state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
             if ancestor_number < shard_start {
                 state.meta.tail_block = None;
             } else {
@@ -1289,7 +1341,7 @@ impl Storage {
         let Some(shard) = shard else {
             return Ok(None);
         };
-        let state = shard.lock().expect("shard lock");
+        let state = shard.lock();
         let offset = (number - shard_start) as usize;
         if !state.bitset.is_set(offset) {
             return Ok(None);
@@ -1365,7 +1417,7 @@ impl Storage {
     }
 
     pub fn upsert_peer(&self, mut peer: StoredPeer) -> Result<()> {
-        let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        let mut cache = self.peer_cache.lock();
         if let Some(existing) = cache.get(&peer.peer_id) {
             if peer.aimd_batch_limit.is_none() {
                 peer.aimd_batch_limit = existing.aimd_batch_limit;
@@ -1376,13 +1428,13 @@ impl Storage {
     }
 
     pub fn flush_peer_cache(&self) -> Result<()> {
-        let cache = self.peer_cache.lock().expect("peer cache lock");
+        let cache = self.peer_cache.lock();
         let peers: Vec<StoredPeer> = cache.values().cloned().collect();
         persist_peer_cache(&self.peer_cache_dir, &peers)
     }
 
     pub fn load_peers(&self, expire_before_ms: u64, max_peers: usize) -> Result<PeerCacheLoad> {
-        let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        let mut cache = self.peer_cache.lock();
         let mut peers: Vec<StoredPeer> = Vec::new();
         let total = cache.len();
         let mut expired = 0usize;
@@ -1401,7 +1453,7 @@ impl Storage {
             peers.truncate(max_peers);
         }
         cache.clear();
-        for peer in peers.iter() {
+        for peer in &peers {
             cache.insert(peer.peer_id.clone(), peer.clone());
         }
         drop(cache);
@@ -1416,12 +1468,12 @@ impl Storage {
     }
 
     pub fn peer_cache_snapshot(&self) -> Vec<StoredPeer> {
-        let cache = self.peer_cache.lock().expect("peer cache lock");
+        let cache = self.peer_cache.lock();
         cache.values().cloned().collect()
     }
 
     pub fn update_peer_batch_limits(&self, limits: &[(String, u64)]) {
-        let mut cache = self.peer_cache.lock().expect("peer cache lock");
+        let mut cache = self.peer_cache.lock();
         for (peer_id, limit) in limits {
             if let Some(peer) = cache.get_mut(peer_id) {
                 peer.aimd_batch_limit = Some(*limit);
@@ -1430,7 +1482,7 @@ impl Storage {
     }
 
     fn get_shard(&self, shard_start: u64) -> Result<Option<Arc<Mutex<ShardState>>>> {
-        let shards = self.shards.lock().expect("shards lock");
+        let shards = self.shards.lock();
         Ok(shards.get(&shard_start).cloned())
     }
 
@@ -1438,7 +1490,7 @@ impl Storage {
         if let Some(shard) = self.get_shard(shard_start)? {
             return Ok(shard);
         }
-        let mut shards = self.shards.lock().expect("shards lock");
+        let mut shards = self.shards.lock();
         if let Some(shard) = shards.get(&shard_start) {
             return Ok(Arc::clone(shard));
         }
@@ -1466,7 +1518,7 @@ impl Storage {
     }
 
     fn bump_max_present(&self, block: u64) -> Result<()> {
-        let mut meta = self.meta.lock().expect("meta lock");
+        let mut meta = self.meta.lock();
         match meta.max_present_block {
             None => {
                 meta.max_present_block = Some(block);
@@ -1484,19 +1536,20 @@ impl Storage {
 
     fn recompute_max_present(&self) -> Result<()> {
         let shard_size = self.shard_size();
-        let shards = self.shards.lock().expect("shards lock");
+        let shards = self.shards.lock();
         let mut max_present = None;
         for shard in shards.values() {
-            let state = shard.lock().expect("shard lock");
+            let state = shard.lock();
             if let Some(max_block) = max_present_in_bitset(&state, shard_size) {
                 max_present = Some(max_present.unwrap_or(0).max(max_block));
             }
         }
-        let mut meta = self.meta.lock().expect("meta lock");
+        let mut meta = self.meta.lock();
         meta.max_present_block = max_present;
         persist_meta(&meta_path(&self.data_dir), &meta)
     }
 
+    #[expect(clippy::unused_self, reason = "method signature for consistency")]
     fn seal_shard_locked(&self, state: &mut ShardState) -> Result<()> {
         let Some(tail_block) = state.meta.tail_block else {
             return Ok(());
@@ -1514,14 +1567,6 @@ impl Storage {
         state.meta.content_hash_algo = "sha256".to_string();
         Ok(())
     }
-}
-
-struct ShardRawSegments {
-    headers: SegmentRawSource<SegmentHeader>,
-    tx_hashes: SegmentRawSource<SegmentHeader>,
-    tx_meta: SegmentRawSource<SegmentHeader>,
-    receipts: SegmentRawSource<SegmentHeader>,
-    sizes: SegmentRawSource<SegmentHeader>,
 }
 
 struct ShardSegments {
@@ -1582,7 +1627,7 @@ fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<S
     Ok(Some(shard_segment_writers(sorted_dir, shard_start)?))
 }
 
-fn shard_start(block_number: u64, shard_size: u64) -> u64 {
+const fn shard_start(block_number: u64, shard_size: u64) -> u64 {
     (block_number / shard_size) * shard_size
 }
 
@@ -1811,18 +1856,18 @@ pub enum ShardRecoveryResult {
 
 impl ShardRecoveryResult {
     /// Returns true if recovery was needed
-    pub fn needs_recovery(&self) -> bool {
-        !matches!(self, ShardRecoveryResult::Clean)
+    pub const fn needs_recovery(&self) -> bool {
+        !matches!(self, Self::Clean)
     }
 
     /// Returns a human-readable description
-    pub fn description(&self) -> &'static str {
+    pub const fn description(&self) -> &'static str {
         match self {
-            ShardRecoveryResult::Clean => "OK",
-            ShardRecoveryResult::RecoveredWriting => "recovered from interrupted write phase",
-            ShardRecoveryResult::RecoveredSwapping => "recovered from interrupted swap phase",
-            ShardRecoveryResult::RecoveredCleanup => "completed interrupted cleanup",
-            ShardRecoveryResult::CleanedOrphans => "cleaned orphan files",
+            Self::Clean => "OK",
+            Self::RecoveredWriting => "recovered from interrupted write phase",
+            Self::RecoveredSwapping => "recovered from interrupted swap phase",
+            Self::RecoveredCleanup => "completed interrupted cleanup",
+            Self::CleanedOrphans => "cleaned orphan files",
         }
     }
 }
@@ -1857,13 +1902,14 @@ impl RepairReport {
     }
 
     /// Total shard count
-    pub fn total_count(&self) -> usize {
+    pub const fn total_count(&self) -> usize {
         self.shards.len()
     }
 }
 
 /// Recover a shard from an interrupted compaction based on its phase.
 /// Returns what kind of recovery was performed (for UI/logging).
+#[expect(clippy::cognitive_complexity, reason = "recovery handles multiple interrupted states")]
 fn recover_shard(shard_dir: &Path, meta: &mut ShardMeta) -> Result<ShardRecoveryResult> {
     let sorted = sorted_dir(shard_dir);
     let backup = shard_dir.join("sorted.old");
@@ -1982,7 +2028,7 @@ fn recover_shard(shard_dir: &Path, meta: &mut ShardMeta) -> Result<ShardRecovery
 fn reconcile_shard_meta(state: &mut ShardState) {
     let count = state.bitset.count_ones();
     state.meta.present_count = count;
-    state.meta.complete = count as u64 >= state.meta.shard_size;
+    state.meta.complete = u64::from(count) >= state.meta.shard_size;
 }
 
 fn default_hash_algo() -> String {

@@ -43,7 +43,7 @@ impl UIController {
     }
 
     /// Get the current bar (for external progress updates).
-    pub fn current_bar(&self) -> Option<&ProgressBar> {
+    pub const fn current_bar(&self) -> Option<&ProgressBar> {
         self.current_bar.as_ref()
     }
 
@@ -81,7 +81,7 @@ impl UIController {
         }
         let bar = create_compacting_bar(&self.multi, total_shards);
         let left = total_shards;
-        bar.set_message(format!("Compacting: {} shards left", left));
+        bar.set_message(format!("Compacting: {left} shards left"));
         self.current_bar = Some(bar);
         self.state = UIState::Compacting;
     }
@@ -98,7 +98,7 @@ impl UIController {
         }
         let bar = create_sealing_bar(&self.multi, total_shards);
         let left = total_shards;
-        bar.set_message(format!("Sealing: {} shards left", left));
+        bar.set_message(format!("Sealing: {left} shards left"));
         self.current_bar = Some(bar);
         self.state = UIState::Sealing;
     }
@@ -216,25 +216,13 @@ impl UIController {
             "--".to_string()
         };
 
-        let peers_active = snapshot.peers_active.min(snapshot.peers_total);
-        let msg = format_progress_message(
-            snapshot.status,
-            peers_active,
-            snapshot.peers_total,
-            snapshot.queue,
-            snapshot.inflight,
-            snapshot.escalation,
-            snapshot.compactions_done,
-            snapshot.compactions_total,
-            speed,
-            &eta,
-        );
+        let msg = format_progress_message(snapshot, speed, &eta);
         bar.set_message(msg);
         bar.set_position(processed);
     }
 
     /// Update the compacting progress bar.
-    fn update_compacting_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+    fn update_compacting_bar(&self, snapshot: &SyncProgressSnapshot) {
         let Some(bar) = self.current_bar.as_ref() else {
             return;
         };
@@ -245,11 +233,11 @@ impl UIController {
 
         bar.set_length(total.max(1));
         bar.set_position(done);
-        bar.set_message(format!("Compacting: {} shards left", left));
+        bar.set_message(format!("Compacting: {left} shards left"));
     }
 
     /// Update the sealing progress bar.
-    fn update_sealing_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+    fn update_sealing_bar(&self, snapshot: &SyncProgressSnapshot) {
         let Some(bar) = self.current_bar.as_ref() else {
             return;
         };
@@ -260,11 +248,11 @@ impl UIController {
 
         bar.set_length(total.max(1));
         bar.set_position(done);
-        bar.set_message(format!("Sealing: {} shards left", left));
+        bar.set_message(format!("Sealing: {left} shards left"));
     }
 
     /// Update the follow mode bar.
-    fn update_follow_bar(&mut self, snapshot: &SyncProgressSnapshot, peers_connected: u64) {
+    fn update_follow_bar(&self, snapshot: &SyncProgressSnapshot, peers_connected: u64) {
         let Some(bar) = self.current_bar.as_ref() else {
             return;
         };
@@ -339,31 +327,24 @@ impl UIController {
 }
 
 /// Format the progress message shown in the sync bar.
-pub fn format_progress_message(
-    status: SyncStatus,
-    peers_active: u64,
-    peers_total: u64,
-    queue: u64,
-    inflight: u64,
-    escalation: u64,
-    compactions_done: u64,
-    compactions_total: u64,
-    speed: f64,
-    eta: &str,
-) -> String {
-    let compact = if status == SyncStatus::Finalizing && compactions_total > 0 {
-        format!(" | compact {compactions_done}/{compactions_total}")
+fn format_progress_message(snapshot: &SyncProgressSnapshot, speed: f64, eta: &str) -> String {
+    let compact = if snapshot.status == SyncStatus::Finalizing && snapshot.compactions_total > 0 {
+        format!(
+            " | compact {}/{}",
+            snapshot.compactions_done, snapshot.compactions_total
+        )
     } else {
         String::new()
     };
+    let peers_active = snapshot.peers_active.min(snapshot.peers_total);
     format!(
         "status {} | peers {}/{} | queue {} | inflight {} | retry {}{} | speed {:.1}/s | eta {}",
-        status.as_str(),
+        snapshot.status.as_str(),
         peers_active,
-        peers_total,
-        queue,
-        inflight,
-        escalation,
+        snapshot.peers_total,
+        snapshot.queue,
+        snapshot.inflight,
+        snapshot.escalation,
         compact,
         speed,
         eta
@@ -372,7 +353,7 @@ pub fn format_progress_message(
 
 /// Spawn the background task that updates progress bars.
 pub fn spawn_progress_updater(
-    ui: Arc<std::sync::Mutex<UIController>>,
+    ui: Arc<parking_lot::Mutex<UIController>>,
     stats: Arc<SyncProgressStats>,
     peer_pool: Arc<PeerPool>,
     peer_health: Option<Arc<PeerHealthTracker>>,
@@ -406,10 +387,36 @@ pub fn spawn_progress_updater(
             let peers_connected = peer_pool.len() as u64;
 
             // Update UI
-            if let Ok(mut ui) = ui.lock() {
-                ui.update(&snapshot, peers_connected);
-            }
+            ui.lock().update(&snapshot, peers_connected);
         }
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::FinalizePhase;
+
+    #[test]
+    fn progress_message_formats_status() {
+        let snapshot = SyncProgressSnapshot {
+            status: SyncStatus::Fetching,
+            peers_active: 2,
+            peers_total: 5,
+            queue: 10,
+            inflight: 1,
+            escalation: 0,
+            compactions_done: 0,
+            compactions_total: 0,
+            processed: 0,
+            head_block: 0,
+            head_seen: 0,
+            fetch_complete: false,
+            finalize_phase: FinalizePhase::default(),
+        };
+        assert_eq!(
+            format_progress_message(&snapshot, 1.5, "12s"),
+            "status fetching | peers 2/5 | queue 10 | inflight 1 | retry 0 | speed 1.5/s | eta 12s"
+        );
+    }
+}

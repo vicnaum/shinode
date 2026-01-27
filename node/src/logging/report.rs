@@ -1,5 +1,8 @@
 //! Run report types and generation for benchmarking runs.
 
+// Verbose mode outputs JSON summary to stdout for user inspection
+#![expect(clippy::print_stdout, reason = "verbose summary output to stdout")]
+
 use crate::cli::NodeConfig;
 use crate::p2p::p2p_limits;
 use crate::sync::historical::{BenchEventLogger, IngestBenchSummary, PeerHealthTracker};
@@ -150,10 +153,7 @@ pub fn run_timestamp_utc(now: SystemTime) -> String {
     let min = (rem % 3_600) / 60;
     let sec = rem % 60;
     let (year, month, day) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}__{:02}-{:02}-{:02}",
-        year, month, day, hour, min, sec
-    )
+    format!("{year:04}-{month:02}-{day:02}__{hour:02}-{min:02}-{sec:02}")
 }
 
 /// Convert days since Unix epoch to civil date (year, month, day).
@@ -167,7 +167,7 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
+    let year = y + i64::from(m <= 2);
     (year as i32, m as i32, d as i32)
 }
 
@@ -196,7 +196,7 @@ pub fn env_info() -> EnvInfo {
         os: env::consts::OS.to_string(),
         arch: env::consts::ARCH.to_string(),
         cpu_count: std::thread::available_parallelism()
-            .map(|count| count.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(1),
         pid: process::id(),
     }
@@ -222,8 +222,19 @@ pub fn write_run_report(output_dir: &Path, base_name: &str, report: &RunReport) 
     Ok(path)
 }
 
+/// Rename a temporary log file to its final path.
+#[expect(clippy::cognitive_complexity, reason = "simple if-else with logging")]
+fn rename_log_file(tmp_path: &Path, final_path: &Path, log_type: &str) {
+    if let Err(err) = fs::rename(tmp_path, final_path) {
+        warn!(error = %err, log_type, "failed to rename log file");
+    } else {
+        info!(path = %final_path.display(), log_type, "log file written");
+    }
+}
+
 /// Finalize log files by renaming tmp files to final names.
 /// Called on any clean exit (Ctrl-C or natural completion).
+#[expect(clippy::cognitive_complexity, reason = "handles 4 log types with optional loggers")]
 pub fn finalize_log_files(
     run_context: &RunContext,
     base_name: &str,
@@ -241,11 +252,7 @@ pub fn finalize_log_files(
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.events.jsonl"));
-            if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename event log");
-            } else {
-                info!(path = %final_path.display(), "event log written");
-            }
+            rename_log_file(tmp_path, &final_path, "events");
         }
     }
 
@@ -258,11 +265,7 @@ pub fn finalize_log_files(
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.logs.jsonl"));
-            if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename json log");
-            } else {
-                info!(path = %final_path.display(), "json log written");
-            }
+            rename_log_file(tmp_path, &final_path, "logs");
         }
     }
 
@@ -275,11 +278,7 @@ pub fn finalize_log_files(
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.resources.jsonl"));
-            if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename resources log");
-            } else {
-                info!(path = %final_path.display(), "resources log written");
-            }
+            rename_log_file(tmp_path, &final_path, "resources");
         }
     }
 
@@ -289,17 +288,17 @@ pub fn finalize_log_files(
             .output_dir
             .join(format!("{base_name}.trace.json"));
         drop(chrome_guard.take());
-        if let Err(err) = fs::rename(tmp_path, &final_path) {
-            warn!(error = %err, "failed to rename trace");
-        } else {
-            info!(path = %final_path.display(), "trace written");
-        }
+        rename_log_file(tmp_path, &final_path, "trace");
     }
 }
 
 /// Generate and save run report. Returns the base_name used for file naming.
 /// Report is saved only if `config.log_report` is true.
 /// Summary is printed to console only if `config.verbosity >= 1`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "report generation has sequential formatting steps that are clearer inline"
+)]
 pub async fn generate_run_report(
     run_context: &RunContext,
     config: &NodeConfig,
@@ -335,7 +334,7 @@ pub async fn generate_run_report(
             safe_head: head_at_startup.saturating_sub(config.rollback_window),
             rollback_window_applied: config.rollback_window > 0,
             worker_count: std::thread::available_parallelism()
-                .map(|count| count.get())
+                .map(std::num::NonZero::get)
                 .unwrap_or(4)
                 .max(1),
             p2p_limits: P2pLimitsSummary {

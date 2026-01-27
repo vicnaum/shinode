@@ -1,9 +1,9 @@
 //! Lightweight metrics helpers.
 
+use parking_lot::Mutex;
 use std::ops::RangeInclusive;
-use std::sync::Mutex;
 
-pub fn range_len(range: &RangeInclusive<u64>) -> u64 {
+pub const fn range_len(range: &RangeInclusive<u64>) -> u64 {
     range.end().saturating_sub(*range.start()).saturating_add(1)
 }
 
@@ -15,13 +15,11 @@ pub fn rate_per_sec(value: u64, elapsed_ms: u64) -> f64 {
 }
 
 pub fn percentile_triplet(values: &Mutex<Vec<u64>>) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let mut data = match values.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => Vec::new(),
-    };
+    let data = values.lock().clone();
     if data.is_empty() {
         return (None, None, None);
     }
+    let mut data = data;
     data.sort_unstable();
     let p50 = percentile(&data, 0.50);
     let p95 = percentile(&data, 0.95);

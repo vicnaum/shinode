@@ -339,6 +339,10 @@ pub fn spawn_resource_logger(
 // ============================================================================
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "resource monitoring loop with OS-specific metric collection is clearer inline"
+)]
 pub fn spawn_resource_logger(
     stats: Option<Arc<SyncProgressStats>>,
     events: Option<Arc<BenchEventLogger>>,
@@ -368,14 +372,13 @@ pub fn spawn_resource_logger(
             sys.refresh_cpu_usage();
             disks.refresh(false);
 
-            let proc = match sys.process(pid) {
-                Some(proc) => proc,
-                None => continue,
+            let Some(proc) = sys.process(pid) else {
+                continue;
             };
 
             let rss_kb = proc.memory().saturating_div(1024);
             let cpu_count = sys.cpus().len().max(1) as f64;
-            let cpu_busy_pct = sys.global_cpu_usage() as f64 / cpu_count;
+            let cpu_busy_pct = f64::from(sys.global_cpu_usage()) / cpu_count;
             let swap_kb = sys.used_swap().saturating_div(1024);
             let cpu_iowait_pct = 0.0;
             let rss_anon_kb = 0u64;

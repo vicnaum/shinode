@@ -18,7 +18,7 @@ pub struct HeadTrackerHandles {
 }
 
 /// Handles returned from spawning the tail feeder.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "fields accessed via destructuring")]
 pub struct TailFeederHandles {
     pub handle: JoinHandle<()>,
     pub stop_tx: watch::Sender<bool>,
@@ -36,7 +36,7 @@ pub fn spawn_head_tracker(
     let (stop_tx, stop_rx) = watch::channel(false);
     let (head_seen_tx, head_seen_rx) = watch::channel(initial_head);
 
-    let mut stop_rx_head = stop_rx.clone();
+    let mut stop_rx_head = stop_rx;
     let handle = tokio::spawn(async move {
         let mut last_head = initial_head;
         loop {
@@ -65,7 +65,7 @@ pub fn spawn_head_tracker(
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
     });
@@ -84,12 +84,12 @@ pub fn spawn_head_tracker(
 pub fn spawn_tail_feeder(
     initial_end: u64,
     rollback_window: u64,
-    head_seen_rx: watch::Receiver<u64>,
+    head_seen_rx: &watch::Receiver<u64>,
 ) -> TailFeederHandles {
     let (stop_tx, stop_rx) = watch::channel(false);
     let (tail_tx, ranges_rx) = mpsc::unbounded_channel();
 
-    let mut stop_rx_tail = stop_rx.clone();
+    let mut stop_rx_tail = stop_rx;
     let mut head_seen_rx_tail = head_seen_rx.clone();
     let mut next_to_schedule = initial_end.saturating_add(1);
 
@@ -113,7 +113,7 @@ pub fn spawn_tail_feeder(
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                () = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
     });

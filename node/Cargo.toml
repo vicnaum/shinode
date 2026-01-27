@@ -9,6 +9,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 alloy-primitives = "1.5.2"
+parking_lot = "0.12"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -40,3 +41,63 @@ sysinfo = "0.37.2"
 tikv-jemallocator = { version = "0.5", optional = true }
 memmap2 = "0.9"
 zstd = "0.13"
+
+# ============================================
+# RUST-MAGIC-LINTER - Maximum Preset
+# ============================================
+# AI guardrails to enforce best practices and prevent common mistakes
+# https://github.com/vicnaum/rust-magic-linter
+
+[lints.clippy]
+# Enable all lint groups at deny level for maximum strictness
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# === THE GUARDRAILS (Critical for AI Agents) ===
+# Panic safety - agents must handle errors, not crash
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+
+# The "no cheating" rule
+allow_attributes = "deny"
+
+# Code hygiene - no debug leftovers
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# === ASYNC SAFETY ===
+await_holding_lock = "deny"       # Prevents deadlocks
+
+# === COMPLEXITY ===
+cognitive_complexity = "warn"     # Flags deeply nested/branching functions
+
+# === PROCESS SAFETY ===
+exit = "deny"                     # Libraries shouldn't exit
+
+# === PEDANTIC RELAXATIONS ===
+# These are too noisy for most projects
+doc_markdown = "allow"                  # cosmetic doc comment formatting
+similar_names = "allow"                 # intentional patterns like stop_tx_head/stop_tx_tail
+single_match_else = "allow"             # match vs if-let is stylistic
+unnecessary_wraps = "allow"             # Result for API consistency with error-returning interfaces
+struct_field_names = "allow"            # timing structs use _us suffix for units
+large_futures = "allow"                 # would require boxing futures
+
+# === NURSERY RELAXATIONS ===
+# These are unavoidable or have too many false positives
+multiple_crate_versions = "allow"       # Transitive deps from reth
+cargo_common_metadata = "allow"         # Not publishing to crates.io
+significant_drop_tightening = "allow"   # Too many false positives for mutex guards
+
+# === CAST RELAXATIONS ===
+# Numeric casts are pervasive in this codebase (block numbers, sizes, etc.)
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"

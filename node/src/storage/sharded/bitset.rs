@@ -10,7 +10,7 @@ pub struct Bitset {
 
 impl Bitset {
     pub fn new(size_bits: usize) -> Self {
-        let bytes_len = (size_bits + 7) / 8;
+        let bytes_len = size_bits.div_ceil(8);
         Self {
             bytes: vec![0u8; bytes_len],
             size_bits,
@@ -22,7 +22,7 @@ impl Bitset {
             return Ok(Self::new(size_bits));
         }
         let bytes = fs::read(path).wrap_err("failed to read present.bitset")?;
-        let expected_len = (size_bits + 7) / 8;
+        let expected_len = size_bits.div_ceil(8);
         if bytes.len() != expected_len {
             return Err(eyre::eyre!(
                 "bitset size mismatch: expected {}, got {}",
