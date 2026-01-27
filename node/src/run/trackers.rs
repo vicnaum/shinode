@@ -36,7 +36,7 @@ pub fn spawn_head_tracker(
     let (stop_tx, stop_rx) = watch::channel(false);
     let (head_seen_tx, head_seen_rx) = watch::channel(initial_head);
 
-    let mut stop_rx_head = stop_rx.clone();
+    let mut stop_rx_head = stop_rx;
     let handle = tokio::spawn(async move {
         let mut last_head = initial_head;
         loop {
@@ -89,7 +89,7 @@ pub fn spawn_tail_feeder(
     let (stop_tx, stop_rx) = watch::channel(false);
     let (tail_tx, ranges_rx) = mpsc::unbounded_channel();
 
-    let mut stop_rx_tail = stop_rx.clone();
+    let mut stop_rx_tail = stop_rx;
     let mut head_seen_rx_tail = head_seen_rx.clone();
     let mut next_to_schedule = initial_end.saturating_add(1);
 

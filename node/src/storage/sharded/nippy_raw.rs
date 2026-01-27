@@ -49,7 +49,7 @@ impl<H: DeserializeOwned> SegmentRawSource<H> {
         })
     }
 
-    pub fn config(&self) -> &NippyJarConfig<H> {
+    pub const fn config(&self) -> &NippyJarConfig<H> {
         &self.config
     }
 

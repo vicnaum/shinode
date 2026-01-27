@@ -186,7 +186,7 @@ pub struct JsonLogLayer {
 impl JsonLogLayer {
     /// Create a new JSON log layer that accepts all events.
     #[expect(dead_code, reason = "convenience constructor for unfiltered logging")]
-    pub fn new(writer: std::sync::Arc<JsonLogWriter>) -> Self {
+    pub const fn new(writer: std::sync::Arc<JsonLogWriter>) -> Self {
         Self {
             writer,
             filter: JsonLogFilter::All,
@@ -194,7 +194,7 @@ impl JsonLogLayer {
     }
 
     /// Create a new JSON log layer with a specific filter.
-    pub fn with_filter(writer: std::sync::Arc<JsonLogWriter>, filter: JsonLogFilter) -> Self {
+    pub const fn with_filter(writer: std::sync::Arc<JsonLogWriter>, filter: JsonLogFilter) -> Self {
         Self { writer, filter }
     }
 }

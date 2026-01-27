@@ -568,7 +568,7 @@ pub struct IngestDbWriteSummary {
     pub write_mib_per_sec_avg: f64,
 }
 
-fn avg_us(total_us: u64, count: u64) -> u64 {
+const fn avg_us(total_us: u64, count: u64) -> u64 {
     if count == 0 {
         0
     } else {
@@ -576,7 +576,7 @@ fn avg_us(total_us: u64, count: u64) -> u64 {
     }
 }
 
-fn avg_u64(total: u64, count: u64) -> u64 {
+const fn avg_u64(total: u64, count: u64) -> u64 {
     if count == 0 {
         0
     } else {
@@ -593,7 +593,7 @@ pub struct FetchByteTotals {
 }
 
 impl FetchByteTotals {
-    pub fn add(&mut self, other: FetchByteTotals) {
+    pub const fn add(&mut self, other: Self) {
         self.headers = self.headers.saturating_add(other.headers);
         self.bodies = self.bodies.saturating_add(other.bodies);
         self.receipts = self.receipts.saturating_add(other.receipts);
@@ -613,7 +613,7 @@ pub struct DbWriteByteTotals {
 }
 
 impl DbWriteByteTotals {
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.headers
             .saturating_add(self.tx_hashes)
             .saturating_add(self.transactions)

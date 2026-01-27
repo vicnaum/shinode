@@ -27,7 +27,7 @@ use crate::storage::Storage;
 use db_writer::{run_db_writer, DbWriteConfig, DbWriteMode, DbWriterMessage, DbWriterParams};
 pub use follow::run_follow_loop;
 use process::process_ingest;
-pub(crate) use scheduler::PeerHealthTracker;
+pub use scheduler::PeerHealthTracker;
 use scheduler::{PeerHealthConfig, PeerWorkScheduler, SchedulerConfig};
 use stats::FetchByteTotals;
 pub use stats::{BenchEvent, BenchEventLogger, IngestBenchStats, IngestBenchSummary, SummaryInput};
@@ -61,10 +61,10 @@ async fn pick_best_ready_peer_index(
     best_idx
 }
 
-pub(crate) fn build_peer_health_tracker(config: &NodeConfig) -> Arc<PeerHealthTracker> {
+pub fn build_peer_health_tracker(config: &NodeConfig) -> Arc<PeerHealthTracker> {
     let max_blocks = config
         .fast_sync_chunk_max
-        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .unwrap_or_else(|| config.fast_sync_chunk_size.saturating_mul(4))
         .max(1) as usize;
     let initial_blocks = (config.fast_sync_chunk_size.max(1) as usize).min(max_blocks);
     let scheduler_config = SchedulerConfig {
@@ -359,7 +359,7 @@ pub async fn run_ingest_pipeline(
 
     let max_blocks = config
         .fast_sync_chunk_max
-        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .unwrap_or_else(|| config.fast_sync_chunk_size.saturating_mul(4))
         .max(1) as usize;
     let initial_blocks = (config.fast_sync_chunk_size.max(1) as usize).min(max_blocks);
     let mut scheduler_config = SchedulerConfig {
@@ -408,7 +408,7 @@ pub async fn run_ingest_pipeline(
         Arc::clone(&peer_health),
     ));
     if !ranges.is_empty() {
-        for range in ranges.drain(..) {
+        for range in std::mem::take(&mut ranges) {
             let _ = scheduler.enqueue_range(range).await;
         }
     }
@@ -421,6 +421,7 @@ pub async fn run_ingest_pipeline(
     let tail_stop_when_caught_up = tail.as_ref().is_none_or(|t| t.stop_when_caught_up);
     let tail_head_offset = tail.as_ref().map_or(0, |t| t.head_offset);
     let mut tail_stop_sent = false;
+    #[expect(clippy::option_if_let_else, reason = "complex spawn logic clearer with if-let")]
     let tail_task = if let Some(mut tail) = tail {
         let scheduler = Arc::clone(&scheduler);
         let remaining_per_shard = remaining_per_shard.clone();
@@ -498,6 +499,7 @@ pub async fn run_ingest_pipeline(
     };
 
     let (gauge_stop_tx, gauge_stop_rx) = watch::channel(false);
+    #[expect(clippy::option_if_let_else, reason = "complex spawn logic clearer with if-let")]
     let scheduler_gauge_handle = if let Some(events) = events.clone() {
         let scheduler = Arc::clone(&scheduler);
         let mut stop_rx = gauge_stop_rx.clone();
@@ -709,7 +711,7 @@ pub async fn run_ingest_pipeline(
                     // stale. In follow mode we cap scheduling at the global observed head.
                     tail_head_seen
                         .as_ref()
-                        .map_or(*range.end(), |rx| *rx.borrow())
+                        .map_or_else(|| *range.end(), |rx| *rx.borrow())
                 } else if peer.head_number == 0 {
                     *range.end()
                 } else {
@@ -869,7 +871,7 @@ pub async fn run_ingest_pipeline(
     })
 }
 
-fn range_len(range: &RangeInclusive<u64>) -> u64 {
+const fn range_len(range: &RangeInclusive<u64>) -> u64 {
     let start = *range.start();
     let end = *range.end();
     if end >= start {

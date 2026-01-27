@@ -3,7 +3,7 @@
 use parking_lot::Mutex;
 use std::ops::RangeInclusive;
 
-pub fn range_len(range: &RangeInclusive<u64>) -> u64 {
+pub const fn range_len(range: &RangeInclusive<u64>) -> u64 {
     range.end().saturating_sub(*range.start()).saturating_add(1)
 }
 

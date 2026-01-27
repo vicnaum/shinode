@@ -223,7 +223,7 @@ impl NodeConfig {
     /// Normalize config by propagating convenience flags.
     ///
     /// If `--log` is set, enables all log outputs.
-    pub fn normalize(&mut self) {
+    pub const fn normalize(&mut self) {
         if self.log {
             self.log_trace = true;
             self.log_events = true;

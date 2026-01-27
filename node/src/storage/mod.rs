@@ -10,7 +10,7 @@ use reth_primitives_traits::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub(crate) const ZSTD_DICT_MAX_SIZE: usize = 5000;
+pub const ZSTD_DICT_MAX_SIZE: usize = 5000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTxHashes {
@@ -63,7 +63,7 @@ impl SerdeBincodeCompat for StoredReceipts {
             .into_iter()
             .map(<Receipt as SerdeBincodeCompat>::from_repr)
             .collect();
-        StoredReceipts { receipts }
+        Self { receipts }
     }
 }
 
@@ -112,7 +112,7 @@ pub struct PeerCacheLoad {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct StorageConfigKey {
+pub struct StorageConfigKey {
     retention_mode: RetentionMode,
     head_source: HeadSource,
     reorg_strategy: ReorgStrategy,
@@ -132,20 +132,20 @@ mod sharded;
 
 pub use sharded::Storage;
 
-pub(crate) fn encode_bincode_value<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+pub fn encode_bincode_value<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     bincode::serialize(value).wrap_err("failed to encode bincode payload")
 }
 
-pub(crate) fn decode_bincode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+pub fn decode_bincode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     bincode::deserialize(bytes).wrap_err("failed to decode bincode payload")
 }
 
-pub(crate) fn encode_bincode_compat_value<T: SerdeBincodeCompat>(value: &T) -> Result<Vec<u8>> {
+pub fn encode_bincode_compat_value<T: SerdeBincodeCompat>(value: &T) -> Result<Vec<u8>> {
     let repr = value.as_repr();
     bincode::serialize(&repr).wrap_err("failed to encode bincode payload")
 }
 
-pub(crate) fn decode_bincode_compat_value<T>(bytes: &[u8]) -> Result<T>
+pub fn decode_bincode_compat_value<T>(bytes: &[u8]) -> Result<T>
 where
     T: SerdeBincodeCompat,
     <T as SerdeBincodeCompat>::BincodeRepr<'static>: DeserializeOwned,
@@ -155,11 +155,11 @@ where
     Ok(<T as SerdeBincodeCompat>::from_repr(repr))
 }
 
-pub(crate) fn encode_u64_value(value: u64) -> Vec<u8> {
+pub fn encode_u64_value(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
-pub(crate) fn decode_u64(bytes: &[u8]) -> Result<u64> {
+pub fn decode_u64(bytes: &[u8]) -> Result<u64> {
     if bytes.len() != 8 {
         return Err(eyre::eyre!("invalid u64 encoding"));
     }

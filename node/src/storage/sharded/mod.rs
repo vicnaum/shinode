@@ -86,7 +86,7 @@ impl ShardRawWriters {
     }
 }
 
-fn create_segment_config(
+const fn create_segment_config(
     shard_start: u64,
     compression: SegmentCompression,
     existing_max_row_size: usize,
@@ -207,7 +207,7 @@ enum SegmentCompression {
     },
 }
 
-fn segment_compressor(compression: SegmentCompression) -> Option<Compressors> {
+const fn segment_compressor(compression: SegmentCompression) -> Option<Compressors> {
     match compression {
         SegmentCompression::None => None,
         SegmentCompression::Zstd {
@@ -818,13 +818,13 @@ impl Storage {
         }
 
         let mut written_blocks = Vec::new();
-        for (shard_start, mut records) in per_shard {
+        for (shard_start, records) in per_shard {
             let shard = self.get_or_create_shard(shard_start)?;
             let mut state = shard.lock();
             let mut to_append: Vec<WalRecord> = Vec::new();
             let mut seen_offsets: HashSet<usize> = HashSet::new();
 
-            for record in records.drain(..) {
+            for record in records {
                 let offset = (record.block_number - shard_start) as usize;
                 if state.bitset.is_set(offset) || !seen_offsets.insert(offset) {
                     continue;
@@ -1627,7 +1627,7 @@ fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<S
     Ok(Some(shard_segment_writers(sorted_dir, shard_start)?))
 }
 
-fn shard_start(block_number: u64, shard_size: u64) -> u64 {
+const fn shard_start(block_number: u64, shard_size: u64) -> u64 {
     (block_number / shard_size) * shard_size
 }
 
@@ -1856,18 +1856,18 @@ pub enum ShardRecoveryResult {
 
 impl ShardRecoveryResult {
     /// Returns true if recovery was needed
-    pub fn needs_recovery(&self) -> bool {
-        !matches!(self, ShardRecoveryResult::Clean)
+    pub const fn needs_recovery(&self) -> bool {
+        !matches!(self, Self::Clean)
     }
 
     /// Returns a human-readable description
-    pub fn description(&self) -> &'static str {
+    pub const fn description(&self) -> &'static str {
         match self {
-            ShardRecoveryResult::Clean => "OK",
-            ShardRecoveryResult::RecoveredWriting => "recovered from interrupted write phase",
-            ShardRecoveryResult::RecoveredSwapping => "recovered from interrupted swap phase",
-            ShardRecoveryResult::RecoveredCleanup => "completed interrupted cleanup",
-            ShardRecoveryResult::CleanedOrphans => "cleaned orphan files",
+            Self::Clean => "OK",
+            Self::RecoveredWriting => "recovered from interrupted write phase",
+            Self::RecoveredSwapping => "recovered from interrupted swap phase",
+            Self::RecoveredCleanup => "completed interrupted cleanup",
+            Self::CleanedOrphans => "cleaned orphan files",
         }
     }
 }
@@ -1902,7 +1902,7 @@ impl RepairReport {
     }
 
     /// Total shard count
-    pub fn total_count(&self) -> usize {
+    pub const fn total_count(&self) -> usize {
         self.shards.len()
     }
 }

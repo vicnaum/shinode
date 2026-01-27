@@ -89,7 +89,7 @@ const PEER_CACHE_MAX: usize = 5000;
 static HEAD_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct P2pLimits {
+pub struct P2pLimits {
     pub max_outbound: usize,
     pub max_concurrent_dials: usize,
     pub peer_refill_interval_ms: u64,
@@ -99,7 +99,7 @@ pub(crate) struct P2pLimits {
     pub peer_cache_max: usize,
 }
 
-pub(crate) fn p2p_limits() -> P2pLimits {
+pub const fn p2p_limits() -> P2pLimits {
     P2pLimits {
         max_outbound: MAX_OUTBOUND,
         max_concurrent_dials: MAX_CONCURRENT_DIALS,
@@ -260,7 +260,7 @@ pub struct PeerPool {
 }
 
 impl PeerPool {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             peers: RwLock::new(Vec::new()),
         }
@@ -479,7 +479,7 @@ async fn request_head_number(
     Ok(header.number)
 }
 
-pub(crate) async fn request_headers_batch(
+pub async fn request_headers_batch(
     peer: &NetworkPeer,
     start_block: u64,
     limit: usize,
@@ -487,7 +487,7 @@ pub(crate) async fn request_headers_batch(
     request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages).await
 }
 
-pub(crate) async fn discover_head_p2p(
+pub async fn discover_head_p2p(
     pool: &PeerPool,
     baseline: u64,
     probe_peers: usize,
@@ -537,7 +537,7 @@ pub(crate) async fn discover_head_p2p(
 }
 
 #[derive(Debug)]
-pub(crate) struct HeaderCountMismatch {
+pub struct HeaderCountMismatch {
     expected: usize,
     got: usize,
 }
@@ -555,7 +555,7 @@ impl std::fmt::Display for HeaderCountMismatch {
 impl std::error::Error for HeaderCountMismatch {}
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FetchStageStats {
+pub struct FetchStageStats {
     pub headers_ms: u64,
     pub bodies_ms: u64,
     pub receipts_ms: u64,
@@ -565,7 +565,7 @@ pub(crate) struct FetchStageStats {
 }
 
 #[derive(Debug)]
-pub(crate) struct HeadersChunkedResponse {
+pub struct HeadersChunkedResponse {
     pub headers: Vec<Header>,
     pub requests: u64,
 }
@@ -581,7 +581,7 @@ pub(crate) async fn request_headers_chunked(
         .headers)
 }
 
-pub(crate) async fn request_headers_chunked_with_stats(
+pub async fn request_headers_chunked_with_stats(
     peer: &NetworkPeer,
     start_block: u64,
     count: usize,
@@ -614,7 +614,7 @@ pub(crate) async fn request_headers_chunked_with_stats(
     Ok(HeadersChunkedResponse { headers, requests })
 }
 
-pub(crate) async fn request_headers_chunked_strict(
+pub async fn request_headers_chunked_strict(
     peer: &NetworkPeer,
     start_block: u64,
     count: usize,
@@ -643,13 +643,13 @@ pub(crate) async fn request_headers_chunked_strict(
 }
 
 #[derive(Debug)]
-pub(crate) struct PayloadFetchOutcome {
+pub struct PayloadFetchOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
     pub fetch_stats: FetchStageStats,
 }
 
-pub(crate) async fn fetch_payloads_for_peer(
+pub async fn fetch_payloads_for_peer(
     peer: &NetworkPeer,
     range: std::ops::RangeInclusive<u64>,
 ) -> Result<PayloadFetchOutcome> {
@@ -824,7 +824,7 @@ async fn request_bodies(
 }
 
 #[derive(Debug)]
-pub(crate) struct ChunkedResponse<T> {
+pub struct ChunkedResponse<T> {
     pub results: Vec<Option<T>>,
     pub requests: u64,
 }
@@ -881,7 +881,7 @@ async fn request_bodies_chunked_partial_with_stats(
     Ok(ChunkedResponse { results, requests })
 }
 
-pub(crate) async fn request_receipts(
+pub async fn request_receipts(
     peer: &NetworkPeer,
     hashes: &[B256],
 ) -> Result<Vec<Vec<Receipt>>> {

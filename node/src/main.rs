@@ -18,8 +18,6 @@ use cli::NodeConfig;
 use eyre::Result;
 use indicatif::ProgressBar;
 use std::env;
-#[cfg(test)]
-use sync::SyncStatus;
 
 impl sync::ProgressReporter for ProgressBar {
     fn set_length(&self, len: u64) {

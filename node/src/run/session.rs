@@ -53,7 +53,7 @@ pub struct FollowModeResources {
 
 impl FollowModeResources {
     /// Create empty resources (for non-follow mode).
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             head_tracker: None,
             tail_feeder: None,
@@ -84,7 +84,7 @@ impl FollowModeResources {
 
     /// Check if follow mode is enabled.
     #[expect(dead_code, reason = "API for checking follow mode state")]
-    pub fn is_enabled(&self) -> bool {
+    pub const fn is_enabled(&self) -> bool {
         self.head_tracker.is_some()
     }
 }

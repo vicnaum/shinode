@@ -39,18 +39,15 @@ pub fn init_tracing(
     log_path: Option<PathBuf>,
     resources_path: Option<PathBuf>,
 ) -> TracingGuards {
-    let log_filter = match EnvFilter::try_from_default_env() {
-        Ok(filter) => filter,
-        Err(_) => {
-            let (global, local) = match config.verbosity {
-                0 => ("error", "error"),
-                1 => ("warn", "info"),
-                2 => ("warn", "debug"),
-                _ => ("warn", "trace"),
-            };
-            EnvFilter::new(format!("{global},stateless_history_node={local}"))
-        }
-    };
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let (global, local) = match config.verbosity {
+            0 => ("error", "error"),
+            1 => ("warn", "info"),
+            2 => ("warn", "debug"),
+            _ => ("warn", "trace"),
+        };
+        EnvFilter::new(format!("{global},stateless_history_node={local}"))
+    });
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
         .with_filter(log_filter);

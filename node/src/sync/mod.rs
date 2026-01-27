@@ -37,24 +37,24 @@ pub enum FinalizePhase {
 
 impl SyncStatus {
     /// Machine-readable status string (for logging/metrics).
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            SyncStatus::LookingForPeers => "looking_for_peers",
-            SyncStatus::Fetching => "fetching",
-            SyncStatus::Finalizing => "finalizing",
-            SyncStatus::UpToDate => "up_to_date",
-            SyncStatus::Following => "following",
+            Self::LookingForPeers => "looking_for_peers",
+            Self::Fetching => "fetching",
+            Self::Finalizing => "finalizing",
+            Self::UpToDate => "up_to_date",
+            Self::Following => "following",
         }
     }
 
     /// Human-readable display name (for UI).
     #[expect(dead_code, reason = "API for UI display")]
-    pub fn display_name(self) -> &'static str {
+    pub const fn display_name(self) -> &'static str {
         match self {
-            SyncStatus::LookingForPeers => "Waiting for peers",
-            SyncStatus::Fetching => "Syncing",
-            SyncStatus::Finalizing => "Finalizing",
-            SyncStatus::UpToDate | SyncStatus::Following => "Synced",
+            Self::LookingForPeers => "Waiting for peers",
+            Self::Fetching => "Syncing",
+            Self::Finalizing => "Finalizing",
+            Self::UpToDate | Self::Following => "Synced",
         }
     }
 }

@@ -57,11 +57,11 @@ impl EscalationState {
         self.peer_attempts.remove(&block);
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.total_count == 0
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.total_count
     }
 }
@@ -95,7 +95,7 @@ impl Default for SchedulerConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PeerHealthConfig {
+pub struct PeerHealthConfig {
     peer_failure_threshold: u32,
     peer_ban_duration: Duration,
     aimd_increase_after: u32,
@@ -110,7 +110,7 @@ pub(crate) struct PeerHealthConfig {
 }
 
 impl PeerHealthConfig {
-    pub(crate) fn from_scheduler_config(config: &SchedulerConfig) -> Self {
+    pub fn from_scheduler_config(config: &SchedulerConfig) -> Self {
         let max_batch = config.blocks_per_assignment.max(1);
         let initial_batch = config.initial_blocks_per_assignment.max(1).min(max_batch);
         Self {
@@ -162,13 +162,13 @@ impl PeerHealth {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PeerQuality {
+pub struct PeerQuality {
     pub score: f64,
     pub samples: u64,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PeerHealthDump {
+pub struct PeerHealthDump {
     pub peer_id: PeerId,
     pub is_banned: bool,
     pub ban_remaining_ms: Option<u64>,
@@ -195,7 +195,7 @@ pub(crate) struct PeerHealthDump {
 }
 
 #[derive(Debug)]
-pub(crate) struct PeerHealthTracker {
+pub struct PeerHealthTracker {
     config: PeerHealthConfig,
     health: Mutex<HashMap<PeerId, PeerHealth>>,
 }
@@ -362,8 +362,10 @@ impl PeerHealthTracker {
             let quality_score = if total == 0 {
                 1.0
             } else {
-                let weighted_success = entry.successes as f64
-                    + (entry.partials as f64 * self.config.quality_partial_weight);
+                let weighted_success = (entry.partials as f64).mul_add(
+                    self.config.quality_partial_weight,
+                    entry.successes as f64,
+                );
                 (weighted_success / total as f64).clamp(0.0, 1.0)
             };
             let ban_remaining_ms = entry.banned_until.and_then(|until| {
@@ -438,8 +440,10 @@ impl PeerHealthTracker {
                 samples: 0,
             };
         }
-        let weighted_success =
-            entry.successes as f64 + (entry.partials as f64 * self.config.quality_partial_weight);
+        let weighted_success = (entry.partials as f64).mul_add(
+            self.config.quality_partial_weight,
+            entry.successes as f64,
+        );
         PeerQuality {
             score: (weighted_success / total as f64).clamp(0.0, 1.0),
             samples: total,

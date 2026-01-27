@@ -43,7 +43,7 @@ impl UIController {
     }
 
     /// Get the current bar (for external progress updates).
-    pub fn current_bar(&self) -> Option<&ProgressBar> {
+    pub const fn current_bar(&self) -> Option<&ProgressBar> {
         self.current_bar.as_ref()
     }
 
@@ -222,7 +222,7 @@ impl UIController {
     }
 
     /// Update the compacting progress bar.
-    fn update_compacting_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+    fn update_compacting_bar(&self, snapshot: &SyncProgressSnapshot) {
         let Some(bar) = self.current_bar.as_ref() else {
             return;
         };
@@ -237,7 +237,7 @@ impl UIController {
     }
 
     /// Update the sealing progress bar.
-    fn update_sealing_bar(&mut self, snapshot: &SyncProgressSnapshot) {
+    fn update_sealing_bar(&self, snapshot: &SyncProgressSnapshot) {
         let Some(bar) = self.current_bar.as_ref() else {
             return;
         };
@@ -252,7 +252,7 @@ impl UIController {
     }
 
     /// Update the follow mode bar.
-    fn update_follow_bar(&mut self, snapshot: &SyncProgressSnapshot, peers_connected: u64) {
+    fn update_follow_bar(&self, snapshot: &SyncProgressSnapshot, peers_connected: u64) {
         let Some(bar) = self.current_bar.as_ref() else {
             return;
         };

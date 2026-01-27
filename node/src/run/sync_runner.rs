@@ -51,7 +51,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Validate and normalize chunk sizes
     let chunk_max = config
         .fast_sync_chunk_max
-        .unwrap_or(config.fast_sync_chunk_size.saturating_mul(4))
+        .unwrap_or_else(|| config.fast_sync_chunk_size.saturating_mul(4))
         .max(1);
     if chunk_max < config.fast_sync_chunk_size.max(1) {
         warn!(

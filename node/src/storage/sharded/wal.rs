@@ -178,7 +178,7 @@ impl ByteRange {
         self.end.saturating_sub(self.start)
     }
 
-    pub fn as_range(self) -> Range<usize> {
+    pub const fn as_range(self) -> Range<usize> {
         self.start..self.end
     }
 }

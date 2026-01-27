@@ -435,7 +435,7 @@ fn parse_block_tag(value: &Value) -> Result<BlockTag, ErrorObjectOwned> {
     }
 }
 
-fn resolve_block_tag_optional(
+const fn resolve_block_tag_optional(
     tag: BlockTag,
     latest: Option<u64>,
 ) -> Result<Option<u64>, ErrorObjectOwned> {
@@ -446,7 +446,7 @@ fn resolve_block_tag_optional(
     })
 }
 
-fn resolve_block_tag_required(tag: BlockTag, latest: u64) -> Result<u64, ErrorObjectOwned> {
+const fn resolve_block_tag_required(tag: BlockTag, latest: u64) -> Result<u64, ErrorObjectOwned> {
     Ok(match tag {
         BlockTag::Latest => latest,
         BlockTag::Earliest => 0,

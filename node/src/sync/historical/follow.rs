@@ -35,22 +35,26 @@ fn spawn_synced_watcher(
 ) {
     tokio::spawn(async move {
         loop {
-            let synced = if let Some(stats) = stats.as_ref() {
-                matches!(
-                    stats.snapshot().status,
-                    SyncStatus::UpToDate | SyncStatus::Following
-                )
-            } else {
-                match (
-                    storage.last_indexed_block().ok().flatten(),
-                    storage.head_seen().ok().flatten(),
-                ) {
-                    (Some(last), Some(head)) => last >= head,
-                    _ => false,
-                }
-            };
+            let synced = stats.as_ref().map_or_else(
+                || {
+                    match (
+                        storage.last_indexed_block().ok().flatten(),
+                        storage.head_seen().ok().flatten(),
+                    ) {
+                        (Some(last), Some(head)) => last >= head,
+                        _ => false,
+                    }
+                },
+                |stats| {
+                    matches!(
+                        stats.snapshot().status,
+                        SyncStatus::UpToDate | SyncStatus::Following
+                    )
+                },
+            );
             if synced {
-                if let Some(tx) = synced_sender.lock().await.take() {
+                let tx = synced_sender.lock().await.take();
+                if let Some(tx) = tx {
                     let _ = tx.send(());
                 }
                 break;
