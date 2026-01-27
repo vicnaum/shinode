@@ -206,7 +206,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         let tail_handles = spawn_tail_feeder(
             *range.end(),
             config.rollback_window,
-            head_handles.head_seen_rx.clone(),
+            &head_handles.head_seen_rx,
         );
 
         tail_config = Some(build_tail_config(

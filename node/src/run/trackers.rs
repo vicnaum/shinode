@@ -84,7 +84,7 @@ pub fn spawn_head_tracker(
 pub fn spawn_tail_feeder(
     initial_end: u64,
     rollback_window: u64,
-    head_seen_rx: watch::Receiver<u64>,
+    head_seen_rx: &watch::Receiver<u64>,
 ) -> TailFeederHandles {
     let (stop_tx, stop_rx) = watch::channel(false);
     let (tail_tx, ranges_rx) = mpsc::unbounded_channel();

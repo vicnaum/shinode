@@ -411,7 +411,7 @@ fn missing_block_error(block: u64) -> ErrorObjectOwned {
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum BlockTag {
     Number(u64),
     Latest,

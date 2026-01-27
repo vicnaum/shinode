@@ -5,7 +5,6 @@ use crate::storage::StorageDiskStats;
 use serde::Serialize;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -756,11 +755,11 @@ pub struct BenchEventLogger {
 }
 
 impl BenchEventLogger {
-    pub fn new(path: PathBuf) -> eyre::Result<Self> {
+    pub fn new(path: &std::path::Path) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = fs::File::create(&path)?;
+        let file = fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
 
         let (tx, rx) = mpsc::channel::<BenchEventMessage>();

@@ -5,7 +5,6 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use parking_lot::Mutex;
 use std::{
     io::{BufWriter, Write},
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
@@ -86,11 +85,11 @@ pub struct JsonLogWriter {
 
 impl JsonLogWriter {
     /// Create a new JSON log writer that writes to the specified path.
-    pub fn new(path: PathBuf, capacity: usize) -> eyre::Result<Self> {
+    pub fn new(path: &std::path::Path, capacity: usize) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
         let (tx, rx) = mpsc::sync_channel::<LogRecord>(capacity);
         let handle = std::thread::spawn(move || -> eyre::Result<()> {

@@ -59,7 +59,7 @@ pub fn init_tracing(
     let json_log_filter = EnvFilter::try_new(&config.log_json_filter)
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_JSON_FILTER));
 
-    let log_writer = log_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+    let log_writer = log_path.and_then(|path| match JsonLogWriter::new(&path, LOG_BUFFER) {
         Ok(writer) => Some(Arc::new(writer)),
         Err(err) => {
             warn!(error = %err, "failed to initialize json log writer");
@@ -69,7 +69,7 @@ pub fn init_tracing(
 
     // Resources log file writer (separate file for resource metrics).
     let resources_writer =
-        resources_path.and_then(|path| match JsonLogWriter::new(path, LOG_BUFFER) {
+        resources_path.and_then(|path| match JsonLogWriter::new(&path, LOG_BUFFER) {
             Ok(writer) => Some(Arc::new(writer)),
             Err(err) => {
                 warn!(error = %err, "failed to initialize resources log writer");
