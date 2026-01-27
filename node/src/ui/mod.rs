@@ -16,22 +16,46 @@
 mod bars;
 mod progress;
 mod state;
+pub mod tui;
 
 pub use bars::{format_startup_segment, BAR_WIDTH};
-pub use progress::{spawn_progress_updater, UIController};
+pub use progress::{spawn_progress_updater, spawn_tui_progress_updater, UIController};
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag indicating TUI mode is active.
+/// When true, print_status_bar and clear_status_bar should be no-ops.
+static TUI_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Set TUI mode active state. Call this before initializing TUI.
+pub fn set_tui_mode(active: bool) {
+    TUI_MODE_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+/// Check if TUI mode is active.
+pub fn is_tui_mode() -> bool {
+    TUI_MODE_ACTIVE.load(Ordering::SeqCst)
+}
 
 /// Print a yellow status bar to stderr (used during startup phases).
 /// This is a simple one-line status that overwrites itself.
+/// Does nothing if TUI mode is active.
 pub fn print_status_bar(message: &str) {
+    if is_tui_mode() {
+        return;
+    }
     let bar = format_startup_segment(message);
     eprint!("\r{bar}");
     let _ = std::io::stderr().flush();
 }
 
 /// Clear the status bar line.
+/// Does nothing if TUI mode is active.
 pub fn clear_status_bar() {
+    if is_tui_mode() {
+        return;
+    }
     eprint!("\r{:width$}\r", "", width = BAR_WIDTH + 10);
     let _ = std::io::stderr().flush();
 }

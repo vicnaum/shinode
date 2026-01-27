@@ -82,6 +82,61 @@ pub fn format_eta_seconds(seconds: f64) -> String {
     }
 }
 
+/// Coverage tracking for the blocks map visualization.
+/// Stores (start_block, end_block, buckets) where each bucket is a count of synced blocks.
+#[derive(Debug, Default)]
+pub struct CoverageTracker {
+    /// Start block of the range being tracked.
+    start_block: u64,
+    /// End block of the range being tracked.
+    end_block: u64,
+    /// Number of synced blocks per bucket.
+    buckets: Vec<u16>,
+}
+
+impl CoverageTracker {
+    /// Initialize coverage tracking for a block range.
+    pub fn init(&mut self, start: u64, end: u64, num_buckets: usize) {
+        self.start_block = start;
+        self.end_block = end;
+        self.buckets = vec![0; num_buckets];
+    }
+
+    /// Record a completed block, incrementing the appropriate bucket.
+    pub fn record_completed(&mut self, block: u64) {
+        if block < self.start_block || block >= self.end_block || self.buckets.is_empty() {
+            return;
+        }
+        let range = self.end_block - self.start_block;
+        let offset = block - self.start_block;
+        let bucket_idx = ((offset as f64 / range as f64) * self.buckets.len() as f64) as usize;
+        if bucket_idx < self.buckets.len() {
+            self.buckets[bucket_idx] = self.buckets[bucket_idx].saturating_add(1);
+        }
+    }
+
+    /// Record multiple completed blocks.
+    pub fn record_completed_batch(&mut self, blocks: &[u64]) {
+        for &block in blocks {
+            self.record_completed(block);
+        }
+    }
+
+    /// Get the coverage buckets (clone for thread safety).
+    pub fn buckets(&self) -> Vec<u16> {
+        self.buckets.clone()
+    }
+
+    /// Get the blocks per bucket (for percentage calculation).
+    pub fn blocks_per_bucket(&self) -> u64 {
+        if self.buckets.is_empty() {
+            return 1;
+        }
+        let range = self.end_block.saturating_sub(self.start_block);
+        (range / self.buckets.len() as u64).max(1)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SyncProgressStats {
     processed: std::sync::atomic::AtomicU64,
@@ -100,6 +155,14 @@ pub struct SyncProgressStats {
     escalation: std::sync::atomic::AtomicU64,
     /// Current finalize sub-phase (compacting or sealing).
     finalize_phase: std::sync::atomic::AtomicU8,
+    /// First block of the sync range (from CLI).
+    start_block: std::sync::atomic::AtomicU64,
+    /// Peak speed observed during this session (blocks/s).
+    peak_speed: std::sync::atomic::AtomicU64,
+    /// Timestamp (ms since epoch) when last block was received. Used for "Xs ago" display.
+    last_block_received_ms: std::sync::atomic::AtomicU64,
+    /// Coverage tracking for blocks map visualization.
+    coverage: parking_lot::Mutex<CoverageTracker>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +183,12 @@ pub struct SyncProgressSnapshot {
     pub escalation: u64,
     /// Current finalize sub-phase.
     pub finalize_phase: FinalizePhase,
+    /// First block of the sync range (from CLI).
+    pub start_block: u64,
+    /// Peak speed observed during this session (blocks/s).
+    pub peak_speed: u64,
+    /// Timestamp (ms since epoch) when last block was received.
+    pub last_block_received_ms: u64,
 }
 
 impl SyncProgressStats {
@@ -153,6 +222,11 @@ impl SyncProgressStats {
                 1 => FinalizePhase::Sealing,
                 _ => FinalizePhase::Compacting,
             },
+            start_block: self.start_block.load(std::sync::atomic::Ordering::SeqCst),
+            peak_speed: self.peak_speed.load(std::sync::atomic::Ordering::SeqCst),
+            last_block_received_ms: self
+                .last_block_received_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -245,5 +319,57 @@ impl SyncProgressStats {
         };
         self.finalize_phase
             .store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_start_block(&self, block: u64) {
+        self.start_block
+            .store(block, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[expect(dead_code, reason = "API for direct setting")]
+    pub fn set_peak_speed(&self, speed: u64) {
+        self.peak_speed
+            .store(speed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Update peak speed if the new value is higher.
+    pub fn update_peak_speed_max(&self, speed: u64) {
+        let _ = self.peak_speed.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| Some(current.max(speed)),
+        );
+    }
+
+    /// Set the timestamp of the last block received (for "Xs ago" display).
+    pub fn set_last_block_received_ms(&self, ms: u64) {
+        self.last_block_received_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Initialize coverage tracking for a block range.
+    pub fn init_coverage(&self, start: u64, end: u64, num_buckets: usize) {
+        let mut coverage = self.coverage.lock();
+        coverage.init(start, end, num_buckets);
+    }
+
+    /// Record completed blocks for coverage tracking.
+    pub fn record_coverage_completed(&self, blocks: &[u64]) {
+        let mut coverage = self.coverage.lock();
+        coverage.record_completed_batch(blocks);
+    }
+
+    /// Get coverage buckets as percentages (0-100).
+    pub fn get_coverage_percentages(&self) -> Vec<u8> {
+        let coverage = self.coverage.lock();
+        let blocks_per_bucket = coverage.blocks_per_bucket();
+        coverage
+            .buckets()
+            .iter()
+            .map(|&count| {
+                let pct = (count as u64 * 100 / blocks_per_bucket).min(100);
+                pct as u8
+            })
+            .collect()
     }
 }

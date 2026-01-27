@@ -248,6 +248,16 @@ async fn handle_fetch_success(
         .collect();
     if !completed.is_empty() {
         let _ = ctx.scheduler.mark_completed(&completed).await;
+        // Record completed blocks for coverage tracking (instant TUI updates)
+        // Also update last block received timestamp for "Xs ago" display
+        if let Some(stats) = ctx.stats.as_ref() {
+            stats.record_coverage_completed(&completed);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            stats.set_last_block_received_ms(now_ms);
+        }
     }
 
     if let Some(bench) = ctx.bench.as_ref() {
