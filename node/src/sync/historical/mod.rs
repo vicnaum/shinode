@@ -47,6 +47,8 @@ async fn pick_best_ready_peer_index(
     let mut best_samples = 0u64;
     for (idx, peer) in peers.iter().enumerate() {
         let quality = peer_health.quality(peer.peer_id).await;
+        // Use exact equality for tie-breaking: only prefer more samples when scores are identical
+        #[expect(clippy::float_cmp, reason = "exact equality needed for tie-breaking")]
         if quality.score > best_score
             || (quality.score == best_score && quality.samples > best_samples)
         {
@@ -229,16 +231,16 @@ pub async fn run_ingest_pipeline(
     let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
         let mut remaining: HashMap<u64, usize> = HashMap::new();
         let shard_size = storage.shard_size();
-        if !ranges.is_empty() {
+        if ranges.is_empty() {
+            for block in &blocks {
+                let shard_start = (block / shard_size) * shard_size;
+                *remaining.entry(shard_start).or_insert(0) += 1;
+            }
+        } else {
             for range in &ranges {
                 let shard_start = (range.start() / shard_size) * shard_size;
                 let count = range_len(range) as usize;
                 *remaining.entry(shard_start).or_insert(0) += count;
-            }
-        } else {
-            for block in &blocks {
-                let shard_start = (block / shard_size) * shard_size;
-                *remaining.entry(shard_start).or_insert(0) += 1;
             }
         }
         if let Some(stats) = stats.as_ref() {
@@ -264,8 +266,8 @@ pub async fn run_ingest_pipeline(
     let tail_head_seen = tail.as_ref().map(|t| t.head_seen_rx.clone());
     let mut tail_head_seen_rx = tail_head_seen.clone();
     let tail_stop_tx = tail.as_ref().map(|t| t.stop_tx.clone());
-    let tail_stop_when_caught_up = tail.as_ref().map(|t| t.stop_when_caught_up).unwrap_or(true);
-    let tail_head_offset = tail.as_ref().map(|t| t.head_offset).unwrap_or(0);
+    let tail_stop_when_caught_up = tail.as_ref().is_none_or(|t| t.stop_when_caught_up);
+    let tail_head_offset = tail.as_ref().map_or(0, |t| t.head_offset);
     let mut tail_stop_sent = false;
     let tail_task = if let Some(mut tail) = tail {
         let scheduler = Arc::clone(&scheduler);
@@ -401,7 +403,7 @@ pub async fn run_ingest_pipeline(
     let logs_total = Arc::new(AtomicU64::new(0));
     let active_fetch_tasks = Arc::new(AtomicU64::new(0));
     let worker_count = std::thread::available_parallelism()
-        .map(|count| count.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(4)
         .max(1);
     let fetched_rx = Arc::new(Mutex::new(fetched_blocks_rx));
@@ -504,12 +506,12 @@ pub async fn run_ingest_pipeline(
                 let current: HashSet<PeerId> = snapshot.iter().map(|peer| peer.peer_id).collect();
                 for added in current.difference(&known_peers) {
                     events.record(BenchEvent::PeerConnected {
-                        peer_id: format!("{:?}", added),
+                        peer_id: format!("{added:?}"),
                     });
                 }
                 for removed in known_peers.difference(&current) {
                     events.record(BenchEvent::PeerDisconnected {
-                        peer_id: format!("{:?}", removed),
+                        peer_id: format!("{removed:?}"),
                     });
                 }
                 known_peers = current;
@@ -536,7 +538,7 @@ pub async fn run_ingest_pipeline(
                             break;
                         }
                     }
-                    _ = sleep(Duration::from_secs(1)) => {}
+                    () = sleep(Duration::from_secs(1)) => {}
                 }
             }
         }))
@@ -562,7 +564,7 @@ pub async fn run_ingest_pipeline(
         if ready_peers.is_empty() {
             let peer = tokio::select! {
                 peer = ready_rx.recv() => peer,
-                _ = async {
+                () = async {
                     if let Some(stop_rx) = stop_rx.as_mut() {
                         let _ = stop_rx.changed().await;
                     } else {
@@ -579,7 +581,7 @@ pub async fn run_ingest_pipeline(
             continue;
         }
         while fetch_tasks.try_join_next().is_some() {}
-        if stop_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false) {
+        if stop_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
             break;
         }
         if scheduler.is_done().await {
@@ -607,19 +609,19 @@ pub async fn run_ingest_pipeline(
                     }
                     // Follow-style tailing: wait for head updates and continue.
                     tokio::select! {
-                        _ = async {
+                        () = async {
                             if let Some(stop_rx) = stop_rx.as_mut() {
                                 let _ = stop_rx.changed().await;
                             } else {
                                 std::future::pending::<()>().await;
                             }
                         } => {
-                            if stop_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false) {
+                            if stop_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
                                 break;
                             }
                         }
                         _ = head_seen_rx.changed() => {}
-                        _ = sleep(Duration::from_millis(200)) => {}
+                        () = sleep(Duration::from_millis(200)) => {}
                     }
                     continue;
                 }
@@ -629,12 +631,9 @@ pub async fn run_ingest_pipeline(
         }
 
         let active_peers = pool.len();
-        let permit = match fetch_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                sleep(Duration::from_millis(10)).await;
-                continue;
-            }
+        let Ok(permit) = fetch_semaphore.clone().try_acquire_owned() else {
+            sleep(Duration::from_millis(10)).await;
+            continue;
         };
 
         let best_idx = pick_best_ready_peer_index(&ready_peers, peer_health.as_ref()).await;
@@ -648,8 +647,7 @@ pub async fn run_ingest_pipeline(
                     // stale. In follow mode we cap scheduling at the global observed head.
                     tail_head_seen
                         .as_ref()
-                        .map(|rx| *rx.borrow())
-                        .unwrap_or(*range.end())
+                        .map_or(*range.end(), |rx| *rx.borrow())
                 } else if peer.head_number == 0 {
                     *range.end()
                 } else {
@@ -700,8 +698,6 @@ pub async fn run_ingest_pipeline(
         let bench = bench.clone();
         let events = events.clone();
         let assigned_blocks = batch.blocks.len();
-        let batch_limit = batch_limit;
-        let fetch_timeout = fetch_timeout;
         let active_fetch_tasks = Arc::clone(&active_fetch_tasks);
 
         let active_now = active_fetch_tasks
@@ -803,9 +799,9 @@ pub async fn run_ingest_pipeline(
                     if let Some(events) = events.as_ref() {
                         let range_start = batch.blocks.first().copied().unwrap_or(0);
                         let range_end = batch.blocks.last().copied().unwrap_or(range_start);
-                        let bytes_headers = bytes.map(|b| b.headers).unwrap_or(0);
-                        let bytes_bodies = bytes.map(|b| b.bodies).unwrap_or(0);
-                        let bytes_receipts = bytes.map(|b| b.receipts).unwrap_or(0);
+                        let bytes_headers = bytes.map_or(0, |b| b.headers);
+                        let bytes_bodies = bytes.map_or(0, |b| b.bodies);
+                        let bytes_receipts = bytes.map_or(0, |b| b.receipts);
                         events.record(BenchEvent::FetchEnd {
                             peer_id: format!("{:?}", peer.peer_id),
                             range_start,

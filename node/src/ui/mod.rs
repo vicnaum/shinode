@@ -10,6 +10,9 @@
 //! - **Following** (Green): Synced and following the chain head
 //! - **Recovery** (Red): Recovering failed blocks (overlay bar)
 
+// UI output requires direct stdout/stderr for terminal control
+#![expect(clippy::print_stdout, clippy::print_stderr, reason = "UI output")]
+
 mod bars;
 mod progress;
 mod state;
@@ -17,7 +20,7 @@ mod state;
 pub use bars::{format_startup_segment, BAR_WIDTH};
 pub use progress::{spawn_progress_updater, UIController};
 // Used in tests
-#[allow(unused_imports)]
+#[expect(unused_imports, reason = "re-exported for test modules")]
 pub use progress::format_progress_message;
 
 use std::io::Write;
@@ -26,7 +29,7 @@ use std::io::Write;
 /// This is a simple one-line status that overwrites itself.
 pub fn print_status_bar(message: &str) {
     let bar = format_startup_segment(message);
-    eprint!("\r{}", bar);
+    eprint!("\r{bar}");
     let _ = std::io::stderr().flush();
 }
 

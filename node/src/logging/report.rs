@@ -1,5 +1,8 @@
 //! Run report types and generation for benchmarking runs.
 
+// Verbose mode outputs JSON summary to stdout for user inspection
+#![expect(clippy::print_stdout, reason = "verbose summary output to stdout")]
+
 use crate::cli::NodeConfig;
 use crate::p2p::p2p_limits;
 use crate::sync::historical::{BenchEventLogger, IngestBenchSummary, PeerHealthTracker};
@@ -150,10 +153,7 @@ pub fn run_timestamp_utc(now: SystemTime) -> String {
     let min = (rem % 3_600) / 60;
     let sec = rem % 60;
     let (year, month, day) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}__{:02}-{:02}-{:02}",
-        year, month, day, hour, min, sec
-    )
+    format!("{year:04}-{month:02}-{day:02}__{hour:02}-{min:02}-{sec:02}")
 }
 
 /// Convert days since Unix epoch to civil date (year, month, day).
@@ -167,7 +167,7 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
+    let year = y + i64::from(m <= 2);
     (year as i32, m as i32, d as i32)
 }
 
@@ -196,7 +196,7 @@ pub fn env_info() -> EnvInfo {
         os: env::consts::OS.to_string(),
         arch: env::consts::ARCH.to_string(),
         cpu_count: std::thread::available_parallelism()
-            .map(|count| count.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(1),
         pid: process::id(),
     }
@@ -335,7 +335,7 @@ pub async fn generate_run_report(
             safe_head: head_at_startup.saturating_sub(config.rollback_window),
             rollback_window_applied: config.rollback_window > 0,
             worker_count: std::thread::available_parallelism()
-                .map(|count| count.get())
+                .map(std::num::NonZero::get)
                 .unwrap_or(4)
                 .max(1),
             p2p_limits: P2pLimitsSummary {

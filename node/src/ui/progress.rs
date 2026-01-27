@@ -81,7 +81,7 @@ impl UIController {
         }
         let bar = create_compacting_bar(&self.multi, total_shards);
         let left = total_shards;
-        bar.set_message(format!("Compacting: {} shards left", left));
+        bar.set_message(format!("Compacting: {left} shards left"));
         self.current_bar = Some(bar);
         self.state = UIState::Compacting;
     }
@@ -98,7 +98,7 @@ impl UIController {
         }
         let bar = create_sealing_bar(&self.multi, total_shards);
         let left = total_shards;
-        bar.set_message(format!("Sealing: {} shards left", left));
+        bar.set_message(format!("Sealing: {left} shards left"));
         self.current_bar = Some(bar);
         self.state = UIState::Sealing;
     }
@@ -245,7 +245,7 @@ impl UIController {
 
         bar.set_length(total.max(1));
         bar.set_position(done);
-        bar.set_message(format!("Compacting: {} shards left", left));
+        bar.set_message(format!("Compacting: {left} shards left"));
     }
 
     /// Update the sealing progress bar.
@@ -260,7 +260,7 @@ impl UIController {
 
         bar.set_length(total.max(1));
         bar.set_position(done);
-        bar.set_message(format!("Sealing: {} shards left", left));
+        bar.set_message(format!("Sealing: {left} shards left"));
     }
 
     /// Update the follow mode bar.
@@ -372,7 +372,7 @@ pub fn format_progress_message(
 
 /// Spawn the background task that updates progress bars.
 pub fn spawn_progress_updater(
-    ui: Arc<std::sync::Mutex<UIController>>,
+    ui: Arc<parking_lot::Mutex<UIController>>,
     stats: Arc<SyncProgressStats>,
     peer_pool: Arc<PeerPool>,
     peer_health: Option<Arc<PeerHealthTracker>>,
@@ -406,9 +406,7 @@ pub fn spawn_progress_updater(
             let peers_connected = peer_pool.len() as u64;
 
             // Update UI
-            if let Ok(mut ui) = ui.lock() {
-                ui.update(&snapshot, peers_connected);
-            }
+            ui.lock().update(&snapshot, peers_connected);
         }
     });
 }

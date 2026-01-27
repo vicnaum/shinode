@@ -1,0 +1,43 @@
+# ============================================
+# CLIPPY CONFIGURATION
+# ============================================
+# Place this file in your project root (next to Cargo.toml)
+# These thresholds complement the lint configuration in Cargo.toml
+
+# Complexity thresholds - prevent sprawling functions
+cognitive-complexity-threshold = 15
+type-complexity-threshold = 200
+too-many-lines-threshold = 100
+
+# Domain terms that shouldn't trigger spelling warnings in docs
+# Add your own domain-specific terms here
+doc-valid-idents = [
+    "LLM",      # Large Language Model
+    "AI",       # Artificial Intelligence
+    "API",      # Application Programming Interface
+    "CLI",      # Command Line Interface
+    "TUI",      # Terminal User Interface
+    "AST",      # Abstract Syntax Tree
+    "MCP",      # Model Context Protocol
+    "DSPy",     # Declarative Self-improving Python
+    "PTY",      # Pseudo-terminal
+    "JIT",      # Just-In-Time
+    "FFI",      # Foreign Function Interface
+    "JSON",     # JavaScript Object Notation
+    "TOML",     # Tom's Obvious Minimal Language
+    "UUID",     # Universally Unique Identifier
+    "URL",      # Uniform Resource Locator
+    "HTTP",     # HyperText Transfer Protocol
+    "HTTPS",    # HTTP Secure
+    "TCP",      # Transmission Control Protocol
+    "UDP",      # User Datagram Protocol
+    "WebSocket",
+    "OAuth",
+    "JWT",      # JSON Web Token
+    # Ethereum-specific terms
+    "EVM",      # Ethereum Virtual Machine
+    "RPC",      # Remote Procedure Call
+    "P2P",      # Peer-to-Peer
+    "WAL",      # Write-Ahead Log
+    "devp2p",   # Ethereum devp2p protocol
+]

@@ -18,7 +18,7 @@ pub struct HeadTrackerHandles {
 }
 
 /// Handles returned from spawning the tail feeder.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "fields accessed via destructuring")]
 pub struct TailFeederHandles {
     pub handle: JoinHandle<()>,
     pub stop_tx: watch::Sender<bool>,
@@ -65,7 +65,7 @@ pub fn spawn_head_tracker(
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
     });
@@ -113,7 +113,7 @@ pub fn spawn_tail_feeder(
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                () = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
     });

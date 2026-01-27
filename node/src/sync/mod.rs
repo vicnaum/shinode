@@ -48,14 +48,13 @@ impl SyncStatus {
     }
 
     /// Human-readable display name (for UI).
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for UI display")]
     pub fn display_name(self) -> &'static str {
         match self {
             SyncStatus::LookingForPeers => "Waiting for peers",
             SyncStatus::Fetching => "Syncing",
             SyncStatus::Finalizing => "Finalizing",
-            SyncStatus::UpToDate => "Synced",
-            SyncStatus::Following => "Synced",
+            SyncStatus::UpToDate | SyncStatus::Following => "Synced",
         }
     }
 }

@@ -54,14 +54,14 @@ impl SerdeBincodeCompat for StoredReceipts {
     fn as_repr(&self) -> Self::BincodeRepr<'_> {
         self.receipts
             .iter()
-            .map(|receipt| receipt.as_repr())
+            .map(SerdeBincodeCompat::as_repr)
             .collect()
     }
 
     fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
         let receipts = repr
             .into_iter()
-            .map(|repr| <Receipt as SerdeBincodeCompat>::from_repr(repr))
+            .map(<Receipt as SerdeBincodeCompat>::from_repr)
             .collect();
         StoredReceipts { receipts }
     }

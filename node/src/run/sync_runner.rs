@@ -1,5 +1,8 @@
 //! Main sync orchestration.
 
+// SIGINT handler must terminate the process on second signal
+#![expect(clippy::exit, reason = "SIGINT handler must terminate process")]
+
 use crate::cli::{compute_target_range, HeadSource, NodeConfig};
 use crate::logging::{init_tracing, spawn_resource_logger, TracingGuards};
 #[cfg(unix)]
@@ -269,7 +272,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Log finalize stats for follow mode transition
     let finalize_stats = match &outcome {
         IngestPipelineOutcome::RangeApplied { finalize, .. } => Some(*finalize),
-        _ => None,
+        IngestPipelineOutcome::UpToDate { .. } => None,
     };
 
     if follow_after {
@@ -363,6 +366,7 @@ fn log_follow_transition(
     );
 }
 
+#[expect(clippy::ref_option, reason = "consistent signature with caller-owned Options")]
 async fn run_follow_mode(
     storage: &Arc<Storage>,
     session: &p2p::NetworkSession,
@@ -457,7 +461,7 @@ async fn run_follow_mode(
                 warn!("shutdown signal received");
                 break;
             }
-            _ = async {
+            () = async {
                 if let Some(rx) = synced_rx.take() {
                     let _ = rx.await;
                 } else {

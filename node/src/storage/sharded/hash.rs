@@ -13,14 +13,14 @@ pub fn compute_shard_hash(
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"stateless-history-shard-v1\n");
-    hasher.update(&shard_start.to_le_bytes());
-    hasher.update(&shard_size.to_le_bytes());
-    hasher.update(&tail_block.to_le_bytes());
+    hasher.update(shard_start.to_le_bytes());
+    hasher.update(shard_size.to_le_bytes());
+    hasher.update(tail_block.to_le_bytes());
     hasher.update(bitset);
 
     let mut files: Vec<PathBuf> = fs::read_dir(sorted_dir)
         .wrap_err("failed to read sorted dir")?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_file())
         .collect();
@@ -38,10 +38,10 @@ pub fn compute_shard_hash(
         hasher.update(name.as_bytes());
         hasher.update([0u8]);
         let len = fs::metadata(&path)?.len();
-        hasher.update(&len.to_le_bytes());
+        hasher.update(len.to_le_bytes());
         hasher.update([0u8]);
         let mut file = fs::File::open(&path)?;
-        let mut buf = [0u8; 1024 * 1024];
+        let mut buf = vec![0u8; 1024 * 1024];
         loop {
             let read = file.read(&mut buf)?;
             if read == 0 {

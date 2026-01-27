@@ -6,9 +6,9 @@ use serde::Serialize;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -29,10 +29,9 @@ pub struct PeerSummary {
 const SAMPLE_LIMIT: usize = 100_000;
 
 fn push_sample(samples: &Mutex<Vec<u64>>, value: u64) {
-    if let Ok(mut guard) = samples.lock() {
-        if guard.len() < SAMPLE_LIMIT {
-            guard.push(value);
-        }
+    let mut guard = samples.lock();
+    if guard.len() < SAMPLE_LIMIT {
+        guard.push(value);
     }
 }
 
@@ -798,11 +797,7 @@ impl BenchEventLogger {
             t_ms: self.started_at.elapsed().as_millis() as u64,
             event,
         };
-        let sender = self
-            .sender
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
+        let sender = self.sender.lock().as_ref().cloned();
         if let Some(sender) = sender {
             match sender.send(BenchEventMessage::Record(record)) {
                 Ok(()) => {
@@ -818,16 +813,10 @@ impl BenchEventLogger {
     }
 
     pub fn finish(&self) -> eyre::Result<()> {
-        let sender = match self.sender.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
+        let sender = self.sender.lock().take();
         drop(sender);
 
-        let handle = match self.handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => None,
-        };
+        let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             match handle.join() {
                 Ok(res) => res?,
@@ -837,12 +826,12 @@ impl BenchEventLogger {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for diagnostics, used in tests")]
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::SeqCst)
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "API for diagnostics, used in tests")]
     pub fn total_events(&self) -> u64 {
         self.total_events.load(Ordering::SeqCst)
     }
@@ -850,9 +839,9 @@ impl BenchEventLogger {
 
 impl Drop for BenchEventLogger {
     fn drop(&mut self) {
-        let sender = self.sender.lock().ok().and_then(|mut g| g.take());
+        let sender = self.sender.lock().take();
         drop(sender);
-        let handle = self.handle.lock().ok().and_then(|mut g| g.take());
+        let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             let _ = handle.join();
         }

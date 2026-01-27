@@ -11,7 +11,8 @@ use eyre::Result;
 use std::fs;
 use std::io::IsTerminal;
 use std::process;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::sleep;
 use tracing::info;
@@ -39,22 +40,22 @@ pub fn build_run_context(config: &NodeConfig, argv: Vec<String>) -> Option<RunCo
     let output_dir = config.log_output_dir.clone();
 
     let trace_tmp_path = if config.log_trace {
-        Some(output_dir.join(format!("{}.trace.json.part", timestamp_utc)))
+        Some(output_dir.join(format!("{timestamp_utc}.trace.json.part")))
     } else {
         None
     };
     let events_tmp_path = if config.log_events {
-        Some(output_dir.join(format!("{}.events.jsonl.part", timestamp_utc)))
+        Some(output_dir.join(format!("{timestamp_utc}.events.jsonl.part")))
     } else {
         None
     };
     let logs_tmp_path = if config.log_json {
-        Some(output_dir.join(format!("{}.logs.jsonl.part", timestamp_utc)))
+        Some(output_dir.join(format!("{timestamp_utc}.logs.jsonl.part")))
     } else {
         None
     };
     let resources_tmp_path = if config.log_resources {
-        Some(output_dir.join(format!("{}.resources.jsonl.part", timestamp_utc)))
+        Some(output_dir.join(format!("{timestamp_utc}.resources.jsonl.part")))
     } else {
         None
     };
@@ -85,7 +86,7 @@ pub async fn init_storage(config: &NodeConfig) -> Result<Arc<Storage>> {
     let dirty_shards = storage.dirty_complete_shards()?;
     if !dirty_shards.is_empty() {
         let shard_count = dirty_shards.len();
-        ui::print_status_bar(&format!("Compacting {} shards...", shard_count));
+        ui::print_status_bar(&format!("Compacting {shard_count} shards..."));
         info!(shard_count, "startup: compacting completed dirty shards");
         let storage_clone = Arc::clone(&storage);
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -108,7 +109,7 @@ pub async fn connect_p2p(storage: Arc<Storage>) -> Result<p2p::NetworkSession> {
     let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
     let initial_peers = session.pool.len();
     info!(peers = initial_peers, "p2p peers connected");
-    ui::print_status_bar(&format!("P2P connected | {} peers", initial_peers));
+    ui::print_status_bar(&format!("P2P connected | {initial_peers} peers"));
     Ok(session)
 }
 
@@ -123,7 +124,7 @@ pub async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
             ui::clear_status_bar();
             return;
         }
-        ui::print_status_bar(&format!("Waiting for peers... {}/{}", peers, min_peers));
+        ui::print_status_bar(&format!("Waiting for peers... {peers}/{min_peers}"));
         sleep(Duration::from_millis(200)).await;
     }
 }
@@ -135,7 +136,9 @@ pub async fn wait_for_peer_head(
     end_block: Option<u64>,
     rollback_window: u64,
 ) -> u64 {
-    let mut last_log = Instant::now() - Duration::from_secs(10);
+    let mut last_log = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
     loop {
         let peers = pool.snapshot();
         let best_head = peers.iter().map(|peer| peer.head_number).max().unwrap_or(0);
@@ -169,7 +172,7 @@ pub async fn wait_for_peer_head(
 /// Setup result containing UI components and progress tracking.
 pub struct UiSetup {
     /// UI controller for progress display (currently unused but kept for potential debug use).
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "kept for potential debug use")]
     pub ui_controller: Arc<Mutex<UIController>>,
     pub progress: Option<Arc<IngestProgress>>,
     pub events: Option<Arc<BenchEventLogger>>,
@@ -186,8 +189,12 @@ pub fn setup_ui(
 ) -> Result<UiSetup> {
     // Create event logger if enabled
     let events = if config.log_events {
-        let run_ctx = run_context.expect("run context required for log_events");
-        let tmp_path = run_ctx.events_tmp_path.clone().expect("events tmp path");
+        let run_ctx = run_context
+            .ok_or_else(|| eyre::eyre!("run context required for log_events"))?;
+        let tmp_path = run_ctx
+            .events_tmp_path
+            .clone()
+            .ok_or_else(|| eyre::eyre!("events tmp path required"))?;
         Some(Arc::new(BenchEventLogger::new(tmp_path)?))
     } else {
         None
@@ -200,7 +207,7 @@ pub fn setup_ui(
     let progress: Option<Arc<IngestProgress>> = if is_tty {
         // Initialize syncing state with progress bar
         {
-            let mut ui = ui_controller.lock().expect("ui lock");
+            let mut ui = ui_controller.lock();
             ui.show_syncing(total_len);
         }
         if let Some(stats) = progress_stats {
@@ -214,12 +221,14 @@ pub fn setup_ui(
             );
         }
         // Get the bar from the controller for IngestProgress
+        // SAFETY: sync bar is created in show_syncing above, so it should always exist
         let bar = ui_controller
             .lock()
-            .expect("ui lock")
             .current_bar()
-            .cloned()
-            .expect("sync bar should exist");
+            .cloned();
+        let Some(bar) = bar else {
+            return Err(eyre::eyre!("sync bar should exist after show_syncing"));
+        };
         Some(Arc::new(IngestProgress::new(bar, total_len)))
     } else {
         None

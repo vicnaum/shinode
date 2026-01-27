@@ -121,7 +121,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     .map_err(internal_error)?
                     .unwrap_or(0);
                 info!(method = "eth_blockNumber", latest, "rpc response");
-                Ok(format!("0x{:x}", latest))
+                Ok(format!("0x{latest:x}"))
             },
         )
         .wrap_err("failed to register eth_blockNumber")?;
@@ -183,19 +183,18 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     .unwrap_or_default();
                 let txs = tx_hashes
                     .into_iter()
-                    .map(|tx| format!("{:#x}", tx))
+                    .map(|tx| format!("{tx:#x}"))
                     .collect::<Vec<_>>();
                 let size = ctx
                     .storage
                     .block_size(number)
                     .map_err(internal_error)?
-                    .map(|stored| stored.size)
-                    .unwrap_or(0);
+                    .map_or(0, |stored| stored.size);
                 let withdrawals = None;
 
                 let response = RpcBlock {
                     number: format!("0x{:x}", header.number),
-                    hash: format!("{:#x}", hash),
+                    hash: format!("{hash:#x}"),
                     parent_hash: format!("{:#x}", header.parent_hash),
                     nonce: format!("{:#x}", header.nonce),
                     sha3_uncles: format!("{:#x}", header.ommers_hash),
@@ -208,20 +207,20 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     difficulty: format!("{:#x}", header.difficulty),
                     total_difficulty: "0x0".to_string(),
                     extra_data: format!("{:#x}", header.extra_data),
-                    size: format!("0x{:x}", size),
+                    size: format!("0x{size:x}"),
                     gas_limit: format!("0x{:x}", header.gas_limit),
                     gas_used: format!("0x{:x}", header.gas_used),
                     transactions: txs,
                     uncles: Vec::new(),
                     mix_hash: format!("{:#x}", header.mix_hash),
-                    base_fee_per_gas: header.base_fee_per_gas.map(|fee| format!("0x{:x}", fee)),
-                    withdrawals_root: header.withdrawals_root.map(|root| format!("{:#x}", root)),
+                    base_fee_per_gas: header.base_fee_per_gas.map(|fee| format!("0x{fee:x}")),
+                    withdrawals_root: header.withdrawals_root.map(|root| format!("{root:#x}")),
                     withdrawals,
-                    blob_gas_used: header.blob_gas_used.map(|gas| format!("0x{:x}", gas)),
-                    excess_blob_gas: header.excess_blob_gas.map(|gas| format!("0x{:x}", gas)),
+                    blob_gas_used: header.blob_gas_used.map(|gas| format!("0x{gas:x}")),
+                    excess_blob_gas: header.excess_blob_gas.map(|gas| format!("0x{gas:x}")),
                     parent_beacon_block_root: header
                         .parent_beacon_block_root
-                        .map(|root| format!("{:#x}", root)),
+                        .map(|root| format!("{root:#x}")),
                 };
 
                 info!(
@@ -279,9 +278,9 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let topic0_filter = topics_filter
                     .as_ref()
                     .and_then(|topics| topics.first())
-                    .and_then(|entry| entry.clone());
-                let address_count = address_filter.as_ref().map(|v| v.len()).unwrap_or(0);
-                let topic0_count = topic0_filter.as_ref().map(|v| v.len()).unwrap_or(0);
+                    .and_then(Clone::clone);
+                let address_count = address_filter.as_ref().map_or(0, Vec::len);
+                let topic0_count = topic0_filter.as_ref().map_or(0, Vec::len);
                 info!(
                     method = "eth_getLogs",
                     from_block, to_block, address_count, topic0_count, "rpc request"
@@ -566,7 +565,7 @@ fn format_log(log: &DerivedLog) -> RpcLog {
         topics: log
             .topics
             .iter()
-            .map(|topic| format!("{:#x}", topic))
+            .map(|topic| format!("{topic:#x}"))
             .collect(),
         data: format!("{:x}", log.data),
         block_number: format!("0x{:x}", log.block_number),

@@ -9,6 +9,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 alloy-primitives = "1.5.2"
+parking_lot = "0.12"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -40,3 +41,60 @@ sysinfo = "0.37.2"
 tikv-jemallocator = { version = "0.5", optional = true }
 memmap2 = "0.9"
 zstd = "0.13"
+
+# ============================================
+# RUST-MAGIC-LINTER - Standard Preset
+# ============================================
+# AI guardrails to enforce best practices and prevent common mistakes
+# https://github.com/vicnaum/rust-magic-linter
+
+[lints.clippy]
+# Enable pedantic group for comprehensive checks
+pedantic = { level = "warn", priority = -1 }
+
+# === THE GUARDRAILS (Critical for AI Agents) ===
+# Panic safety - agents must handle errors, not crash
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+
+# The "no cheating" rule
+allow_attributes = "deny"
+
+# Code hygiene - no debug leftovers
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# === ASYNC SAFETY ===
+await_holding_lock = "deny"       # Prevents deadlocks
+
+# === PROCESS SAFETY ===
+exit = "deny"                     # Libraries shouldn't exit
+
+# === PEDANTIC RELAXATIONS ===
+# These are too noisy for most projects
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+single_match_else = "allow"             # match vs if-let is stylistic
+unnecessary_wraps = "allow"             # Result wrapping for API consistency
+too_many_arguments = "allow"            # Complex functions need many args
+struct_field_names = "allow"            # Field naming conventions
+needless_pass_by_value = "allow"        # By-value is sometimes clearer
+large_futures = "allow"                 # Async futures can be large
+struct_excessive_bools = "allow"        # CLI config structs need bools
+
+# === CAST RELAXATIONS ===
+# Numeric casts are pervasive in this codebase (block numbers, sizes, etc.)
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"

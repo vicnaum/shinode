@@ -122,7 +122,7 @@ pub fn process_ingest(
     let mut stored_transactions = Vec::with_capacity(body.transactions.len());
     for (tx, tx_hash) in body.transactions.iter().zip(tx_hashes.iter()) {
         let value = tx.value();
-        let signature = tx.signature().clone();
+        let signature = *tx.signature();
         let signing_hash = signing_hash_fast(&mut signing_hasher, tx);
         let to = match tx.kind() {
             TxKind::Call(address) => Some(address),
@@ -150,7 +150,7 @@ pub fn process_ingest(
 
     let logs_start = Instant::now();
     let mut log_count = 0u64;
-    for receipt in receipts.iter() {
+    for receipt in &receipts {
         log_count = log_count.saturating_add(receipt.logs.len() as u64);
     }
     let logs_build_us = logs_start.elapsed().as_micros() as u64;

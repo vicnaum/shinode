@@ -34,7 +34,7 @@ async fn dump_follow_debug(
     let head_seen = storage.head_seen().ok().flatten();
     let peers = pool.snapshot();
     let peers_len = peers.len();
-    let snapshot = stats.map(|s| s.snapshot());
+    let snapshot = stats.map(SyncProgressStats::snapshot);
     let health = peer_health.snapshot().await;
 
     tracing::info!(
@@ -153,17 +153,15 @@ pub async fn run_follow_loop(
             .unwrap_or(config.start_block)
             .max(config.start_block);
 
-        let observed_head =
-            match discover_head_p2p(&pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT).await? {
-                Some(head) => head,
-                None => {
-                    if let Some(stats) = stats.as_ref() {
-                        stats.set_status(SyncStatus::LookingForPeers);
-                    }
-                    sleep(poll).await;
-                    continue;
-                }
-            };
+        let Some(observed_head) =
+            discover_head_p2p(&pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT).await?
+        else {
+            if let Some(stats) = stats.as_ref() {
+                stats.set_status(SyncStatus::LookingForPeers);
+            }
+            sleep(poll).await;
+            continue;
+        };
 
         storage.set_head_seen(observed_head)?;
         if let Some(stats) = stats.as_ref() {
@@ -171,8 +169,7 @@ pub async fn run_follow_loop(
         }
 
         let start = last_indexed
-            .map(|block| block.saturating_add(1))
-            .unwrap_or(config.start_block)
+            .map_or(config.start_block, |block| block.saturating_add(1))
             .max(config.start_block);
         let mut target_head = observed_head;
         if let Some(end) = config.end_block {
@@ -308,7 +305,7 @@ pub async fn run_follow_loop(
                         continue;
                     }
                 };
-                let capped = end_block.map(|end| head.min(end)).unwrap_or(head);
+                let capped = end_block.map_or(head, |end| head.min(end));
                 if capped > last_head {
                     last_head = capped;
                     let _ = head_seen_tx.send(capped);
@@ -325,7 +322,7 @@ pub async fn run_follow_loop(
                             break;
                         }
                     }
-                    _ = sleep(poll) => {}
+                    () = sleep(poll) => {}
                 }
             }
         });
@@ -349,7 +346,7 @@ pub async fn run_follow_loop(
                             break;
                         }
                     }
-                    _ = sleep(Duration::from_millis(200)) => {}
+                    () = sleep(Duration::from_millis(200)) => {}
                 }
             }
         });
@@ -364,12 +361,9 @@ pub async fn run_follow_loop(
                 if *stop_rx_reorg.borrow() {
                     break;
                 }
-                let last_indexed = match storage_reorg.last_indexed_block() {
-                    Ok(Some(block)) => block,
-                    _ => {
-                        sleep(poll).await;
-                        continue;
-                    }
+                let Ok(Some(last_indexed)) = storage_reorg.last_indexed_block() else {
+                    sleep(poll).await;
+                    continue;
                 };
                 let start = last_indexed.saturating_add(1).max(start_block);
                 match preflight_reorg(
@@ -427,7 +421,7 @@ pub async fn run_follow_loop(
                             break;
                         }
                     }
-                    _ = sleep(poll) => {}
+                    () = sleep(poll) => {}
                 }
             }
         });

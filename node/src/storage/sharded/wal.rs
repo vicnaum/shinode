@@ -14,7 +14,7 @@ pub struct WalRecord {
 
 #[derive(Debug, Clone, Copy)]
 pub struct WalIndexEntry {
-    #[allow(dead_code)] // Kept for debugging/future use
+    #[expect(dead_code, reason = "kept for debugging and future use")]
     pub block_number: u64,
 }
 
@@ -147,7 +147,7 @@ pub fn build_index(path: &Path) -> Result<Vec<WalIndexEntry>> {
         let next_offset = record_offset
             .saturating_add(8)
             .saturating_add(4)
-            .saturating_add(payload_len as u64)
+            .saturating_add(u64::from(payload_len))
             .saturating_add(4);
         if next_offset > file_len {
             break;

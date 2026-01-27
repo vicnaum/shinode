@@ -157,8 +157,7 @@ struct PeerHealth {
 impl PeerHealth {
     fn is_banned(&self) -> bool {
         self.banned_until
-            .map(|until| Instant::now() < until)
-            .unwrap_or(false)
+            .is_some_and(|until| Instant::now() < until)
     }
 }
 
@@ -206,9 +205,7 @@ impl PeerHealthTracker {
         if entry.batch_limit == 0 {
             entry.batch_limit = self.config.aimd_initial_batch.max(1);
         }
-        if entry.batch_limit_max == 0 {
-            entry.batch_limit_max = entry.batch_limit;
-        } else if entry.batch_limit > entry.batch_limit_max {
+        if entry.batch_limit_max == 0 || entry.batch_limit > entry.batch_limit_max {
             entry.batch_limit_max = entry.batch_limit;
         }
     }
@@ -282,8 +279,7 @@ impl PeerHealthTracker {
         let health = self.health.lock().await;
         health
             .get(&peer_id)
-            .map(|entry| entry.is_banned())
-            .unwrap_or(false)
+            .is_some_and(PeerHealth::is_banned)
     }
 
     pub(crate) async fn note_error(&self, peer_id: PeerId, error: String) {
@@ -349,7 +345,7 @@ impl PeerHealthTracker {
         let mut count = 0u64;
         for peer_id in peer_ids {
             if let Some(entry) = health.get(peer_id) {
-                if entry.banned_until.map(|until| now < until).unwrap_or(false) {
+                if entry.banned_until.is_some_and(|until| now < until) {
                     count = count.saturating_add(1);
                 }
             }
@@ -429,14 +425,11 @@ impl PeerHealthTracker {
 
     pub(crate) async fn quality(&self, peer_id: PeerId) -> PeerQuality {
         let health = self.health.lock().await;
-        let entry = match health.get(&peer_id) {
-            Some(entry) => entry,
-            None => {
-                return PeerQuality {
-                    score: 1.0,
-                    samples: 0,
-                }
-            }
+        let Some(entry) = health.get(&peer_id) else {
+            return PeerQuality {
+                score: 1.0,
+                samples: 0,
+            };
         };
         let total = entry.successes + entry.failures + entry.partials;
         if total == 0 {
@@ -595,7 +588,7 @@ impl PeerWorkScheduler {
         &self,
         peer_id: PeerId,
         peer_head: u64,
-        _active_peers: usize,
+        active_peers: usize,
     ) -> FetchBatch {
         if self.is_peer_banned(peer_id).await {
             return FetchBatch {
@@ -605,7 +598,7 @@ impl PeerWorkScheduler {
         }
         if self
             .peer_health
-            .should_defer_peer(peer_id, _active_peers)
+            .should_defer_peer(peer_id, active_peers)
             .await
         {
             return FetchBatch {
@@ -730,7 +723,7 @@ impl PeerWorkScheduler {
             let mut best_block: Option<u64> = None;
             let mut best_staleness: Option<Duration> = None;
 
-            for &block in shard_blocks.iter() {
+            for &block in shard_blocks {
                 // Skip completed blocks (will be cleaned up on success)
                 if completed.contains(&block) {
                     continue;
@@ -749,7 +742,7 @@ impl PeerWorkScheduler {
                     }
                     Some(duration) if duration >= ESCALATION_PEER_COOLDOWN => {
                         // Peer tried but cooldown passed - acceptable
-                        if best_staleness.map(|b| duration > b).unwrap_or(true) {
+                        if best_staleness.is_none_or(|b| duration > b) {
                             best_block = Some(block);
                             best_staleness = Some(duration);
                         }
@@ -762,17 +755,15 @@ impl PeerWorkScheduler {
 
             if let Some(block) = best_block {
                 // Remove from shard set (will be re-added on failure)
-                escalation
-                    .shards
-                    .get_mut(&shard_start)
-                    .unwrap()
-                    .remove(&block);
+                // SAFETY: best_block was found by iterating over shard entries above
+                if let Some(shard_set) = escalation.shards.get_mut(&shard_start) {
+                    shard_set.remove(&block);
+                }
                 escalation.total_count = escalation.total_count.saturating_sub(1);
                 if escalation
                     .shards
                     .get(&shard_start)
-                    .map(|s| s.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(std::collections::HashSet::is_empty)
                 {
                     escalation.shards.remove(&shard_start);
                 }

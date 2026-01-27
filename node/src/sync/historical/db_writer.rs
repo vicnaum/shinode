@@ -16,12 +16,15 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+/// Tracks remaining blocks per shard for compaction scheduling.
+type ShardRemainingTracker = Arc<Mutex<HashMap<u64, usize>>>;
+
 async fn flush_fast_sync_buffer(
     storage: &Arc<Storage>,
     buffer: &mut Vec<BlockBundle>,
     bench: Option<&Arc<IngestBenchStats>>,
     events: Option<&Arc<BenchEventLogger>>,
-    remaining_per_shard: Option<&Arc<Mutex<HashMap<u64, usize>>>>,
+    remaining_per_shard: Option<&ShardRemainingTracker>,
     progress_stats: Option<&Arc<SyncProgressStats>>,
     compactions: &mut Vec<JoinHandle<Result<()>>>,
     semaphore: &Arc<Semaphore>,
@@ -36,7 +39,7 @@ async fn flush_fast_sync_buffer(
         None
     };
     if let Some(events) = events.as_ref() {
-        let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+        let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
         events.record(BenchEvent::DbFlushStart {
             blocks: buffer.len() as u64,
             bytes_total,
@@ -53,7 +56,7 @@ async fn flush_fast_sync_buffer(
     }
     if let Some(events) = events.as_ref() {
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+        let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
         events.record(BenchEvent::DbFlushEnd {
             blocks: buffer.len() as u64,
             bytes_total,
@@ -124,6 +127,7 @@ impl DbWriteConfig {
     }
 }
 
+#[expect(clippy::large_enum_variant, reason = "Block variant is the hot path, boxing adds overhead")]
 pub enum DbWriterMessage {
     Block(BlockBundle),
     Finalize,
@@ -150,7 +154,7 @@ pub async fn run_db_writer(
     events: Option<Arc<BenchEventLogger>>,
     mode: DbWriteMode,
     progress_stats: Option<Arc<SyncProgressStats>>,
-    remaining_per_shard: Option<Arc<Mutex<HashMap<u64, usize>>>>,
+    remaining_per_shard: Option<ShardRemainingTracker>,
     follow_expected_start: Option<u64>,
 ) -> Result<DbWriterFinalizeStats> {
     let mut interval = config.flush_interval.map(tokio::time::interval);
@@ -178,12 +182,12 @@ pub async fn run_db_writer(
 
     let write_follow_bundle = |bundle: BlockBundle| -> Result<()> {
         let bytes = if bench.is_some() || events.is_some() {
-            Some(db_bytes_for_bundles(&[bundle.clone()])?)
+            Some(db_bytes_for_bundles(std::slice::from_ref(&bundle))?)
         } else {
             None
         };
         if let Some(events) = events.as_ref() {
-            let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+            let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
             events.record(BenchEvent::DbFlushStart {
                 blocks: 1,
                 bytes_total,
@@ -199,7 +203,7 @@ pub async fn run_db_writer(
         }
         if let Some(events) = events.as_ref() {
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            let bytes_total = bytes.as_ref().map(|totals| totals.total()).unwrap_or(0);
+            let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
             events.record(BenchEvent::DbFlushEnd {
                 blocks: 1,
                 bytes_total,
@@ -241,28 +245,7 @@ pub async fn run_db_writer(
                             }
                         }
                     }
-                    Some(DbWriterMessage::Finalize) => {
-                        if mode == DbWriteMode::FastSync {
-                            flush_fast_sync_buffer(
-                                &storage,
-                                &mut buffer,
-                                bench.as_ref(),
-                                events.as_ref(),
-                                remaining_per_shard.as_ref(),
-                                progress_stats.as_ref(),
-                                &mut compactions,
-                                &semaphore,
-                            )
-                            .await?;
-                        } else {
-                            while let Some(bundle) = follow_buffer.remove(&follow_expected) {
-                                write_follow_bundle(bundle)?;
-                                follow_expected = follow_expected.saturating_add(1);
-                            }
-                        }
-                        break;
-                    }
-                    None => {
+                    Some(DbWriterMessage::Finalize) | None => {
                         if mode == DbWriteMode::FastSync {
                             flush_fast_sync_buffer(
                                 &storage,
@@ -285,7 +268,7 @@ pub async fn run_db_writer(
                     }
                 }
             }
-            _ = async {
+            () = async {
                 if let Some(interval) = interval.as_mut() {
                     interval.tick().await;
                 }
