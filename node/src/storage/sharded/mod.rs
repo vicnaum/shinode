@@ -2089,6 +2089,7 @@ mod tests {
             log_resources: false,
             min_peers: 1,
             repair: false,
+            no_tui: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,

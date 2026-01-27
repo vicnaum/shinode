@@ -33,24 +33,37 @@ pub struct TracingGuards {
 }
 
 /// Initialize the tracing subscriber with optional Chrome trace and JSON logging.
+///
+/// When `tui_mode` is true, the stdout fmt_layer is suppressed to avoid
+/// corrupting the TUI display.
 pub fn init_tracing(
     config: &NodeConfig,
     chrome_trace_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
     resources_path: Option<PathBuf>,
+    tui_mode: bool,
 ) -> TracingGuards {
+    // Default verbosity is now INFO level (previously required -v)
     let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let (global, local) = match config.verbosity {
-            0 => ("error", "error"),
-            1 => ("warn", "info"),
-            2 => ("warn", "debug"),
-            _ => ("warn", "trace"),
+            0 => ("warn", "info"),   // INFO default (was error/error)
+            1 => ("warn", "debug"),  // -v = debug (was info)
+            2 => ("info", "trace"),  // -vv = trace (was debug)
+            _ => ("debug", "trace"), // -vvv = verbose trace
         };
         EnvFilter::new(format!("{global},stateless_history_node={local}"))
     });
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stdout)
-        .with_filter(log_filter);
+
+    // When TUI mode is active, suppress stdout logging to avoid corrupting display
+    let fmt_layer = if tui_mode {
+        None
+    } else {
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_filter(log_filter),
+        )
+    };
 
     // JSON log file uses its own filter (defaults to DEBUG level).
     let json_log_filter = EnvFilter::try_new(&config.log_json_filter)

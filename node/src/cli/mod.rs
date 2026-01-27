@@ -163,6 +163,9 @@ pub struct NodeConfig {
     /// performs recovery, and exits with a summary.
     #[arg(long, default_value_t = false)]
     pub repair: bool,
+    /// Disable fullscreen TUI dashboard, use legacy progress bars.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
     /// Optional command.
     #[command(subcommand)]
     #[serde(skip)]
@@ -318,6 +321,7 @@ mod tests {
         );
         assert_eq!(config.db_write_batch_blocks, DEFAULT_DB_WRITE_BATCH_BLOCKS);
         assert_eq!(config.db_write_flush_interval_ms, None);
+        assert!(!config.no_tui);
     }
 
     #[test]

@@ -1141,15 +1141,15 @@ fn render_speed_chart(area: Rect, buf: &mut Buffer, data: &TuiState) {
     // Find max for scaling - scale to actual peak with nice rounding
     let max_val = data.speed_history.iter().copied().max().unwrap_or(1).max(1);
     let scale_max = if max_val <= 50 {
-        ((max_val / 10) + 1) * 10  // Round to 10s: 41 -> 50
+        ((max_val / 10) + 1) * 10
     } else if max_val <= 200 {
-        ((max_val / 25) + 1) * 25  // Round to 25s: 180 -> 200
+        ((max_val / 25) + 1) * 25
     } else if max_val <= 500 {
-        ((max_val / 50) + 1) * 50  // Round to 50s: 450 -> 500
+        ((max_val / 50) + 1) * 50
     } else if max_val <= 2000 {
-        ((max_val / 100) + 1) * 100  // Round to 100s
+        ((max_val / 100) + 1) * 100
     } else {
-        ((max_val / 500) + 1) * 500  // Round to 500s for large values
+        ((max_val / 500) + 1) * 500
     };
 
     // Draw Y-axis labels
@@ -1165,8 +1165,8 @@ fn render_speed_chart(area: Rect, buf: &mut Buffer, data: &TuiState) {
         }
     }
 
-    let bar_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-
+    // Braille dots for smooth line graph (each cell is 2x4 dots)
+    // We'll use the bottom row of dots for the line
     let chart_start_x = inner.x + y_axis_width;
     let history_len = data.speed_history.len();
 
@@ -1174,32 +1174,82 @@ fn render_speed_chart(area: Rect, buf: &mut Buffer, data: &TuiState) {
         return;
     }
 
+    // Calculate values for each column (with sub-cell precision using braille)
+    // Braille cell has 4 vertical dot positions per character
+    let total_dots_height = chart_height as f64 * 4.0;
+
+    // Gradient colors based on relative height (red at bottom, green at top)
+    let color_for_height = |ratio: f64| -> Color {
+        if ratio < 0.25 {
+            Color::Rgb(255, 80, 80)   // Red (low)
+        } else if ratio < 0.5 {
+            Color::Rgb(255, 180, 50)  // Orange
+        } else if ratio < 0.75 {
+            Color::Rgb(200, 220, 50)  // Yellow-green
+        } else {
+            Color::Rgb(80, 220, 120)  // Green (high)
+        }
+    };
+
+    // First pass: draw filled area with gradient
     let samples_per_col = history_len as f64 / chart_width as f64;
 
     for col in 0..chart_width {
         let sample_idx = (col as f64 * samples_per_col) as usize;
         let value = data.speed_history.get(sample_idx).copied().unwrap_or(0);
+        let ratio = value as f64 / scale_max as f64;
+        let dot_height = (ratio * total_dots_height).round() as u16;
 
-        let normalized_f = value as f64 / scale_max as f64 * chart_height as f64;
-        let full_rows = normalized_f as u16;
-        let partial = ((normalized_f - full_rows as f64) * 8.0) as usize;
-
+        // Draw each row of this column
         for row in 0..chart_height {
             let y = inner.y + chart_height - 1 - row;
-            let ch = if row < full_rows {
-                '\u{2588}'
-            } else if row == full_rows && partial > 0 {
-                bar_chars[partial]
+            let row_dot_start = row * 4;
+            let row_dot_end = row_dot_start + 4;
+
+            // How many dots in this cell should be filled?
+            let dots_in_cell = if dot_height <= row_dot_start {
+                0
+            } else if dot_height >= row_dot_end {
+                4
             } else {
-                ' '
+                (dot_height - row_dot_start) as usize
             };
 
-            buf.set_string(
-                chart_start_x + col,
-                y,
-                ch.to_string(),
-                Style::default().fg(data.phase.color()),
-            );
+            // Braille patterns for 0-4 dots filled from bottom
+            // Using left column only for thin line look: ⠀⢀⢠⢰⢸
+            let ch = match dots_in_cell {
+                0 => '⠀',  // Empty
+                1 => '⢀',  // Dot 7
+                2 => '⢠',  // Dots 7,4
+                3 => '⢰',  // Dots 7,4,2
+                _ => '⢸',  // Dots 7,4,2,1 (full left column)
+            };
+
+            let cell_ratio = (row as f64 + 0.5) / chart_height as f64;
+            let color = if dots_in_cell > 0 {
+                color_for_height(cell_ratio.min(ratio))
+            } else {
+                Color::Rgb(30, 30, 40)  // Dark background
+            };
+
+            if let Some(cell) = buf.cell_mut((chart_start_x + col, y)) {
+                cell.set_char(ch);
+                cell.set_fg(color);
+            }
+        }
+    }
+
+    // Draw sparkline on top (current value marker)
+    if !data.speed_history.is_empty() {
+        let last_val = *data.speed_history.back().unwrap_or(&0);
+        let last_ratio = last_val as f64 / scale_max as f64;
+        let last_row = ((1.0 - last_ratio) * (chart_height as f64 - 1.0)).round() as u16;
+        let marker_y = inner.y + last_row.min(chart_height - 1);
+        let marker_x = chart_start_x + chart_width - 1;
+
+        if let Some(cell) = buf.cell_mut((marker_x, marker_y)) {
+            cell.set_char('●');
+            cell.set_fg(Color::White);
         }
     }
 
@@ -1217,15 +1267,15 @@ fn render_speed_chart(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let stats_y = inner.y + inner.height - 1;
     let mut x = inner.x + 1;
 
-    buf.set_string(x, stats_y, "\u{25CF} Current: ", Style::default().fg(Color::Yellow));
-    x += 11;
+    buf.set_string(x, stats_y, "● Cur: ", Style::default().fg(Color::Yellow));
+    x += 7;
     buf.set_string(x, stats_y, &format!("{}/s", format_number(data.current_speed)), Style::default().fg(Color::Yellow));
-    x += 12;
-    buf.set_string(x, stats_y, "\u{25C6} Average: ", Style::default().fg(Color::White));
-    x += 11;
+    x += 10;
+    buf.set_string(x, stats_y, "◆ Avg: ", Style::default().fg(Color::White));
+    x += 7;
     buf.set_string(x, stats_y, &format!("{}/s", format_number(data.avg_speed)), Style::default().fg(Color::White));
-    x += 12;
-    buf.set_string(x, stats_y, "\u{2605} Peak: ", Style::default().fg(Color::LightCyan));
+    x += 10;
+    buf.set_string(x, stats_y, "★ Peak: ", Style::default().fg(Color::LightCyan));
     x += 8;
     buf.set_string(x, stats_y, &format!("{}/s", format_number(data.peak_speed)), Style::default().fg(Color::LightCyan));
 
