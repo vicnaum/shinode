@@ -14,11 +14,11 @@ following, and failed block recovery.
 - `bars.rs` - Progress bar creation helpers and color definitions.
   - **Key items**: `colors`, `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `format_colored_segment()`
 - `progress.rs` - Main progress tracking logic with UIController and background updater.
-  - **Key items**: `UIController`, `format_progress_message()`, `spawn_progress_updater()`
+  - **Key items**: `UIController`, `spawn_progress_updater()` (note: `format_progress_message()` is now private)
 
 ## Key APIs (no snippets)
 - **Types**: `UIState`, `UIController`
-- **Functions**: `print_status_bar()`, `clear_status_bar()`, `format_progress_message()`, `spawn_progress_updater()`, `print_db_stats()`, `human_bytes()`
+- **Functions**: `print_status_bar()`, `clear_status_bar()`, `spawn_progress_updater()`, `print_db_stats()`, `human_bytes()` (note: `format_progress_message()` is now private, takes `&SyncProgressSnapshot`)
 - **Bar creators**: `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`
 
 ## UIController State Machine
