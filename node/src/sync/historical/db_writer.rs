@@ -400,16 +400,16 @@ fn finalize_fast_sync(
         });
     }
 
-    // Sealing phase
+    // Sealing phase - uses separate counters from compaction
     if let Some(events) = events {
         events.record(BenchEvent::SealCompletedStart);
     }
     let seal_started = Instant::now();
 
     if let Some(stats) = progress_stats {
-        stats.set_compactions_done(0);
+        stats.set_sealings_done(0);
         let to_seal = storage.count_shards_to_seal().unwrap_or(0);
-        stats.set_compactions_total(to_seal);
+        stats.set_sealings_total(to_seal);
         stats.set_finalize_phase(FinalizePhase::Sealing);
     }
 
@@ -418,7 +418,7 @@ fn finalize_fast_sync(
     storage.seal_completed_shards_with_progress(|_shard_start| {
         sealed_count += 1;
         if let Some(stats) = stats_for_seal.as_ref() {
-            stats.inc_compactions_done(1);
+            stats.inc_sealings_done(1);
         }
     })?;
     if sealed_count > 0 {

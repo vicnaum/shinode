@@ -554,6 +554,8 @@ mod tests {
             escalation: 0,
             compactions_done: 0,
             compactions_total: 0,
+            sealings_done: 0,
+            sealings_total: 0,
             processed: 0,
             head_block: 0,
             head_seen: 0,

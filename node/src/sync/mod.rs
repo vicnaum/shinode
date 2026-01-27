@@ -144,6 +144,9 @@ pub struct SyncProgressStats {
     inflight: std::sync::atomic::AtomicU64,
     compactions_done: std::sync::atomic::AtomicU64,
     compactions_total: std::sync::atomic::AtomicU64,
+    /// Separate counters for sealing phase (distinct from compaction).
+    sealings_done: std::sync::atomic::AtomicU64,
+    sealings_total: std::sync::atomic::AtomicU64,
     peers_active: std::sync::atomic::AtomicU64,
     peers_total: std::sync::atomic::AtomicU64,
     status: std::sync::atomic::AtomicU8,
@@ -172,6 +175,9 @@ pub struct SyncProgressSnapshot {
     pub inflight: u64,
     pub compactions_done: u64,
     pub compactions_total: u64,
+    /// Separate counters for sealing phase (distinct from compaction).
+    pub sealings_done: u64,
+    pub sealings_total: u64,
     pub peers_active: u64,
     pub peers_total: u64,
     pub status: SyncStatus,
@@ -202,6 +208,12 @@ impl SyncProgressStats {
                 .load(std::sync::atomic::Ordering::SeqCst),
             compactions_total: self
                 .compactions_total
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sealings_done: self
+                .sealings_done
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sealings_total: self
+                .sealings_total
                 .load(std::sync::atomic::Ordering::SeqCst),
             peers_active: self.peers_active.load(std::sync::atomic::Ordering::SeqCst),
             peers_total: self.peers_total.load(std::sync::atomic::Ordering::SeqCst),
@@ -271,6 +283,24 @@ impl SyncProgressStats {
 
     pub fn set_compactions_done(&self, done: u64) {
         self.compactions_done
+            .store(done, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_sealings_total(&self, total: u64) {
+        self.sealings_total
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn inc_sealings_done(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        self.sealings_done
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_sealings_done(&self, done: u64) {
+        self.sealings_done
             .store(done, std::sync::atomic::Ordering::SeqCst);
     }
 

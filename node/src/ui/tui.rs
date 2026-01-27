@@ -99,6 +99,9 @@ pub struct TuiState {
     pub total_shards: u64,
     pub compacted_shards: u64,
     pub current_shard: u64,
+    /// Separate sealing counters (distinct from compaction).
+    pub sealed_shards: u64,
+    pub total_to_seal: u64,
     pub last_block_secs: u64,
 
     // Extended tracking
@@ -188,6 +191,8 @@ impl TuiState {
             total_shards: 0,
             compacted_shards: 0,
             current_shard: 0,
+            sealed_shards: 0,
+            total_to_seal: 0,
             last_block_secs: 0,
             speed_history: VecDeque::with_capacity(60),
             avg_speed_window: VecDeque::with_capacity(300), // 30 seconds at 100ms intervals
@@ -276,10 +281,33 @@ impl TuiState {
             self.blocks_to_sync = current_total;
         }
 
-        // Calculate progress using blocks_to_sync (actual work), not full range
-        // This ensures progress = 100% when all missing blocks are synced
-        if self.blocks_to_sync > 0 {
-            self.progress = (snapshot.processed as f64 / self.blocks_to_sync as f64).clamp(0.0, 1.0);
+        // Calculate progress based on current phase
+        // - Sync/Retry: based on blocks processed vs blocks to sync
+        // - Compact: based on compactions_done vs compactions_total
+        // - Seal: based on sealings_done vs sealings_total
+        match self.phase {
+            Phase::Sync | Phase::Retry | Phase::Startup => {
+                if self.blocks_to_sync > 0 {
+                    self.progress = (snapshot.processed as f64 / self.blocks_to_sync as f64).clamp(0.0, 1.0);
+                }
+            }
+            Phase::Compact => {
+                if snapshot.compactions_total > 0 {
+                    self.progress = (snapshot.compactions_done as f64 / snapshot.compactions_total as f64).clamp(0.0, 1.0);
+                } else {
+                    self.progress = 1.0; // No compactions needed = 100%
+                }
+            }
+            Phase::Seal => {
+                if snapshot.sealings_total > 0 {
+                    self.progress = (snapshot.sealings_done as f64 / snapshot.sealings_total as f64).clamp(0.0, 1.0);
+                } else {
+                    self.progress = 1.0; // No sealings needed = 100%
+                }
+            }
+            Phase::Follow => {
+                self.progress = 1.0; // Following = 100%
+            }
         }
 
         // Speed tracking
@@ -329,10 +357,14 @@ impl TuiState {
         self.retry = snapshot.escalation;
         // failed stays as placeholder for now
 
-        // Compaction tracking
+        // Compaction tracking (separate from sealing)
         self.total_shards = snapshot.compactions_total;
         self.compacted_shards = snapshot.compactions_done;
         self.current_shard = snapshot.compactions_done;
+
+        // Sealing tracking (separate counters)
+        self.sealed_shards = snapshot.sealings_done;
+        self.total_to_seal = snapshot.sealings_total;
 
         // Last block timing
         if snapshot.last_block_received_ms > 0 {
@@ -960,11 +992,24 @@ fn render_compact_progress_section(area: Rect, buf: &mut Buffer, data: &TuiState
         );
     }
 
-    let shards_text = format!(
-        "{} / {} shards compacted",
-        data.compacted_shards,
-        data.total_shards
-    );
+    // Show different counters and text based on phase
+    let shards_text = match data.phase {
+        Phase::Compact => format!(
+            "{} / {} shards compacted",
+            data.compacted_shards,
+            data.total_shards
+        ),
+        Phase::Seal => format!(
+            "{} / {} shards sealed",
+            data.sealed_shards,
+            data.total_to_seal
+        ),
+        _ => format!(
+            "{} / {} shards",
+            data.compacted_shards,
+            data.total_shards
+        ),
+    };
     let shards_x = area.x + (area.width.saturating_sub(shards_text.len() as u16)) / 2;
     buf.set_string(
         shards_x,
@@ -1070,27 +1115,33 @@ fn render_shards_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let label = "Shards";
     buf.set_string(area.x + 2, area.y, label, Style::default().fg(Color::Gray));
 
+    // Use phase-appropriate counters and colors
+    let (total, done, done_color) = match data.phase {
+        Phase::Seal => (data.total_to_seal, data.sealed_shards, Color::Green),
+        _ => (data.total_shards, data.compacted_shards, Color::Magenta),
+    };
+
     let start_label = "Shard 0".to_string();
-    let end_label = format!("Shard {}", data.total_shards.saturating_sub(1));
+    let end_label = format!("Shard {}", total.saturating_sub(1));
 
     let map_start = area.x + 2 + label_width;
     let map_end = area.x + area.width - right_margin - 1;
     let map_width = map_end.saturating_sub(map_start) as usize;
 
-    if map_width == 0 || data.total_shards == 0 {
+    if map_width == 0 || total == 0 {
         return;
     }
 
     // Scale shards to fit width
-    let scale = data.total_shards as f64 / map_width as f64;
+    let scale = total as f64 / map_width as f64;
 
     // Row 1 & 2
     for row in 0..2 {
         for i in 0..map_width {
             let shard_idx = (i as f64 * scale) as u64;
-            let (ch, color) = if shard_idx < data.compacted_shards {
-                ('\u{2588}', Color::Magenta)
-            } else if shard_idx == data.compacted_shards {
+            let (ch, color) = if shard_idx < done {
+                ('\u{2588}', done_color)
+            } else if shard_idx == done {
                 ('\u{2593}', Color::Yellow)
             } else {
                 ('\u{2591}', Color::DarkGray)
@@ -1497,8 +1548,14 @@ fn render_rpc_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
 }
 
 fn render_compaction_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
+    // Use phase-appropriate title, counters, and colors
+    let (title, done, total, done_color) = match data.phase {
+        Phase::Seal => (" SEALING ", data.sealed_shards, data.total_to_seal, Color::Green),
+        _ => (" COMPACTION ", data.compacted_shards, data.total_shards, Color::Magenta),
+    };
+
     let block = Block::default()
-        .title(" COMPACTION ")
+        .title(title)
         .title_style(Style::default().fg(Color::White).bold())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -1510,26 +1567,23 @@ fn render_compaction_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     buf.set_string(
         inner.x + 11,
         inner.y,
-        &format!("{:>6}", data.compacted_shards),
-        Style::default().fg(Color::Magenta),
+        &format!("{:>6}", done),
+        Style::default().fg(done_color),
     );
 
     buf.set_string(inner.x + 1, inner.y + 1, "Current", Style::default().fg(Color::Gray));
-    if data.compacted_shards < data.total_shards {
+    if done < total {
         buf.set_string(
             inner.x + 11,
             inner.y + 1,
-            &format!("{:>6}", data.current_shard),
+            &format!("{:>6}", done),
             Style::default().fg(Color::Yellow),
         );
     } else {
         buf.set_string(inner.x + 11, inner.y + 1, "     -", Style::default().fg(Color::DarkGray));
     }
 
-    let pending = data
-        .total_shards
-        .saturating_sub(data.compacted_shards)
-        .saturating_sub(1);
+    let pending = total.saturating_sub(done).saturating_sub(1);
     buf.set_string(inner.x + 1, inner.y + 2, "Pending", Style::default().fg(Color::Gray));
     buf.set_string(
         inner.x + 11,
