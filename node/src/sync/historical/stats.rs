@@ -25,6 +25,18 @@ pub struct PeerSummary {
     pub peer_failures_total: u64,
 }
 
+/// Input parameters for generating a summary.
+#[derive(Debug, Clone)]
+pub struct SummaryInput {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub head_at_startup: u64,
+    pub rollback_window_applied: bool,
+    pub peers_used: u64,
+    pub logs_total: u64,
+    pub storage_stats: Option<StorageDiskStats>,
+}
+
 const SAMPLE_LIMIT: usize = 100_000;
 
 fn push_sample(samples: &Mutex<Vec<u64>>, value: u64) {
@@ -240,16 +252,20 @@ impl IngestBenchStats {
         self.logs_total.fetch_add(count, Ordering::SeqCst);
     }
 
-    pub fn summary(
-        &self,
-        range_start: u64,
-        range_end: u64,
-        head_at_startup: u64,
-        rollback_window_applied: bool,
-        peers_used: u64,
-        logs_total: u64,
-        storage_stats: Option<StorageDiskStats>,
-    ) -> IngestBenchSummary {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "summary builds multiple nested structs with computed statistics"
+    )]
+    pub fn summary(&self, input: SummaryInput) -> IngestBenchSummary {
+        let SummaryInput {
+            range_start,
+            range_end,
+            head_at_startup,
+            rollback_window_applied,
+            peers_used,
+            logs_total,
+            storage_stats,
+        } = input;
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         let fetch_blocks = self.fetch_blocks.load(Ordering::SeqCst);
         let fetch_failed_blocks = self.fetch_failed_blocks.load(Ordering::SeqCst);

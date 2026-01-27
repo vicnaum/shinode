@@ -19,9 +19,6 @@ mod state;
 
 pub use bars::{format_startup_segment, BAR_WIDTH};
 pub use progress::{spawn_progress_updater, UIController};
-// Used in tests
-#[expect(unused_imports, reason = "re-exported for test modules")]
-pub use progress::format_progress_message;
 
 use std::io::Write;
 

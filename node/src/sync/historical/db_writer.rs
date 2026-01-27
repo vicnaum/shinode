@@ -17,28 +17,44 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 /// Tracks remaining blocks per shard for compaction scheduling.
-type ShardRemainingTracker = Arc<Mutex<HashMap<u64, usize>>>;
+pub type ShardRemainingTracker = Arc<Mutex<HashMap<u64, usize>>>;
+
+/// Full configuration for the DB writer task.
+pub struct DbWriterParams {
+    pub config: DbWriteConfig,
+    pub mode: DbWriteMode,
+    pub bench: Option<Arc<IngestBenchStats>>,
+    pub events: Option<Arc<BenchEventLogger>>,
+    pub progress_stats: Option<Arc<SyncProgressStats>>,
+    pub remaining_per_shard: Option<ShardRemainingTracker>,
+    pub follow_expected_start: Option<u64>,
+}
+
+/// Shared context for fast-sync flush operations (immutable parts).
+struct FlushContext<'a> {
+    storage: &'a Arc<Storage>,
+    bench: Option<&'a Arc<IngestBenchStats>>,
+    events: Option<&'a Arc<BenchEventLogger>>,
+    remaining_per_shard: Option<&'a ShardRemainingTracker>,
+    progress_stats: Option<&'a Arc<SyncProgressStats>>,
+    semaphore: &'a Arc<Semaphore>,
+}
 
 async fn flush_fast_sync_buffer(
-    storage: &Arc<Storage>,
+    ctx: &FlushContext<'_>,
     buffer: &mut Vec<BlockBundle>,
-    bench: Option<&Arc<IngestBenchStats>>,
-    events: Option<&Arc<BenchEventLogger>>,
-    remaining_per_shard: Option<&ShardRemainingTracker>,
-    progress_stats: Option<&Arc<SyncProgressStats>>,
     compactions: &mut Vec<JoinHandle<Result<()>>>,
-    semaphore: &Arc<Semaphore>,
 ) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
     }
 
-    let bytes = if bench.is_some() || events.is_some() {
+    let bytes = if ctx.bench.is_some() || ctx.events.is_some() {
         Some(db_bytes_for_bundles(buffer)?)
     } else {
         None
     };
-    if let Some(events) = events.as_ref() {
+    if let Some(events) = ctx.events.as_ref() {
         let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
         events.record(BenchEvent::DbFlushStart {
             blocks: buffer.len() as u64,
@@ -47,14 +63,14 @@ async fn flush_fast_sync_buffer(
     }
 
     let started = Instant::now();
-    let written_blocks = storage.write_block_bundles_wal(buffer)?;
-    if let Some(bench) = bench.as_ref() {
+    let written_blocks = ctx.storage.write_block_bundles_wal(buffer)?;
+    if let Some(bench) = ctx.bench.as_ref() {
         bench.record_db_write(buffer.len() as u64, started.elapsed());
         if let Some(bytes) = bytes.as_ref() {
             bench.record_db_write_bytes(*bytes);
         }
     }
-    if let Some(events) = events.as_ref() {
+    if let Some(events) = ctx.events.as_ref() {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let bytes_total = bytes.as_ref().map_or(0, super::stats::DbWriteByteTotals::total);
         events.record(BenchEvent::DbFlushEnd {
@@ -64,11 +80,11 @@ async fn flush_fast_sync_buffer(
         });
     }
 
-    if let Some(remaining) = remaining_per_shard.as_ref() {
+    if let Some(remaining) = ctx.remaining_per_shard.as_ref() {
         let mut shards_to_compact = Vec::new();
         let mut guard = remaining.lock().await;
         for number in written_blocks {
-            let shard_start = (number / storage.shard_size()) * storage.shard_size();
+            let shard_start = (number / ctx.storage.shard_size()) * ctx.storage.shard_size();
             if let Some(count) = guard.get_mut(&shard_start) {
                 if *count > 0 {
                     *count -= 1;
@@ -81,10 +97,10 @@ async fn flush_fast_sync_buffer(
         drop(guard);
 
         for shard_start in shards_to_compact {
-            let storage = Arc::clone(storage);
-            let semaphore = Arc::clone(semaphore);
-            let events = events.cloned();
-            let progress_stats = progress_stats.cloned();
+            let storage = Arc::clone(ctx.storage);
+            let semaphore = Arc::clone(ctx.semaphore);
+            let events = ctx.events.cloned();
+            let progress_stats = ctx.progress_stats.cloned();
             compactions.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
                 if let Some(events) = events.as_ref() {
@@ -146,17 +162,25 @@ pub struct DbWriterFinalizeStats {
     pub seal_completed_ms: u64,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "async select loop with finalization logic is clearer inline"
+)]
 pub async fn run_db_writer(
     storage: Arc<Storage>,
-    mut rx: mpsc::Receiver<DbWriterMessage>,
-    config: DbWriteConfig,
-    bench: Option<Arc<IngestBenchStats>>,
-    events: Option<Arc<BenchEventLogger>>,
-    mode: DbWriteMode,
-    progress_stats: Option<Arc<SyncProgressStats>>,
-    remaining_per_shard: Option<ShardRemainingTracker>,
-    follow_expected_start: Option<u64>,
+    rx: mpsc::Receiver<DbWriterMessage>,
+    params: DbWriterParams,
 ) -> Result<DbWriterFinalizeStats> {
+    let DbWriterParams {
+        config,
+        mode,
+        bench,
+        events,
+        progress_stats,
+        remaining_per_shard,
+        follow_expected_start,
+    } = params;
+    let mut rx = rx;
     let mut interval = config.flush_interval.map(tokio::time::interval);
     // Compaction is a large, bursty workload (reads WAL + writes new segment files).
     // Serializing it avoids compaction fan-out doubling peak memory/IO.
@@ -213,6 +237,15 @@ pub async fn run_db_writer(
         Ok(())
     };
 
+    let flush_ctx = FlushContext {
+        storage: &storage,
+        bench: bench.as_ref(),
+        events: events.as_ref(),
+        remaining_per_shard: remaining_per_shard.as_ref(),
+        progress_stats: progress_stats.as_ref(),
+        semaphore: &semaphore,
+    };
+
     loop {
         tokio::select! {
             maybe_msg = rx.recv() => {
@@ -221,17 +254,7 @@ pub async fn run_db_writer(
                         if mode == DbWriteMode::FastSync {
                             buffer.push(block);
                             if buffer.len() >= config.batch_blocks {
-                                flush_fast_sync_buffer(
-                                    &storage,
-                                    &mut buffer,
-                                    bench.as_ref(),
-                                    events.as_ref(),
-                                    remaining_per_shard.as_ref(),
-                                    progress_stats.as_ref(),
-                                    &mut compactions,
-                                    &semaphore,
-                                )
-                                .await?;
+                                flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                             }
                         } else {
                             let number = block.number;
@@ -247,17 +270,7 @@ pub async fn run_db_writer(
                     }
                     Some(DbWriterMessage::Finalize) | None => {
                         if mode == DbWriteMode::FastSync {
-                            flush_fast_sync_buffer(
-                                &storage,
-                                &mut buffer,
-                                bench.as_ref(),
-                                events.as_ref(),
-                                remaining_per_shard.as_ref(),
-                                progress_stats.as_ref(),
-                                &mut compactions,
-                                &semaphore,
-                            )
-                            .await?;
+                            flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                         } else {
                             while let Some(bundle) = follow_buffer.remove(&follow_expected) {
                                 write_follow_bundle(bundle)?;
@@ -274,17 +287,7 @@ pub async fn run_db_writer(
                 }
             }, if interval.is_some() => {
                 if mode == DbWriteMode::FastSync {
-                    flush_fast_sync_buffer(
-                        &storage,
-                        &mut buffer,
-                    bench.as_ref(),
-                    events.as_ref(),
-                    remaining_per_shard.as_ref(),
-                    progress_stats.as_ref(),
-                    &mut compactions,
-                    &semaphore,
-                )
-                .await?;
+                    flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                 }
             }
             _ = gauge_tick.tick() => {
@@ -478,13 +481,15 @@ mod tests {
         let handle = tokio::spawn(run_db_writer(
             Arc::clone(&storage),
             rx,
-            DbWriteConfig::new(1, None),
-            None,
-            None,
-            DbWriteMode::FastSync,
-            None,
-            None,
-            None,
+            DbWriterParams {
+                config: DbWriteConfig::new(1, None),
+                mode: DbWriteMode::FastSync,
+                bench: None,
+                events: None,
+                progress_stats: None,
+                remaining_per_shard: None,
+                follow_expected_start: None,
+            },
         ));
 
         tx.send(DbWriterMessage::Block(bundle_with_number(2)))

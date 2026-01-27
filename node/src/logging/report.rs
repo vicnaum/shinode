@@ -300,6 +300,10 @@ pub fn finalize_log_files(
 /// Generate and save run report. Returns the base_name used for file naming.
 /// Report is saved only if `config.log_report` is true.
 /// Summary is printed to console only if `config.verbosity >= 1`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "report generation has sequential formatting steps that are clearer inline"
+)]
 pub async fn generate_run_report(
     run_context: &RunContext,
     config: &NodeConfig,

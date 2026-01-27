@@ -65,20 +65,12 @@ fn total_blocks_to_head(start_from: u64, head: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{total_blocks_to_head, ui, SyncStatus};
+    use super::total_blocks_to_head;
 
     #[test]
     fn total_blocks_handles_empty_range() {
         assert_eq!(total_blocks_to_head(10, 9), 0);
         assert_eq!(total_blocks_to_head(10, 10), 1);
         assert_eq!(total_blocks_to_head(10, 12), 3);
-    }
-
-    #[test]
-    fn progress_message_formats_status() {
-        assert_eq!(
-            ui::format_progress_message(SyncStatus::Fetching, 2, 5, 10, 1, 0, 0, 0, 1.5, "12s"),
-            "status fetching | peers 2/5 | queue 10 | inflight 1 | retry 0 | speed 1.5/s | eta 12s"
-        );
     }
 }

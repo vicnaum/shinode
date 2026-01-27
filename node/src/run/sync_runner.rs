@@ -13,7 +13,8 @@ use crate::rpc;
 use crate::storage::Storage;
 use crate::sync::historical::{
     build_peer_health_tracker, run_follow_loop, run_ingest_pipeline, BenchEventLogger,
-    IngestBenchStats, IngestPipelineOutcome, MissingBlocks, PeerHealthTracker,
+    IngestBenchStats, IngestPipelineConfig, IngestPipelineOutcome, IngestPipelineTrackers,
+    MissingBlocks, PeerHealthTracker, SummaryInput,
 };
 use crate::sync::{ProgressReporter, SyncProgressStats};
 use eyre::Result;
@@ -41,6 +42,10 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
 }
 
 /// Run the main sync process.
+#[expect(
+    clippy::too_many_lines,
+    reason = "main sync orchestration has sequential setup phases that are clearer inline"
+)]
 pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Validate and normalize chunk sizes
     let chunk_max = config
@@ -253,19 +258,23 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     let outcome = run_ingest_pipeline(
         Arc::clone(&storage),
         Arc::clone(&session.pool),
-        &config,
-        range.clone(),
+        IngestPipelineConfig {
+            config: &config,
+            range: range.clone(),
+            head_at_startup,
+            db_mode_override: None,
+            head_cap_override: None,
+            stop_rx: Some(stop_rx),
+            tail: tail_config,
+        },
         blocks,
-        head_at_startup,
-        progress_ref,
-        progress_stats.clone(),
-        Some(Arc::clone(&bench)),
-        None,
-        None,
+        IngestPipelineTrackers {
+            progress: progress_ref,
+            stats: progress_stats.clone(),
+            bench: Some(Arc::clone(&bench)),
+            events: events.clone(),
+        },
         Arc::clone(&peer_health),
-        events.clone(),
-        Some(stop_rx),
-        tail_config,
     )
     .await?;
 
@@ -282,19 +291,25 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Handle follow mode or finalization
     if follow_after && !shutdown_requested.load(Ordering::SeqCst) {
         run_follow_mode(
-            &storage,
-            &session,
-            &config,
-            &range,
-            head_at_startup,
-            &peer_health,
-            &bench,
-            &events,
-            &progress,
-            progress_stats.clone(),
-            &mut follow_resources,
-            run_context.as_ref(),
-            &mut tracing_guards,
+            FollowModeConfig {
+                storage: &storage,
+                session: &session,
+                config: &config,
+                range: &range,
+                head_at_startup,
+                peer_health: &peer_health,
+            },
+            FollowModeTrackers {
+                bench: &bench,
+                events: &events,
+                progress: &progress,
+                progress_stats: progress_stats.clone(),
+            },
+            FollowModeState {
+                follow_resources: &mut follow_resources,
+                run_context: run_context.as_ref(),
+                tracing_guards: &mut tracing_guards,
+            },
             &outcome,
         )
         .await?;
@@ -366,23 +381,60 @@ fn log_follow_transition(
     );
 }
 
-#[expect(clippy::ref_option, reason = "consistent signature with caller-owned Options")]
-async fn run_follow_mode(
-    storage: &Arc<Storage>,
-    session: &p2p::NetworkSession,
-    config: &NodeConfig,
-    range: &RangeInclusive<u64>,
+/// Configuration for follow mode execution.
+struct FollowModeConfig<'a> {
+    storage: &'a Arc<Storage>,
+    session: &'a p2p::NetworkSession,
+    config: &'a NodeConfig,
+    range: &'a RangeInclusive<u64>,
     head_at_startup: u64,
-    peer_health: &Arc<PeerHealthTracker>,
-    bench: &Arc<IngestBenchStats>,
-    events: &Option<Arc<BenchEventLogger>>,
-    progress: &Option<Arc<IngestProgress>>,
+    peer_health: &'a Arc<PeerHealthTracker>,
+}
+
+/// Trackers and optional logging for follow mode.
+struct FollowModeTrackers<'a> {
+    bench: &'a Arc<IngestBenchStats>,
+    events: &'a Option<Arc<BenchEventLogger>>,
+    progress: &'a Option<Arc<IngestProgress>>,
     progress_stats: Option<Arc<SyncProgressStats>>,
-    follow_resources: &mut FollowModeResources,
-    run_context: Option<&crate::logging::RunContext>,
-    tracing_guards: &mut TracingGuards,
+}
+
+/// Mutable state for follow mode.
+struct FollowModeState<'a> {
+    follow_resources: &'a mut FollowModeResources,
+    run_context: Option<&'a crate::logging::RunContext>,
+    tracing_guards: &'a mut TracingGuards,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "follow mode orchestration with select loop is clearer inline"
+)]
+async fn run_follow_mode(
+    cfg: FollowModeConfig<'_>,
+    trackers: FollowModeTrackers<'_>,
+    state: FollowModeState<'_>,
     outcome: &IngestPipelineOutcome,
 ) -> Result<()> {
+    let FollowModeConfig {
+        storage,
+        session,
+        config,
+        range,
+        head_at_startup,
+        peer_health,
+    } = cfg;
+    let FollowModeTrackers {
+        bench,
+        events,
+        progress,
+        progress_stats,
+    } = trackers;
+    let FollowModeState {
+        follow_resources,
+        run_context,
+        tracing_guards,
+    } = state;
     info!("fast-sync complete; switching to follow mode");
 
     // Generate report at fast-sync completion
@@ -399,15 +451,15 @@ async fn run_follow_mode(
         }
     };
 
-    let summary = bench.summary(
-        *range.start(),
-        *range.end(),
+    let summary = bench.summary(SummaryInput {
+        range_start: *range.start(),
+        range_end: *range.end(),
         head_at_startup,
-        config.rollback_window > 0,
-        session.pool.len() as u64,
+        rollback_window_applied: config.rollback_window > 0,
+        peers_used: session.pool.len() as u64,
         logs_total,
         storage_stats,
-    );
+    });
 
     let report_base_name = if let Some(run_ctx) = run_context {
         match crate::logging::generate_run_report(

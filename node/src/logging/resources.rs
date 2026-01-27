@@ -339,6 +339,10 @@ pub fn spawn_resource_logger(
 // ============================================================================
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "resource monitoring loop with OS-specific metric collection is clearer inline"
+)]
 pub fn spawn_resource_logger(
     stats: Option<Arc<SyncProgressStats>>,
     events: Option<Arc<BenchEventLogger>>,

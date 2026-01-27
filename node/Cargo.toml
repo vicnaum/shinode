@@ -79,10 +79,8 @@ exit = "deny"                     # Libraries shouldn't exit
 # These are too noisy for most projects
 doc_markdown = "allow"                  # cosmetic doc comment formatting
 similar_names = "allow"                 # intentional patterns like stop_tx_head/stop_tx_tail
-too_many_lines = "allow"                # TODO: refactor 10 functions (800+ lines max)
 single_match_else = "allow"             # match vs if-let is stylistic
 unnecessary_wraps = "allow"             # Result for API consistency with error-returning interfaces
-too_many_arguments = "allow"            # TODO: create config structs for 6 functions
 struct_field_names = "allow"            # timing structs use _us suffix for units
 large_futures = "allow"                 # would require boxing futures
 

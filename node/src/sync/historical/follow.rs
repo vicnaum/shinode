@@ -12,7 +12,10 @@ use tokio::time::{sleep, Duration};
 
 use super::db_writer::DbWriteMode;
 use super::reorg::{find_common_ancestor, preflight_reorg, ReorgCheck};
-use super::{run_ingest_pipeline, IngestPipelineOutcome, PeerHealthTracker, TailIngestConfig};
+use super::{
+    run_ingest_pipeline, IngestPipelineConfig, IngestPipelineOutcome, IngestPipelineTrackers,
+    PeerHealthTracker, TailIngestConfig,
+};
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -73,6 +76,10 @@ async fn dump_follow_debug(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "follow loop coordinates reorg detection, head tracking, and ingest pipeline"
+)]
 pub async fn run_follow_loop(
     storage: Arc<Storage>,
     pool: Arc<PeerPool>,
@@ -437,19 +444,23 @@ pub async fn run_follow_loop(
         let outcome = run_ingest_pipeline(
             Arc::clone(&storage),
             Arc::clone(&pool),
-            config,
-            range,
+            IngestPipelineConfig {
+                config,
+                range,
+                head_at_startup: observed_head,
+                db_mode_override: Some(DbWriteMode::Follow),
+                head_cap_override: None,
+                stop_rx: Some(stop_rx),
+                tail: Some(tail),
+            },
             super::MissingBlocks::Precomputed(blocks),
-            observed_head,
-            progress_ref,
-            stats.clone(),
-            None,
-            Some(DbWriteMode::Follow),
-            None,
+            IngestPipelineTrackers {
+                progress: progress_ref,
+                stats: stats.clone(),
+                bench: None,
+                events: None,
+            },
             Arc::clone(&peer_health),
-            None,
-            Some(stop_rx),
-            Some(tail),
         )
         .await?;
         let _ = stop_tx.send(true);

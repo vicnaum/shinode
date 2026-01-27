@@ -48,6 +48,105 @@ const PHASE_WRITING: &str = "writing";
 const PHASE_SWAPPING: &str = "swapping";
 const PHASE_CLEANUP: &str = "cleanup";
 
+/// Container for raw segment readers used during compaction.
+struct ShardRawSegments {
+    headers: SegmentRawSource<SegmentHeader>,
+    tx_hashes: SegmentRawSource<SegmentHeader>,
+    tx_meta: SegmentRawSource<SegmentHeader>,
+    receipts: SegmentRawSource<SegmentHeader>,
+    sizes: SegmentRawSource<SegmentHeader>,
+}
+
+/// Container for raw segment writers used during compaction.
+struct ShardRawWriters {
+    headers: SegmentRawWriter<SegmentHeader>,
+    tx_hashes: SegmentRawWriter<SegmentHeader>,
+    tx_meta: SegmentRawWriter<SegmentHeader>,
+    receipts: SegmentRawWriter<SegmentHeader>,
+    sizes: SegmentRawWriter<SegmentHeader>,
+}
+
+impl ShardRawWriters {
+    fn finish(self) -> Result<()> {
+        self.headers.finish()?;
+        self.tx_hashes.finish()?;
+        self.tx_meta.finish()?;
+        self.receipts.finish()?;
+        self.sizes.finish()?;
+        Ok(())
+    }
+
+    fn push_empty(&mut self) -> Result<()> {
+        self.headers.push_empty()?;
+        self.tx_hashes.push_empty()?;
+        self.tx_meta.push_empty()?;
+        self.receipts.push_empty()?;
+        self.sizes.push_empty()?;
+        Ok(())
+    }
+}
+
+fn create_segment_config(
+    shard_start: u64,
+    compression: SegmentCompression,
+    existing_max_row_size: usize,
+) -> NippyJarConfig<SegmentHeader> {
+    NippyJarConfig {
+        version: 1,
+        user_header: SegmentHeader { start_block: shard_start },
+        columns: 1,
+        rows: 0,
+        compressor: segment_compressor(compression),
+        max_row_size: existing_max_row_size,
+    }
+}
+
+fn create_compaction_writers(
+    temp_dir: &Path,
+    shard_start: u64,
+    existing: Option<&ShardRawSegments>,
+) -> Result<ShardRawWriters> {
+    let headers_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::None,
+        existing.map_or(0, |s| s.headers.config().max_row_size),
+    );
+    let tx_hashes_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::None,
+        existing.map_or(0, |s| s.tx_hashes.config().max_row_size),
+    );
+    let tx_meta_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::Zstd {
+            use_dict: false,
+            max_dict_size: ZSTD_DICT_MAX_SIZE,
+        },
+        existing.map_or(0, |s| s.tx_meta.config().max_row_size),
+    );
+    let receipts_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::Zstd {
+            use_dict: false,
+            max_dict_size: ZSTD_DICT_MAX_SIZE,
+        },
+        existing.map_or(0, |s| s.receipts.config().max_row_size),
+    );
+    let sizes_cfg = create_segment_config(
+        shard_start,
+        SegmentCompression::None,
+        existing.map_or(0, |s| s.sizes.config().max_row_size),
+    );
+
+    Ok(ShardRawWriters {
+        headers: SegmentRawWriter::create(&temp_dir.join("headers"), headers_cfg)?,
+        tx_hashes: SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?,
+        tx_meta: SegmentRawWriter::create(&temp_dir.join("tx_meta"), tx_meta_cfg)?,
+        receipts: SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?,
+        sizes: SegmentRawWriter::create(&temp_dir.join("block_sizes"), sizes_cfg)?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
     schema_version: u64,
@@ -816,6 +915,10 @@ impl Storage {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compaction has atomic phases (write/swap/cleanup) that must stay in sync"
+    )]
     pub fn compact_shard(&self, shard_start: u64) -> Result<()> {
         let shard = self.get_shard(shard_start)?;
         let Some(shard) = shard else {
@@ -897,59 +1000,8 @@ impl Storage {
 
         let total_rows = max_offset.saturating_add(1);
 
-        // Create segment configs
-        let headers_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing.as_ref().map_or(0, |s| s.headers.config().max_row_size),
-        };
-        let tx_hashes_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing.as_ref().map_or(0, |s| s.tx_hashes.config().max_row_size),
-        };
-        let tx_meta_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::Zstd {
-                use_dict: false,
-                max_dict_size: ZSTD_DICT_MAX_SIZE,
-            }),
-            max_row_size: existing.as_ref().map_or(0, |s| s.tx_meta.config().max_row_size),
-        };
-        let receipts_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::Zstd {
-                use_dict: false,
-                max_dict_size: ZSTD_DICT_MAX_SIZE,
-            }),
-            max_row_size: existing.as_ref().map_or(0, |s| s.receipts.config().max_row_size),
-        };
-        let sizes_cfg = NippyJarConfig {
-            version: 1,
-            user_header: SegmentHeader { start_block: shard_start },
-            columns: 1,
-            rows: 0,
-            compressor: segment_compressor(SegmentCompression::None),
-            max_row_size: existing.as_ref().map_or(0, |s| s.sizes.config().max_row_size),
-        };
-
-        let mut headers_out = SegmentRawWriter::create(&temp_dir.join("headers"), headers_cfg)?;
-        let mut tx_hashes_out = SegmentRawWriter::create(&temp_dir.join("tx_hashes"), tx_hashes_cfg)?;
-        let mut tx_meta_out = SegmentRawWriter::create(&temp_dir.join("tx_meta"), tx_meta_cfg)?;
-        let mut receipts_out = SegmentRawWriter::create(&temp_dir.join("receipts"), receipts_cfg)?;
-        let mut sizes_out = SegmentRawWriter::create(&temp_dir.join("block_sizes"), sizes_cfg)?;
+        // Create segment writers
+        let mut writers = create_compaction_writers(&temp_dir, shard_start, existing.as_ref())?;
 
         // Iterate over all rows, checking WAL and existing segment for actual data
         // DO NOT use the old bitset - it may be out of sync
@@ -983,11 +1035,7 @@ impl Storage {
 
             if wal_data.is_none() && !has_existing_data {
                 // No data for this row - write empty
-                headers_out.push_empty()?;
-                tx_hashes_out.push_empty()?;
-                tx_meta_out.push_empty()?;
-                receipts_out.push_empty()?;
-                sizes_out.push_empty()?;
+                writers.push_empty()?;
                 continue;
             }
 
@@ -1008,11 +1056,11 @@ impl Storage {
                 let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
                 let size_bytes = &wal.mmap[slices.size.as_range()];
 
-                headers_out.push_bytes(header_bytes, slices.header.len())?;
-                tx_hashes_out.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
-                tx_meta_out.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
-                receipts_out.push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
-                sizes_out.push_bytes(size_bytes, slices.size.len())?;
+                writers.headers.push_bytes(header_bytes, slices.header.len())?;
+                writers.tx_hashes.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
+                writers.tx_meta.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
+                writers.receipts.push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
+                writers.sizes.push_bytes(size_bytes, slices.size.len())?;
             } else {
                 // Copy from existing segment (we verified all fields exist above)
                 let ex = existing
@@ -1031,20 +1079,16 @@ impl Storage {
                 let size_bytes = ex.sizes.row_bytes(local_offset)?
                     .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
 
-                headers_out.push_bytes(header_bytes, header_bytes.len())?;
-                tx_hashes_out.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
+                writers.headers.push_bytes(header_bytes, header_bytes.len())?;
+                writers.tx_hashes.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
                 // For zstd segments, the bytes are already compressed
-                tx_meta_out.push_bytes(tx_meta_bytes, 0)?;
-                receipts_out.push_bytes(receipt_bytes, 0)?;
-                sizes_out.push_bytes(size_bytes, size_bytes.len())?;
+                writers.tx_meta.push_bytes(tx_meta_bytes, 0)?;
+                writers.receipts.push_bytes(receipt_bytes, 0)?;
+                writers.sizes.push_bytes(size_bytes, size_bytes.len())?;
             }
         }
 
-        headers_out.finish()?;
-        tx_hashes_out.finish()?;
-        tx_meta_out.finish()?;
-        receipts_out.finish()?;
-        sizes_out.finish()?;
+        writers.finish()?;
 
         // Write new bitset to tmp file
         new_bitset.flush(&bitset_tmp)?;
@@ -1521,14 +1565,6 @@ impl Storage {
         state.meta.content_hash_algo = "sha256".to_string();
         Ok(())
     }
-}
-
-struct ShardRawSegments {
-    headers: SegmentRawSource<SegmentHeader>,
-    tx_hashes: SegmentRawSource<SegmentHeader>,
-    tx_meta: SegmentRawSource<SegmentHeader>,
-    receipts: SegmentRawSource<SegmentHeader>,
-    sizes: SegmentRawSource<SegmentHeader>,
 }
 
 struct ShardSegments {

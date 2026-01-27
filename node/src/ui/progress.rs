@@ -216,19 +216,7 @@ impl UIController {
             "--".to_string()
         };
 
-        let peers_active = snapshot.peers_active.min(snapshot.peers_total);
-        let msg = format_progress_message(
-            snapshot.status,
-            peers_active,
-            snapshot.peers_total,
-            snapshot.queue,
-            snapshot.inflight,
-            snapshot.escalation,
-            snapshot.compactions_done,
-            snapshot.compactions_total,
-            speed,
-            &eta,
-        );
+        let msg = format_progress_message(snapshot, speed, &eta);
         bar.set_message(msg);
         bar.set_position(processed);
     }
@@ -339,31 +327,24 @@ impl UIController {
 }
 
 /// Format the progress message shown in the sync bar.
-pub fn format_progress_message(
-    status: SyncStatus,
-    peers_active: u64,
-    peers_total: u64,
-    queue: u64,
-    inflight: u64,
-    escalation: u64,
-    compactions_done: u64,
-    compactions_total: u64,
-    speed: f64,
-    eta: &str,
-) -> String {
-    let compact = if status == SyncStatus::Finalizing && compactions_total > 0 {
-        format!(" | compact {compactions_done}/{compactions_total}")
+fn format_progress_message(snapshot: &SyncProgressSnapshot, speed: f64, eta: &str) -> String {
+    let compact = if snapshot.status == SyncStatus::Finalizing && snapshot.compactions_total > 0 {
+        format!(
+            " | compact {}/{}",
+            snapshot.compactions_done, snapshot.compactions_total
+        )
     } else {
         String::new()
     };
+    let peers_active = snapshot.peers_active.min(snapshot.peers_total);
     format!(
         "status {} | peers {}/{} | queue {} | inflight {} | retry {}{} | speed {:.1}/s | eta {}",
-        status.as_str(),
+        snapshot.status.as_str(),
         peers_active,
-        peers_total,
-        queue,
-        inflight,
-        escalation,
+        snapshot.peers_total,
+        snapshot.queue,
+        snapshot.inflight,
+        snapshot.escalation,
         compact,
         speed,
         eta
@@ -411,3 +392,31 @@ pub fn spawn_progress_updater(
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::FinalizePhase;
+
+    #[test]
+    fn progress_message_formats_status() {
+        let snapshot = SyncProgressSnapshot {
+            status: SyncStatus::Fetching,
+            peers_active: 2,
+            peers_total: 5,
+            queue: 10,
+            inflight: 1,
+            escalation: 0,
+            compactions_done: 0,
+            compactions_total: 0,
+            processed: 0,
+            head_block: 0,
+            head_seen: 0,
+            fetch_complete: false,
+            finalize_phase: FinalizePhase::default(),
+        };
+        assert_eq!(
+            format_progress_message(&snapshot, 1.5, "12s"),
+            "status fetching | peers 2/5 | queue 10 | inflight 1 | retry 0 | speed 1.5/s | eta 12s"
+        );
+    }
+}

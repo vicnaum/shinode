@@ -7,7 +7,7 @@ use crate::cli::NodeConfig;
 use crate::logging::{finalize_log_files, generate_run_report, RunContext, TracingGuards};
 use crate::p2p;
 use crate::storage::Storage;
-use crate::sync::historical::{BenchEventLogger, IngestBenchStats, PeerHealthTracker};
+use crate::sync::historical::{BenchEventLogger, IngestBenchStats, PeerHealthTracker, SummaryInput};
 use reth_network_api::PeerId;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
@@ -40,15 +40,15 @@ pub async fn finalize_session(ctx: FinalizeContext<'_>, logs_total: u64) {
         }
     };
 
-    let summary = ctx.bench.summary(
-        *ctx.range.start(),
-        *ctx.range.end(),
-        ctx.head_at_startup,
-        ctx.config.rollback_window > 0,
-        ctx.network.pool.len() as u64,
+    let summary = ctx.bench.summary(SummaryInput {
+        range_start: *ctx.range.start(),
+        range_end: *ctx.range.end(),
+        head_at_startup: ctx.head_at_startup,
+        rollback_window_applied: ctx.config.rollback_window > 0,
+        peers_used: ctx.network.pool.len() as u64,
         logs_total,
         storage_stats,
-    );
+    });
 
     // Generate report if run_context exists
     let base_name = if let Some(run_ctx) = ctx.run_context {
