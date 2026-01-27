@@ -181,6 +181,7 @@ pub struct IngestPipelineTrackers {
 
 #[expect(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "pipeline orchestrates fetching, processing, and DB writes with complex state machine"
 )]
 pub async fn run_ingest_pipeline(

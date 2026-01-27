@@ -222,8 +222,19 @@ pub fn write_run_report(output_dir: &Path, base_name: &str, report: &RunReport) 
     Ok(path)
 }
 
+/// Rename a temporary log file to its final path.
+#[expect(clippy::cognitive_complexity, reason = "simple if-else with logging")]
+fn rename_log_file(tmp_path: &Path, final_path: &Path, log_type: &str) {
+    if let Err(err) = fs::rename(tmp_path, final_path) {
+        warn!(error = %err, log_type, "failed to rename log file");
+    } else {
+        info!(path = %final_path.display(), log_type, "log file written");
+    }
+}
+
 /// Finalize log files by renaming tmp files to final names.
 /// Called on any clean exit (Ctrl-C or natural completion).
+#[expect(clippy::cognitive_complexity, reason = "handles 4 log types with optional loggers")]
 pub fn finalize_log_files(
     run_context: &RunContext,
     base_name: &str,
@@ -241,11 +252,7 @@ pub fn finalize_log_files(
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.events.jsonl"));
-            if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename event log");
-            } else {
-                info!(path = %final_path.display(), "event log written");
-            }
+            rename_log_file(tmp_path, &final_path, "events");
         }
     }
 
@@ -258,11 +265,7 @@ pub fn finalize_log_files(
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.logs.jsonl"));
-            if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename json log");
-            } else {
-                info!(path = %final_path.display(), "json log written");
-            }
+            rename_log_file(tmp_path, &final_path, "logs");
         }
     }
 
@@ -275,11 +278,7 @@ pub fn finalize_log_files(
             let final_path = run_context
                 .output_dir
                 .join(format!("{base_name}.resources.jsonl"));
-            if let Err(err) = fs::rename(tmp_path, &final_path) {
-                warn!(error = %err, "failed to rename resources log");
-            } else {
-                info!(path = %final_path.display(), "resources log written");
-            }
+            rename_log_file(tmp_path, &final_path, "resources");
         }
     }
 
@@ -289,11 +288,7 @@ pub fn finalize_log_files(
             .output_dir
             .join(format!("{base_name}.trace.json"));
         drop(chrome_guard.take());
-        if let Err(err) = fs::rename(tmp_path, &final_path) {
-            warn!(error = %err, "failed to rename trace");
-        } else {
-            info!(path = %final_path.display(), "trace written");
-        }
+        rename_log_file(tmp_path, &final_path, "trace");
     }
 }
 

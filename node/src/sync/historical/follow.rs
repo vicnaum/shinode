@@ -27,6 +27,7 @@ const HEAD_PROBE_PEERS: usize = 3;
 const HEAD_PROBE_LIMIT: usize = 1024;
 const REORG_PROBE_PEERS: usize = 3;
 
+#[expect(clippy::cognitive_complexity, reason = "debug dump logs multiple subsystems")]
 async fn dump_follow_debug(
     storage: &Storage,
     pool: &PeerPool,
@@ -78,6 +79,7 @@ async fn dump_follow_debug(
 
 #[expect(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "follow loop coordinates reorg detection, head tracking, and ingest pipeline"
 )]
 pub async fn run_follow_loop(

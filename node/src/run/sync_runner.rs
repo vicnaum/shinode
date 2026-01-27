@@ -44,6 +44,7 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
 /// Run the main sync process.
 #[expect(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "main sync orchestration has sequential setup phases that are clearer inline"
 )]
 pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
@@ -408,6 +409,7 @@ struct FollowModeState<'a> {
 
 #[expect(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "follow mode orchestration with select loop is clearer inline"
 )]
 async fn run_follow_mode(

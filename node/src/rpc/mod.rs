@@ -94,7 +94,8 @@ pub async fn start(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "RPC module setup registers multiple methods; splitting would fragment the API surface"
+    clippy::cognitive_complexity,
+    reason = "RPC module setup registers multiple methods with parameter validation"
 )]
 pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
     let mut module = RpcModule::new(ctx);

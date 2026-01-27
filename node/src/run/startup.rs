@@ -76,6 +76,7 @@ pub fn build_run_context(config: &NodeConfig, argv: Vec<String>) -> Option<RunCo
 }
 
 /// Initialize storage with startup compaction of dirty shards.
+#[expect(clippy::cognitive_complexity, reason = "storage init with optional compaction")]
 pub async fn init_storage(config: &NodeConfig) -> Result<Arc<Storage>> {
     ui::print_status_bar("Opening storage...");
     let storage = Arc::new(Storage::open(config)?);
@@ -103,6 +104,7 @@ pub async fn init_storage(config: &NodeConfig) -> Result<Arc<Storage>> {
 }
 
 /// Connect to the P2P network.
+#[expect(clippy::cognitive_complexity, reason = "P2P connection with status updates")]
 pub async fn connect_p2p(storage: Arc<Storage>) -> Result<p2p::NetworkSession> {
     ui::print_status_bar("Connecting to P2P network...");
     info!("starting p2p network");

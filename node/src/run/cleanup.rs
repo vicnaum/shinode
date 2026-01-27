@@ -30,6 +30,7 @@ pub struct FinalizeContext<'a> {
 /// Single function replacing 3 duplicated cleanup paths.
 ///
 /// This generates the run report (if enabled), finalizes log files, and flushes the peer cache.
+#[expect(clippy::cognitive_complexity, reason = "cleanup orchestrates report, logs, and cache")]
 pub async fn finalize_session(ctx: FinalizeContext<'_>, logs_total: u64) {
     // Build summary from bench stats
     let storage_stats = match ctx.storage.disk_usage() {
@@ -115,6 +116,7 @@ async fn persist_peer_limits(storage: &Storage, peer_health: &PeerHealthTracker)
 }
 
 /// Flush peer cache with batch limits.
+#[expect(clippy::cognitive_complexity, reason = "cache flush with health snapshot")]
 pub async fn flush_peer_cache_with_limits(
     session: &p2p::NetworkSession,
     storage: &Storage,

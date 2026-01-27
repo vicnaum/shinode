@@ -55,6 +55,7 @@ impl Drop for ActiveFetchTaskGuard {
 }
 
 /// Execute a single fetch task for a batch of blocks from a peer.
+#[expect(clippy::cognitive_complexity, reason = "fetch task with timeout handling and stats")]
 pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let FetchTaskParams {
         peer,
@@ -125,6 +126,7 @@ pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let _ = ctx.ready_tx.send(peer);
 }
 
+#[expect(clippy::cognitive_complexity, reason = "timeout handling with logging and stats")]
 async fn handle_fetch_timeout(
     ctx: &FetchTaskContext,
     peer: &NetworkPeer,
@@ -187,7 +189,7 @@ async fn handle_fetch_timeout(
     let _ = ctx.ready_tx.send(peer.clone());
 }
 
-#[expect(clippy::too_many_lines, reason = "handles success path with detailed event recording and error tracking")]
+#[expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "handles success path with detailed event recording and error tracking")]
 async fn handle_fetch_success(
     ctx: &FetchTaskContext,
     peer: &NetworkPeer,

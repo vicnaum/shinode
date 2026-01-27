@@ -72,6 +72,9 @@ print_stderr = "deny"
 # === ASYNC SAFETY ===
 await_holding_lock = "deny"       # Prevents deadlocks
 
+# === COMPLEXITY ===
+cognitive_complexity = "warn"     # Flags deeply nested/branching functions
+
 # === PROCESS SAFETY ===
 exit = "deny"                     # Libraries shouldn't exit
 

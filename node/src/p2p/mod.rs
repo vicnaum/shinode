@@ -225,6 +225,7 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
 }
 
 impl NetworkSession {
+    #[expect(clippy::cognitive_complexity, reason = "cache flush with error handling for each peer")]
     pub fn flush_peer_cache(&self) -> Result<()> {
         let Some(cache) = self.peer_cache.as_ref() else {
             return Ok(());
@@ -396,6 +397,7 @@ fn spawn_peer_discovery_watcher(
     });
 }
 
+#[expect(clippy::cognitive_complexity, reason = "cache seeding with validation for each peer")]
 fn seed_peer_cache(handle: &NetworkHandle<EthNetworkPrimitives>, storage: &Storage) -> Result<()> {
     let ttl_ms = Duration::from_secs(PEER_CACHE_TTL_DAYS * 24 * 60 * 60).as_millis() as u64;
     let expire_before_ms = now_ms().saturating_sub(ttl_ms);

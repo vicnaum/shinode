@@ -164,7 +164,8 @@ pub struct DbWriterFinalizeStats {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "async select loop with finalization logic is clearer inline"
+    clippy::cognitive_complexity,
+    reason = "async select loop with mode branching and finalization logic"
 )]
 pub async fn run_db_writer(
     storage: Arc<Storage>,

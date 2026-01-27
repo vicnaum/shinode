@@ -425,6 +425,7 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
+    #[expect(clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
     pub fn open(config: &NodeConfig) -> Result<Self> {
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
         let peer_cache_dir = config
@@ -917,6 +918,7 @@ impl Storage {
 
     #[expect(
         clippy::too_many_lines,
+        clippy::cognitive_complexity,
         reason = "compaction has atomic phases (write/swap/cleanup) that must stay in sync"
     )]
     pub fn compact_shard(&self, shard_start: u64) -> Result<()> {
@@ -1907,6 +1909,7 @@ impl RepairReport {
 
 /// Recover a shard from an interrupted compaction based on its phase.
 /// Returns what kind of recovery was performed (for UI/logging).
+#[expect(clippy::cognitive_complexity, reason = "recovery handles multiple interrupted states")]
 fn recover_shard(shard_dir: &Path, meta: &mut ShardMeta) -> Result<ShardRecoveryResult> {
     let sorted = sorted_dir(shard_dir);
     let backup = shard_dir.join("sorted.old");
