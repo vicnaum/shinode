@@ -10,7 +10,7 @@ mod json;
 mod report;
 mod resources;
 
-pub use json::{JsonLogFilter, JsonLogLayer, JsonLogWriter, LOG_BUFFER};
+pub use json::{JsonLogFilter, JsonLogLayer, JsonLogWriter, TuiLogBuffer, TuiLogLayer, LOG_BUFFER};
 pub use report::{finalize_log_files, generate_run_report, run_timestamp_utc, RunContext};
 pub use resources::spawn_resource_logger;
 #[cfg(unix)]
@@ -30,6 +30,8 @@ pub struct TracingGuards {
     pub chrome_guard: Option<tracing_chrome::FlushGuard>,
     pub log_writer: Option<Arc<JsonLogWriter>>,
     pub resources_writer: Option<Arc<JsonLogWriter>>,
+    /// Shared buffer for TUI log capture (only present when TUI mode is active).
+    pub tui_log_buffer: Option<Arc<TuiLogBuffer>>,
 }
 
 /// Initialize the tracing subscriber with optional Chrome trace and JSON logging.
@@ -55,15 +57,25 @@ pub fn init_tracing(
     });
 
     // When TUI mode is active, suppress stdout logging to avoid corrupting display
-    let fmt_layer = if tui_mode {
-        None
+    // Instead, capture logs to a shared buffer for the TUI to display
+    let (fmt_layer, tui_log_buffer) = if tui_mode {
+        let buffer = Arc::new(TuiLogBuffer::new());
+        (None, Some(buffer))
     } else {
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stdout)
-                .with_filter(log_filter),
+        (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stdout)
+                    .with_filter(log_filter),
+            ),
+            None,
         )
     };
+
+    // TUI log layer captures logs for display in the TUI
+    let tui_layer = tui_log_buffer
+        .as_ref()
+        .map(|buffer| TuiLogLayer::new(Arc::clone(buffer)));
 
     // JSON log file uses its own filter (defaults to DEBUG level).
     let json_log_filter = EnvFilter::try_new(&config.log_json_filter)
@@ -113,6 +125,7 @@ pub fn init_tracing(
         });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
+            .with(tui_layer.clone())
             .with(log_layer)
             .with(resources_layer);
         registry.with(chrome_layer.with_filter(trace_filter)).init();
@@ -128,6 +141,7 @@ pub fn init_tracing(
         });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
+            .with(tui_layer)
             .with(log_layer)
             .with(resources_layer);
         registry.init();
@@ -136,5 +150,6 @@ pub fn init_tracing(
         chrome_guard,
         log_writer,
         resources_writer,
+        tui_log_buffer,
     }
 }

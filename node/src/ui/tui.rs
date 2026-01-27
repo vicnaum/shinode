@@ -161,10 +161,11 @@ pub struct LogEntry {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "placeholder for future feature")]
 pub enum LogLevel {
+    Debug,
     Info,
     Warn,
+    Error,
 }
 
 impl TuiState {
@@ -228,6 +229,24 @@ impl TuiState {
         if self.phase == Phase::Startup {
             self.phase = Phase::Sync;
         }
+    }
+
+    /// Add a log entry from a tracing Level.
+    pub fn add_log(&mut self, level: tracing::Level, message: String) {
+        let log_level = match level {
+            tracing::Level::ERROR => LogLevel::Error,
+            tracing::Level::WARN => LogLevel::Warn,
+            tracing::Level::INFO => LogLevel::Info,
+            tracing::Level::DEBUG | tracing::Level::TRACE => LogLevel::Debug,
+        };
+        // Keep only the last 100 logs
+        if self.logs.len() >= 100 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(LogEntry {
+            message,
+            level: log_level,
+        });
     }
 
     /// Update state from a `SyncProgressSnapshot`.
@@ -1617,10 +1636,13 @@ fn render_logs_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
         return;
     }
 
-    for (i, log) in data.logs.iter().take(inner.height as usize).enumerate() {
+    // Show most recent logs first (reverse order), limited to visible height
+    for (i, log) in data.logs.iter().rev().take(inner.height as usize).enumerate() {
         let style = match log.level {
-            LogLevel::Info => Style::default().fg(Color::Gray),
+            LogLevel::Error => Style::default().fg(Color::Red),
             LogLevel::Warn => Style::default().fg(Color::Yellow),
+            LogLevel::Info => Style::default().fg(Color::Gray),
+            LogLevel::Debug => Style::default().fg(Color::DarkGray),
         };
         let truncated: String = log.message.chars().take(inner.width as usize - 1).collect();
         buf.set_string(inner.x + 1, inner.y + i as u16, &truncated, style);

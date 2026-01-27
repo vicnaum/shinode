@@ -292,6 +292,7 @@ pub fn setup_ui(
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     early_tui: Option<EarlyTui>,
+    tui_log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
 ) -> Result<UiSetup> {
     // Create event logger if enabled
     let events = if config.log_events {
@@ -341,6 +342,7 @@ pub fn setup_ui(
                 end_block,
                 shutdown_tx,
                 completion_rx,
+                tui_log_buffer,
             );
         }
 

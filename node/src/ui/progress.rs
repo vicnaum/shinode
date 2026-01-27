@@ -409,6 +409,7 @@ pub fn spawn_tui_progress_updater(
     end_block: u64,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -506,6 +507,13 @@ pub fn spawn_tui_progress_updater(
                             tui_guard.state.coverage_buckets = coverage;
                         }
                         // Note: we update the timestamp outside the lock below
+                    }
+
+                    // Drain logs from buffer and add to TUI state
+                    if let Some(buffer) = log_buffer.as_ref() {
+                        for entry in buffer.drain() {
+                            tui_guard.state.add_log(entry.level, entry.message);
+                        }
                     }
 
                     // Draw

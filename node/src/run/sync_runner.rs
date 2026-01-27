@@ -269,6 +269,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         Some(stop_tx.clone()),
         Some(completion_rx),
         early_tui,
+        tracing_guards.tui_log_buffer.clone(),
     )?;
 
     spawn_resource_logger(progress_stats.clone(), events.clone());

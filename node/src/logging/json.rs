@@ -235,3 +235,106 @@ where
         self.writer.record(record);
     }
 }
+
+// ============================================================================
+// TUI Log Capture
+// ============================================================================
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+/// Maximum number of log entries to keep in the TUI buffer.
+const TUI_LOG_BUFFER_SIZE: usize = 100;
+
+/// A single log entry for TUI display.
+#[derive(Clone, Debug)]
+pub struct TuiLogEntry {
+    pub level: tracing::Level,
+    pub message: String,
+}
+
+/// Shared buffer for TUI log capture.
+#[derive(Debug, Default)]
+pub struct TuiLogBuffer {
+    entries: Mutex<VecDeque<TuiLogEntry>>,
+}
+
+impl TuiLogBuffer {
+    /// Create a new empty buffer.
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(TUI_LOG_BUFFER_SIZE)),
+        }
+    }
+
+    /// Add a log entry, removing oldest if at capacity.
+    pub fn push(&self, entry: TuiLogEntry) {
+        let mut entries = self.entries.lock();
+        if entries.len() >= TUI_LOG_BUFFER_SIZE {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    /// Drain all entries from the buffer (returns and clears).
+    pub fn drain(&self) -> Vec<TuiLogEntry> {
+        let mut entries = self.entries.lock();
+        entries.drain(..).collect()
+    }
+
+    /// Get a snapshot of all entries (doesn't clear).
+    pub fn snapshot(&self) -> Vec<TuiLogEntry> {
+        let entries = self.entries.lock();
+        entries.iter().cloned().collect()
+    }
+}
+
+/// A tracing layer that captures logs to a shared TUI buffer.
+#[derive(Clone)]
+pub struct TuiLogLayer {
+    buffer: Arc<TuiLogBuffer>,
+}
+
+impl TuiLogLayer {
+    /// Create a new TUI log layer with the given buffer.
+    pub fn new(buffer: Arc<TuiLogBuffer>) -> Self {
+        Self { buffer }
+    }
+}
+
+impl<S> Layer<S> for TuiLogLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let meta = event.metadata();
+        let level = *meta.level();
+
+        // Skip TRACE level to reduce noise
+        if level == tracing::Level::TRACE {
+            return;
+        }
+
+        let mut visitor = JsonLogVisitor::default();
+        event.record(&mut visitor);
+
+        // Build message from visitor fields
+        let message = visitor
+            .fields
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                // Fallback: use target and first field
+                let target = meta.target();
+                let short_target = target.rsplit("::").next().unwrap_or(target);
+                if let Some((key, value)) = visitor.fields.iter().next() {
+                    format!("{}: {}={}", short_target, key, value)
+                } else {
+                    short_target.to_string()
+                }
+            });
+
+        self.buffer.push(TuiLogEntry { level, message });
+    }
+}
