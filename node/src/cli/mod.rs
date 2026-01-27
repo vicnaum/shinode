@@ -74,6 +74,7 @@ pub struct DbStatsArgs {
 /// Stateless history node configuration.
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 #[command(name = "stateless-history-node", about = "Stateless history node v0.2.0")]
+#[expect(clippy::struct_excessive_bools, reason = "CLI config needs many boolean flags")]
 pub struct NodeConfig {
     /// Chain ID to expose over RPC.
     #[arg(long, default_value_t = 1)]
