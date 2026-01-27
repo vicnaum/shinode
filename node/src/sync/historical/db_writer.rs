@@ -114,9 +114,10 @@ async fn flush_fast_sync_buffer(
                         duration_ms: started.elapsed().as_millis() as u64,
                     });
                 }
-                if let Some(stats) = progress_stats.as_ref() {
-                    stats.inc_compactions_done(1);
-                }
+                // Note: We don't increment compactions_done here because sync-phase
+                // compactions are background work without a known total. The finalize
+                // phase tracks its own compactions with proper total/done counters.
+                let _ = progress_stats; // suppress unused warning
                 result
             }));
         }

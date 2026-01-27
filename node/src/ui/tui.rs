@@ -93,7 +93,6 @@ pub struct TuiState {
     pub pending: u64,
     pub inflight: u64,
     pub retry: u64,
-    pub failed: u64,
     pub chain_head: u64,
     pub our_head: u64,
     pub total_shards: u64,
@@ -185,7 +184,6 @@ impl TuiState {
             pending: 0,
             inflight: 0,
             retry: 0,
-            failed: 0,
             chain_head: 0,
             our_head: start_block,
             total_shards: 0,
@@ -309,6 +307,9 @@ impl TuiState {
                 self.progress = 1.0; // Following = 100%
             }
         }
+
+        // RPC active flag is set from snapshot (signaled when RPC server starts)
+        self.rpc_active = snapshot.rpc_active;
 
         // Speed tracking
         self.current_speed = current_speed;
@@ -1047,14 +1048,22 @@ fn render_blocks_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
     //   Row 1: bucket 1     Row 1: bucket 3     Row 1: bucket 5
     let total_cells = 2 * map_width;
     let has_coverage = !data.coverage_buckets.is_empty();
+    let num_buckets = data.coverage_buckets.len();
 
     for col in 0..map_width {
         for row in 0..2 {
-            // Column-major: bucket_idx = col * 2 + row
+            // Column-major: cell_idx = col * 2 + row
             let cell_idx = col * 2 + row;
 
-            let coverage_pct = if has_coverage && cell_idx < data.coverage_buckets.len() {
-                data.coverage_buckets[cell_idx]
+            // Scale cell position to bucket index (buckets may differ from cells)
+            let bucket_idx = if num_buckets > 0 {
+                (cell_idx * num_buckets / total_cells).min(num_buckets - 1)
+            } else {
+                0
+            };
+
+            let coverage_pct = if has_coverage && bucket_idx < num_buckets {
+                data.coverage_buckets[bucket_idx]
             } else if has_coverage {
                 // Out of bounds, treat as not synced
                 0
@@ -1399,11 +1408,6 @@ fn render_queue_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
         ("Remaining", remaining, Color::White),
         ("Inflight", data.inflight, Color::Yellow),
         ("Retry", data.retry, Color::Rgb(255, 165, 0)),
-        (
-            "Failed",
-            data.failed,
-            if data.failed > 0 { Color::Red } else { Color::Green },
-        ),
     ];
 
     for (i, (label, value, color)) in items.iter().enumerate() {

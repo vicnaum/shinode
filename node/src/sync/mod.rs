@@ -164,6 +164,8 @@ pub struct SyncProgressStats {
     peak_speed: std::sync::atomic::AtomicU64,
     /// Timestamp (ms since epoch) when last block was received. Used for "Xs ago" display.
     last_block_received_ms: std::sync::atomic::AtomicU64,
+    /// True when RPC server has been started and is serving requests.
+    rpc_active: std::sync::atomic::AtomicBool,
     /// Coverage tracking for blocks map visualization.
     coverage: parking_lot::Mutex<CoverageTracker>,
 }
@@ -195,6 +197,8 @@ pub struct SyncProgressSnapshot {
     pub peak_speed: u64,
     /// Timestamp (ms since epoch) when last block was received.
     pub last_block_received_ms: u64,
+    /// True when RPC server has been started and is serving requests.
+    pub rpc_active: bool,
 }
 
 impl SyncProgressStats {
@@ -238,6 +242,9 @@ impl SyncProgressStats {
             peak_speed: self.peak_speed.load(std::sync::atomic::Ordering::SeqCst),
             last_block_received_ms: self
                 .last_block_received_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_active: self
+                .rpc_active
                 .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
@@ -375,6 +382,12 @@ impl SyncProgressStats {
     pub fn set_last_block_received_ms(&self, ms: u64) {
         self.last_block_received_ms
             .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set whether the RPC server is active (started and serving requests).
+    pub fn set_rpc_active(&self, active: bool) {
+        self.rpc_active
+            .store(active, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Initialize coverage tracking for a block range.

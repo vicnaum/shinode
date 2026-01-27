@@ -564,6 +564,7 @@ mod tests {
             start_block: 0,
             peak_speed: 0,
             last_block_received_ms: 0,
+            rpc_active: false,
         };
         assert_eq!(
             format_progress_message(&snapshot, 1.5, "12s"),

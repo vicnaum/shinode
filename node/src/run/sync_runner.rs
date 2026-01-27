@@ -576,6 +576,8 @@ async fn run_follow_mode(
         .as_ref()
         .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
     let (synced_tx, synced_rx) = tokio::sync::oneshot::channel();
+    // Clone progress_stats so we can set rpc_active when RPC starts
+    let stats_for_rpc = progress_stats.clone();
     let follow_future = run_follow_loop(
         Arc::clone(storage),
         Arc::clone(&session.pool),
@@ -616,6 +618,10 @@ async fn run_follow_mode(
                     )
                     .await?;
                     info!(rpc_bind = %config.rpc_bind, "rpc server started");
+                    // Signal to UI that RPC is now active
+                    if let Some(stats) = stats_for_rpc.as_ref() {
+                        stats.set_rpc_active(true);
+                    }
                     rpc_handle = Some(handle);
                 }
             }
