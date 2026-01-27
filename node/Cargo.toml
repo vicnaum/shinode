@@ -3,6 +3,10 @@ name = "stateless-history-node"
 version = "0.2.0"
 edition = "2021"
 
+[[bin]]
+name = "ui-mock"
+path = "src/bin/ui_mock.rs"
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
@@ -41,6 +45,9 @@ sysinfo = "0.37.2"
 tikv-jemallocator = { version = "0.5", optional = true }
 memmap2 = "0.9"
 zstd = "0.13"
+ratatui = "0.29"
+crossterm = "0.28"
+rand = "0.8"
 
 # ============================================
 # RUST-MAGIC-LINTER - Maximum Preset
