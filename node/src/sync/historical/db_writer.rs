@@ -328,97 +328,111 @@ pub async fn run_db_writer(
         );
     }
 
+    // Wait for in-flight compactions
     let compaction_started = Instant::now();
     let mut finalize_stats = DbWriterFinalizeStats::default();
-    if mode == DbWriteMode::FastSync {
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::CompactAllDirtyStart);
-        }
-    }
     for handle in compactions {
         handle.await??;
     }
     finalize_stats.compactions_wait_ms = compaction_started.elapsed().as_millis() as u64;
-    // Safety net: if shard completion tracking isn't provided (or we have a partial tail shard),
-    // compact whatever is still in WAL so reads work after finalize.
+
+    // Finalize fast-sync: compact dirty shards and seal completed ones
     if mode == DbWriteMode::FastSync {
-        // Reset compaction progress counters for finalize phase
-        // Set counters BEFORE phase to ensure UI sees consistent values
-        if let Some(stats) = progress_stats.as_ref() {
-            stats.set_compactions_done(0);
-            stats.set_compactions_total(0);
-            stats.set_finalize_phase(FinalizePhase::Compacting);
-        }
-
-        if let Ok(mut dirty) = storage.dirty_shards() {
-            if !dirty.is_empty() {
-                let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
-                dirty.sort_by_key(|info| std::cmp::Reverse(info.wal_bytes));
-                let top = dirty.iter().take(5).collect::<Vec<_>>();
-                tracing::info!(
-                    dirty_shards = dirty.len(),
-                    total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round(),
-                    top_shards = ?top,
-                    "finalizing: compacting dirty shards (WAL present or unsorted)"
-                );
-                if let Some(stats) = progress_stats.as_ref() {
-                    stats.set_compactions_total(dirty.len() as u64);
-                }
-            }
-        }
-        let compact_started = Instant::now();
-        let stats_for_callback = progress_stats.clone();
-        storage.compact_all_dirty_with_progress(|_shard_start| {
-            if let Some(stats) = stats_for_callback.as_ref() {
-                stats.inc_compactions_done(1);
-            }
-        })?;
-        finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
-    }
-    if mode == DbWriteMode::FastSync {
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::CompactAllDirtyEnd {
-                duration_ms: compaction_started.elapsed().as_millis() as u64,
-            });
-        }
-    }
-
-    // Seal shards after all queued compactions are done.
-    if mode == DbWriteMode::FastSync {
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::SealCompletedStart);
-        }
-        let started = Instant::now();
-
-        // Sealing phase - get count UPFRONT so UI shows "N/M left" format
-        if let Some(stats) = progress_stats.as_ref() {
-            stats.set_compactions_done(0);
-            let to_seal = storage.count_shards_to_seal().unwrap_or(0);
-            stats.set_compactions_total(to_seal);
-            stats.set_finalize_phase(FinalizePhase::Sealing);
-        }
-
-        let mut sealed_count = 0u64;
-        let stats_for_seal = progress_stats.clone();
-        storage.seal_completed_shards_with_progress(|_shard_start| {
-            sealed_count += 1;
-            if let Some(stats) = stats_for_seal.as_ref() {
-                stats.inc_compactions_done(1);
-            }
-        })?;
-        if sealed_count > 0 {
-            tracing::info!(sealed = sealed_count, "finalizing: sealed shards");
-        }
-
-        if let Some(events) = events.as_ref() {
-            events.record(BenchEvent::SealCompletedEnd {
-                duration_ms: started.elapsed().as_millis() as u64,
-            });
-        }
-        finalize_stats.seal_completed_ms = started.elapsed().as_millis() as u64;
+        finalize_fast_sync(
+            &storage,
+            events.as_ref(),
+            progress_stats.as_ref(),
+            &mut finalize_stats,
+        )?;
     }
 
     Ok(finalize_stats)
+}
+
+/// Finalize fast-sync mode: compact all dirty shards and seal completed ones.
+#[expect(clippy::cognitive_complexity, reason = "finalization with compaction and sealing phases")]
+fn finalize_fast_sync(
+    storage: &Storage,
+    events: Option<&Arc<BenchEventLogger>>,
+    progress_stats: Option<&Arc<SyncProgressStats>>,
+    finalize_stats: &mut DbWriterFinalizeStats,
+) -> Result<()> {
+    if let Some(events) = events {
+        events.record(BenchEvent::CompactAllDirtyStart);
+    }
+
+    // Reset compaction progress counters for finalize phase
+    if let Some(stats) = progress_stats {
+        stats.set_compactions_done(0);
+        stats.set_compactions_total(0);
+        stats.set_finalize_phase(FinalizePhase::Compacting);
+    }
+
+    if let Ok(mut dirty) = storage.dirty_shards() {
+        if !dirty.is_empty() {
+            let total_wal_bytes: u64 = dirty.iter().map(|info| info.wal_bytes).sum();
+            dirty.sort_by_key(|info| std::cmp::Reverse(info.wal_bytes));
+            let top = dirty.iter().take(5).collect::<Vec<_>>();
+            tracing::info!(
+                dirty_shards = dirty.len(),
+                total_wal_mib = (total_wal_bytes as f64 / (1024.0 * 1024.0)).round(),
+                top_shards = ?top,
+                "finalizing: compacting dirty shards (WAL present or unsorted)"
+            );
+            if let Some(stats) = progress_stats {
+                stats.set_compactions_total(dirty.len() as u64);
+            }
+        }
+    }
+
+    let compact_started = Instant::now();
+    let stats_for_callback = progress_stats.cloned();
+    storage.compact_all_dirty_with_progress(|_shard_start| {
+        if let Some(stats) = stats_for_callback.as_ref() {
+            stats.inc_compactions_done(1);
+        }
+    })?;
+    finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
+
+    if let Some(events) = events {
+        events.record(BenchEvent::CompactAllDirtyEnd {
+            duration_ms: compact_started.elapsed().as_millis() as u64,
+        });
+    }
+
+    // Sealing phase
+    if let Some(events) = events {
+        events.record(BenchEvent::SealCompletedStart);
+    }
+    let seal_started = Instant::now();
+
+    if let Some(stats) = progress_stats {
+        stats.set_compactions_done(0);
+        let to_seal = storage.count_shards_to_seal().unwrap_or(0);
+        stats.set_compactions_total(to_seal);
+        stats.set_finalize_phase(FinalizePhase::Sealing);
+    }
+
+    let mut sealed_count = 0u64;
+    let stats_for_seal = progress_stats.cloned();
+    storage.seal_completed_shards_with_progress(|_shard_start| {
+        sealed_count += 1;
+        if let Some(stats) = stats_for_seal.as_ref() {
+            stats.inc_compactions_done(1);
+        }
+    })?;
+    if sealed_count > 0 {
+        tracing::info!(sealed = sealed_count, "finalizing: sealed shards");
+    }
+
+    if let Some(events) = events {
+        events.record(BenchEvent::SealCompletedEnd {
+            duration_ms: seal_started.elapsed().as_millis() as u64,
+        });
+    }
+    finalize_stats.seal_completed_ms = seal_started.elapsed().as_millis() as u64;
+
+    Ok(())
 }
 
 fn encoded_len<T: Serialize>(value: &T) -> Result<u64> {
