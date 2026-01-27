@@ -130,6 +130,127 @@ fn spawn_peer_feeder(
     })
 }
 
+/// Context for processor workers.
+struct ProcessorContext {
+    logs_total: Arc<AtomicU64>,
+    progress: Option<Arc<dyn ProgressReporter>>,
+    stats: Option<Arc<SyncProgressStats>>,
+    bench: Option<Arc<IngestBenchStats>>,
+    events: Option<Arc<BenchEventLogger>>,
+}
+
+/// Run a single processor worker that receives payloads and sends bundles to DB.
+#[expect(clippy::cognitive_complexity, reason = "processor handles success/error with optional stats")]
+async fn run_processor_worker(
+    rx: Arc<Mutex<mpsc::Receiver<BlockPayload>>>,
+    tx: mpsc::Sender<DbWriterMessage>,
+    ctx: ProcessorContext,
+) {
+    loop {
+        let next = {
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        };
+        let Some(payload) = next else {
+            break;
+        };
+        if let Some(events) = ctx.events.as_ref() {
+            events.record(BenchEvent::ProcessStart {
+                block: payload.header.number,
+            });
+        }
+        let process_started = Instant::now();
+        let bench_ref = ctx.bench.as_ref().map(Arc::as_ref);
+        let span = tracing::trace_span!("process_block", block = payload.header.number);
+        let result = span.in_scope(|| process_ingest(payload, bench_ref));
+        match result {
+            Ok((bundle, log_count)) => {
+                if let Some(events) = ctx.events.as_ref() {
+                    events.record(BenchEvent::ProcessEnd {
+                        block: bundle.number,
+                        duration_us: process_started.elapsed().as_micros() as u64,
+                        logs: log_count,
+                    });
+                }
+                ctx.logs_total.fetch_add(log_count, Ordering::SeqCst);
+                if let Some(progress) = ctx.progress.as_ref() {
+                    progress.inc(1);
+                }
+                if let Some(stats) = ctx.stats.as_ref() {
+                    stats.inc_processed(1);
+                    stats.update_head_block_max(bundle.number);
+                }
+                if let Some(bench) = ctx.bench.as_ref() {
+                    bench.record_logs(log_count);
+                }
+                if tx.send(DbWriterMessage::Block(bundle)).await.is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                if let Some(bench) = ctx.bench.as_ref() {
+                    bench.record_process_failure();
+                }
+                tracing::warn!(error = %err, "ingest processing failed");
+            }
+        }
+    }
+}
+
+/// Run peer events tracker that logs connect/disconnect/ban events.
+async fn run_peer_events_tracker(
+    pool: Arc<PeerPool>,
+    peer_health: Arc<PeerHealthTracker>,
+    events: Arc<BenchEventLogger>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut known_peers: HashSet<PeerId> = HashSet::new();
+    let mut banned_state: HashMap<PeerId, bool> = HashMap::new();
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        let snapshot = pool.snapshot();
+        let current: HashSet<PeerId> = snapshot.iter().map(|peer| peer.peer_id).collect();
+        for added in current.difference(&known_peers) {
+            events.record(BenchEvent::PeerConnected {
+                peer_id: format!("{added:?}"),
+            });
+        }
+        for removed in known_peers.difference(&current) {
+            events.record(BenchEvent::PeerDisconnected {
+                peer_id: format!("{removed:?}"),
+            });
+        }
+        known_peers = current;
+
+        let health_snapshot = peer_health.snapshot().await;
+        for dump in &health_snapshot {
+            let was_banned = banned_state.get(&dump.peer_id).copied().unwrap_or(false);
+            if dump.is_banned && !was_banned {
+                events.record(BenchEvent::PeerBanned {
+                    peer_id: format!("{:?}", dump.peer_id),
+                    reason: "health",
+                });
+            } else if !dump.is_banned && was_banned {
+                events.record(BenchEvent::PeerUnbanned {
+                    peer_id: format!("{:?}", dump.peer_id),
+                });
+            }
+            banned_state.insert(dump.peer_id, dump.is_banned);
+        }
+
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            () = sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IngestPipelineOutcome {
     UpToDate {
@@ -440,64 +561,18 @@ pub async fn run_ingest_pipeline(
     let fetched_rx = Arc::new(Mutex::new(fetched_blocks_rx));
     let mut processor_handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
-        let rx = Arc::clone(&fetched_rx);
-        let tx = processed_blocks_tx.clone();
-        let logs_total = Arc::clone(&logs_total);
-        let progress = progress.clone();
-        let stats = stats.clone();
-        let bench = bench.clone();
-        let events = events.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let next = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-                let Some(payload) = next else {
-                    break;
-                };
-                if let Some(events) = events.as_ref() {
-                    events.record(BenchEvent::ProcessStart {
-                        block: payload.header.number,
-                    });
-                }
-                let process_started = Instant::now();
-                let bench_ref = bench.as_ref().map(Arc::as_ref);
-                let span = tracing::trace_span!("process_block", block = payload.header.number);
-                let result = span.in_scope(|| process_ingest(payload, bench_ref));
-                match result {
-                    Ok((bundle, log_count)) => {
-                        if let Some(events) = events.as_ref() {
-                            events.record(BenchEvent::ProcessEnd {
-                                block: bundle.number,
-                                duration_us: process_started.elapsed().as_micros() as u64,
-                                logs: log_count,
-                            });
-                        }
-                        logs_total.fetch_add(log_count, Ordering::SeqCst);
-                        if let Some(progress) = progress.as_ref() {
-                            progress.inc(1);
-                        }
-                        if let Some(stats) = stats.as_ref() {
-                            stats.inc_processed(1);
-                            stats.update_head_block_max(bundle.number);
-                        }
-                        if let Some(bench) = bench.as_ref() {
-                            bench.record_logs(log_count);
-                        }
-                        if tx.send(DbWriterMessage::Block(bundle)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        if let Some(bench) = bench.as_ref() {
-                            bench.record_process_failure();
-                        }
-                        tracing::warn!(error = %err, "ingest processing failed");
-                    }
-                }
-            }
-        });
+        let ctx = ProcessorContext {
+            logs_total: Arc::clone(&logs_total),
+            progress: progress.clone(),
+            stats: stats.clone(),
+            bench: bench.clone(),
+            events: events.clone(),
+        };
+        let handle = tokio::spawn(run_processor_worker(
+            Arc::clone(&fetched_rx),
+            processed_blocks_tx.clone(),
+            ctx,
+        ));
         processor_handles.push(handle);
     }
     drop(processed_blocks_tx);
@@ -524,60 +599,14 @@ pub async fn run_ingest_pipeline(
 
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let peer_events_handle = if let Some(events) = events.clone() {
-        let pool = Arc::clone(&pool);
-        let peer_health = Arc::clone(&peer_health);
-        let mut shutdown_rx = shutdown_rx.clone();
-        Some(tokio::spawn(async move {
-            let mut known_peers: HashSet<PeerId> = HashSet::new();
-            let mut banned_state: HashMap<PeerId, bool> = HashMap::new();
-            loop {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-                let snapshot = pool.snapshot();
-                let current: HashSet<PeerId> = snapshot.iter().map(|peer| peer.peer_id).collect();
-                for added in current.difference(&known_peers) {
-                    events.record(BenchEvent::PeerConnected {
-                        peer_id: format!("{added:?}"),
-                    });
-                }
-                for removed in known_peers.difference(&current) {
-                    events.record(BenchEvent::PeerDisconnected {
-                        peer_id: format!("{removed:?}"),
-                    });
-                }
-                known_peers = current;
-
-                let health_snapshot = peer_health.snapshot().await;
-                for dump in &health_snapshot {
-                    let was_banned = banned_state.get(&dump.peer_id).copied().unwrap_or(false);
-                    if dump.is_banned && !was_banned {
-                        events.record(BenchEvent::PeerBanned {
-                            peer_id: format!("{:?}", dump.peer_id),
-                            reason: "health",
-                        });
-                    } else if !dump.is_banned && was_banned {
-                        events.record(BenchEvent::PeerUnbanned {
-                            peer_id: format!("{:?}", dump.peer_id),
-                        });
-                    }
-                    banned_state.insert(dump.peer_id, dump.is_banned);
-                }
-
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                    () = sleep(Duration::from_secs(1)) => {}
-                }
-            }
-        }))
-    } else {
-        None
-    };
+    let peer_events_handle = events.clone().map(|events| {
+        tokio::spawn(run_peer_events_tracker(
+            Arc::clone(&pool),
+            Arc::clone(&peer_health),
+            events,
+            shutdown_rx.clone(),
+        ))
+    });
     let peer_feeder_handle = spawn_peer_feeder(Arc::clone(&pool), ready_tx.clone(), shutdown_rx);
 
     let fetch_semaphore = Arc::new(tokio::sync::Semaphore::new(
