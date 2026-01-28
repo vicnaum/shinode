@@ -410,7 +410,7 @@ impl SyncProgressStats {
             .buckets()
             .iter()
             .map(|&count| {
-                let pct = (count as u64 * 100 / blocks_per_bucket).min(100);
+                let pct = (u64::from(count) * 100 / blocks_per_bucket).min(100);
                 pct as u8
             })
             .collect()

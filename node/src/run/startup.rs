@@ -26,11 +26,19 @@ pub type EarlyTui = Arc<Mutex<TuiController>>;
 /// Update the TUI startup status message.
 /// This is a no-op if tui is None.
 /// Returns true if quit was requested.
-pub fn update_tui_startup(tui: Option<&EarlyTui>, status: &str) -> bool {
+pub fn update_tui_startup(
+    tui: Option<&EarlyTui>,
+    status: &str,
+    log_buffer: Option<&std::sync::Arc<crate::logging::TuiLogBuffer>>,
+) -> bool {
     if let Some(tui) = tui {
         let mut guard = tui.lock();
         guard.state.startup_status = status.to_string();
         guard.state.phase = Phase::Startup;
+        // Drain logs from buffer
+        if let Some(buffer) = log_buffer {
+            guard.state.drain_log_buffer(buffer);
+        }
         // Check for quit
         if guard.poll_quit().unwrap_or(false) || guard.should_quit {
             guard.state.quitting = true;
@@ -44,13 +52,24 @@ pub fn update_tui_startup(tui: Option<&EarlyTui>, status: &str) -> bool {
 
 /// Update the TUI startup status with best head seen and peer count.
 /// Returns true if quit was requested.
-pub fn update_tui_startup_head(tui: Option<&EarlyTui>, status: &str, best_head: u64, peers: u64) -> bool {
+pub fn update_tui_startup_head(
+    tui: Option<&EarlyTui>,
+    status: &str,
+    best_head: u64,
+    peers: u64,
+    log_buffer: Option<&std::sync::Arc<crate::logging::TuiLogBuffer>>,
+) -> bool {
     if let Some(tui) = tui {
         let mut guard = tui.lock();
         guard.state.startup_status = status.to_string();
         guard.state.phase = Phase::Startup;
         guard.state.best_head_seen = best_head;
         guard.state.peers_connected = peers;
+        guard.state.peers_max = peers; // During startup, all connected peers are "available"
+        // Drain logs from buffer
+        if let Some(buffer) = log_buffer {
+            guard.state.drain_log_buffer(buffer);
+        }
         // Check for quit
         if guard.poll_quit().unwrap_or(false) || guard.should_quit {
             guard.state.quitting = true;
@@ -64,12 +83,22 @@ pub fn update_tui_startup_head(tui: Option<&EarlyTui>, status: &str, best_head: 
 
 /// Update the TUI startup status with peer count.
 /// Returns true if quit was requested.
-pub fn update_tui_startup_peers(tui: Option<&EarlyTui>, status: &str, peers: u64) -> bool {
+pub fn update_tui_startup_peers(
+    tui: Option<&EarlyTui>,
+    status: &str,
+    peers: u64,
+    log_buffer: Option<&std::sync::Arc<crate::logging::TuiLogBuffer>>,
+) -> bool {
     if let Some(tui) = tui {
         let mut guard = tui.lock();
         guard.state.startup_status = status.to_string();
         guard.state.phase = Phase::Startup;
         guard.state.peers_connected = peers;
+        guard.state.peers_max = peers; // During startup, all connected peers are "available"
+        // Drain logs from buffer
+        if let Some(buffer) = log_buffer {
+            guard.state.drain_log_buffer(buffer);
+        }
         // Check for quit
         if guard.poll_quit().unwrap_or(false) || guard.should_quit {
             guard.state.quitting = true;
@@ -82,6 +111,7 @@ pub fn update_tui_startup_peers(tui: Option<&EarlyTui>, status: &str, peers: u64
 }
 
 /// Handle quit request during startup - restores terminal and exits.
+#[expect(clippy::exit, reason = "intentional exit on user quit request during startup")]
 pub fn handle_startup_quit(tui: Option<&EarlyTui>) -> ! {
     if let Some(tui) = tui {
         let guard = tui.lock();
@@ -146,11 +176,18 @@ pub fn build_run_context(config: &NodeConfig, argv: Vec<String>) -> Option<RunCo
     })
 }
 
+/// Type alias for the log buffer reference.
+pub type LogBufferRef = Option<std::sync::Arc<crate::logging::TuiLogBuffer>>;
+
 /// Initialize storage with startup compaction of dirty shards.
 #[expect(clippy::cognitive_complexity, reason = "storage init with optional compaction")]
-pub async fn init_storage(config: &NodeConfig, tui: Option<&EarlyTui>) -> Result<Arc<Storage>> {
+pub async fn init_storage(
+    config: &NodeConfig,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
+) -> Result<Arc<Storage>> {
     ui::print_status_bar("Opening storage...");
-    update_tui_startup(tui, "Opening storage...");
+    update_tui_startup(tui, "Opening storage...", log_buffer.as_ref());
     let storage = Arc::new(Storage::open(config)?);
 
     // Resume behavior: if the previous run exited before compaction finished, ensure we
@@ -161,7 +198,7 @@ pub async fn init_storage(config: &NodeConfig, tui: Option<&EarlyTui>) -> Result
         let shard_count = dirty_shards.len();
         let status_msg = format!("Compacting {shard_count} shards...");
         ui::print_status_bar(&status_msg);
-        update_tui_startup(tui, &status_msg);
+        update_tui_startup(tui, &status_msg, log_buffer.as_ref());
         info!(shard_count, "startup: compacting completed dirty shards");
         let storage_clone = Arc::clone(&storage);
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -179,21 +216,30 @@ pub async fn init_storage(config: &NodeConfig, tui: Option<&EarlyTui>) -> Result
 
 /// Connect to the P2P network.
 #[expect(clippy::cognitive_complexity, reason = "P2P connection with status updates")]
-pub async fn connect_p2p(storage: Arc<Storage>, tui: Option<&EarlyTui>) -> Result<p2p::NetworkSession> {
+pub async fn connect_p2p(
+    storage: Arc<Storage>,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
+) -> Result<p2p::NetworkSession> {
     ui::print_status_bar("Connecting to P2P network...");
-    update_tui_startup(tui, "Connecting to P2P network...");
+    update_tui_startup(tui, "Connecting to P2P network...", log_buffer.as_ref());
     info!("starting p2p network");
     let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
     let initial_peers = session.pool.len();
     info!(peers = initial_peers, "p2p peers connected");
     let status_msg = format!("P2P connected | {initial_peers} peers");
     ui::print_status_bar(&status_msg);
-    update_tui_startup_peers(tui, &status_msg, initial_peers as u64);
+    update_tui_startup_peers(tui, &status_msg, initial_peers as u64, log_buffer.as_ref());
     Ok(session)
 }
 
 /// Wait for minimum number of peers.
-pub async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize, tui: Option<&EarlyTui>) {
+pub async fn wait_for_min_peers(
+    pool: &Arc<PeerPool>,
+    min_peers: usize,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
+) {
     if min_peers == 0 {
         return;
     }
@@ -205,7 +251,7 @@ pub async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize, tui: Opt
         }
         let status_msg = format!("Waiting for peers... {peers}/{min_peers}");
         ui::print_status_bar(&status_msg);
-        if update_tui_startup_peers(tui, &status_msg, peers as u64) {
+        if update_tui_startup_peers(tui, &status_msg, peers as u64, log_buffer.as_ref()) {
             handle_startup_quit(tui);
         }
         sleep(Duration::from_millis(200)).await;
@@ -219,6 +265,7 @@ pub async fn wait_for_peer_head(
     end_block: Option<u64>,
     rollback_window: u64,
     tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
 ) -> u64 {
     let mut last_log = Instant::now()
         .checked_sub(Duration::from_secs(10))
@@ -240,7 +287,7 @@ pub async fn wait_for_peer_head(
         );
         ui::print_status_bar(&status_msg);
         // TUI shows head/peers in dedicated fields, so use simpler status
-        if update_tui_startup_head(tui, "Discovering chain head...", best_head, peers.len() as u64) {
+        if update_tui_startup_head(tui, "Discovering chain head...", best_head, peers.len() as u64, log_buffer.as_ref()) {
             handle_startup_quit(tui);
         }
         if last_log.elapsed() >= Duration::from_secs(5) {
@@ -324,8 +371,15 @@ pub fn setup_ui(
             }
             tui
         } else {
-            let tui = TuiController::new(start_block, end_block)
+            let mut tui = TuiController::new(start_block, end_block)
                 .map_err(|e| eyre::eyre!("failed to create TUI: {}", e))?;
+            // Set config values for display
+            tui.state.set_config(
+                &config.data_dir.display().to_string(),
+                config.shard_size,
+                &config.rpc_bind.to_string(),
+                config.rollback_window,
+            );
             Arc::new(Mutex::new(tui))
         };
 

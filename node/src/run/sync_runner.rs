@@ -50,6 +50,9 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
     reason = "main sync orchestration has sequential setup phases that are clearer inline"
 )]
 pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
+    // Number of coverage buckets for TUI blocks map visualization
+    const COVERAGE_BUCKETS: usize = 200;
+
     // Validate and normalize chunk sizes
     let chunk_max = config
         .fast_sync_chunk_max
@@ -111,10 +114,17 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         match TuiController::new(config.start_block, 0) {
             Ok(tui) => {
                 let tui_arc = Arc::new(Mutex::new(tui));
-                // Draw initial startup screen
+                // Draw initial startup screen with config info
                 {
                     let mut guard = tui_arc.lock();
                     guard.state.startup_status = "Initializing...".to_string();
+                    // Set config values for display
+                    guard.state.set_config(
+                        &config.data_dir.display().to_string(),
+                        config.shard_size,
+                        &config.rpc_bind.to_string(),
+                        config.rollback_window,
+                    );
                     let _ = guard.draw();
                 }
                 Some(tui_arc)
@@ -128,15 +138,18 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         None
     };
 
+    // Get log buffer reference for startup TUI updates
+    let log_buffer = &tracing_guards.tui_log_buffer;
+
     // Initialize storage
-    let storage = init_storage(&config, early_tui.as_ref()).await?;
+    let storage = init_storage(&config, early_tui.as_ref(), log_buffer).await?;
 
     // Connect to P2P network
-    let session = connect_p2p(Arc::clone(&storage), early_tui.as_ref()).await?;
+    let session = connect_p2p(Arc::clone(&storage), early_tui.as_ref(), log_buffer).await?;
 
     // Wait for minimum peers
     let min_peers = config.min_peers as usize;
-    wait_for_min_peers(&session.pool, min_peers, early_tui.as_ref()).await;
+    wait_for_min_peers(&session.pool, min_peers, early_tui.as_ref(), log_buffer).await;
     info!(
         peers = session.pool.len(),
         min_peers, "peer warmup complete"
@@ -151,6 +164,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         config.end_block,
         config.rollback_window,
         early_tui.as_ref(),
+        log_buffer,
     )
     .await;
 
@@ -201,7 +215,6 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         stats.set_head_seen(head_at_startup);
 
         // Initialize coverage tracking for TUI blocks map
-        const COVERAGE_BUCKETS: usize = 200;
         stats.init_coverage(*range.start(), *range.end(), COVERAGE_BUCKETS);
 
         // Pre-fill coverage with blocks already in DB (computed from missing ranges)

@@ -1,5 +1,8 @@
 //! Main progress tracking and UIController.
 
+// Allow process::exit for TUI quit functionality - needed to force exit after user presses 'q'
+#![expect(clippy::exit, reason = "intentional exit on user quit request")]
+
 use crate::p2p::PeerPool;
 use crate::sync::historical::PeerHealthTracker;
 use crate::sync::{format_eta_seconds, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
@@ -401,6 +404,7 @@ pub fn spawn_progress_updater(
 ///
 /// If `completion_rx` is provided, the TUI will wait for sync completion
 /// (or timeout) before exiting after user presses 'q'.
+#[expect(clippy::too_many_arguments, reason = "TUI updater needs all sync state")]
 pub fn spawn_tui_progress_updater(
     tui: Arc<Mutex<TuiController>>,
     stats: Arc<SyncProgressStats>,

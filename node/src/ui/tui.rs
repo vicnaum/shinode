@@ -116,6 +116,12 @@ pub struct TuiState {
     pub startup_status: String,
     pub best_head_seen: u64,
 
+    // Config parameters (set once at startup)
+    pub config_data_dir: String,
+    pub config_shard_size: u64,
+    pub config_rpc_bind: String,
+    pub config_rollback_window: u64,
+
     // Quitting state
     pub quitting: bool,
 
@@ -200,6 +206,10 @@ impl TuiState {
             animation_frame: 0,
             startup_status: "Initializing...".to_string(),
             best_head_seen: 0,
+            config_data_dir: String::new(),
+            config_shard_size: 0,
+            config_rpc_bind: String::new(),
+            config_rollback_window: 0,
             quitting: false,
             blocks_to_sync: 0,  // Will be set on first sync update
             storage_total: None,
@@ -233,6 +243,21 @@ impl TuiState {
         }
     }
 
+    /// Set configuration parameters for display.
+    pub fn set_config(&mut self, data_dir: &str, shard_size: u64, rpc_bind: &str, rollback_window: u64) {
+        self.config_data_dir = data_dir.to_string();
+        self.config_shard_size = shard_size;
+        self.config_rpc_bind = rpc_bind.to_string();
+        self.config_rollback_window = rollback_window;
+    }
+
+    /// Drain logs from a TuiLogBuffer and add them to state.
+    pub fn drain_log_buffer(&mut self, buffer: &crate::logging::TuiLogBuffer) {
+        for entry in buffer.drain() {
+            self.add_log(entry.level, entry.message, entry.timestamp_ms);
+        }
+    }
+
     /// Add a log entry from a tracing Level.
     pub fn add_log(&mut self, level: tracing::Level, message: String, timestamp_ms: u64) {
         let log_level = match level {
@@ -253,6 +278,7 @@ impl TuiState {
     }
 
     /// Update state from a `SyncProgressSnapshot`.
+    #[expect(clippy::cognitive_complexity, reason = "sync state update is inherently complex")]
     pub fn update_from_snapshot(&mut self, snapshot: &SyncProgressSnapshot, current_speed: u64) {
         // Determine phase from snapshot
         let new_phase = match snapshot.status {
@@ -685,7 +711,7 @@ fn render_startup_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
             Constraint::Length(1),  // Separator
             Constraint::Length(3),  // Startup status
             Constraint::Length(1),  // Separator
-            Constraint::Length(8),  // Network panel (centered)
+            Constraint::Length(8),  // Network + Config panels
             Constraint::Length(1),  // Separator
             Constraint::Min(4),     // Logs
         ])
@@ -697,16 +723,14 @@ fn render_startup_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
     render_startup_status(chunks[4], frame.buffer_mut(), data);
     render_separator(chunks[5], frame.buffer_mut());
 
-    // Center the network panel
-    let panel_width = inner.width.min(40);
-    let panel_x = inner.x + (inner.width.saturating_sub(panel_width)) / 2;
-    let panel_area = Rect {
-        x: panel_x,
-        y: chunks[6].y,
-        width: panel_width,
-        height: chunks[6].height,
-    };
-    render_network_panel(panel_area, frame.buffer_mut(), data);
+    // Two side-by-side panels: NETWORK and CONFIG
+    let panels = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(chunks[6]);
+
+    render_network_panel(panels[0], frame.buffer_mut(), data);
+    render_config_panel(panels[1], frame.buffer_mut(), data);
 
     render_separator(chunks[7], frame.buffer_mut());
     render_logs_panel(chunks[8], frame.buffer_mut(), data);
@@ -719,24 +743,27 @@ fn render_startup_status(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
     buf.set_string(
         x,
-        area.y + 1,
+        area.y,
         status,
         Style::default().fg(Color::Yellow).bold(),
     );
 
-    // Show best head seen if available
-    if data.best_head_seen > 0 {
-        let head_text = format!("Chain head: {}", format_number(data.best_head_seen));
-        let head_x = area.x + (area.width.saturating_sub(head_text.len() as u16)) / 2;
-        buf.set_string(
-            head_x,
-            area.y + 2,
-            &head_text,
-            Style::default().fg(Color::White),
-        );
-    }
+    // Show best head seen (or waiting message)
+    let head_text = if data.best_head_seen > 0 {
+        format!("Best chain head seen: {}", format_number(data.best_head_seen))
+    } else {
+        "Waiting for peer heads...".to_string()
+    };
+    let head_x = area.x + (area.width.saturating_sub(head_text.len() as u16)) / 2;
+    buf.set_string(
+        head_x,
+        area.y + 1,
+        &head_text,
+        Style::default().fg(if data.best_head_seen > 0 { Color::White } else { Color::DarkGray }),
+    );
 }
 
+#[expect(clippy::cognitive_complexity, reason = "ASCII overlay rendering is verbose but straightforward")]
 fn render_quit_overlay(frame: &mut Frame, area: Rect) {
     use ratatui::widgets::Clear;
 
@@ -1202,6 +1229,11 @@ fn render_shards_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
     );
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "chart rendering with gradient colors is verbose but straightforward"
+)]
 fn render_speed_chart(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let block = Block::default()
         .title(" Speed (blocks/s) ")
@@ -1380,38 +1412,142 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    // Peers visual
-    let max_dots = 10u64;
-    let peers_visual: String = (0..max_dots)
-        .map(|i| {
-            if i < data.peers_connected.min(max_dots) {
-                '\u{25CF}'
-            } else {
-                '\u{25CB}'
-            }
-        })
-        .collect();
+    let value_col = inner.x + 12;
+
+    // Peers visual: 1 peer = 1 character
+    // ● = active (fetching), ○ = connected but idle
+    // If peers exceed available width, show … at the end
+    let available_width = inner.width.saturating_sub(12) as u64;
+    let active = data.peers_connected;
+    let connected = data.peers_max;
+    let idle = connected.saturating_sub(active);
+
+    let peers_visual = if connected == 0 {
+        "—".to_string() // No peers
+    } else if connected <= available_width {
+        // All peers fit: show each one
+        let active_chars: String = (0..active).map(|_| '\u{25CF}').collect(); // ●
+        let idle_chars: String = (0..idle).map(|_| '\u{25CB}').collect(); // ○
+        format!("{active_chars}{idle_chars}")
+    } else {
+        // Too many peers: show as many as fit, then …
+        let display_slots = available_width.saturating_sub(1); // Reserve 1 for …
+        let active_to_show = active.min(display_slots);
+        let remaining_slots = display_slots.saturating_sub(active_to_show);
+        let idle_to_show = idle.min(remaining_slots);
+
+        let active_chars: String = (0..active_to_show).map(|_| '\u{25CF}').collect();
+        let idle_chars: String = (0..idle_to_show).map(|_| '\u{25CB}').collect();
+        format!("{active_chars}{idle_chars}\u{2026}") // … (ellipsis)
+    };
 
     buf.set_string(inner.x + 1, inner.y, "Peers", Style::default().fg(Color::Gray));
-    buf.set_string(inner.x + 7, inner.y, &peers_visual, Style::default().fg(Color::Green));
+    buf.set_string(value_col, inner.y, &peers_visual, Style::default().fg(Color::Green));
 
+    // Active peers (currently fetching blocks)
+    buf.set_string(inner.x + 1, inner.y + 1, "Active", Style::default().fg(Color::Gray));
     buf.set_string(
-        inner.x + 7,
+        value_col,
         inner.y + 1,
-        &format!("{} / {}", data.peers_connected, data.peers_max),
+        &data.peers_connected.to_string(),
+        Style::default().fg(Color::Yellow),
+    );
+
+    // Connected peers (total available in pool)
+    buf.set_string(inner.x + 1, inner.y + 2, "Connected", Style::default().fg(Color::Gray));
+    buf.set_string(
+        value_col,
+        inner.y + 2,
+        &data.peers_max.to_string(),
         Style::default().fg(Color::White),
     );
 
-    buf.set_string(inner.x + 1, inner.y + 3, "\u{2193} Rx", Style::default().fg(Color::Gray));
-    buf.set_string(inner.x + 7, inner.y + 3, "--", Style::default().fg(Color::DarkGray));
-
+    // Chain Head - use best_head_seen during startup, chain_head during sync
+    let head_value = if data.phase == Phase::Startup && data.chain_head == 0 {
+        data.best_head_seen
+    } else {
+        data.chain_head
+    };
     buf.set_string(inner.x + 1, inner.y + 4, "Chain Head", Style::default().fg(Color::Gray));
     buf.set_string(
-        inner.x + 12,
+        value_col,
         inner.y + 4,
-        &format_number(data.chain_head),
+        &format_number(head_value),
         Style::default().fg(Color::White),
     );
+}
+
+fn render_config_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
+    let block = Block::default()
+        .title(" CONFIG ")
+        .title_style(Style::default().fg(Color::White).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let value_col = inner.x + 12;
+
+    // Start block
+    buf.set_string(inner.x + 1, inner.y, "Start", Style::default().fg(Color::Gray));
+    buf.set_string(
+        value_col,
+        inner.y,
+        &format_number(data.start_block),
+        Style::default().fg(Color::White),
+    );
+
+    // End block
+    buf.set_string(inner.x + 1, inner.y + 1, "End", Style::default().fg(Color::Gray));
+    let end_str = if data.end_block > 0 {
+        format_number(data.end_block)
+    } else {
+        "head".to_string()
+    };
+    buf.set_string(value_col, inner.y + 1, &end_str, Style::default().fg(Color::White));
+
+    // Shard size
+    buf.set_string(inner.x + 1, inner.y + 2, "Shard Size", Style::default().fg(Color::Gray));
+    let shard_str = if data.config_shard_size > 0 {
+        format_number(data.config_shard_size)
+    } else {
+        "--".to_string()
+    };
+    buf.set_string(value_col, inner.y + 2, &shard_str, Style::default().fg(Color::White));
+
+    // Rollback window
+    buf.set_string(inner.x + 1, inner.y + 3, "Rollback", Style::default().fg(Color::Gray));
+    let rollback_str = if data.config_rollback_window > 0 {
+        format_number(data.config_rollback_window)
+    } else {
+        "--".to_string()
+    };
+    buf.set_string(value_col, inner.y + 3, &rollback_str, Style::default().fg(Color::White));
+
+    // RPC bind address
+    buf.set_string(inner.x + 1, inner.y + 4, "RPC", Style::default().fg(Color::Gray));
+    let rpc_str = if data.config_rpc_bind.is_empty() {
+        "--".to_string()
+    } else {
+        data.config_rpc_bind.clone()
+    };
+    buf.set_string(value_col, inner.y + 4, &rpc_str, Style::default().fg(Color::White));
+
+    // Data directory (truncated if needed)
+    buf.set_string(inner.x + 1, inner.y + 5, "Data Dir", Style::default().fg(Color::Gray));
+    let dir_str = if data.config_data_dir.is_empty() {
+        "--".to_string()
+    } else {
+        // Truncate to fit in panel, show last part of path
+        let max_len = (inner.width as usize).saturating_sub(13);
+        if data.config_data_dir.len() > max_len {
+            format!("...{}", &data.config_data_dir[data.config_data_dir.len() - max_len + 3..])
+        } else {
+            data.config_data_dir.clone()
+        }
+    };
+    buf.set_string(value_col, inner.y + 5, &dir_str, Style::default().fg(Color::DarkGray));
 }
 
 fn render_queue_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
@@ -1732,7 +1868,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (year as u64, month as u64, day as u64)
 }
 
-fn is_leap_year(year: i64) -> bool {
+const fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 

@@ -131,7 +131,7 @@ pub fn init_tracing(
         });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
-            .with(tui_layer.clone())
+            .with(tui_layer)
             .with(log_layer)
             .with(resources_layer);
         registry.with(chrome_layer.with_filter(trace_filter)).init();

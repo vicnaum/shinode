@@ -295,7 +295,7 @@ pub struct TuiLogLayer {
 
 impl TuiLogLayer {
     /// Create a new TUI log layer with the given buffer and minimum level.
-    pub fn new(buffer: Arc<TuiLogBuffer>, min_level: tracing::Level) -> Self {
+    pub const fn new(buffer: Arc<TuiLogBuffer>, min_level: tracing::Level) -> Self {
         Self { buffer, min_level }
     }
 }
@@ -321,17 +321,19 @@ where
             .fields
             .get("message")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                // Fallback: use target and first field
-                let target = meta.target();
-                let short_target = target.rsplit("::").next().unwrap_or(target);
-                if let Some((key, value)) = visitor.fields.iter().next() {
-                    format!("{}: {}={}", short_target, key, value)
-                } else {
-                    short_target.to_string()
-                }
-            });
+            .map_or_else(
+                || {
+                    // Fallback: use target and first field
+                    let target = meta.target();
+                    let short_target = target.rsplit("::").next().unwrap_or(target);
+                    if let Some((key, value)) = visitor.fields.iter().next() {
+                        format!("{short_target}: {key}={value}")
+                    } else {
+                        short_target.to_string()
+                    }
+                },
+                ToString::to_string,
+            );
 
         // Use system time for absolute timestamps
         let timestamp_ms = std::time::SystemTime::now()
