@@ -105,8 +105,6 @@ pub struct PeerHealthConfig {
     aimd_initial_batch: usize,
     aimd_max_batch: usize,
     quality_partial_weight: f64,
-    quality_min_samples: u64,
-    quality_defer_threshold: f64,
 }
 
 impl PeerHealthConfig {
@@ -122,9 +120,9 @@ impl PeerHealthConfig {
             aimd_min_batch: 1,
             aimd_initial_batch: initial_batch,
             aimd_max_batch: max_batch,
-            quality_partial_weight: 0.5,
-            quality_min_samples: 5,
-            quality_defer_threshold: 0.6,
+            // Partials count same as successes for quality scoring (used for peer sorting).
+            // Partials still reduce batch_limit via AIMD (aimd_partial_decrease).
+            quality_partial_weight: 1.0,
         }
     }
 }
@@ -450,17 +448,6 @@ impl PeerHealthTracker {
         }
     }
 
-    pub(crate) async fn should_defer_peer(&self, peer_id: PeerId, active_peers: usize) -> bool {
-        // If we only have a couple of peers, keep using them even if they're not great.
-        if active_peers <= 3 {
-            return false;
-        }
-        let quality = self.quality(peer_id).await;
-        if quality.samples < self.config.quality_min_samples {
-            return false;
-        }
-        quality.score < self.config.quality_defer_threshold
-    }
 }
 
 /// Peer-driven scheduler state.
@@ -495,15 +482,15 @@ mod tests {
         let scheduler = scheduler_with_blocks(config, 0, 9);
         let peer_id = PeerId::random();
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
         assert_eq!(batch.blocks, vec![0, 1, 2]);
         assert_eq!(batch.mode, FetchMode::Normal);
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
         assert_eq!(batch.blocks, vec![3, 4]);
         assert_eq!(batch.mode, FetchMode::Normal);
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
         assert!(batch.blocks.is_empty());
     }
 
@@ -534,15 +521,15 @@ mod tests {
         let scheduler = scheduler_with_blocks(config, 1, 1);
         let peer_id = PeerId::random();
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 10, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
         assert_eq!(batch.blocks, vec![1]);
 
         scheduler.requeue_failed(&[1]).await;
-        let batch = scheduler.next_batch_for_peer(peer_id, 10, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
         assert_eq!(batch.blocks, vec![1]);
 
         scheduler.requeue_failed(&[1]).await;
-        let batch = scheduler.next_batch_for_peer(peer_id, 10, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
         assert_eq!(batch.blocks, vec![1]);
         assert_eq!(batch.mode, FetchMode::Escalation);
     }
@@ -588,23 +575,16 @@ impl PeerWorkScheduler {
     ///
     /// Escalation blocks get priority - they are checked FIRST before the normal queue.
     /// This ensures difficult blocks don't get starved while new blocks keep arriving.
+    ///
+    /// Note: Quality-based peer prioritization happens in `pick_best_ready_peer_index`
+    /// before this function is called. We don't defer peers here - only banned peers
+    /// are skipped. This ensures all peers can improve their quality by doing work.
     pub async fn next_batch_for_peer(
         &self,
         peer_id: PeerId,
         peer_head: u64,
-        active_peers: usize,
     ) -> FetchBatch {
         if self.is_peer_banned(peer_id).await {
-            return FetchBatch {
-                blocks: Vec::new(),
-                mode: FetchMode::Normal,
-            };
-        }
-        if self
-            .peer_health
-            .should_defer_peer(peer_id, active_peers)
-            .await
-        {
             return FetchBatch {
                 blocks: Vec::new(),
                 mode: FetchMode::Normal,

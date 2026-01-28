@@ -694,7 +694,6 @@ pub async fn run_ingest_pipeline(
             }
         }
 
-        let active_peers = pool.len();
         let Ok(permit) = fetch_semaphore.clone().try_acquire_owned() else {
             sleep(Duration::from_millis(10)).await;
             continue;
@@ -720,7 +719,7 @@ pub async fn run_ingest_pipeline(
             }
         };
         let batch = scheduler
-            .next_batch_for_peer(peer.peer_id, head_cap, active_peers)
+            .next_batch_for_peer(peer.peer_id, head_cap)
             .await;
         if batch.blocks.is_empty() {
             drop(permit);
