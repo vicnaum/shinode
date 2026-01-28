@@ -317,6 +317,12 @@ pub struct UiSetup {
     pub events: Option<Arc<BenchEventLogger>>,
 }
 
+/// Log writers for TUI quit flushing.
+pub struct LogWriters {
+    pub log_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+    pub resources_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+}
+
 /// Setup UI controller, progress bar, and event logger.
 ///
 /// The `shutdown_tx` is used to signal the sync runner to stop when the user
@@ -327,6 +333,9 @@ pub struct UiSetup {
 ///
 /// If `early_tui` is provided, it will be reused instead of creating a new TUI.
 /// The early TUI is created during startup to show startup phase status.
+///
+/// If `log_writers` is provided, the TUI will flush the log writers before
+/// exiting to prevent log truncation.
 #[expect(clippy::too_many_arguments, reason = "setup function needs many config params")]
 pub fn setup_ui(
     config: &NodeConfig,
@@ -340,6 +349,7 @@ pub fn setup_ui(
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     early_tui: Option<EarlyTui>,
     tui_log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
+    log_writers: Option<LogWriters>,
 ) -> Result<UiSetup> {
     // Create event logger if enabled
     let events = if config.log_events {
@@ -388,6 +398,8 @@ pub fn setup_ui(
             stats.set_start_block(start_block);
             stats.set_peers_active(0);
             stats.set_peers_total(pool.len() as u64);
+            let (log_writer, resources_writer) = log_writers
+                .map_or((None, None), |w| (w.log_writer, w.resources_writer));
             ui::spawn_tui_progress_updater(
                 Arc::clone(&tui_controller),
                 Arc::clone(stats),
@@ -397,6 +409,8 @@ pub fn setup_ui(
                 shutdown_tx,
                 completion_rx,
                 tui_log_buffer,
+                log_writer,
+                resources_writer,
             );
         }
 

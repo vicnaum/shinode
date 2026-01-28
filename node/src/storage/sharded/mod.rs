@@ -2162,7 +2162,6 @@ mod tests {
             fast_sync_chunk_size: 16,
             fast_sync_chunk_max: None,
             fast_sync_max_inflight: 2,
-            fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,

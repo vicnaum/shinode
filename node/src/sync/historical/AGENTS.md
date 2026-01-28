@@ -15,8 +15,8 @@ benchmark stats/event logging.
   - **Key items**: `DbWriteConfig`, `DbWriteMode`, `DbWriterMessage`, `DbWriterFinalizeStats`, `DbWriterParams`, `FlushContext`, `run_db_writer()`, `flush_fast_sync_buffer()`, `finalize_fast_sync()`
 - `fetch.rs` - Ingest fetch wrappers around the P2P layer (consecutive batch enforcement, ingest payload fetch).
   - **Key items**: `fetch_ingest_batch()`, `FetchIngestOutcome`, `ensure_consecutive()`
-- `fetch_task.rs` - Fetch task execution for the ingest pipeline; encapsulates per-batch fetch logic with timeout/error handling.
-  - **Key items**: `FetchTaskContext`, `FetchTaskParams`, `run_fetch_task()`, `handle_fetch_timeout()`, `handle_fetch_success()`, `handle_fetch_error()`, `requeue_blocks()`
+- `fetch_task.rs` - Fetch task execution for the ingest pipeline; encapsulates per-batch fetch logic with error handling.
+  - **Key items**: `FetchTaskContext`, `FetchTaskParams`, `run_fetch_task()`, `handle_fetch_success()`, `handle_fetch_error()`, `requeue_blocks()`
 - `follow.rs` - Live follow loop: head discovery, near-tip backoff, reorg detection, rollback, and incremental ingest.
   - **Key items**: `run_follow_loop()`, `run_head_tracker()`, `run_tail_scheduler()`, `run_reorg_detector()`, `spawn_synced_watcher()`, `SyncStatus::UpToDate`
 - `mod.rs` - Pipeline orchestration for ingest (fetch loop, processing workers, DB writer wiring, progress bars).
@@ -53,7 +53,7 @@ benchmark stats/event logging.
   - Uses `scheduler::{PeerWorkScheduler, PeerHealthTracker}` to assign work and adapt per-peer batch limits.
   - When `TailIngestConfig` is provided, enqueues appended ranges via `PeerWorkScheduler::enqueue_range()` and updates progress totals; head offset controls safe-head vs head tracking.
 - **Knobs / invariants**:
-  - Concurrency is bounded by `fast_sync_max_inflight`; per-batch timeout is `fast_sync_batch_timeout_ms`.
+  - Concurrency is bounded by `fast_sync_max_inflight`.
   - In follow mode, retries are unbounded (`max_attempts_per_block = u32::MAX`) to tolerate propagation lag near the tip.
   - In follow mode, scheduling caps batches by the global observed head (from head tracking), not per-peer `head_number` which can go stale.
   - In follow mode, "missing blocks" responses (including empty batches) are treated as partials to avoid banning peers for near-tip propagation lag.
@@ -61,9 +61,9 @@ benchmark stats/event logging.
 
 ### `fetch_task.rs`
 - **Role**: Encapsulates fetch task execution for a single batch of blocks from a peer. Handles timeouts, success/failure outcomes, stats recording, and requeueing.
-- **Key items**: `FetchTaskContext` (shared context with scheduler, peer_health, channels, stats, events), `FetchTaskParams` (per-task parameters: peer, blocks, mode, batch_limit, permit), `run_fetch_task()`, `handle_fetch_timeout()`, `handle_fetch_success()`, `handle_fetch_error()`, `requeue_blocks()`
+- **Key items**: `FetchTaskContext` (shared context with scheduler, peer_health, channels, stats, events), `FetchTaskParams` (per-task parameters: peer, blocks, mode, batch_limit, permit), `run_fetch_task()`, `handle_fetch_success()`, `handle_fetch_error()`, `requeue_blocks()`
 - **Interactions**: Called from `mod.rs` fetch loop; uses `fetch::fetch_ingest_batch()` for P2P; updates `PeerHealthTracker` and `PeerWorkScheduler` on outcomes; sends payloads to processing workers via `fetched_tx`.
-- **Knobs / invariants**: Timeout is configured via `fetch_timeout` in context; escalation vs normal mode affects requeue behavior.
+- **Knobs / invariants**: Escalation vs normal mode affects requeue behavior.
 
 ### `scheduler.rs`
 - **Role**: Maintains the global work queue, priority escalation queue, and per-peer health/quality model so scheduling adapts to real-world peer behavior.

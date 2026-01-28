@@ -7,16 +7,25 @@ use std::{
     io::{BufWriter, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, SyncSender, TrySendError},
+        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::JoinHandle,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::Event;
 use tracing_subscriber::Layer;
 
 /// Buffer size for JSON log channel.
 pub const LOG_BUFFER: usize = 10_000;
+
+/// Flush after this many records (count-based).
+const FLUSH_COUNT: usize = 4096;
+
+/// Flush after this duration (time-based, for timely log visibility during debugging).
+const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Timeout for recv_timeout to allow periodic flushing even without new records.
+const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A single log record serialized to JSON.
 #[derive(Debug, Serialize)]
@@ -94,15 +103,39 @@ impl JsonLogWriter {
         let (tx, rx) = mpsc::sync_channel::<LogRecord>(capacity);
         let handle = std::thread::spawn(move || -> eyre::Result<()> {
             let mut since_flush = 0usize;
-            for record in rx {
-                serde_json::to_writer(&mut writer, &record)?;
-                writer.write_all(b"\n")?;
-                since_flush = since_flush.saturating_add(1);
-                if since_flush >= 4096 {
-                    writer.flush()?;
-                    since_flush = 0;
+            let mut last_flush = Instant::now();
+
+            loop {
+                // Use recv_timeout to allow periodic flushing even without new records
+                match rx.recv_timeout(RECV_TIMEOUT) {
+                    Ok(record) => {
+                        serde_json::to_writer(&mut writer, &record)?;
+                        writer.write_all(b"\n")?;
+                        since_flush = since_flush.saturating_add(1);
+
+                        // Flush on count threshold or time interval
+                        let elapsed = last_flush.elapsed();
+                        if since_flush >= FLUSH_COUNT || elapsed >= FLUSH_INTERVAL {
+                            writer.flush()?;
+                            since_flush = 0;
+                            last_flush = Instant::now();
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Flush any pending records on timeout
+                        if since_flush > 0 {
+                            writer.flush()?;
+                            since_flush = 0;
+                            last_flush = Instant::now();
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // Channel closed, flush and exit
+                        break;
+                    }
                 }
             }
+
             writer.flush()?;
             Ok(())
         });

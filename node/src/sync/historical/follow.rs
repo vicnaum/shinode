@@ -272,8 +272,8 @@ async fn dump_follow_debug(
     for entry in health.into_iter().take(50) {
         tracing::info!(
             peer_id = ?entry.peer_id,
-            banned = entry.is_banned,
-            ban_remaining_ms = entry.ban_remaining_ms,
+            cooling_down = entry.is_cooling_down,
+            backoff_remaining_ms = entry.backoff_remaining_ms,
             inflight_blocks = entry.inflight_blocks,
             last_assigned_age_ms = entry.last_assigned_age_ms,
             quality = entry.quality_score,
@@ -551,7 +551,7 @@ pub async fn run_follow_loop(
                 if let Some(s) = stats.as_ref() {
                     s.set_head_block(*range.end());
                 }
-                tracing::debug!(
+                tracing::info!(
                     range_start = *range.start(),
                     range_end = *range.end(),
                     logs,

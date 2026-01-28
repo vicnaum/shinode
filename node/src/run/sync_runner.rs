@@ -266,6 +266,10 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
 
     // Setup UI (pass shutdown_tx for TUI quit handling, and early_tui to reuse)
+    let log_writers = super::startup::LogWriters {
+        log_writer: tracing_guards.log_writer.clone(),
+        resources_writer: tracing_guards.resources_writer.clone(),
+    };
     let UiSetup {
         ui_controller: _,
         tui_controller: _,
@@ -283,9 +287,15 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         Some(completion_rx),
         early_tui,
         tracing_guards.tui_log_buffer.clone(),
+        Some(log_writers),
     )?;
 
-    spawn_resource_logger(progress_stats.clone(), events.clone());
+    spawn_resource_logger(
+        progress_stats.clone(),
+        events.clone(),
+        Some(session.handle.clone()),
+        Some(Arc::clone(&session.p2p_stats)),
+    );
 
     #[cfg(unix)]
     spawn_usr1_state_logger(
