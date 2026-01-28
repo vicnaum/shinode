@@ -251,21 +251,14 @@ const TUI_LOG_BUFFER_SIZE: usize = 100;
 pub struct TuiLogEntry {
     pub level: tracing::Level,
     pub message: String,
-    /// Milliseconds since TUI log capture started.
+    /// Unix timestamp in milliseconds.
     pub timestamp_ms: u64,
 }
 
 /// Shared buffer for TUI log capture.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TuiLogBuffer {
     entries: Mutex<VecDeque<TuiLogEntry>>,
-    started_at: Instant,
-}
-
-impl Default for TuiLogBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl TuiLogBuffer {
@@ -273,13 +266,7 @@ impl TuiLogBuffer {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(VecDeque::with_capacity(TUI_LOG_BUFFER_SIZE)),
-            started_at: Instant::now(),
         }
-    }
-
-    /// Get elapsed time since buffer creation.
-    pub fn elapsed_ms(&self) -> u64 {
-        self.started_at.elapsed().as_millis() as u64
     }
 
     /// Add a log entry, removing oldest if at capacity.
@@ -295,12 +282,6 @@ impl TuiLogBuffer {
     pub fn drain(&self) -> Vec<TuiLogEntry> {
         let mut entries = self.entries.lock();
         entries.drain(..).collect()
-    }
-
-    /// Get a snapshot of all entries (doesn't clear).
-    pub fn snapshot(&self) -> Vec<TuiLogEntry> {
-        let entries = self.entries.lock();
-        entries.iter().cloned().collect()
     }
 }
 
@@ -352,7 +333,11 @@ where
                 }
             });
 
-        let timestamp_ms = self.buffer.elapsed_ms();
+        // Use system time for absolute timestamps
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         self.buffer.push(TuiLogEntry { level, message, timestamp_ms });
     }
 }

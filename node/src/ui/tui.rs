@@ -1641,27 +1641,99 @@ fn render_logs_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
     // Show most recent logs first (reverse order), limited to visible height
     for (i, log) in data.logs.iter().rev().take(inner.height as usize).enumerate() {
-        let (level_str, style) = match log.level {
-            LogLevel::Error => ("ERR", Style::default().fg(Color::Red)),
-            LogLevel::Warn => ("WRN", Style::default().fg(Color::Yellow)),
-            LogLevel::Info => ("INF", Style::default().fg(Color::Gray)),
-            LogLevel::Debug => ("DBG", Style::default().fg(Color::DarkGray)),
+        // Padded level names (ERROR is 5 chars, so pad others)
+        let (level_str, level_style) = match log.level {
+            LogLevel::Error => ("ERROR", Style::default().fg(Color::Red)),
+            LogLevel::Warn => ("WARN ", Style::default().fg(Color::Yellow)),
+            LogLevel::Info => ("INFO ", Style::default().fg(Color::Cyan)),
+            LogLevel::Debug => ("DEBUG", Style::default().fg(Color::DarkGray)),
         };
 
-        // Format timestamp as seconds.millis (e.g., "12.345")
-        let secs = log.timestamp_ms / 1000;
-        let millis = log.timestamp_ms % 1000;
-        let timestamp = format!("{:3}.{:03}", secs, millis);
+        // Format timestamp as "2026-Jan-27 10:46:36.123"
+        let timestamp = format_unix_timestamp_ms(log.timestamp_ms);
 
-        // Format: "123.456 INF message..."
-        let prefix = format!("{} {} ", timestamp, level_str);
-        let prefix_len = prefix.len();
+        // Calculate available width for message
+        // Format: "2026-Jan-27 10:46:36.123 INFO  message..."
+        let prefix_len = timestamp.len() + 1 + 5 + 1; // timestamp + space + level + space
         let max_msg_len = (inner.width as usize).saturating_sub(prefix_len + 1);
         let truncated_msg: String = log.message.chars().take(max_msg_len).collect();
-        let full_line = format!("{}{}", prefix, truncated_msg);
 
-        buf.set_string(inner.x + 1, inner.y + i as u16, &full_line, style);
+        // Render timestamp in gray
+        let x = inner.x + 1;
+        let y = inner.y + i as u16;
+        buf.set_string(x, y, &timestamp, Style::default().fg(Color::DarkGray));
+
+        // Render level with its color
+        let level_x = x + timestamp.len() as u16 + 1;
+        buf.set_string(level_x, y, level_str, level_style);
+
+        // Render message in default style
+        let msg_x = level_x + 6; // 5 chars for level + 1 space
+        buf.set_string(msg_x, y, &truncated_msg, Style::default().fg(Color::Gray));
     }
+}
+
+/// Format a Unix timestamp in milliseconds to "2026-Jan-27 10:46:36.123" format.
+fn format_unix_timestamp_ms(timestamp_ms: u64) -> String {
+    // Convert to time components manually (UTC)
+    // For simplicity, use chrono-free approach with rough calculation
+    let secs = timestamp_ms / 1000;
+    let millis = timestamp_ms % 1000;
+
+    // Get UTC time components (simplified - doesn't account for leap seconds)
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Calculate year/month/day from days since epoch (1970-01-01)
+    let (year, month, day) = days_to_ymd(days_since_epoch);
+
+    let month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month_str = month_names.get(month as usize).unwrap_or(&"???");
+
+    format!("{}-{}-{:02} {:02}:{:02}:{:02}.{:03}",
+            year, month_str, day, hours, minutes, seconds, millis)
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Simplified algorithm - good enough for display purposes
+    let mut remaining_days = days as i64;
+    let mut year = 1970i64;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let days_in_months: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 0i64;
+    for (i, &days_in_month) in days_in_months.iter().enumerate() {
+        if remaining_days < days_in_month {
+            month = i as i64;
+            break;
+        }
+        remaining_days -= days_in_month;
+    }
+
+    let day = remaining_days + 1; // Days are 1-indexed
+    (year as u64, month as u64, day as u64)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 fn render_synced_status(area: Rect, buf: &mut Buffer, data: &TuiState) {
