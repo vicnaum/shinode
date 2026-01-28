@@ -205,7 +205,7 @@ async fn run_peer_events_tracker(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut known_peers: HashSet<PeerId> = HashSet::new();
-    let mut banned_state: HashMap<PeerId, bool> = HashMap::new();
+    let mut cooling_state: HashMap<PeerId, bool> = HashMap::new();
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -226,18 +226,18 @@ async fn run_peer_events_tracker(
 
         let health_snapshot = peer_health.snapshot().await;
         for dump in &health_snapshot {
-            let was_banned = banned_state.get(&dump.peer_id).copied().unwrap_or(false);
-            if dump.is_banned && !was_banned {
+            let was_cooling = cooling_state.get(&dump.peer_id).copied().unwrap_or(false);
+            if dump.is_cooling_down && !was_cooling {
                 events.record(BenchEvent::PeerBanned {
                     peer_id: format!("{:?}", dump.peer_id),
                     reason: "health",
                 });
-            } else if !dump.is_banned && was_banned {
+            } else if !dump.is_cooling_down && was_cooling {
                 events.record(BenchEvent::PeerUnbanned {
                     peer_id: format!("{:?}", dump.peer_id),
                 });
             }
-            banned_state.insert(dump.peer_id, dump.is_banned);
+            cooling_state.insert(dump.peer_id, dump.is_cooling_down);
         }
 
         tokio::select! {
@@ -376,9 +376,10 @@ pub async fn run_ingest_pipeline(
         }
     });
     // In follow mode, missing blocks are typically due to propagation lag near the tip.
-    // Keep retrying indefinitely instead of marking them as permanently failed.
+    // Use a low escalation threshold so difficult blocks quickly enter the priority
+    // escalation queue with per-peer-per-block backoff, preventing spin loops.
     if db_mode == DbWriteMode::Follow {
-        scheduler_config.max_attempts_per_block = u32::MAX;
+        scheduler_config.max_attempts_per_block = 5;
     }
     let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
         let mut remaining: HashMap<u64, usize> = HashMap::new();
@@ -614,11 +615,11 @@ pub async fn run_ingest_pipeline(
     let fetch_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.fast_sync_max_inflight.max(1) as usize,
     ));
-    let fetch_timeout = Duration::from_millis(config.fast_sync_batch_timeout_ms.max(1));
-
     let mut fetch_tasks: JoinSet<()> = JoinSet::new();
     let mut ready_peers: Vec<crate::p2p::NetworkPeer> = Vec::new();
     let mut ready_set: HashSet<PeerId> = HashSet::new();
+    let mut last_progress_check = Instant::now();
+    let mut last_progress_completed = 0u64;
     loop {
         while let Ok(peer) = ready_rx.try_recv() {
             if ready_set.insert(peer.peer_id) {
@@ -645,10 +646,67 @@ pub async fn run_ingest_pipeline(
             continue;
         }
         while fetch_tasks.try_join_next().is_some() {}
+        if last_progress_check.elapsed() >= Duration::from_secs(30) {
+            let current_completed = scheduler.completed_count().await as u64;
+            let pending = scheduler.pending_count().await;
+            let inflight = scheduler.inflight_count().await;
+            let escalation = scheduler.escalation_len().await;
+            if current_completed == last_progress_completed && (pending > 0 || escalation > 0) {
+                tracing::warn!(
+                    completed = current_completed,
+                    pending,
+                    inflight,
+                    escalation,
+                    ready_peers = ready_peers.len(),
+                    "stall detected: no progress in 30s"
+                );
+                let health_snapshot = peer_health.snapshot().await;
+                let tracked = health_snapshot.len();
+                let cooling = health_snapshot.iter().filter(|p| p.is_cooling_down).count();
+                let total_assignments: u64 = health_snapshot.iter().map(|p| p.assignments).sum();
+                tracing::warn!(
+                    tracked_peers = tracked,
+                    cooling_down = cooling,
+                    total_assignments,
+                    "stall: peer health summary"
+                );
+                for entry in health_snapshot.iter().take(10) {
+                    tracing::warn!(
+                        peer_id = ?entry.peer_id,
+                        cooling = entry.is_cooling_down,
+                        backoff_ms = entry.backoff_duration_ms,
+                        succ = entry.successes,
+                        fail = entry.failures,
+                        partial = entry.partials,
+                        assignments = entry.assignments,
+                        inflight = entry.inflight_blocks,
+                        last_err = ?entry.last_error,
+                        "stall: peer"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    completed = current_completed,
+                    delta = current_completed.saturating_sub(last_progress_completed),
+                    pending,
+                    inflight,
+                    escalation,
+                    ready_peers = ready_peers.len(),
+                    "ingest: progress check"
+                );
+            }
+            last_progress_completed = current_completed;
+            last_progress_check = Instant::now();
+        }
         if stop_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
             break;
         }
         if scheduler.is_done().await {
+            tracing::debug!(
+                max_scheduled = max_scheduled.load(Ordering::SeqCst),
+                ready_peers = ready_peers.len(),
+                "ingest: scheduler done, checking tail"
+            );
             if let Some(head_seen_rx) = tail_head_seen_rx.as_mut() {
                 let head_seen = *head_seen_rx.borrow();
                 let safe_head = head_seen.saturating_sub(tail_head_offset);
@@ -672,6 +730,9 @@ pub async fn run_ingest_pipeline(
                         }
                     }
                     // Follow-style tailing: wait for head updates and continue.
+                    tracing::debug!(
+                        "ingest: follow idle, waiting for head update"
+                    );
                     tokio::select! {
                         () = async {
                             if let Some(stop_rx) = stop_rx.as_mut() {
@@ -702,6 +763,69 @@ pub async fn run_ingest_pipeline(
         let best_idx = pick_best_ready_peer_index(&ready_peers, peer_health.as_ref()).await;
         let peer = ready_peers.swap_remove(best_idx);
         ready_set.remove(&peer.peer_id);
+
+        // Stale-head detection: ban peers whose head is too far behind
+        let min_required = if db_mode == DbWriteMode::Follow {
+            tail_head_seen
+                .as_ref()
+                .map_or(*range.start(), |rx| rx.borrow().saturating_sub(64))
+        } else {
+            *range.start()
+        };
+        if peer.head_number > 0 && peer.head_number < min_required {
+            tracing::debug!(
+                peer_id = ?peer.peer_id,
+                peer_head = peer.head_number,
+                min_required,
+                "peer head too far behind, banning for 120s"
+            );
+            peer_health
+                .set_stale_head_cooldown(peer.peer_id, Duration::from_secs(120))
+                .await;
+
+            // Spawn async re-probe so the peer can update its head_number
+            let pool_for_probe = Arc::clone(&pool);
+            let peer_for_probe = peer.clone();
+            let probe_block = if db_mode == DbWriteMode::Follow {
+                tail_head_seen
+                    .as_ref()
+                    .map_or(*range.start(), |rx| rx.borrow().saturating_sub(10))
+            } else {
+                *range.start()
+            };
+            tokio::spawn(async move {
+                match crate::p2p::re_probe_peer_head(
+                    &pool_for_probe,
+                    &peer_for_probe,
+                    probe_block,
+                )
+                .await
+                {
+                    Ok(new_head) => {
+                        tracing::info!(
+                            peer_id = ?peer_for_probe.peer_id,
+                            new_head,
+                            probe_block,
+                            "peer head re-probed successfully"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            peer_id = ?peer_for_probe.peer_id,
+                            probe_block,
+                            error = %err,
+                            "peer head re-probe failed, will retry after cooldown"
+                        );
+                    }
+                }
+            });
+
+            // Recycle peer — cooldown will prevent re-assignment for 120s
+            let _ = ready_tx.send(peer);
+            drop(permit);
+            continue;
+        }
+
         let head_cap = match head_cap_override {
             Some(cap) => cap,
             None => {
@@ -722,6 +846,12 @@ pub async fn run_ingest_pipeline(
             .next_batch_for_peer(peer.peer_id, head_cap)
             .await;
         if batch.blocks.is_empty() {
+            tracing::trace!(
+                peer_id = ?peer.peer_id,
+                head_cap,
+                ready_peers = ready_peers.len(),
+                "ingest: empty batch for peer, recycling"
+            );
             drop(permit);
             let ready_tx = ready_tx.clone();
             tokio::spawn(async move {
@@ -732,6 +862,15 @@ pub async fn run_ingest_pipeline(
         }
 
         let batch_limit = peer_health.batch_limit(peer.peer_id).await as u64;
+        tracing::debug!(
+            peer_id = ?peer.peer_id,
+            blocks = batch.blocks.len(),
+            range_start = batch.blocks.first().copied().unwrap_or(0),
+            range_end = batch.blocks.last().copied().unwrap_or(0),
+            mode = ?batch.mode,
+            head_cap,
+            "ingest: assigned batch"
+        );
         if let Some(events) = events.as_ref() {
             let range_start = batch.blocks.first().copied().unwrap_or(0);
             let range_end = batch.blocks.last().copied().unwrap_or(range_start);
@@ -770,7 +909,6 @@ pub async fn run_ingest_pipeline(
             events: events.clone(),
             active_fetch_tasks: Arc::clone(&active_fetch_tasks),
             db_mode,
-            fetch_timeout,
         };
         let params = FetchTaskParams {
             peer,

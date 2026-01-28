@@ -149,6 +149,7 @@ pub struct SyncProgressStats {
     sealings_total: std::sync::atomic::AtomicU64,
     peers_active: std::sync::atomic::AtomicU64,
     peers_total: std::sync::atomic::AtomicU64,
+    peers_stale: std::sync::atomic::AtomicU64,
     status: std::sync::atomic::AtomicU8,
     head_block: std::sync::atomic::AtomicU64,
     head_seen: std::sync::atomic::AtomicU64,
@@ -182,6 +183,7 @@ pub struct SyncProgressSnapshot {
     pub sealings_total: u64,
     pub peers_active: u64,
     pub peers_total: u64,
+    pub peers_stale: u64,
     pub status: SyncStatus,
     pub head_block: u64,
     pub head_seen: u64,
@@ -221,6 +223,7 @@ impl SyncProgressStats {
                 .load(std::sync::atomic::Ordering::SeqCst),
             peers_active: self.peers_active.load(std::sync::atomic::Ordering::SeqCst),
             peers_total: self.peers_total.load(std::sync::atomic::Ordering::SeqCst),
+            peers_stale: self.peers_stale.load(std::sync::atomic::Ordering::SeqCst),
             status: match self.status.load(std::sync::atomic::Ordering::SeqCst) {
                 1 => SyncStatus::Fetching,
                 2 => SyncStatus::Finalizing,
@@ -319,6 +322,11 @@ impl SyncProgressStats {
     pub fn set_peers_total(&self, total: u64) {
         self.peers_total
             .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_peers_stale(&self, stale: u64) {
+        self.peers_stale
+            .store(stale, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_head_block(&self, block: u64) {

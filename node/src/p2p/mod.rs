@@ -16,6 +16,7 @@ use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network::NetworkHandle;
 use reth_network::PeersConfig;
+use reth_network::PeersInfo;
 use reth_network_api::{
     events::PeerEvent, DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider,
     PeerId, PeerKind, PeerRequest, PeerRequestSender, Peers,
@@ -81,7 +82,8 @@ const MIN_PEER_START: usize = 1;
 const PEER_DISCOVERY_TIMEOUT: Option<Duration> = None;
 const PEER_START_WARMUP_SECS: u64 = 2;
 const MAX_OUTBOUND: usize = 400;
-const MAX_CONCURRENT_DIALS: usize = 100;
+const MAX_INBOUND: usize = 200;
+const MAX_CONCURRENT_DIALS: usize = 200;
 const PEER_REFILL_INTERVAL_MS: u64 = 500;
 const MAX_HEADERS_PER_REQUEST: usize = 1024;
 const PEER_CACHE_TTL_DAYS: u64 = 7;
@@ -166,11 +168,32 @@ pub struct NetworkPeer {
     pub head_number: u64,
 }
 
+/// Shared counters for P2P discovery and session visibility.
+#[derive(Debug)]
+pub struct P2pStats {
+    pub discovered_count: AtomicUsize,
+    pub genesis_mismatch_count: AtomicUsize,
+    pub sessions_established: AtomicUsize,
+    pub sessions_closed: AtomicUsize,
+}
+
+impl P2pStats {
+    fn new() -> Self {
+        Self {
+            discovered_count: AtomicUsize::new(0),
+            genesis_mismatch_count: AtomicUsize::new(0),
+            sessions_established: AtomicUsize::new(0),
+            sessions_closed: AtomicUsize::new(0),
+        }
+    }
+}
+
 /// Wrapper that keeps the network handle alive.
 #[derive(Debug)]
 pub struct NetworkSession {
-    pub _handle: NetworkHandle<EthNetworkPrimitives>,
+    pub handle: NetworkHandle<EthNetworkPrimitives>,
     pub pool: Arc<PeerPool>,
+    pub p2p_stats: Arc<P2pStats>,
     peer_cache: Option<PeerCacheHandle>,
 }
 
@@ -179,6 +202,7 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
     let secret_key = rng_secret_key();
     let peers_config = PeersConfig::default()
         .with_max_outbound(MAX_OUTBOUND)
+        .with_max_inbound(MAX_INBOUND)
         .with_max_concurrent_dials(MAX_CONCURRENT_DIALS)
         .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS));
     let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
@@ -194,18 +218,24 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
         .await
         .wrap_err("failed to start p2p network")?;
     let pool = Arc::new(PeerPool::new());
+    let p2p_stats = Arc::new(P2pStats::new());
     let peer_cache = storage.map(|storage| PeerCacheHandle {
         storage,
         buffer: Arc::new(PeerCacheBuffer::new()),
     });
     if let Some(cache) = peer_cache.as_ref() {
         seed_peer_cache(&handle, &cache.storage)?;
-        spawn_peer_discovery_watcher(handle.clone(), Arc::clone(&cache.buffer));
+        spawn_peer_discovery_watcher(
+            handle.clone(),
+            Arc::clone(&cache.buffer),
+            Arc::clone(&p2p_stats),
+        );
     }
     spawn_peer_watcher(
         handle.clone(),
         Arc::clone(&pool),
         peer_cache.as_ref().map(|cache| Arc::clone(&cache.buffer)),
+        Arc::clone(&p2p_stats),
     );
     let warmup_started = Instant::now();
     let _connected =
@@ -217,9 +247,18 @@ pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<Netw
             sleep(remaining).await;
         }
     }
+    info!(
+        reth_connected = handle.num_connected_peers(),
+        pool_peers = pool.len(),
+        discovered = p2p_stats.discovered_count.load(Ordering::Relaxed),
+        genesis_mismatches = p2p_stats.genesis_mismatch_count.load(Ordering::Relaxed),
+        warmup_ms = warmup_started.elapsed().as_millis() as u64,
+        "peer startup complete"
+    );
     Ok(NetworkSession {
-        _handle: handle,
+        handle,
         pool,
+        p2p_stats,
         peer_cache,
     })
 }
@@ -287,7 +326,7 @@ impl PeerPool {
         peers.push(peer);
     }
 
-    fn update_peer_head(&self, peer_id: PeerId, head_number: u64) {
+    pub fn update_peer_head(&self, peer_id: PeerId, head_number: u64) {
         let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
             peer.head_number = head_number;
@@ -313,6 +352,7 @@ fn spawn_peer_watcher(
     handle: NetworkHandle<EthNetworkPrimitives>,
     pool: Arc<PeerPool>,
     peer_cache: Option<Arc<PeerCacheBuffer>>,
+    p2p_stats: Arc<P2pStats>,
 ) {
     tokio::spawn(async move {
         let mut events = handle.event_listener();
@@ -320,10 +360,21 @@ fn spawn_peer_watcher(
         while let Some(event) = events.next().await {
             match event {
                 NetworkEvent::ActivePeerSession { info, messages } => {
+                    p2p_stats.sessions_established.fetch_add(1, Ordering::Relaxed);
                     if info.status.genesis != MAINNET.genesis_hash() {
+                        p2p_stats.genesis_mismatch_count.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            peer_id = %format!("{:#}", info.peer_id),
+                            "ignoring peer: genesis mismatch"
+                        );
                         continue;
                     }
                     let peer_id = info.peer_id;
+                    info!(
+                        peer_id = %format!("{:#}", peer_id),
+                        eth_version = %info.version,
+                        "peer session established"
+                    );
                     let head_hash = info.status.blockhash;
                     let messages_for_peer = messages.clone();
                     let messages_for_probe = messages.clone();
@@ -363,9 +414,16 @@ fn spawn_peer_watcher(
                         peer_cache.upsert(peer);
                     }
                 }
-                NetworkEvent::Peer(
-                    PeerEvent::SessionClosed { peer_id, .. } | PeerEvent::PeerRemoved(peer_id),
-                ) => {
+                NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
+                    p2p_stats.sessions_closed.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        peer_id = %format!("{:#}", peer_id),
+                        reason = ?reason,
+                        "peer session closed"
+                    );
+                    pool.remove_peer(peer_id);
+                }
+                NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
                     pool.remove_peer(peer_id);
                 }
                 NetworkEvent::Peer(_) => {}
@@ -377,21 +435,34 @@ fn spawn_peer_watcher(
 fn spawn_peer_discovery_watcher(
     handle: NetworkHandle<EthNetworkPrimitives>,
     peer_cache: Arc<PeerCacheBuffer>,
+    p2p_stats: Arc<P2pStats>,
 ) {
     tokio::spawn(async move {
         let mut events = handle.discovery_listener();
-        while let Some(event) = events.next().await {
-            if let DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, addr, .. }) =
-                event
-            {
-                let peer = StoredPeer {
-                    peer_id: peer_id.to_string(),
-                    tcp_addr: addr.tcp(),
-                    udp_addr: addr.udp(),
-                    last_seen_ms: now_ms(),
-                    aimd_batch_limit: None,
-                };
-                peer_cache.upsert(peer);
+        let mut log_interval = tokio::time::interval(Duration::from_secs(30));
+        log_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = events.next() => {
+                    let Some(event) = event else { break };
+                    if let DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, addr, .. }) =
+                        event
+                    {
+                        p2p_stats.discovered_count.fetch_add(1, Ordering::Relaxed);
+                        let peer = StoredPeer {
+                            peer_id: peer_id.to_string(),
+                            tcp_addr: addr.tcp(),
+                            udp_addr: addr.udp(),
+                            last_seen_ms: now_ms(),
+                            aimd_batch_limit: None,
+                        };
+                        peer_cache.upsert(peer);
+                    }
+                }
+                _ = log_interval.tick() => {
+                    let count = p2p_stats.discovered_count.load(Ordering::Relaxed);
+                    info!(discovered = count, "DHT discovery progress");
+                }
             }
         }
     });
@@ -485,6 +556,21 @@ pub async fn request_headers_batch(
     limit: usize,
 ) -> Result<Vec<Header>> {
     request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages).await
+}
+
+/// Re-probe a peer's head by requesting a header at a known block number.
+/// Updates the peer's `head_number` in the pool if the peer responds.
+pub async fn re_probe_peer_head(
+    pool: &PeerPool,
+    peer: &NetworkPeer,
+    probe_block: u64,
+) -> Result<u64> {
+    let headers = request_headers_batch(peer, probe_block, 1).await?;
+    let header = headers
+        .first()
+        .ok_or_else(|| eyre!("empty response for head re-probe"))?;
+    pool.update_peer_head(peer.peer_id, header.number);
+    Ok(header.number)
 }
 
 pub async fn discover_head_p2p(

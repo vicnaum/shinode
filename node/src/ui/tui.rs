@@ -19,6 +19,10 @@ use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Max time since last block before considering status stale in follow mode (30 seconds).
+/// If we haven't received a block in this time, we're likely not truly synced.
+const FOLLOW_STALENESS_THRESHOLD_MS: u64 = 30_000;
+
 use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind},
@@ -90,6 +94,7 @@ pub struct TuiState {
     pub peak_speed: u64,
     pub peers_connected: u64,
     pub peers_max: u64,
+    pub peers_stale: u64,
     pub pending: u64,
     pub inflight: u64,
     pub retry: u64,
@@ -102,6 +107,8 @@ pub struct TuiState {
     pub sealed_shards: u64,
     pub total_to_seal: u64,
     pub last_block_secs: u64,
+    /// Unix timestamp in milliseconds of when we last received a block.
+    pub last_block_received_ms: u64,
 
     // Extended tracking
     pub speed_history: VecDeque<u64>,
@@ -190,6 +197,7 @@ impl TuiState {
             peak_speed: 0,
             peers_connected: 0,
             peers_max: 0,
+            peers_stale: 0,
             pending: 0,
             inflight: 0,
             retry: 0,
@@ -201,6 +209,7 @@ impl TuiState {
             sealed_shards: 0,
             total_to_seal: 0,
             last_block_secs: 0,
+            last_block_received_ms: 0,
             speed_history: VecDeque::with_capacity(60),
             avg_speed_window: VecDeque::with_capacity(300), // 30 seconds at 100ms intervals
             animation_frame: 0,
@@ -286,7 +295,13 @@ impl TuiState {
                 if snapshot.queue == 0 && snapshot.escalation > 0 && !snapshot.fetch_complete {
                     Phase::Retry
                 } else {
-                    Phase::Sync
+                    // If we were at SEAL or later and now fetching, we're in follow mode catching up
+                    // Show FOLLOW (catching up) instead of SYNC to avoid confusing backwards transition
+                    if self.phase >= Phase::Seal {
+                        Phase::Follow
+                    } else {
+                        Phase::Sync
+                    }
                 }
             }
             SyncStatus::Finalizing => match snapshot.finalize_phase {
@@ -296,10 +311,15 @@ impl TuiState {
             SyncStatus::UpToDate | SyncStatus::Following => Phase::Follow,
         };
 
-        // Prevent backwards phase transitions (Fix 7)
-        // Only allow forward transitions (higher ordinal) to avoid race conditions
-        // Exception: Startup can transition to any phase
-        if self.phase != Phase::Startup && (new_phase as u8) < (self.phase as u8) {
+        // Prevent backwards phase transitions to avoid race conditions
+        // Only allow forward transitions (higher ordinal)
+        // Exceptions:
+        // - Startup can transition to any phase
+        // - Transition to Follow is always allowed (follow mode catching up)
+        if self.phase != Phase::Startup
+            && new_phase != Phase::Follow
+            && (new_phase as u8) < (self.phase as u8)
+        {
             // Don't go backwards - keep current phase
         } else {
             self.phase = new_phase;
@@ -399,6 +419,7 @@ impl TuiState {
         // Peer tracking
         self.peers_connected = snapshot.peers_active;
         self.peers_max = snapshot.peers_total;
+        self.peers_stale = snapshot.peers_stale;
 
         // Queue tracking
         self.pending = snapshot.queue;
@@ -417,6 +438,7 @@ impl TuiState {
 
         // Last block timing
         if snapshot.last_block_received_ms > 0 {
+            self.last_block_received_ms = snapshot.last_block_received_ms;
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -445,9 +467,32 @@ impl TuiState {
         self.end_block.saturating_sub(self.start_block)
     }
 
-    /// Returns true if we're fully synced (our head >= chain head).
-    pub const fn is_synced(&self) -> bool {
-        self.our_head >= self.chain_head
+    /// Returns true if we're fully synced (our head >= chain head AND data is fresh).
+    ///
+    /// In follow mode, we also check that we've received a block recently.
+    /// If `last_block_received_ms` is too old (>30 seconds), we're not truly synced.
+    pub fn is_synced(&self) -> bool {
+        // Basic check: our head must be at or past chain head
+        if self.our_head < self.chain_head {
+            return false;
+        }
+
+        // In follow mode, also check if data is fresh
+        if self.phase == Phase::Follow {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            // If last block was too long ago, we're not really synced
+            if self.last_block_received_ms > 0
+                && now_ms.saturating_sub(self.last_block_received_ms) > FOLLOW_STALENESS_THRESHOLD_MS
+            {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Returns blocks behind (0 if synced).
@@ -1415,34 +1460,49 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let value_col = inner.x + 12;
 
     // Peers visual: 1 peer = 1 character
-    // ● = active (fetching), ○ = connected but idle
+    // ● = active (green, fetching), ○ = healthy idle (green), ⊘ = stale-head banned (dark gray)
     // If peers exceed available width, show … at the end
     let available_width = inner.width.saturating_sub(12) as u64;
     let active = data.peers_connected;
-    let connected = data.peers_max;
-    let idle = connected.saturating_sub(active);
+    let stale = data.peers_stale;
+    let connected_total = active.saturating_add(data.peers_max).saturating_add(stale);
+    let healthy_idle = data.peers_max.saturating_sub(active);
 
-    let peers_visual = if connected == 0 {
+    let peers_visual = if connected_total == 0 {
         "—".to_string() // No peers
-    } else if connected <= available_width {
-        // All peers fit: show each one
+    } else if connected_total <= available_width {
         let active_chars: String = (0..active).map(|_| '\u{25CF}').collect(); // ●
-        let idle_chars: String = (0..idle).map(|_| '\u{25CB}').collect(); // ○
-        format!("{active_chars}{idle_chars}")
+        let idle_chars: String = (0..healthy_idle).map(|_| '\u{25CB}').collect(); // ○
+        let stale_chars: String = (0..stale).map(|_| '\u{2298}').collect(); // ⊘
+        format!("{active_chars}{idle_chars}{stale_chars}")
     } else {
-        // Too many peers: show as many as fit, then …
-        let display_slots = available_width.saturating_sub(1); // Reserve 1 for …
+        let display_slots = available_width.saturating_sub(1);
         let active_to_show = active.min(display_slots);
-        let remaining_slots = display_slots.saturating_sub(active_to_show);
-        let idle_to_show = idle.min(remaining_slots);
+        let remaining = display_slots.saturating_sub(active_to_show);
+        let idle_to_show = healthy_idle.min(remaining);
+        let remaining = remaining.saturating_sub(idle_to_show);
+        let stale_to_show = stale.min(remaining);
 
         let active_chars: String = (0..active_to_show).map(|_| '\u{25CF}').collect();
         let idle_chars: String = (0..idle_to_show).map(|_| '\u{25CB}').collect();
-        format!("{active_chars}{idle_chars}\u{2026}") // … (ellipsis)
+        let stale_chars: String = (0..stale_to_show).map(|_| '\u{2298}').collect();
+        format!("{active_chars}{idle_chars}{stale_chars}\u{2026}")
     };
 
     buf.set_string(inner.x + 1, inner.y, "Peers", Style::default().fg(Color::Gray));
-    buf.set_string(value_col, inner.y, &peers_visual, Style::default().fg(Color::Green));
+    // Render active+idle chars in green, then stale chars in dark gray
+    let green_len = active.saturating_add(healthy_idle).min(available_width) as u16;
+    let green_part: String = peers_visual.chars().take(green_len as usize).collect();
+    let rest_part: String = peers_visual.chars().skip(green_len as usize).collect();
+    buf.set_string(value_col, inner.y, &green_part, Style::default().fg(Color::Green));
+    if !rest_part.is_empty() {
+        buf.set_string(
+            value_col + green_len,
+            inner.y,
+            &rest_part,
+            Style::default().fg(Color::DarkGray),
+        );
+    }
 
     // Active peers (currently fetching blocks)
     buf.set_string(inner.x + 1, inner.y + 1, "Active", Style::default().fg(Color::Gray));
@@ -1453,12 +1513,30 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
         Style::default().fg(Color::Yellow),
     );
 
-    // Connected peers (total available in pool)
-    buf.set_string(inner.x + 1, inner.y + 2, "Connected", Style::default().fg(Color::Gray));
+    // Healthy peers (connected & capable, not active)
+    buf.set_string(inner.x + 1, inner.y + 2, "Healthy", Style::default().fg(Color::Gray));
     buf.set_string(
         value_col,
         inner.y + 2,
-        &data.peers_max.to_string(),
+        &healthy_idle.to_string(),
+        Style::default().fg(Color::Green),
+    );
+
+    // Stale peers (banned for stale head)
+    buf.set_string(inner.x + 1, inner.y + 3, "Stale", Style::default().fg(Color::Gray));
+    buf.set_string(
+        value_col,
+        inner.y + 3,
+        &data.peers_stale.to_string(),
+        Style::default().fg(Color::Rgb(139, 0, 0)),
+    );
+
+    // Connected peers (total in pool)
+    buf.set_string(inner.x + 1, inner.y + 4, "Connected", Style::default().fg(Color::Gray));
+    buf.set_string(
+        value_col,
+        inner.y + 4,
+        &connected_total.to_string(),
         Style::default().fg(Color::White),
     );
 
@@ -1468,10 +1546,10 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     } else {
         data.chain_head
     };
-    buf.set_string(inner.x + 1, inner.y + 4, "Chain Head", Style::default().fg(Color::Gray));
+    buf.set_string(inner.x + 1, inner.y + 5, "Chain Head", Style::default().fg(Color::Gray));
     buf.set_string(
         value_col,
-        inner.y + 4,
+        inner.y + 5,
         &format_number(head_value),
         Style::default().fg(Color::White),
     );

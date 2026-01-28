@@ -380,8 +380,10 @@ pub fn spawn_progress_updater(
                 let available = if let Some(peer_health) = peer_health.as_ref() {
                     let peers = peer_pool.snapshot();
                     let peer_ids: Vec<_> = peers.iter().map(|peer| peer.peer_id).collect();
-                    let banned = peer_health.count_banned_peers(&peer_ids).await;
-                    connected.saturating_sub(banned)
+                    let banned = peer_health.count_cooling_down_peers(&peer_ids).await;
+                    let stale = peer_health.count_stale_head_peers(&peer_ids).await;
+                    stats.set_peers_stale(stale);
+                    connected.saturating_sub(banned).saturating_sub(stale)
                 } else {
                     connected
                 };
@@ -404,6 +406,9 @@ pub fn spawn_progress_updater(
 ///
 /// If `completion_rx` is provided, the TUI will wait for sync completion
 /// (or timeout) before exiting after user presses 'q'.
+///
+/// If `log_writer` or `resources_writer` is provided, they will be flushed
+/// before exiting to prevent log truncation.
 #[expect(clippy::too_many_arguments, reason = "TUI updater needs all sync state")]
 pub fn spawn_tui_progress_updater(
     tui: Arc<Mutex<TuiController>>,
@@ -414,6 +419,8 @@ pub fn spawn_tui_progress_updater(
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
+    log_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+    resources_writer: Option<Arc<crate::logging::JsonLogWriter>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -441,8 +448,10 @@ pub fn spawn_tui_progress_updater(
                 let available = if let Some(peer_health) = peer_health.as_ref() {
                     let peers = peer_pool.snapshot();
                     let peer_ids: Vec<_> = peers.iter().map(|peer| peer.peer_id).collect();
-                    let banned = peer_health.count_banned_peers(&peer_ids).await;
-                    connected.saturating_sub(banned)
+                    let banned = peer_health.count_cooling_down_peers(&peer_ids).await;
+                    let stale = peer_health.count_stale_head_peers(&peer_ids).await;
+                    stats.set_peers_stale(stale);
+                    connected.saturating_sub(banned).saturating_sub(stale)
                 } else {
                     connected
                 };
@@ -541,8 +550,16 @@ pub fn spawn_tui_progress_updater(
                     // Timeout or completion - either way, force exit now
                 }
 
+                // Flush log writers before exit to prevent log truncation
+                // (std::process::exit doesn't run destructors)
+                if let Some(writer) = &log_writer {
+                    let _ = writer.finish();
+                }
+                if let Some(writer) = &resources_writer {
+                    let _ = writer.finish();
+                }
+
                 // Restore terminal and force exit
-                // (std::process::exit doesn't run destructors, so restore first)
                 let _ = tui.lock().restore();
                 std::process::exit(0);
             }
@@ -561,6 +578,7 @@ mod tests {
             status: SyncStatus::Fetching,
             peers_active: 2,
             peers_total: 5,
+            peers_stale: 0,
             queue: 10,
             inflight: 1,
             escalation: 0,
