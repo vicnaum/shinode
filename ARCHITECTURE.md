@@ -49,7 +49,7 @@ node/src/
 1. **P2P** connects to Ethereum mainnet peers and fetches headers, bodies, and receipts.
 2. **Sync** schedules work, manages batching and retries, and processes blocks.
 3. **Storage** persists data in sharded static files with WAL for out-of-order ingestion.
-4. **RPC** serves queries from storage (logs derived on-demand from receipts).
+4. **RPC** serves queries from storage (logs derived on-demand from receipts, segment readers cached via LRU).
 5. **Run** orchestrates the lifecycle: startup, fast-sync, follow mode, graceful shutdown.
 
 ## Key Types
@@ -118,7 +118,7 @@ cargo run --manifest-path node/Cargo.toml -- --help
 
 Key options:
 - `--start-block` / `--end-block` - Sync range
-- `--shard-size` - Blocks per storage shard
+- `--shard-size` - Blocks per storage shard (recommend 1000+ for RPC workloads)
 - `--rollback-window` - Max reorg depth (default: 64)
 - `--rpc-bind` - RPC server address (default: localhost:8545)
 - `-v`/`-vv`/`-vvv` - Verbosity levels

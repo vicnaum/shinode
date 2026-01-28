@@ -56,6 +56,7 @@ Focus: stability and performance hardening for production use.
 - Modular codebase (run/, ui/, logging/ modules)
 - AIMD batch sizing per-peer (adaptive concurrency)
 - Peer quality scoring and temporary bans
+- LRU segment reader cache (fixes RPC performance regression)
 
 ---
 

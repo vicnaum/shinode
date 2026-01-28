@@ -27,7 +27,7 @@ presence bitset, a staging WAL for out-of-order writes, and compacted "sorted" s
 
 ## Relationships
 - **Used by**: `node/src/storage/mod.rs` (`pub use sharded::Storage`), `node/src/rpc` (read APIs), `node/src/sync/historical/db_writer.rs` (write + compaction).
-- **Depends on**: `reth_nippy_jar` (segment format), `zstd` (compressed columns), `memmap2` (WAL slice indexing), filesystem layout under `NodeConfig.data_dir`.
+- **Depends on**: `reth_nippy_jar` (segment format), `zstd` (compressed columns), `memmap2` (WAL slice indexing), `lru` (segment cache), filesystem layout under `NodeConfig.data_dir`.
 
 ## Files (detailed)
 
@@ -68,6 +68,22 @@ presence bitset, a staging WAL for out-of-order writes, and compacted "sorted" s
 - **Key items**: `compute_shard_hash()`, `Sha256`, stable file ordering by filename
 - **Interactions**: Called by `Storage::seal_shard_locked()` to populate `ShardMeta.content_hash`.
 - **Knobs / invariants**: Hash input includes shard_start/shard_size/tail_block; changes to layout require bumping the version header string.
+
+## Segment Reader Cache
+
+To avoid reopening segment files on every block read (which caused severe RPC performance issues), the storage maintains an LRU cache of `ShardSegments`:
+
+- **Cache size**: 20 shards (configurable via `SEGMENT_CACHE_SIZE`)
+- **Key**: `shard_start` block number
+- **Value**: `Arc<ShardSegments>` (5 segment readers: headers, tx_hashes, tx_meta, receipts, sizes)
+- **Invalidation**: Cache entries are invalidated on compaction, rollback, or follow writes
+
+Without the cache, each block read opened 5 segment files. For `eth_getLogs` on 100 blocks, this meant 500+ file opens. With the cache, subsequent reads from the same shard reuse already-open readers.
+
+**Performance impact** (10k blocks query):
+- Without cache: ~26,000ms (shard-size 100)
+- With cache: ~3,900ms (shard-size 1000)
+- V1 baseline: ~4,000ms
 
 ## Atomic Compaction Model
 
@@ -119,6 +135,6 @@ shards/<shard_start>/
   6. Delete backups and WAL
   7. Update `sorted=true`, clear `compaction_phase`
 - **Seal**: when a shard becomes complete and sorted, compute and persist a content hash in `shard.json`.
-- **Read**: check the bitset, then read rows from sorted segments (headers/tx hashes/receipts/sizes) by block number.
+- **Read**: check the bitset, then read rows from cached segment readers (headers/tx hashes/receipts/sizes) by block number.
 - **Rollback**: prune sorted segments, clear bitset entries above an ancestor, and recompute `max_present_block` for the store.
 - **Peer cache**: load/update/persist `peers.json` for the P2P static peer seeding path.
