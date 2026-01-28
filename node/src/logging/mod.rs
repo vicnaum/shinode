@@ -73,9 +73,15 @@ pub fn init_tracing(
     };
 
     // TUI log layer captures logs for display in the TUI
+    // Use minimum level based on verbosity (matches the local filter level)
+    let tui_min_level = match config.verbosity {
+        0 => tracing::Level::INFO,
+        1 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
+    };
     let tui_layer = tui_log_buffer
         .as_ref()
-        .map(|buffer| TuiLogLayer::new(Arc::clone(buffer)));
+        .map(|buffer| TuiLogLayer::new(Arc::clone(buffer), tui_min_level));
 
     // JSON log file uses its own filter (defaults to DEBUG level).
     let json_log_filter = EnvFilter::try_new(&config.log_json_filter)

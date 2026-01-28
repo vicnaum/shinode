@@ -251,12 +251,21 @@ const TUI_LOG_BUFFER_SIZE: usize = 100;
 pub struct TuiLogEntry {
     pub level: tracing::Level,
     pub message: String,
+    /// Milliseconds since TUI log capture started.
+    pub timestamp_ms: u64,
 }
 
 /// Shared buffer for TUI log capture.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TuiLogBuffer {
     entries: Mutex<VecDeque<TuiLogEntry>>,
+    started_at: Instant,
+}
+
+impl Default for TuiLogBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TuiLogBuffer {
@@ -264,7 +273,13 @@ impl TuiLogBuffer {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(VecDeque::with_capacity(TUI_LOG_BUFFER_SIZE)),
+            started_at: Instant::now(),
         }
+    }
+
+    /// Get elapsed time since buffer creation.
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
     }
 
     /// Add a log entry, removing oldest if at capacity.
@@ -293,12 +308,14 @@ impl TuiLogBuffer {
 #[derive(Clone)]
 pub struct TuiLogLayer {
     buffer: Arc<TuiLogBuffer>,
+    /// Minimum level to capture (based on verbosity).
+    min_level: tracing::Level,
 }
 
 impl TuiLogLayer {
-    /// Create a new TUI log layer with the given buffer.
-    pub fn new(buffer: Arc<TuiLogBuffer>) -> Self {
-        Self { buffer }
+    /// Create a new TUI log layer with the given buffer and minimum level.
+    pub fn new(buffer: Arc<TuiLogBuffer>, min_level: tracing::Level) -> Self {
+        Self { buffer, min_level }
     }
 }
 
@@ -310,8 +327,8 @@ where
         let meta = event.metadata();
         let level = *meta.level();
 
-        // Skip TRACE level to reduce noise
-        if level == tracing::Level::TRACE {
+        // Skip events below minimum level
+        if level > self.min_level {
             return;
         }
 
@@ -335,6 +352,7 @@ where
                 }
             });
 
-        self.buffer.push(TuiLogEntry { level, message });
+        let timestamp_ms = self.buffer.elapsed_ms();
+        self.buffer.push(TuiLogEntry { level, message, timestamp_ms });
     }
 }

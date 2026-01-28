@@ -512,7 +512,7 @@ pub fn spawn_tui_progress_updater(
                     // Drain logs from buffer and add to TUI state
                     if let Some(buffer) = log_buffer.as_ref() {
                         for entry in buffer.drain() {
-                            tui_guard.state.add_log(entry.level, entry.message);
+                            tui_guard.state.add_log(entry.level, entry.message, entry.timestamp_ms);
                         }
                     }
 

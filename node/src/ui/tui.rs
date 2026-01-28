@@ -158,6 +158,8 @@ pub enum ShardStatus {
 pub struct LogEntry {
     pub message: String,
     pub level: LogLevel,
+    /// Milliseconds since logging started.
+    pub timestamp_ms: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -232,7 +234,7 @@ impl TuiState {
     }
 
     /// Add a log entry from a tracing Level.
-    pub fn add_log(&mut self, level: tracing::Level, message: String) {
+    pub fn add_log(&mut self, level: tracing::Level, message: String, timestamp_ms: u64) {
         let log_level = match level {
             tracing::Level::ERROR => LogLevel::Error,
             tracing::Level::WARN => LogLevel::Warn,
@@ -246,6 +248,7 @@ impl TuiState {
         self.logs.push_back(LogEntry {
             message,
             level: log_level,
+            timestamp_ms,
         });
     }
 
@@ -1638,14 +1641,26 @@ fn render_logs_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
     // Show most recent logs first (reverse order), limited to visible height
     for (i, log) in data.logs.iter().rev().take(inner.height as usize).enumerate() {
-        let style = match log.level {
-            LogLevel::Error => Style::default().fg(Color::Red),
-            LogLevel::Warn => Style::default().fg(Color::Yellow),
-            LogLevel::Info => Style::default().fg(Color::Gray),
-            LogLevel::Debug => Style::default().fg(Color::DarkGray),
+        let (level_str, style) = match log.level {
+            LogLevel::Error => ("ERR", Style::default().fg(Color::Red)),
+            LogLevel::Warn => ("WRN", Style::default().fg(Color::Yellow)),
+            LogLevel::Info => ("INF", Style::default().fg(Color::Gray)),
+            LogLevel::Debug => ("DBG", Style::default().fg(Color::DarkGray)),
         };
-        let truncated: String = log.message.chars().take(inner.width as usize - 1).collect();
-        buf.set_string(inner.x + 1, inner.y + i as u16, &truncated, style);
+
+        // Format timestamp as seconds.millis (e.g., "12.345")
+        let secs = log.timestamp_ms / 1000;
+        let millis = log.timestamp_ms % 1000;
+        let timestamp = format!("{:3}.{:03}", secs, millis);
+
+        // Format: "123.456 INF message..."
+        let prefix = format!("{} {} ", timestamp, level_str);
+        let prefix_len = prefix.len();
+        let max_msg_len = (inner.width as usize).saturating_sub(prefix_len + 1);
+        let truncated_msg: String = log.message.chars().take(max_msg_len).collect();
+        let full_line = format!("{}{}", prefix, truncated_msg);
+
+        buf.set_string(inner.x + 1, inner.y + i as u16, &full_line, style);
     }
 }
 
