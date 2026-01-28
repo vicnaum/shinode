@@ -6119,6 +6119,7 @@ dependencies = [
  "futures",
  "indicatif",
  "jsonrpsee",
+ "lru 0.12.5",
  "memmap2",
  "modular-bitfield",
  "parking_lot",

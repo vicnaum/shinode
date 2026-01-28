@@ -48,6 +48,7 @@ zstd = "0.13"
 ratatui = "0.29"
 crossterm = "0.28"
 rand = "0.8"
+lru = "0.12"
 
 # ============================================
 # RUST-MAGIC-LINTER - Maximum Preset

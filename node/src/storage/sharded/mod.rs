@@ -21,11 +21,13 @@ use reth_nippy_jar::{
     NippyJar, NippyJarCursor, NippyJarWriter, CONFIG_FILE_EXTENSION,
 };
 use reth_primitives_traits::{serde_bincode_compat::SerdeBincodeCompat, Header};
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -33,6 +35,7 @@ use wal::{append_records, build_slice_index, WalRecord};
 use zstd::bulk::Compressor;
 
 const SCHEMA_VERSION: u64 = 2;
+const SEGMENT_CACHE_SIZE: usize = 20; // Cache up to 20 shards worth of segment readers
 const META_FILE_NAME: &str = "meta.json";
 const PEER_FILE_NAME: &str = "peers.json";
 const STATIC_DIR_NAME: &str = "static";
@@ -407,6 +410,9 @@ pub struct Storage {
     meta: Mutex<MetaState>,
     shards: Mutex<HashMap<u64, Arc<Mutex<ShardState>>>>,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
+    /// LRU cache for segment readers, keyed by shard_start.
+    /// Avoids reopening 5 segment files on every block read.
+    segment_cache: Mutex<LruCache<u64, Arc<ShardSegments>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -514,12 +520,17 @@ impl Storage {
         persist_meta(&meta_path, &meta)?;
 
         let peer_cache = load_peer_cache(&peer_cache_dir)?;
+        let segment_cache = LruCache::new(
+            NonZeroUsize::new(SEGMENT_CACHE_SIZE)
+                .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero")),
+        );
         Ok(Self {
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
             meta: Mutex::new(meta),
             shards: Mutex::new(shards),
             peer_cache: Mutex::new(peer_cache),
+            segment_cache: Mutex::new(segment_cache),
         })
     }
 
@@ -877,6 +888,9 @@ impl Storage {
         let sorted_dir = sorted_dir(&state.dir);
         fs::create_dir_all(&sorted_dir).wrap_err("failed to create sorted dir")?;
 
+        // Invalidate cache since we're writing to sorted segments
+        self.invalidate_segment_cache(shard_start);
+
         let segments = shard_segment_writers(&sorted_dir, shard_start)?;
         segments.headers.append_rows(
             bundle.number,
@@ -1145,6 +1159,9 @@ impl Storage {
             fs::remove_file(&wal_p).wrap_err("failed to remove staging.wal")?;
         }
 
+        // Invalidate segment cache since segments were rewritten
+        self.invalidate_segment_cache(shard_start);
+
         // Update in-memory state with the new bitset
         state.bitset = new_bitset;
         state.meta.present_count = state.bitset.count_ones();
@@ -1297,6 +1314,8 @@ impl Storage {
             let mut state = shard.lock();
             let sorted_dir = sorted_dir(&state.dir);
             if sorted_dir.exists() {
+                // Invalidate cache before pruning since segments will change
+                self.invalidate_segment_cache(shard_start);
                 let segments = shard_segment_writers(&sorted_dir, shard_start)?;
                 segments.headers.prune_to(ancestor_number)?;
                 segments.tx_hashes.prune_to(ancestor_number)?;
@@ -1331,26 +1350,69 @@ impl Storage {
         Ok(())
     }
 
+    /// Invalidate the segment cache for a specific shard.
+    /// Call this after any operation that modifies segment files.
+    fn invalidate_segment_cache(&self, shard_start: u64) {
+        let mut cache = self.segment_cache.lock();
+        cache.pop(&shard_start);
+    }
+
+    /// Get cached segment readers for a shard, opening them if not cached.
+    fn get_cached_segments(
+        &self,
+        shard_start: u64,
+        sorted_dir: &Path,
+    ) -> Result<Option<Arc<ShardSegments>>> {
+        // Check cache first
+        {
+            let mut cache = self.segment_cache.lock();
+            if let Some(segments) = cache.get(&shard_start) {
+                return Ok(Some(Arc::clone(segments)));
+            }
+        }
+
+        // Cache miss - open segments
+        let segments = shard_segment_readers(sorted_dir, shard_start)?;
+        let Some(segments) = segments else {
+            return Ok(None);
+        };
+
+        // Cache and return
+        let segments = Arc::new(segments);
+        {
+            let mut cache = self.segment_cache.lock();
+            cache.put(shard_start, Arc::clone(&segments));
+        }
+        Ok(Some(segments))
+    }
+
     fn with_readers_for_present_block<T>(
         &self,
         number: u64,
         f: impl FnOnce(&ShardSegments) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
         let shard_start = shard_start(number, self.shard_size());
-        let shard = self.get_shard(shard_start)?;
-        let Some(shard) = shard else {
-            return Ok(None);
-        };
-        let state = shard.lock();
-        let offset = (number - shard_start) as usize;
-        if !state.bitset.is_set(offset) {
-            return Ok(None);
-        }
-        let sorted_dir = sorted_dir(&state.dir);
-        let segments = shard_segment_readers(&sorted_dir, shard_start)?;
+
+        // Check bitset first (fast path) and get sorted_dir
+        let sorted_dir = {
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                return Ok(None);
+            };
+            let state = shard.lock();
+            let offset = (number - shard_start) as usize;
+            if !state.bitset.is_set(offset) {
+                return Ok(None);
+            }
+            sorted_dir(&state.dir)
+        }; // Release shard lock before cache access
+
+        // Get cached segments
+        let segments = self.get_cached_segments(shard_start, &sorted_dir)?;
         let Some(segments) = segments else {
             return Ok(None);
         };
+
         f(&segments)
     }
 
