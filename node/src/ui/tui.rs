@@ -127,6 +127,7 @@ pub struct TuiState {
     pub peers_connected: u64,
     pub peers_max: u64,
     pub peers_stale: u64,
+    pub peers_peak_total: u64,
     pub pending: u64,
     pub inflight: u64,
     pub retry: u64,
@@ -241,6 +242,7 @@ impl TuiState {
             peers_connected: 0,
             peers_max: 0,
             peers_stale: 0,
+            peers_peak_total: 0,
             pending: 0,
             inflight: 0,
             retry: 0,
@@ -285,6 +287,29 @@ impl TuiState {
             rpc_get_logs: 0,
             rpc_get_block: 0,
             rpc_errors: 0,
+        }
+    }
+
+    /// Seed storage and DB stats directly (for early TUI before snapshot updater starts).
+    pub fn seed_storage_stats(&mut self, agg: &crate::storage::StorageAggregateStats) {
+        if agg.total_blocks > 0 {
+            self.db_blocks = Some(agg.total_blocks);
+        }
+        if agg.total_transactions > 0 {
+            self.db_transactions = Some(agg.total_transactions);
+        }
+        if agg.total_logs > 0 {
+            self.db_logs = Some(agg.total_logs);
+        }
+        if agg.total_shards > 0 {
+            self.db_shards = Some(agg.total_shards);
+            self.db_shards_compacted = Some(agg.compacted_shards);
+        }
+        self.storage_bytes_headers = agg.disk_bytes_headers;
+        self.storage_bytes_transactions = agg.disk_bytes_transactions;
+        self.storage_bytes_receipts = agg.disk_bytes_receipts;
+        if agg.disk_bytes_total > 0 {
+            self.storage_total = Some(agg.disk_bytes_total as f64 / (1024.0 * 1024.0 * 1024.0));
         }
     }
 
@@ -514,6 +539,10 @@ impl TuiState {
         self.peers_connected = snapshot.peers_active;
         self.peers_max = snapshot.peers_total;
         self.peers_stale = snapshot.peers_stale;
+        let current_total = self.peers_connected
+            .saturating_add(self.peers_max.saturating_sub(self.peers_connected))
+            .saturating_add(self.peers_stale);
+        self.peers_peak_total = self.peers_peak_total.max(current_total);
 
         // Queue tracking
         self.pending = snapshot.queue;
@@ -958,7 +987,7 @@ fn render_startup_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
             Constraint::Length(1),  // Separator
             Constraint::Length(3),  // Startup status
             Constraint::Length(1),  // Separator
-            Constraint::Length(8),  // Network + Config panels
+            Constraint::Length(8),  // Network/Config/Storage/DB panels
             Constraint::Length(1),  // Separator
             Constraint::Min(4),     // Logs
         ])
@@ -970,14 +999,21 @@ fn render_startup_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
     render_startup_status(chunks[4], frame.buffer_mut(), data);
     render_separator(chunks[5], frame.buffer_mut());
 
-    // Two side-by-side panels: NETWORK and CONFIG
+    // Four-column layout: NETWORK, CONFIG, STORAGE, DB
     let panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .constraints([
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+        ])
         .split(chunks[6]);
 
     render_network_panel(panels[0], frame.buffer_mut(), data);
     render_config_panel(panels[1], frame.buffer_mut(), data);
+    render_storage_panel(panels[2], frame.buffer_mut(), data);
+    render_db_panel(panels[3], frame.buffer_mut(), data);
 
     render_separator(chunks[7], frame.buffer_mut());
     render_logs_panel(chunks[8], frame.buffer_mut(), data);
@@ -1664,22 +1700,34 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
     let value_col = inner.x + 12;
 
-    // Peers visual: 1 peer = 1 character
-    // ● = active (green, fetching), ○ = healthy idle (green), ⊘ = stale-head banned (dark gray)
-    // If peers exceed available width, show … at the end
+    // Peers visual: 1 peer = 1 character, never shrinks (uses peak high-water mark)
+    // ● = active (green, fetching), ○ = healthy idle (green),
+    // ⊘ = stale-head banned (dark gray), · = gone/disconnected (very dim)
     let available_width = inner.width.saturating_sub(12) as u64;
     let active = data.peers_connected;
     let stale = data.peers_stale;
     let connected_total = active.saturating_add(data.peers_max).saturating_add(stale);
     let healthy_idle = data.peers_max.saturating_sub(active);
+    let gone = data.peers_peak_total.saturating_sub(connected_total);
+    let display_total = data.peers_peak_total;
 
-    let peers_visual = if connected_total == 0 {
-        "—".to_string() // No peers
-    } else if connected_total <= available_width {
+    buf.set_string(inner.x + 1, inner.y, "Peers", Style::default().fg(Color::Gray));
+
+    if display_total == 0 {
+        buf.set_string(value_col, inner.y, "—", Style::default().fg(Color::DarkGray));
+    } else if display_total <= available_width {
+        let mut col = value_col;
         let active_chars: String = (0..active).map(|_| '\u{25CF}').collect(); // ●
+        buf.set_string(col, inner.y, &active_chars, Style::default().fg(Color::Green));
+        col += active_chars.len() as u16;
         let idle_chars: String = (0..healthy_idle).map(|_| '\u{25CB}').collect(); // ○
+        buf.set_string(col, inner.y, &idle_chars, Style::default().fg(Color::Green));
+        col += idle_chars.len() as u16;
         let stale_chars: String = (0..stale).map(|_| '\u{2298}').collect(); // ⊘
-        format!("{active_chars}{idle_chars}{stale_chars}")
+        buf.set_string(col, inner.y, &stale_chars, Style::default().fg(Color::DarkGray));
+        col += stale_chars.len() as u16;
+        let gone_chars: String = (0..gone).map(|_| '\u{00B7}').collect(); // ·
+        buf.set_string(col, inner.y, &gone_chars, Style::default().fg(Color::Rgb(60, 60, 60)));
     } else {
         let display_slots = available_width.saturating_sub(1);
         let active_to_show = active.min(display_slots);
@@ -1687,26 +1735,23 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
         let idle_to_show = healthy_idle.min(remaining);
         let remaining = remaining.saturating_sub(idle_to_show);
         let stale_to_show = stale.min(remaining);
+        let remaining = remaining.saturating_sub(stale_to_show);
+        let gone_to_show = gone.min(remaining);
 
+        let mut col = value_col;
         let active_chars: String = (0..active_to_show).map(|_| '\u{25CF}').collect();
+        buf.set_string(col, inner.y, &active_chars, Style::default().fg(Color::Green));
+        col += active_chars.len() as u16;
         let idle_chars: String = (0..idle_to_show).map(|_| '\u{25CB}').collect();
+        buf.set_string(col, inner.y, &idle_chars, Style::default().fg(Color::Green));
+        col += idle_chars.len() as u16;
         let stale_chars: String = (0..stale_to_show).map(|_| '\u{2298}').collect();
-        format!("{active_chars}{idle_chars}{stale_chars}\u{2026}")
-    };
-
-    buf.set_string(inner.x + 1, inner.y, "Peers", Style::default().fg(Color::Gray));
-    // Render active+idle chars in green, then stale chars in dark gray
-    let green_len = active.saturating_add(healthy_idle).min(available_width) as u16;
-    let green_part: String = peers_visual.chars().take(green_len as usize).collect();
-    let rest_part: String = peers_visual.chars().skip(green_len as usize).collect();
-    buf.set_string(value_col, inner.y, &green_part, Style::default().fg(Color::Green));
-    if !rest_part.is_empty() {
-        buf.set_string(
-            value_col + green_len,
-            inner.y,
-            &rest_part,
-            Style::default().fg(Color::DarkGray),
-        );
+        buf.set_string(col, inner.y, &stale_chars, Style::default().fg(Color::DarkGray));
+        col += stale_chars.len() as u16;
+        let gone_chars: String = (0..gone_to_show).map(|_| '\u{00B7}').collect();
+        buf.set_string(col, inner.y, &gone_chars, Style::default().fg(Color::Rgb(60, 60, 60)));
+        col += gone_chars.len() as u16;
+        buf.set_string(col, inner.y, "\u{2026}", Style::default().fg(Color::DarkGray));
     }
 
     // Active peers (currently fetching blocks)

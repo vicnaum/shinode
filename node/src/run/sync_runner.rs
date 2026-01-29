@@ -157,6 +157,12 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Initialize storage
     let storage = init_storage(&config, early_tui.as_ref(), log_buffer).await?;
 
+    // Seed storage/DB stats into early TUI so panels show data during startup
+    if let Some(tui) = early_tui.as_ref() {
+        let agg = storage.aggregate_stats();
+        tui.lock().state.seed_storage_stats(&agg);
+    }
+
     // Connect to P2P network
     let session = connect_p2p(Arc::clone(&storage), early_tui.as_ref(), log_buffer).await?;
 

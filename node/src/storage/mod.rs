@@ -130,7 +130,7 @@ impl From<&NodeConfig> for StorageConfigKey {
 
 mod sharded;
 
-pub use sharded::Storage;
+pub use sharded::{Storage, StorageAggregateStats};
 
 pub fn encode_bincode_value<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     bincode::serialize(value).wrap_err("failed to encode bincode payload")
