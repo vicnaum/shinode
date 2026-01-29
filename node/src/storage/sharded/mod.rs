@@ -821,8 +821,14 @@ impl Storage {
         }
         let mut zstd = Compressor::new(0).wrap_err("failed to init zstd compressor")?;
         let mut per_shard: HashMap<u64, Vec<WalRecord>> = HashMap::new();
+        let mut block_log_counts: HashMap<u64, u64> = HashMap::new();
         for bundle in bundles {
             let shard_start = shard_start(bundle.number, self.shard_size());
+            // Remember log count per block while we still have decoded receipts
+            block_log_counts.insert(
+                bundle.number,
+                bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>(),
+            );
             let tx_meta_uncompressed = encode_bincode_value(&bundle.transactions)?;
             let tx_meta_uncompressed_len = tx_meta_uncompressed.len() as u32;
             let receipts_uncompressed = encode_bincode_compat_value(&bundle.receipts)?;
@@ -882,11 +888,20 @@ impl Storage {
                 );
             }
 
-            // Mark shard as not sorted (has pending WAL data)
+            // Accumulate log counts for actually appended blocks
+            let logs_delta: u64 = to_append
+                .iter()
+                .map(|r| block_log_counts.get(&r.block_number).copied().unwrap_or(0))
+                .sum();
+            state.meta.total_logs += logs_delta;
+
+            // Mark shard as not sorted (has pending WAL data) and persist
             if !to_append.is_empty() && state.meta.sorted {
                 state.meta.sorted = false;
                 state.meta.sealed = false;
                 state.meta.content_hash = None;
+                persist_shard_meta(&state.dir, &state.meta)?;
+            } else if logs_delta > 0 {
                 persist_shard_meta(&state.dir, &state.meta)?;
             }
 
@@ -1217,6 +1232,8 @@ impl Storage {
         // Authoritative tx/receipt counts recomputed during compaction
         state.meta.total_transactions = total_tx;
         state.meta.total_receipts = total_receipt_count;
+        // Note: total_logs is NOT recomputed here (receipts are zstd-compressed).
+        // It is preserved from WAL writes or set to 0 for fresh shards.
         // Recompute disk sizes from the freshly written segment files
         let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
         state.meta.disk_bytes_headers = dh;
