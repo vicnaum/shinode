@@ -35,7 +35,7 @@ use parking_lot::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Identifier for a peer in the selection pool.
 #[cfg(test)]
@@ -375,7 +375,7 @@ fn spawn_peer_watcher(
                         continue;
                     }
                     let peer_id = info.peer_id;
-                    info!(
+                    debug!(
                         peer_id = %format!("{:#}", peer_id),
                         eth_version = %info.version,
                         "peer session established"
@@ -421,7 +421,7 @@ fn spawn_peer_watcher(
                 }
                 NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
                     p2p_stats.sessions_closed.fetch_add(1, Ordering::Relaxed);
-                    info!(
+                    debug!(
                         peer_id = %format!("{:#}", peer_id),
                         reason = ?reason,
                         "peer session closed"
