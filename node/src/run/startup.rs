@@ -221,8 +221,8 @@ pub async fn connect_p2p(
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
 ) -> Result<p2p::NetworkSession> {
-    ui::print_status_bar("Connecting to P2P network...");
-    update_tui_startup(tui, "Connecting to P2P network...", log_buffer.as_ref());
+    ui::print_status_bar("Connecting to Ethereum P2P network...");
+    update_tui_startup(tui, "Connecting to Ethereum P2P network...", log_buffer.as_ref());
     info!("starting p2p network");
     let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
     let initial_peers = session.pool.len();

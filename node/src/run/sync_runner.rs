@@ -117,7 +117,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
                 // Draw initial startup screen with config info
                 {
                     let mut guard = tui_arc.lock();
-                    guard.state.startup_status = "Initializing...".to_string();
+                    guard.state.startup_status = "Connecting to Ethereum P2P network...".to_string();
                     // Set config values for display
                     guard.state.set_config(
                         &config.data_dir.display().to_string(),
@@ -137,6 +137,19 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     } else {
         None
     };
+
+    // Spawn background redraw ticker so splash animations run while startup blocks
+    let redraw_handle = early_tui.as_ref().map(|tui| {
+        let tui = Arc::clone(tui);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let mut guard = tui.lock();
+                let _ = guard.draw();
+            }
+        })
+    });
 
     // Get log buffer reference for startup TUI updates
     let log_buffer = &tracing_guards.tui_log_buffer;
@@ -270,6 +283,11 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         log_writer: tracing_guards.log_writer.clone(),
         resources_writer: tracing_guards.resources_writer.clone(),
     };
+    // Stop background splash redraw ticker before main UI takes over
+    if let Some(handle) = redraw_handle {
+        handle.abort();
+    }
+
     let UiSetup {
         ui_controller: _,
         tui_controller: _,

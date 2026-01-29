@@ -23,6 +23,38 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// If we haven't received a block in this time, we're likely not truly synced.
 const FOLLOW_STALENESS_THRESHOLD_MS: u64 = 30_000;
 
+// ============================================================================
+// Splash screen constants
+// ============================================================================
+
+const SPLASH_ART: &str = r#" ██████\\████████  ██████\\████████ ████████ ██     | ████████  ██████\  ██████\
+██___\██  | ██  | ██__| ██  | ██  | ██__   | ██     | ██__   | ██___\██ ██___\██
+██    \   | ██  | ██    ██  | ██  | ██  \  | ██     | ██  \   \██    \ \██    \
+\██████\  | ██  | ████████  | ██  | █████  | ██     | █████   _\██████\_\██████\
+ \__| ██  | ██  | ██  | ██  | ██  | ██_____| ██_____| ██_____|  \__| ██  \__| ██
+██    ██  | ██  | ██  | ██  | ██  | ██     \ ██     \ ██     \\██    ██\██    ██
+\██████    \██   \██   \██   \██   \████████\████████\████████ \██████  \██████
+        |  \  |  \      \/      \|        \/      \|       \|  \    /  \
+        | ██  | ██\██████  ██████\\████████  ██████\ ███████\\██\  /  ██
+        | ██__| ██ | ██ | ██___\██  | ██  | ██  | ██ ██__| ██ \██\/  ██
+        | ██    ██ | ██  \██    \   | ██  | ██  | ██ ██    ██  \██  ██
+        | ████████ | ██  _\██████\  | ██  | ██  | ██ ███████\   \████
+        | ██  | ██_| ██_|  \__| ██  | ██  | ██__/ ██ ██  | ██   | ██
+        | ██  | ██   ██ \\██    ██  | ██   \██    ██ ██  | ██   | ██
+         \██   \██\██████ \██████    \██    \██████ \██   \██    \██
+                      |  \  |  \/      \|       \|        \
+                     | ██\ | ██  ██████\ ███████\ ████████
+                     | ███\| ██ ██  | ██ ██  | ██ ██__
+                     | ████\ ██ ██  | ██ ██  | ██ ██  \
+                     | ██\██ ██ ██  | ██ ██  | ██ █████
+                     | ██ \████ ██__/ ██ ██__/ ██ ██_____
+                     | ██  \███\██    ██ ██    ██ ██     \
+                      \██   \██ \██████ \███████ \████████"#;
+
+const CREDIT: &str = "2026 by @vicnaum";
+const ART_WIDTH: u16 = 80;
+const ART_HEIGHT: u16 = 23;
+
 use crossterm::{
     cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind},
@@ -31,7 +63,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders},
+    widgets::{Block, Borders, Clear},
 };
 
 use crate::sync::{FinalizePhase, SyncProgressSnapshot, SyncStatus};
@@ -213,7 +245,7 @@ impl TuiState {
             speed_history: VecDeque::with_capacity(60),
             avg_speed_window: VecDeque::with_capacity(300), // 30 seconds at 100ms intervals
             animation_frame: 0,
-            startup_status: "Initializing...".to_string(),
+            startup_status: "Connecting to Ethereum P2P network...".to_string(),
             best_head_seen: 0,
             config_data_dir: String::new(),
             config_shard_size: 0,
@@ -581,20 +613,25 @@ impl Drop for TuiController {
 
 fn render_ui(frame: &mut Frame, data: &TuiState) {
     let area = frame.area();
+    frame.render_widget(Clear, area);
 
-    // Main border
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Thick)
-        .border_style(Style::default().fg(data.phase.color()));
-    let inner = main_block.inner(area);
-    frame.render_widget(main_block, area);
+    if data.phase == Phase::Startup && data.peers_connected == 0 {
+        render_splash(frame, data);
+    } else {
+        let main_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Thick)
+            .border_style(Style::default().fg(data.phase.color()))
+            .style(Style::default().bg(Color::Rgb(20, 20, 28)));
+        let inner = main_block.inner(area);
+        frame.render_widget(main_block, area);
 
-    match data.phase {
-        Phase::Startup => render_startup_ui(frame, inner, data),
-        Phase::Sync | Phase::Retry => render_sync_ui(frame, inner, data),
-        Phase::Compact | Phase::Seal => render_compact_ui(frame, inner, data),
-        Phase::Follow => render_follow_ui(frame, inner, data),
+        match data.phase {
+            Phase::Startup => render_startup_ui(frame, inner, data),
+            Phase::Sync | Phase::Retry => render_sync_ui(frame, inner, data),
+            Phase::Compact | Phase::Seal => render_compact_ui(frame, inner, data),
+            Phase::Follow => render_follow_ui(frame, inner, data),
+        }
     }
 
     // Render quit overlay if quitting
@@ -744,6 +781,106 @@ fn render_follow_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
 
     render_separator(chunks[7], frame.buffer_mut());
     render_logs_panel(chunks[8], frame.buffer_mut(), data);
+}
+
+fn render_splash(frame: &mut Frame, data: &TuiState) {
+    let area = frame.area();
+
+    let dos_blue = Color::Rgb(0, 0, 170);
+    let dos_gold = Color::Rgb(255, 255, 85);
+
+    // Fill entire screen with DOS blue
+    let bg = Block::default().style(Style::default().bg(dos_blue));
+    frame.render_widget(bg, area);
+
+    let buf = frame.buffer_mut();
+    let art_style = Style::default().fg(dos_gold).bg(dos_blue);
+
+    let lines: Vec<&str> = SPLASH_ART.lines().collect();
+
+    // Center the logo (art + 1 credit line = 24 lines total)
+    let total_height = ART_HEIGHT + 1;
+    let start_y = area.y + area.height.saturating_sub(total_height) / 2;
+    let start_x = area.x + area.width.saturating_sub(ART_WIDTH) / 2;
+
+    // Build status message with animated dots
+    let base_status = data.startup_status.trim_end_matches('.');
+    let max_dots: usize = 3;
+    let dot_count = (data.animation_frame / 5) % (max_dots as u64 + 1);
+    let dots = ".".repeat(dot_count as usize);
+    let padding = " ".repeat(max_dots - dot_count as usize);
+    let status_msg = format!("{}{}{}", base_status, dots, padding);
+    let status_style = Style::default().fg(Color::LightCyan).bg(dos_blue);
+
+    // Two modes: framed (big terminal) vs unframed (small terminal)
+    let framed = area.width >= ART_WIDTH + 4 && area.height >= total_height + 4;
+    let framed_with_status = framed && area.height >= total_height + 4 + 5;
+
+    let (art_x, art_y, frame_bottom_y) = if framed {
+        let frame_w = ART_WIDTH + 4;
+        let frame_h = total_height + 4;
+        let frame_x = area.x + area.width.saturating_sub(frame_w) / 2;
+        let frame_y = area.y + area.height.saturating_sub(frame_h) / 2;
+
+        let frame_style = Style::default().fg(dos_gold).bg(dos_blue);
+
+        // Draw double-line border
+        let horiz: String = "═".repeat(frame_w as usize - 2);
+        buf.set_string(frame_x, frame_y, format!("╔{}╗", horiz), frame_style);
+        buf.set_string(frame_x, frame_y + frame_h - 1, format!("╚{}╝", horiz), frame_style);
+        for row in 1..frame_h - 1 {
+            buf.set_string(frame_x, frame_y + row, "║", frame_style);
+            buf.set_string(frame_x + frame_w - 1, frame_y + row, "║", frame_style);
+        }
+
+        (frame_x + 2, frame_y + 2, frame_y + frame_h - 1)
+    } else {
+        (start_x, start_y, 0)
+    };
+
+    // Draw art lines
+    for (i, line) in lines.iter().enumerate() {
+        let y = art_y + i as u16;
+        if y < area.y + area.height {
+            buf.set_string(art_x, y, *line, art_style);
+        }
+    }
+
+    // Version — gold, right-aligned on the last art line
+    let last_art_y = art_y + ART_HEIGHT - 1;
+    if last_art_y < area.y + area.height {
+        let version = "v0.3";
+        let version_x = art_x + ART_WIDTH - version.len() as u16;
+        buf.set_string(version_x, last_art_y, version, art_style);
+    }
+
+    // Credit line — white, right-aligned on the line after the art
+    let credit_y = art_y + ART_HEIGHT;
+    if credit_y < area.y + area.height {
+        let credit_x = art_x + ART_WIDTH - CREDIT.len() as u16;
+        buf.set_string(
+            credit_x,
+            credit_y,
+            CREDIT,
+            Style::default().fg(Color::White).bg(dos_blue),
+        );
+    }
+
+    // Status message placement depends on mode
+    if framed_with_status {
+        // Big screen: centered below the frame, with 1 line padding
+        let status_x = area.x + area.width.saturating_sub(status_msg.len() as u16) / 2;
+        let status_y = frame_bottom_y + 2;
+        if status_y < area.y + area.height {
+            buf.set_string(status_x, status_y, &status_msg, status_style);
+        }
+    } else {
+        // Small screen: left-aligned on the credit line
+        let status_y = credit_y;
+        if status_y < area.y + area.height {
+            buf.set_string(art_x, status_y, &status_msg, status_style);
+        }
+    }
 }
 
 fn render_startup_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
@@ -1176,8 +1313,11 @@ fn render_blocks_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
             // Braille characters for different fill levels:
             // ⠀ (empty), ⠄ (1 dot), ⠆ (2 dots), ⠇ (3 dots), ⣿ (full)
-            let (ch, color) = match coverage_pct {
-                0 => ('⠀', Color::DarkGray),           // Empty - not synced
+            // Note: macOS Terminal ignores RGB colors on braille chars,
+            // so we use ANSI named colors only. No explicit bg — inherits
+            // from the app background fill.
+            let (ch, fg) = match coverage_pct {
+                0 => ('⣿', Color::DarkGray),           // Dim grid — empty region
                 1..=20 => ('⠄', Color::Yellow),        // 1 dot - starting
                 21..=40 => ('⠆', Color::Yellow),       // 2 dots - partial
                 41..=60 => ('⠇', Color::LightGreen),   // 3 dots - half done
@@ -1186,12 +1326,12 @@ fn render_blocks_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
                 _ => ('⣿', Color::Green),              // Full - complete
             };
 
-            buf.set_string(
-                map_start + col as u16,
-                area.y + row as u16,
-                ch.to_string(),
-                Style::default().fg(color),
-            );
+            let x = map_start + col as u16;
+            let y = area.y + row as u16;
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_char(ch);
+                cell.set_fg(fg);
+            }
         }
     }
 
