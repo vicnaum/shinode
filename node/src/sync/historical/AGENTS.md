@@ -58,6 +58,7 @@ benchmark stats/event logging.
   - In follow mode, scheduling caps batches by the global observed head (from head tracking), not per-peer `head_number` which can go stale.
   - In follow mode, "missing blocks" responses (including empty batches) are treated as partials to avoid banning peers for near-tip propagation lag.
   - Tail ingestion (when enabled) tracks `head_seen_rx` and stops scheduling once the safe head is caught up (or continues in follow epochs).
+  - **Stale-peer handling**: Before the stale-head check, peers already cooling down are recycled with a 500ms delay (prevents spin-loop of re-banning/re-logging/re-probing). Peers >10k blocks behind are dropped entirely instead of recycled. Peer `head_number` is refreshed from the pool at all receive sites so re-probe updates propagate to pipeline clones.
 
 ### `fetch_task.rs`
 - **Role**: Encapsulates fetch task execution for a single batch of blocks from a peer. Handles timeouts, success/failure outcomes, stats recording, and requeueing.

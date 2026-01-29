@@ -621,7 +621,10 @@ pub async fn run_ingest_pipeline(
     let mut last_progress_check = Instant::now();
     let mut last_progress_completed = 0u64;
     loop {
-        while let Ok(peer) = ready_rx.try_recv() {
+        while let Ok(mut peer) = ready_rx.try_recv() {
+            if let Some(h) = pool.get_peer_head(peer.peer_id) {
+                peer.head_number = h;
+            }
             if ready_set.insert(peer.peer_id) {
                 ready_peers.push(peer);
             }
@@ -637,9 +640,12 @@ pub async fn run_ingest_pipeline(
                     }
                 } => None,
             };
-            let Some(peer) = peer else {
+            let Some(mut peer) = peer else {
                 break;
             };
+            if let Some(h) = pool.get_peer_head(peer.peer_id) {
+                peer.head_number = h;
+            }
             if ready_set.insert(peer.peer_id) {
                 ready_peers.push(peer);
             }
@@ -761,8 +767,25 @@ pub async fn run_ingest_pipeline(
         };
 
         let best_idx = pick_best_ready_peer_index(&ready_peers, peer_health.as_ref()).await;
-        let peer = ready_peers.swap_remove(best_idx);
+        let mut peer = ready_peers.swap_remove(best_idx);
         ready_set.remove(&peer.peer_id);
+
+        // Refresh peer head_number from pool (picks up re-probe updates)
+        if let Some(h) = pool.get_peer_head(peer.peer_id) {
+            peer.head_number = h;
+        }
+
+        // If peer is already cooling down, recycle with a delay instead of
+        // re-banning/re-logging/re-probing in a tight loop.
+        if peer_health.is_peer_cooling_down(peer.peer_id).await {
+            let ready_tx = ready_tx.clone();
+            drop(permit);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = ready_tx.send(peer);
+            });
+            continue;
+        }
 
         // Stale-head detection: ban peers whose head is too far behind
         let min_required = if db_mode == DbWriteMode::Follow {
@@ -773,6 +796,21 @@ pub async fn run_ingest_pipeline(
             *range.start()
         };
         if peer.head_number > 0 && peer.head_number < min_required {
+            let gap = min_required.saturating_sub(peer.head_number);
+
+            // Peers more than 10k blocks behind are useless — drop entirely.
+            // The peer_feeder will re-add them if they reconnect with a fresh snapshot.
+            if gap > 10_000 {
+                tracing::debug!(
+                    peer_id = ?peer.peer_id,
+                    peer_head = peer.head_number,
+                    gap,
+                    "dropping truly stale peer"
+                );
+                drop(permit);
+                continue;
+            }
+
             tracing::debug!(
                 peer_id = ?peer.peer_id,
                 peer_head = peer.head_number,

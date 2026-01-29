@@ -9,8 +9,8 @@ disk I/O. Also handles SIGUSR1 signal for on-demand state dumps.
 ### Files
 - `mod.rs` - Public exports and `init_tracing()` for setting up the tracing subscriber.
   - **Key items**: `TracingGuards`, `init_tracing()`
-- `json.rs` - JSON log writer and tracing layer for structured logging to files.
-  - **Key items**: `LogRecord`, `JsonLogWriter`, `JsonLogLayer`, `JsonLogFilter`, `LOG_BUFFER`
+- `json.rs` - JSON log writer and tracing layer for structured logging to files, with consecutive-record deduplication.
+  - **Key items**: `LogRecord`, `JsonLogWriter`, `JsonLogLayer`, `JsonLogFilter`, `LOG_BUFFER`, `DEDUP_WINDOW`, `hash_record()`
 - `report.rs` - Run report types and generation for benchmarking runs.
   - **Key items**: `RunReport`, `RunContext`, `PeerHealthSummary`, `generate_run_report()`, `finalize_log_files()`, `run_timestamp_utc()`
 - `resources.rs` - Resource monitoring with platform-specific implementations.
@@ -39,3 +39,9 @@ Usage: `kill -USR1 <pid>`
 - **Used by**: `node/src/main.rs` for tracing initialization, resource logging, and report generation.
 - **Depends on**: `sync::SyncProgressStats`, `sync::historical::BenchEventLogger`, `sync::historical::PeerHealthTracker`, `p2p::PeerPool`.
 - **Emits**: JSON log files (`.logs.jsonl`), resource logs (`.resources.jsonl`), run reports (`.json`), Chrome traces (`.trace.json`).
+
+## Log Deduplication
+The JSON log writer's background thread collapses consecutive identical records (same message + fields hash)
+within a 1-second window into a single record with `"count": N`. This prevents multi-GB log files from
+spin-loop scenarios (e.g., stale-peer banning). The dedup buffer is flushed on message change, timeout,
+flush interval, and channel close.

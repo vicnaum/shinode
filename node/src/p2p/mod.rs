@@ -326,6 +326,11 @@ impl PeerPool {
         peers.push(peer);
     }
 
+    pub fn get_peer_head(&self, peer_id: PeerId) -> Option<u64> {
+        let peers = self.peers.read();
+        peers.iter().find(|p| p.peer_id == peer_id).map(|p| p.head_number)
+    }
+
     pub fn update_peer_head(&self, peer_id: PeerId, head_number: u64) {
         let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|peer| peer.peer_id == peer_id) {

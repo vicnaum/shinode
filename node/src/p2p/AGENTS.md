@@ -15,7 +15,7 @@ feed the historical sync pipeline.
 
 ## Key APIs (no snippets)
 - **Types**: `NetworkPeer`, `NetworkSession`, `PeerPool`, `P2pLimits`, `PayloadFetchOutcome`, `HeadersChunkedResponse`, `ChunkedResponse<T>`, `FetchStageStats`, `HeaderCountMismatch`
-- **Functions**: `connect_mainnet_peers()`, `p2p_limits()`, `request_headers_batch()`, `discover_head_p2p()`, `fetch_payloads_for_peer()`, `request_headers_chunked_with_stats()`, `request_headers_chunked_strict()`
+- **Functions**: `connect_mainnet_peers()`, `p2p_limits()`, `request_headers_batch()`, `discover_head_p2p()`, `fetch_payloads_for_peer()`, `request_headers_chunked_with_stats()`, `request_headers_chunked_strict()`, `PeerPool::get_peer_head()`
 
 ## Relationships
 - **Depends on**: `reth_network` / `reth_network_api` (peer sessions + requests), `reth_eth_wire_types` (message structs), `tokio` (timeouts/tasks).
@@ -32,6 +32,7 @@ feed the historical sync pipeline.
   - Header probes (`discover_head_p2p()`) only advance the head when headers are actually retrievable above a baseline (does not trust session status head).
   - Chunked request helpers stop early on partial peer responses and report missing blocks upstream.
   - Peer cache is TTL'd (`PEER_CACHE_TTL_DAYS`) and capped (`PEER_CACHE_MAX`) before seeding static peers.
+  - `get_peer_head()` allows the sync pipeline to refresh stale peer `head_number` clones from re-probe updates written to the pool.
 
 ## End-to-end flow (high level)
 - Build a `reth-network` mainnet config and start networking (`connect_mainnet_peers()`).

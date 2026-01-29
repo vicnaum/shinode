@@ -1881,9 +1881,17 @@ fn render_logs_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
         let level_x = x + timestamp.len() as u16 + 1;
         buf.set_string(level_x, y, level_str, level_style);
 
-        // Render message in default style
+        // Render message: base in Gray, structured fields after │ in DarkGray
         let msg_x = level_x + 6; // 5 chars for level + 1 space
-        buf.set_string(msg_x, y, &truncated_msg, Style::default().fg(Color::Gray));
+        if let Some(sep_pos) = truncated_msg.find('\u{2502}') {
+            let base = &truncated_msg[..sep_pos];
+            buf.set_string(msg_x, y, base, Style::default().fg(Color::Gray));
+            let fields_part = &truncated_msg[sep_pos..];
+            let fields_x = msg_x + base.len() as u16;
+            buf.set_string(fields_x, y, fields_part, Style::default().fg(Color::DarkGray));
+        } else {
+            buf.set_string(msg_x, y, &truncated_msg, Style::default().fg(Color::Gray));
+        }
     }
 }
 
