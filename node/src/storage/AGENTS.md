@@ -5,7 +5,7 @@ Defines serialized storage types (headers, tx hashes, receipts, block sizes) and
 re-exports the concrete on-disk storage backend. This is the bridge between sync processing and
 the sharded storage implementation.
 
-Note: Transaction details, withdrawals, and logs are not stored—logs are derived on-demand from
+Note: Transaction details, withdrawals, and logs are not stored--logs are derived on-demand from
 receipts at query time.
 
 ## Contents (one hop)
