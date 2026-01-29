@@ -488,7 +488,6 @@ impl SyncProgressStats {
     }
 
     /// Set DB log count.
-    #[expect(dead_code, reason = "available when log counts are added to ShardMeta")]
     pub fn set_db_logs(&self, count: u64) {
         self.db_logs
             .store(count, std::sync::atomic::Ordering::SeqCst);

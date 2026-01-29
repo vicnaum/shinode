@@ -229,6 +229,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         let agg = storage.aggregate_stats();
         stats.set_db_blocks(agg.total_blocks);
         stats.set_db_transactions(agg.total_transactions);
+        stats.set_db_logs(agg.total_logs);
         stats.set_db_shards(agg.total_shards);
         stats.set_storage_bytes(
             agg.disk_bytes_headers,

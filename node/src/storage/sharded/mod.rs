@@ -156,6 +156,7 @@ pub struct StorageAggregateStats {
     pub total_blocks: u64,
     pub total_transactions: u64,
     pub total_receipts: u64,
+    pub total_logs: u64,
     pub total_shards: u64,
     pub disk_bytes_headers: u64,
     pub disk_bytes_transactions: u64,
@@ -195,6 +196,11 @@ struct ShardMeta {
     /// Total receipt count across all blocks in this shard.
     #[serde(default)]
     total_receipts: u64,
+    /// Total log count across all blocks in this shard.
+    /// Accumulated during follow-mode writes; preserved (not recomputed) during compaction
+    /// because receipts are zstd-compressed and decoding just to count logs is expensive.
+    #[serde(default)]
+    total_logs: u64,
     /// On-disk bytes for headers segment files.
     #[serde(default)]
     disk_bytes_headers: u64,
@@ -608,6 +614,7 @@ impl Storage {
             stats.total_blocks += u64::from(state.meta.present_count);
             stats.total_transactions += state.meta.total_transactions;
             stats.total_receipts += state.meta.total_receipts;
+            stats.total_logs += state.meta.total_logs;
             stats.disk_bytes_headers += state.meta.disk_bytes_headers;
             stats.disk_bytes_transactions += state.meta.disk_bytes_transactions;
             stats.disk_bytes_receipts += state.meta.disk_bytes_receipts;
@@ -923,6 +930,7 @@ impl Storage {
             state.meta.present_count = state.meta.present_count.saturating_add(1);
             state.meta.total_transactions += bundle.tx_hashes.hashes.len() as u64;
             state.meta.total_receipts += bundle.receipts.receipts.len() as u64;
+            state.meta.total_logs += bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>();
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         }
         state.meta.sorted = true;
@@ -1613,6 +1621,7 @@ impl Storage {
             compaction_phase: None,
             total_transactions: 0,
             total_receipts: 0,
+            total_logs: 0,
             disk_bytes_headers: 0,
             disk_bytes_transactions: 0,
             disk_bytes_receipts: 0,
