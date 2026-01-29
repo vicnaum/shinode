@@ -158,6 +158,7 @@ pub struct StorageAggregateStats {
     pub total_receipts: u64,
     pub total_logs: u64,
     pub total_shards: u64,
+    pub compacted_shards: u64,
     pub disk_bytes_headers: u64,
     pub disk_bytes_transactions: u64,
     pub disk_bytes_receipts: u64,
@@ -615,6 +616,9 @@ impl Storage {
             stats.total_transactions += state.meta.total_transactions;
             stats.total_receipts += state.meta.total_receipts;
             stats.total_logs += state.meta.total_logs;
+            if state.meta.sorted {
+                stats.compacted_shards += 1;
+            }
             stats.disk_bytes_headers += state.meta.disk_bytes_headers;
             stats.disk_bytes_transactions += state.meta.disk_bytes_transactions;
             stats.disk_bytes_receipts += state.meta.disk_bytes_receipts;

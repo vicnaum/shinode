@@ -179,6 +179,7 @@ pub struct TuiState {
     pub db_transactions: Option<u64>,
     pub db_logs: Option<u64>,
     pub db_shards: Option<u64>,
+    pub db_shards_compacted: Option<u64>,
     /// Per-segment storage sizes in bytes.
     pub storage_bytes_headers: u64,
     pub storage_bytes_transactions: u64,
@@ -270,6 +271,7 @@ impl TuiState {
             db_transactions: None,
             db_logs: None,
             db_shards: None,
+            db_shards_compacted: None,
             storage_bytes_headers: 0,
             storage_bytes_transactions: 0,
             storage_bytes_receipts: 0,
@@ -451,6 +453,7 @@ impl TuiState {
         }
         if snapshot.db_shards > 0 {
             self.db_shards = Some(snapshot.db_shards);
+            self.db_shards_compacted = Some(snapshot.db_shards_compacted);
         }
 
         // Storage sizes
@@ -1932,7 +1935,10 @@ fn render_db_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     buf.set_string(value_col, inner.y + 2, &logs_str, Style::default().fg(Color::White));
 
     buf.set_string(inner.x + 1, inner.y + 3, "Shards", Style::default().fg(Color::Gray));
-    let shards_str = data.db_shards.map_or("--".into(), format_number);
+    let shards_str = match (data.db_shards_compacted, data.db_shards) {
+        (Some(compacted), Some(total)) => format!("{}/{}", format_number(compacted), format_number(total)),
+        _ => "--".into(),
+    };
     buf.set_string(value_col, inner.y + 3, &shards_str, Style::default().fg(Color::White));
 }
 

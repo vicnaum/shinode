@@ -169,6 +169,8 @@ pub struct SyncProgressStats {
     db_logs: std::sync::atomic::AtomicU64,
     /// DB counters: total shards.
     db_shards: std::sync::atomic::AtomicU64,
+    /// DB counters: compacted (sorted, no WAL) shards.
+    db_shards_compacted: std::sync::atomic::AtomicU64,
     /// Storage bytes for headers segment.
     storage_bytes_headers: std::sync::atomic::AtomicU64,
     /// Storage bytes for transactions segment.
@@ -219,6 +221,7 @@ pub struct SyncProgressSnapshot {
     pub db_transactions: u64,
     pub db_logs: u64,
     pub db_shards: u64,
+    pub db_shards_compacted: u64,
     /// Per-segment storage sizes in bytes.
     pub storage_bytes_headers: u64,
     pub storage_bytes_transactions: u64,
@@ -290,6 +293,9 @@ impl SyncProgressStats {
                 .load(std::sync::atomic::Ordering::SeqCst),
             db_logs: self.db_logs.load(std::sync::atomic::Ordering::SeqCst),
             db_shards: self.db_shards.load(std::sync::atomic::Ordering::SeqCst),
+            db_shards_compacted: self
+                .db_shards_compacted
+                .load(std::sync::atomic::Ordering::SeqCst),
             storage_bytes_headers: self
                 .storage_bytes_headers
                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -493,10 +499,12 @@ impl SyncProgressStats {
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Set DB shard count.
-    pub fn set_db_shards(&self, count: u64) {
+    /// Set DB shard counts (total and compacted).
+    pub fn set_db_shards(&self, total: u64, compacted: u64) {
         self.db_shards
-            .store(count, std::sync::atomic::Ordering::SeqCst);
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+        self.db_shards_compacted
+            .store(compacted, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Increment DB counters for a single processed block.

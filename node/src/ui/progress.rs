@@ -603,6 +603,7 @@ mod tests {
             db_transactions: 0,
             db_logs: 0,
             db_shards: 0,
+            db_shards_compacted: 0,
             storage_bytes_headers: 0,
             storage_bytes_transactions: 0,
             storage_bytes_receipts: 0,

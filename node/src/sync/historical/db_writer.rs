@@ -122,7 +122,7 @@ async fn flush_fast_sync_buffer(
                 if result.is_ok() {
                     if let Some(stats) = progress_stats.as_ref() {
                         let agg = storage.aggregate_stats();
-                        stats.set_db_shards(agg.total_shards);
+                        stats.set_db_shards(agg.total_shards, agg.compacted_shards);
                         stats.set_storage_bytes(
                             agg.disk_bytes_headers,
                             agg.disk_bytes_transactions,
@@ -253,7 +253,7 @@ pub async fn run_db_writer(
         // (DB counters are updated incrementally at processing time)
         if let Some(stats) = progress_stats.as_ref() {
             let agg = storage.aggregate_stats();
-            stats.set_db_shards(agg.total_shards);
+            stats.set_db_shards(agg.total_shards, agg.compacted_shards);
             stats.set_storage_bytes(
                 agg.disk_bytes_headers,
                 agg.disk_bytes_transactions,
@@ -424,7 +424,7 @@ fn finalize_fast_sync(
     // (DB counters are updated incrementally at processing time)
     if let Some(stats) = progress_stats {
         let agg = storage.aggregate_stats();
-        stats.set_db_shards(agg.total_shards);
+        stats.set_db_shards(agg.total_shards, agg.compacted_shards);
         stats.set_storage_bytes(
             agg.disk_bytes_headers,
             agg.disk_bytes_transactions,
