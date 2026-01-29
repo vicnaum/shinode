@@ -156,6 +156,7 @@ pub struct StorageAggregateStats {
     pub total_blocks: u64,
     pub total_transactions: u64,
     pub total_receipts: u64,
+    pub total_shards: u64,
     pub disk_bytes_headers: u64,
     pub disk_bytes_transactions: u64,
     pub disk_bytes_receipts: u64,
@@ -601,6 +602,7 @@ impl Storage {
     pub fn aggregate_stats(&self) -> StorageAggregateStats {
         let shards = self.shards.lock();
         let mut stats = StorageAggregateStats::default();
+        stats.total_shards = shards.len() as u64;
         for shard in shards.values() {
             let state = shard.lock();
             stats.total_blocks += u64::from(state.meta.present_count);

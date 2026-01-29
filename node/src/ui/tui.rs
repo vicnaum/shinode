@@ -177,7 +177,8 @@ pub struct TuiState {
     pub write_rate: Option<f64>,
     pub db_blocks: Option<u64>,
     pub db_transactions: Option<u64>,
-    pub db_receipts: Option<u64>,
+    pub db_logs: Option<u64>,
+    pub db_shards: Option<u64>,
     /// Per-segment storage sizes in bytes.
     pub storage_bytes_headers: u64,
     pub storage_bytes_transactions: u64,
@@ -267,7 +268,8 @@ impl TuiState {
             write_rate: None,
             db_blocks: None,
             db_transactions: None,
-            db_receipts: None,
+            db_logs: None,
+            db_shards: None,
             storage_bytes_headers: 0,
             storage_bytes_transactions: 0,
             storage_bytes_receipts: 0,
@@ -444,8 +446,11 @@ impl TuiState {
         if snapshot.db_transactions > 0 {
             self.db_transactions = Some(snapshot.db_transactions);
         }
-        if snapshot.db_receipts > 0 {
-            self.db_receipts = Some(snapshot.db_receipts);
+        if snapshot.db_logs > 0 {
+            self.db_logs = Some(snapshot.db_logs);
+        }
+        if snapshot.db_shards > 0 {
+            self.db_shards = Some(snapshot.db_shards);
         }
 
         // Storage sizes
@@ -1922,9 +1927,13 @@ fn render_db_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let txns_str = data.db_transactions.map_or("--".into(), format_number);
     buf.set_string(value_col, inner.y + 1, &txns_str, Style::default().fg(Color::White));
 
-    buf.set_string(inner.x + 1, inner.y + 2, "Receipts", Style::default().fg(Color::Gray));
-    let receipts_str = data.db_receipts.map_or("--".into(), format_number);
-    buf.set_string(value_col, inner.y + 2, &receipts_str, Style::default().fg(Color::White));
+    buf.set_string(inner.x + 1, inner.y + 2, "Logs", Style::default().fg(Color::Gray));
+    let logs_str = data.db_logs.map_or("--".into(), format_number);
+    buf.set_string(value_col, inner.y + 2, &logs_str, Style::default().fg(Color::White));
+
+    buf.set_string(inner.x + 1, inner.y + 3, "Shards", Style::default().fg(Color::Gray));
+    let shards_str = data.db_shards.map_or("--".into(), format_number);
+    buf.set_string(value_col, inner.y + 3, &shards_str, Style::default().fg(Color::White));
 }
 
 fn render_rpc_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {

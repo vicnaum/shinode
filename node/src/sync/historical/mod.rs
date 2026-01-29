@@ -181,7 +181,7 @@ async fn run_processor_worker(
                     stats.update_head_block_max(bundle.number);
                     stats.inc_db_counters(
                         bundle.tx_hashes.hashes.len() as u64,
-                        bundle.receipts.receipts.len() as u64,
+                        log_count as u64,
                     );
                 }
                 if let Some(bench) = ctx.bench.as_ref() {

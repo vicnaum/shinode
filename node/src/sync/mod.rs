@@ -165,8 +165,10 @@ pub struct SyncProgressStats {
     db_blocks: std::sync::atomic::AtomicU64,
     /// DB counters: total transactions in storage.
     db_transactions: std::sync::atomic::AtomicU64,
-    /// DB counters: total receipts in storage.
-    db_receipts: std::sync::atomic::AtomicU64,
+    /// DB counters: total logs processed.
+    db_logs: std::sync::atomic::AtomicU64,
+    /// DB counters: total shards.
+    db_shards: std::sync::atomic::AtomicU64,
     /// Storage bytes for headers segment.
     storage_bytes_headers: std::sync::atomic::AtomicU64,
     /// Storage bytes for transactions segment.
@@ -215,7 +217,8 @@ pub struct SyncProgressSnapshot {
     /// DB counters.
     pub db_blocks: u64,
     pub db_transactions: u64,
-    pub db_receipts: u64,
+    pub db_logs: u64,
+    pub db_shards: u64,
     /// Per-segment storage sizes in bytes.
     pub storage_bytes_headers: u64,
     pub storage_bytes_transactions: u64,
@@ -285,9 +288,8 @@ impl SyncProgressStats {
             db_transactions: self
                 .db_transactions
                 .load(std::sync::atomic::Ordering::SeqCst),
-            db_receipts: self
-                .db_receipts
-                .load(std::sync::atomic::Ordering::SeqCst),
+            db_logs: self.db_logs.load(std::sync::atomic::Ordering::SeqCst),
+            db_shards: self.db_shards.load(std::sync::atomic::Ordering::SeqCst),
             storage_bytes_headers: self
                 .storage_bytes_headers
                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -485,20 +487,27 @@ impl SyncProgressStats {
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Set DB receipt count.
-    pub fn set_db_receipts(&self, count: u64) {
-        self.db_receipts
+    /// Set DB log count.
+    #[expect(dead_code, reason = "available when log counts are added to ShardMeta")]
+    pub fn set_db_logs(&self, count: u64) {
+        self.db_logs
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB shard count.
+    pub fn set_db_shards(&self, count: u64) {
+        self.db_shards
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Increment DB counters for a single processed block.
-    pub fn inc_db_counters(&self, transactions: u64, receipts: u64) {
+    pub fn inc_db_counters(&self, transactions: u64, logs: u64) {
         self.db_blocks
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.db_transactions
             .fetch_add(transactions, std::sync::atomic::Ordering::SeqCst);
-        self.db_receipts
-            .fetch_add(receipts, std::sync::atomic::Ordering::SeqCst);
+        self.db_logs
+            .fetch_add(logs, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Set storage byte sizes for all segments.
