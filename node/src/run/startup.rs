@@ -6,7 +6,7 @@ use crate::p2p::{self, PeerPool};
 use crate::storage::Storage;
 use crate::sync::historical::{BenchEventLogger, PeerHealthTracker};
 use crate::sync::SyncProgressStats;
-use crate::ui::{self, UIController};
+use crate::ui::{self, tui::TuiController, UIController};
 use eyre::Result;
 use std::fs;
 use std::io::IsTerminal;
@@ -18,6 +18,107 @@ use tokio::time::sleep;
 use tracing::info;
 
 use super::session::IngestProgress;
+use crate::ui::tui::Phase;
+
+/// Type alias for early TUI controller used during startup.
+pub type EarlyTui = Arc<Mutex<TuiController>>;
+
+/// Update the TUI startup status message.
+/// This is a no-op if tui is None.
+/// Returns true if quit was requested.
+pub fn update_tui_startup(
+    tui: Option<&EarlyTui>,
+    status: &str,
+    log_buffer: Option<&std::sync::Arc<crate::logging::TuiLogBuffer>>,
+) -> bool {
+    if let Some(tui) = tui {
+        let mut guard = tui.lock();
+        guard.state.startup_status = status.to_string();
+        guard.state.phase = Phase::Startup;
+        // Drain logs from buffer
+        if let Some(buffer) = log_buffer {
+            guard.state.drain_log_buffer(buffer);
+        }
+        // Check for quit
+        if guard.poll_quit().unwrap_or(false) || guard.should_quit {
+            guard.state.quitting = true;
+            let _ = guard.draw();
+            return true;
+        }
+        let _ = guard.draw();
+    }
+    false
+}
+
+/// Update the TUI startup status with best head seen and peer count.
+/// Returns true if quit was requested.
+pub fn update_tui_startup_head(
+    tui: Option<&EarlyTui>,
+    status: &str,
+    best_head: u64,
+    peers: u64,
+    log_buffer: Option<&std::sync::Arc<crate::logging::TuiLogBuffer>>,
+) -> bool {
+    if let Some(tui) = tui {
+        let mut guard = tui.lock();
+        guard.state.startup_status = status.to_string();
+        guard.state.phase = Phase::Startup;
+        guard.state.best_head_seen = best_head;
+        guard.state.peers_connected = peers;
+        guard.state.peers_max = peers; // During startup, all connected peers are "available"
+        // Drain logs from buffer
+        if let Some(buffer) = log_buffer {
+            guard.state.drain_log_buffer(buffer);
+        }
+        // Check for quit
+        if guard.poll_quit().unwrap_or(false) || guard.should_quit {
+            guard.state.quitting = true;
+            let _ = guard.draw();
+            return true;
+        }
+        let _ = guard.draw();
+    }
+    false
+}
+
+/// Update the TUI startup status with peer count.
+/// Returns true if quit was requested.
+pub fn update_tui_startup_peers(
+    tui: Option<&EarlyTui>,
+    status: &str,
+    peers: u64,
+    log_buffer: Option<&std::sync::Arc<crate::logging::TuiLogBuffer>>,
+) -> bool {
+    if let Some(tui) = tui {
+        let mut guard = tui.lock();
+        guard.state.startup_status = status.to_string();
+        guard.state.phase = Phase::Startup;
+        guard.state.peers_connected = peers;
+        guard.state.peers_max = peers; // During startup, all connected peers are "available"
+        // Drain logs from buffer
+        if let Some(buffer) = log_buffer {
+            guard.state.drain_log_buffer(buffer);
+        }
+        // Check for quit
+        if guard.poll_quit().unwrap_or(false) || guard.should_quit {
+            guard.state.quitting = true;
+            let _ = guard.draw();
+            return true;
+        }
+        let _ = guard.draw();
+    }
+    false
+}
+
+/// Handle quit request during startup - restores terminal and exits.
+#[expect(clippy::exit, reason = "intentional exit on user quit request during startup")]
+pub fn handle_startup_quit(tui: Option<&EarlyTui>) -> ! {
+    if let Some(tui) = tui {
+        let guard = tui.lock();
+        let _ = guard.restore();
+    }
+    process::exit(0);
+}
 
 /// Build the run context for log artifacts.
 pub fn build_run_context(config: &NodeConfig, argv: Vec<String>) -> Option<RunContext> {
@@ -75,10 +176,18 @@ pub fn build_run_context(config: &NodeConfig, argv: Vec<String>) -> Option<RunCo
     })
 }
 
+/// Type alias for the log buffer reference.
+pub type LogBufferRef = Option<std::sync::Arc<crate::logging::TuiLogBuffer>>;
+
 /// Initialize storage with startup compaction of dirty shards.
 #[expect(clippy::cognitive_complexity, reason = "storage init with optional compaction")]
-pub async fn init_storage(config: &NodeConfig) -> Result<Arc<Storage>> {
+pub async fn init_storage(
+    config: &NodeConfig,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
+) -> Result<Arc<Storage>> {
     ui::print_status_bar("Opening storage...");
+    update_tui_startup(tui, "Opening storage...", log_buffer.as_ref());
     let storage = Arc::new(Storage::open(config)?);
 
     // Resume behavior: if the previous run exited before compaction finished, ensure we
@@ -87,7 +196,9 @@ pub async fn init_storage(config: &NodeConfig) -> Result<Arc<Storage>> {
     let dirty_shards = storage.dirty_complete_shards()?;
     if !dirty_shards.is_empty() {
         let shard_count = dirty_shards.len();
-        ui::print_status_bar(&format!("Compacting {shard_count} shards..."));
+        let status_msg = format!("Compacting {shard_count} shards...");
+        ui::print_status_bar(&status_msg);
+        update_tui_startup(tui, &status_msg, log_buffer.as_ref());
         info!(shard_count, "startup: compacting completed dirty shards");
         let storage_clone = Arc::clone(&storage);
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -105,18 +216,30 @@ pub async fn init_storage(config: &NodeConfig) -> Result<Arc<Storage>> {
 
 /// Connect to the P2P network.
 #[expect(clippy::cognitive_complexity, reason = "P2P connection with status updates")]
-pub async fn connect_p2p(storage: Arc<Storage>) -> Result<p2p::NetworkSession> {
-    ui::print_status_bar("Connecting to P2P network...");
+pub async fn connect_p2p(
+    storage: Arc<Storage>,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
+) -> Result<p2p::NetworkSession> {
+    ui::print_status_bar("Connecting to Ethereum P2P network...");
+    update_tui_startup(tui, "Connecting to Ethereum P2P network...", log_buffer.as_ref());
     info!("starting p2p network");
     let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
     let initial_peers = session.pool.len();
     info!(peers = initial_peers, "p2p peers connected");
-    ui::print_status_bar(&format!("P2P connected | {initial_peers} peers"));
+    let status_msg = format!("P2P connected | {initial_peers} peers");
+    ui::print_status_bar(&status_msg);
+    update_tui_startup_peers(tui, &status_msg, initial_peers as u64, log_buffer.as_ref());
     Ok(session)
 }
 
 /// Wait for minimum number of peers.
-pub async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
+pub async fn wait_for_min_peers(
+    pool: &Arc<PeerPool>,
+    min_peers: usize,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
+) {
     if min_peers == 0 {
         return;
     }
@@ -126,7 +249,11 @@ pub async fn wait_for_min_peers(pool: &Arc<PeerPool>, min_peers: usize) {
             ui::clear_status_bar();
             return;
         }
-        ui::print_status_bar(&format!("Waiting for peers... {peers}/{min_peers}"));
+        let status_msg = format!("Waiting for peers... {peers}/{min_peers}");
+        ui::print_status_bar(&status_msg);
+        if update_tui_startup_peers(tui, &status_msg, peers as u64, log_buffer.as_ref()) {
+            handle_startup_quit(tui);
+        }
         sleep(Duration::from_millis(200)).await;
     }
 }
@@ -137,6 +264,8 @@ pub async fn wait_for_peer_head(
     start_block: u64,
     end_block: Option<u64>,
     rollback_window: u64,
+    tui: Option<&EarlyTui>,
+    log_buffer: &LogBufferRef,
 ) -> u64 {
     let mut last_log = Instant::now()
         .checked_sub(Duration::from_secs(10))
@@ -151,11 +280,16 @@ pub async fn wait_for_peer_head(
             ui::clear_status_bar();
             return best_head;
         }
-        ui::print_status_bar(&format!(
+        let status_msg = format!(
             "Discovering chain head... {} | peers {}",
             best_head,
             peers.len()
-        ));
+        );
+        ui::print_status_bar(&status_msg);
+        // TUI shows head/peers in dedicated fields, so use simpler status
+        if update_tui_startup_head(tui, "Discovering chain head...", best_head, peers.len() as u64, log_buffer.as_ref()) {
+            handle_startup_quit(tui);
+        }
         if last_log.elapsed() >= Duration::from_secs(5) {
             info!(
                 peers = peers.len(),
@@ -173,21 +307,49 @@ pub async fn wait_for_peer_head(
 
 /// Setup result containing UI components and progress tracking.
 pub struct UiSetup {
-    /// UI controller for progress display (currently unused but kept for potential debug use).
+    /// UI controller for progress display (indicatif mode).
     #[expect(dead_code, reason = "kept for potential debug use")]
-    pub ui_controller: Arc<Mutex<UIController>>,
+    pub ui_controller: Option<Arc<Mutex<UIController>>>,
+    /// TUI controller for fullscreen dashboard mode.
+    #[expect(dead_code, reason = "TUI runs in background task")]
+    pub tui_controller: Option<Arc<Mutex<TuiController>>>,
     pub progress: Option<Arc<IngestProgress>>,
     pub events: Option<Arc<BenchEventLogger>>,
 }
 
+/// Log writers for TUI quit flushing.
+pub struct LogWriters {
+    pub log_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+    pub resources_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+}
+
 /// Setup UI controller, progress bar, and event logger.
+///
+/// The `shutdown_tx` is used to signal the sync runner to stop when the user
+/// presses 'q' in the TUI.
+///
+/// The `completion_rx` is used to wait for sync completion before fully exiting
+/// the TUI after the user presses 'q'.
+///
+/// If `early_tui` is provided, it will be reused instead of creating a new TUI.
+/// The early TUI is created during startup to show startup phase status.
+///
+/// If `log_writers` is provided, the TUI will flush the log writers before
+/// exiting to prevent log truncation.
+#[expect(clippy::too_many_arguments, reason = "setup function needs many config params")]
 pub fn setup_ui(
     config: &NodeConfig,
     run_context: Option<&RunContext>,
-    total_len: u64,
+    start_block: u64,
+    end_block: u64,
     progress_stats: Option<&Arc<SyncProgressStats>>,
     peer_health: &Arc<PeerHealthTracker>,
     pool: &Arc<PeerPool>,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    early_tui: Option<EarlyTui>,
+    tui_log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
+    log_writers: Option<LogWriters>,
 ) -> Result<UiSetup> {
     // Create event logger if enabled
     let events = if config.log_events {
@@ -202,8 +364,65 @@ pub fn setup_ui(
         None
     };
 
-    // Create UI controller and progress bar
     let is_tty = std::io::stderr().is_terminal();
+    let total_len = end_block.saturating_sub(start_block);
+    let use_tui = !config.no_tui && is_tty;
+
+    // TUI mode: fullscreen dashboard (default when TTY unless --no-tui)
+    // Note: TUI mode flag is set earlier in run_sync before storage init
+    if use_tui {
+        // Reuse early TUI if provided, otherwise create new one
+        let tui_controller = if let Some(tui) = early_tui {
+            // Update the early TUI with actual end_block and transition to Sync phase
+            {
+                let mut guard = tui.lock();
+                guard.state.end_block = end_block;
+                guard.state.phase = Phase::Sync;
+            }
+            tui
+        } else {
+            let mut tui = TuiController::new(start_block, end_block)
+                .map_err(|e| eyre::eyre!("failed to create TUI: {}", e))?;
+            // Set config values for display
+            tui.state.set_config(
+                &config.data_dir.display().to_string(),
+                config.shard_size,
+                &config.rpc_bind.to_string(),
+                config.rollback_window,
+            );
+            Arc::new(Mutex::new(tui))
+        };
+
+        // Initialize stats and spawn TUI progress updater
+        if let Some(stats) = progress_stats {
+            stats.set_start_block(start_block);
+            stats.set_peers_active(0);
+            stats.set_peers_total(pool.len() as u64);
+            let (log_writer, resources_writer) = log_writers
+                .map_or((None, None), |w| (w.log_writer, w.resources_writer));
+            ui::spawn_tui_progress_updater(
+                Arc::clone(&tui_controller),
+                Arc::clone(stats),
+                Arc::clone(pool),
+                Some(Arc::clone(peer_health)),
+                end_block,
+                shutdown_tx,
+                completion_rx,
+                tui_log_buffer,
+                log_writer,
+                resources_writer,
+            );
+        }
+
+        return Ok(UiSetup {
+            ui_controller: None,
+            tui_controller: Some(tui_controller),
+            progress: None,
+            events,
+        });
+    }
+
+    // Indicatif mode: progress bars
     let ui_controller = Arc::new(Mutex::new(UIController::new(is_tty)));
 
     let progress: Option<Arc<IngestProgress>> = if is_tty {
@@ -213,6 +432,7 @@ pub fn setup_ui(
             ui.show_syncing(total_len);
         }
         if let Some(stats) = progress_stats {
+            stats.set_start_block(start_block);
             stats.set_peers_active(0);
             stats.set_peers_total(pool.len() as u64);
             ui::spawn_progress_updater(
@@ -237,7 +457,8 @@ pub fn setup_ui(
     };
 
     Ok(UiSetup {
-        ui_controller,
+        ui_controller: Some(ui_controller),
+        tui_controller: None,
         progress,
         events,
     })

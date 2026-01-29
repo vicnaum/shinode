@@ -8,7 +8,7 @@ Full reference for CLI options and environment variables.
 |--------|---------|-------------|
 | `--chain-id <u64>` | `1` | Chain ID for RPC (Ethereum mainnet only) |
 | `--data-dir <path>` | `data` | Base data directory for storage |
-| `--peer-cache-dir <path>` | `~/.stateless-history-node` | Directory for persisted peer cache |
+| `--peer-cache-dir <path>` | (data dir) | Directory for persisted peer cache; defaults to data directory if unset |
 | `--start-block <u64>` | `10000000` | First block to backfill (pre-Uniswap V2) |
 | `--end-block <u64>` | - | Optional final block to stop at |
 | `--shard-size <u64>` | `10000` | Blocks per storage shard |
@@ -16,6 +16,12 @@ Full reference for CLI options and environment variables.
 | `--retention-mode <mode>` | `full` | Retention policy (`full` only) |
 | `--head-source <source>` | `p2p` | Head source (`p2p` only) |
 | `--reorg-strategy <strategy>` | `delete` | Rollback strategy (`delete` only) |
+
+## Display Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-tui` | `false` | Disable fullscreen TUI dashboard; use legacy progress bars |
 
 ## RPC Options
 
@@ -40,11 +46,9 @@ Full reference for CLI options and environment variables.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--fast-sync-chunk-size <u64>` | `32` | Initial blocks per peer batch |
-| `--fast-sync-chunk-max <u64>` | `128` | Max per-peer batch size (4x chunk-size) |
+| `--fast-sync-chunk-max <u64>` | (4x chunk-size) | Hard cap for AIMD upper bound |
 | `--fast-sync-max-inflight <u32>` | `32` | Max concurrent peer batches |
-| `--fast-sync-batch-timeout-ms <u64>` | `10000` | Per-batch timeout (10s) |
 | `--fast-sync-max-buffered-blocks <u64>` | `8192` | Max buffered blocks |
-| `--fast-sync-max-lookahead-blocks <u64>` | `100000` | Max blocks ahead of DB writer (`0` = unlimited) |
 | `--db-write-batch-blocks <u64>` | `512` | Batch size for fast-sync WAL writes |
 | `--db-write-flush-interval-ms <u64>` | - | Optional time-based flush interval |
 
@@ -63,15 +67,24 @@ Full reference for CLI options and environment variables.
 
 | Option | Description |
 |--------|-------------|
-| `--log` | Enable all log outputs (trace, events, json, report) |
+| `--log` | Enable all log outputs (trace, events, json, report, resources) |
 | `--run-name <string>` | Label for output filenames (default: timestamp) |
 | `--log-output-dir <path>` | Output directory for log artifacts (default: `logs`) |
 | `--log-trace` | Emit Chrome trace (`.trace.json`) for timeline inspection |
+| `--log-trace-filter <filter>` | Trace filter (default: `off,stateless_history_node=trace,...`) |
+| `--log-trace-include-args` | Include span/event args in trace output (default: true) |
+| `--log-trace-include-locations` | Include file+line info in trace output (default: true) |
 | `--log-events` | Emit JSONL event log (`.events.jsonl`) for analysis |
 | `--log-json` | Emit JSON structured logs (`.logs.jsonl`) |
 | `--log-json-filter <filter>` | JSON log filter (default: `warn,stateless_history_node=debug`) |
 | `--log-report` | Emit run summary report (`.report.json`) |
-| `--log-resources` | Include CPU/memory/disk metrics |
+| `--log-resources` | Emit separate resource metrics JSONL file (CPU/memory/disk) |
+
+## Operational Modes
+
+| Option | Description |
+|--------|-------------|
+| `--repair` | Run storage repair/recovery without starting sync |
 
 ## Commands
 
@@ -97,7 +110,7 @@ cargo run --release --manifest-path node/Cargo.toml -- \
 
 ```bash
 cargo run --release --manifest-path node/Cargo.toml -- \
-  repair --data-dir <path>
+  --repair --data-dir <path>
 ```
 
 ## Environment Variables
@@ -122,8 +135,9 @@ After running, `data_dir` contains:
 ```
 data_dir/
 ├── meta.json                          # Schema, chain id, checkpoints
+├── peers.json                         # Persisted peer cache
 └── static/shards/<shard_start>/       # One per shard
-    ├── shard.json                     # Shard metadata
+    ├── shard.json                     # Shard metadata (stats, compaction phase)
     ├── present.bitset                 # Block presence tracking
     ├── state/staging.wal              # WAL (during ingestion)
     └── sorted/                        # Compacted segments
@@ -134,8 +148,6 @@ data_dir/
         └── block_sizes
 ```
 
-Peer cache is stored at `--peer-cache-dir/peers.json` (default: `~/.stateless-history-node/peers.json`).
-
 ## Configuration Persistence
 
 Storage-affecting settings are persisted in `meta.json` and validated on startup:
@@ -144,4 +156,4 @@ Storage-affecting settings are persisted in `meta.json` and validated on startup
 - `--head-source`
 - `--reorg-strategy`
 
-If you change these, use a new `data_dir`. Runtime-only settings (verbosity, RPC limits) can be changed freely.
+If you change these, use a new `data_dir`. Runtime-only settings (verbosity, RPC limits, `--no-tui`) can be changed freely.

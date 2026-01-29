@@ -14,7 +14,6 @@ pub const DEFAULT_START_BLOCK: u64 = 10_000_000;
 pub const DEFAULT_FAST_SYNC_CHUNK_SIZE: u64 = 32;
 pub const DEFAULT_FAST_SYNC_MAX_INFLIGHT: u32 = 32;
 pub const DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS: u64 = 8192;
-pub const DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 pub const DEFAULT_SHARD_SIZE: u64 = 10_000;
 pub const DEFAULT_LOG_OUTPUT_DIR: &str = "logs";
@@ -163,6 +162,9 @@ pub struct NodeConfig {
     /// performs recovery, and exits with a summary.
     #[arg(long, default_value_t = false)]
     pub repair: bool,
+    /// Disable fullscreen TUI dashboard, use legacy progress bars.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
     /// Optional command.
     #[command(subcommand)]
     #[serde(skip)]
@@ -196,11 +198,6 @@ pub struct NodeConfig {
     /// Max in-flight chunk requests for fast sync.
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_INFLIGHT)]
     pub fast_sync_max_inflight: u32,
-    /// Timeout (ms) for a single peer ingest batch (headers + bodies + receipts).
-    ///
-    /// This bounds "stuck" peers so work can move to other peers.
-    #[arg(long, default_value_t = DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS)]
-    pub fast_sync_batch_timeout_ms: u64,
     /// Max buffered blocks (across completed chunks) for fast sync.
     #[arg(long, default_value_t = DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS)]
     pub fast_sync_max_buffered_blocks: u64,
@@ -309,15 +306,12 @@ mod tests {
             DEFAULT_FAST_SYNC_MAX_INFLIGHT
         );
         assert_eq!(
-            config.fast_sync_batch_timeout_ms,
-            DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS
-        );
-        assert_eq!(
             config.fast_sync_max_buffered_blocks,
             DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS
         );
         assert_eq!(config.db_write_batch_blocks, DEFAULT_DB_WRITE_BATCH_BLOCKS);
         assert_eq!(config.db_write_flush_interval_ms, None);
+        assert!(!config.no_tui);
     }
 
     #[test]

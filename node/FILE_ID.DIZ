@@ -1,0 +1,49 @@
+STATELESS HISTORY NODE v0.3 - Stateless ETH history indexer
+EL P2P backfill -> RPC subset | reorg-safe | Rust | by @vicnaum
+
+ ▓▓▓▓▓▓\\▓▓▓▓▓▓▓▓  ▓▓▓▓▓▓\\▓▓▓▓▓▓▓▓ ▓▓▓▓▓▓▓▓ ▓▓     | ▓▓▓▓▓▓▓▓  ▓▓▓▓▓▓\  ▓▓▓▓▓▓\
+▓▓___\▓▓  | ▓▓  | ▓▓__| ▓▓  | ▓▓  | ▓▓__   | ▓▓     | ▓▓__   | ▓▓___\▓▓ ▓▓___\▓▓
+▓▓    \   | ▓▓  | ▓▓    ▓▓  | ▓▓  | ▓▓  \  | ▓▓     | ▓▓  \   \▓▓    \ \▓▓    \
+\▓▓▓▓▓▓\  | ▓▓  | ▓▓▓▓▓▓▓▓  | ▓▓  | ▓▓▓▓▓  | ▓▓     | ▓▓▓▓▓   _\▓▓▓▓▓▓\_\▓▓▓▓▓▓\
+ \__| ▓▓  | ▓▓  | ▓▓  | ▓▓  | ▓▓  | ▓▓_____| ▓▓_____| ▓▓_____|  \__| ▓▓  \__| ▓▓
+▓▓    ▓▓  | ▓▓  | ▓▓  | ▓▓  | ▓▓  | ▓▓     \ ▓▓     \ ▓▓     \\▓▓    ▓▓\▓▓    ▓▓
+\▓▓▓▓▓▓    \▓▓   \▓▓   \▓▓   \▓▓   \▓▓▓▓▓▓▓▓\▓▓▓▓▓▓▓▓\▓▓▓▓▓▓▓▓ \▓▓▓▓▓▓  \▓▓▓▓▓▓
+        |  \  |  \      \/      \|        \/      \|       \|  \    /  \
+        | ▓▓  | ▓▓\▓▓▓▓▓▓  ▓▓▓▓▓▓\\▓▓▓▓▓▓▓▓  ▓▓▓▓▓▓\ ▓▓▓▓▓▓▓\\▓▓\  /  ▓▓
+        | ▓▓__| ▓▓ | ▓▓ | ▓▓___\▓▓  | ▓▓  | ▓▓  | ▓▓ ▓▓__| ▓▓ \▓▓\/  ▓▓
+        | ▓▓    ▓▓ | ▓▓  \▓▓    \   | ▓▓  | ▓▓  | ▓▓ ▓▓    ▓▓  \▓▓  ▓▓
+        | ▓▓▓▓▓▓▓▓ | ▓▓  _\▓▓▓▓▓▓\  | ▓▓  | ▓▓  | ▓▓ ▓▓▓▓▓▓▓\   \▓▓▓▓
+        | ▓▓  | ▓▓_| ▓▓_|  \__| ▓▓  | ▓▓  | ▓▓__/ ▓▓ ▓▓  | ▓▓   | ▓▓
+        | ▓▓  | ▓▓   ▓▓ \\▓▓    ▓▓  | ▓▓   \▓▓    ▓▓ ▓▓  | ▓▓   | ▓▓
+         \▓▓   \▓▓\▓▓▓▓▓▓ \▓▓▓▓▓▓    \▓▓    \▓▓▓▓▓▓ \▓▓   \▓▓    \▓▓
+                      |  \  |  \/      \|       \|        \
+                     | ▓▓\ | ▓▓  ▓▓▓▓▓▓\ ▓▓▓▓▓▓▓\ ▓▓▓▓▓▓▓▓
+                     | ▓▓▓\| ▓▓ ▓▓  | ▓▓ ▓▓  | ▓▓ ▓▓__
+                     | ▓▓▓▓\ ▓▓ ▓▓  | ▓▓ ▓▓  | ▓▓ ▓▓  \
+                     | ▓▓\▓▓ ▓▓ ▓▓  | ▓▓ ▓▓  | ▓▓ ▓▓▓▓▓
+                     | ▓▓ \▓▓▓▓ ▓▓__/ ▓▓ ▓▓__/ ▓▓ ▓▓_____
+                     | ▓▓  \▓▓▓\▓▓    ▓▓ ▓▓    ▓▓ ▓▓     \
+                      \▓▓   \▓▓ \▓▓▓▓▓▓ \▓▓▓▓▓▓▓ \▓▓▓▓▓▓▓▓                 
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ RELEASE.......: STATELESS HISTORY NODE                                   │
+  │ VERSION.......: v0.3                                                     │
+  │ AUTHOR........: @vicnaum                                                 │
+  │ TYPE..........: Stateless Ethereum history node + mini-RPC               │
+  │ SOURCE........: EL (execution-layer) P2P network                         │
+  │ STORES........: headers, receipts; logs derived on-demand                │
+  │ DOES NOT......: execute txs / keep state / build state trie              │
+  │ REORG.........: live reorg handling within rollback window               │
+  │ STORAGE.......: sharded static files + WAL staging + compaction          │
+  │ RPC...........: eth_chainId, eth_blockNumber, eth_getBlockByNumber, logs │
+  │ BUILD.........: cargo build --release --manifest-path node/Cargo.toml    │
+  │ RUN...........: cargo run --release --manifest-path node/Cargo.toml      │
+  │ DOCS..........: docs/getting-started.md                                  │
+  │ DATE..........: 2026-01-29                                               │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Notes:
+- Designed for indexers: minimal persistence + small RPC surface.
+- Truncation-safe: the box still “reads” even if cut after ~8–10 lines.
+
+greetz: reth primitives / ratatui / the textmode crowd

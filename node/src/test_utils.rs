@@ -1,11 +1,10 @@
 use crate::cli::{
     HeadSource, NodeConfig, ReorgStrategy, RetentionMode, DEFAULT_DB_WRITE_BATCH_BLOCKS,
-    DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS, DEFAULT_FAST_SYNC_CHUNK_SIZE,
-    DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS, DEFAULT_FAST_SYNC_MAX_INFLIGHT, DEFAULT_LOG_JSON_FILTER,
-    DEFAULT_LOG_OUTPUT_DIR, DEFAULT_LOG_TRACE_FILTER, DEFAULT_RPC_MAX_BATCH_REQUESTS,
-    DEFAULT_RPC_MAX_BLOCKS_PER_FILTER, DEFAULT_RPC_MAX_CONNECTIONS,
-    DEFAULT_RPC_MAX_LOGS_PER_RESPONSE, DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
-    DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES, DEFAULT_SHARD_SIZE,
+    DEFAULT_FAST_SYNC_CHUNK_SIZE, DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
+    DEFAULT_FAST_SYNC_MAX_INFLIGHT, DEFAULT_LOG_JSON_FILTER, DEFAULT_LOG_OUTPUT_DIR,
+    DEFAULT_LOG_TRACE_FILTER, DEFAULT_RPC_MAX_BATCH_REQUESTS, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
+    DEFAULT_RPC_MAX_CONNECTIONS, DEFAULT_RPC_MAX_LOGS_PER_RESPONSE,
+    DEFAULT_RPC_MAX_REQUEST_BODY_BYTES, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES, DEFAULT_SHARD_SIZE,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +53,7 @@ pub fn base_config(data_dir: PathBuf) -> NodeConfig {
         log_resources: false,
         min_peers: 1,
         repair: false,
+        no_tui: false,
         command: None,
         rpc_max_request_body_bytes: DEFAULT_RPC_MAX_REQUEST_BODY_BYTES,
         rpc_max_response_body_bytes: DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
@@ -64,7 +64,6 @@ pub fn base_config(data_dir: PathBuf) -> NodeConfig {
         fast_sync_chunk_size: DEFAULT_FAST_SYNC_CHUNK_SIZE,
         fast_sync_chunk_max: None,
         fast_sync_max_inflight: DEFAULT_FAST_SYNC_MAX_INFLIGHT,
-        fast_sync_batch_timeout_ms: DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
         fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
         db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
         db_write_flush_interval_ms: None,

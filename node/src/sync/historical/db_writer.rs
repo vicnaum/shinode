@@ -114,8 +114,22 @@ async fn flush_fast_sync_buffer(
                         duration_ms: started.elapsed().as_millis() as u64,
                     });
                 }
-                if let Some(stats) = progress_stats.as_ref() {
-                    stats.inc_compactions_done(1);
+                // Note: We don't increment compactions_done here because sync-phase
+                // compactions are background work without a known total. The finalize
+                // phase tracks its own compactions with proper total/done counters.
+                // Refresh storage byte stats after inline compaction
+                // (DB counters are updated incrementally at processing time)
+                if result.is_ok() {
+                    if let Some(stats) = progress_stats.as_ref() {
+                        let agg = storage.aggregate_stats();
+                        stats.set_db_shards(agg.total_shards, agg.compacted_shards);
+                        stats.set_storage_bytes(
+                            agg.disk_bytes_headers,
+                            agg.disk_bytes_transactions,
+                            agg.disk_bytes_receipts,
+                            agg.disk_bytes_total,
+                        );
+                    }
                 }
                 result
             }));
@@ -234,6 +248,18 @@ pub async fn run_db_writer(
                 bytes_total,
                 duration_ms: elapsed_ms,
             });
+        }
+        // Refresh storage byte + shard stats after follow-mode write
+        // (DB counters are updated incrementally at processing time)
+        if let Some(stats) = progress_stats.as_ref() {
+            let agg = storage.aggregate_stats();
+            stats.set_db_shards(agg.total_shards, agg.compacted_shards);
+            stats.set_storage_bytes(
+                agg.disk_bytes_headers,
+                agg.disk_bytes_transactions,
+                agg.disk_bytes_receipts,
+                agg.disk_bytes_total,
+            );
         }
         Ok(())
     };
@@ -394,22 +420,35 @@ fn finalize_fast_sync(
     })?;
     finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
 
+    // Refresh storage byte + shard stats after compaction
+    // (DB counters are updated incrementally at processing time)
+    if let Some(stats) = progress_stats {
+        let agg = storage.aggregate_stats();
+        stats.set_db_shards(agg.total_shards, agg.compacted_shards);
+        stats.set_storage_bytes(
+            agg.disk_bytes_headers,
+            agg.disk_bytes_transactions,
+            agg.disk_bytes_receipts,
+            agg.disk_bytes_total,
+        );
+    }
+
     if let Some(events) = events {
         events.record(BenchEvent::CompactAllDirtyEnd {
             duration_ms: compact_started.elapsed().as_millis() as u64,
         });
     }
 
-    // Sealing phase
+    // Sealing phase - uses separate counters from compaction
     if let Some(events) = events {
         events.record(BenchEvent::SealCompletedStart);
     }
     let seal_started = Instant::now();
 
     if let Some(stats) = progress_stats {
-        stats.set_compactions_done(0);
+        stats.set_sealings_done(0);
         let to_seal = storage.count_shards_to_seal().unwrap_or(0);
-        stats.set_compactions_total(to_seal);
+        stats.set_sealings_total(to_seal);
         stats.set_finalize_phase(FinalizePhase::Sealing);
     }
 
@@ -418,7 +457,7 @@ fn finalize_fast_sync(
     storage.seal_completed_shards_with_progress(|_shard_start| {
         sealed_count += 1;
         if let Some(stats) = stats_for_seal.as_ref() {
-            stats.inc_compactions_done(1);
+            stats.inc_sealings_done(1);
         }
     })?;
     if sealed_count > 0 {

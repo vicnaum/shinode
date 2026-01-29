@@ -1,8 +1,12 @@
 //! Resource monitoring for CPU, memory, and disk I/O.
 
-use crate::p2p::PeerPool;
+use crate::p2p::{P2pStats, PeerPool};
 use crate::sync::historical::{BenchEvent, BenchEventLogger, PeerHealthTracker};
 use crate::sync::SyncProgressStats;
+use reth_eth_wire::EthNetworkPrimitives;
+use reth_network::NetworkHandle;
+use reth_network::PeersInfo;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -185,6 +189,8 @@ fn read_proc_disk_sample() -> Option<DiskSample> {
 pub fn spawn_resource_logger(
     stats: Option<Arc<SyncProgressStats>>,
     events: Option<Arc<BenchEventLogger>>,
+    network: Option<NetworkHandle<EthNetworkPrimitives>>,
+    p2p_stats: Option<Arc<P2pStats>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -249,6 +255,12 @@ pub fn spawn_resource_logger(
             let (cpu_busy_pct, cpu_iowait_pct) = cpu_metrics.unwrap_or((0.0, 0.0));
             let (disk_read_mib_s, disk_write_mib_s) = disk_metrics.unwrap_or((0.0, 0.0));
 
+            let reth_connected = network.as_ref().map(|n| n.num_connected_peers());
+            let discovered = p2p_stats.as_ref().map(|s| s.discovered_count.load(Ordering::Relaxed));
+            let genesis_mismatches = p2p_stats.as_ref().map(|s| s.genesis_mismatch_count.load(Ordering::Relaxed));
+            let sessions_established = p2p_stats.as_ref().map(|s| s.sessions_established.load(Ordering::Relaxed));
+            let sessions_closed = p2p_stats.as_ref().map(|s| s.sessions_closed.load(Ordering::Relaxed));
+
             if let Some(stats) = stats.as_ref() {
                 let snapshot = stats.snapshot();
                 if let Some(events) = events.as_ref() {
@@ -271,6 +283,11 @@ pub fn spawn_resource_logger(
                         peers_total: Some(snapshot.peers_total),
                         head_block: Some(snapshot.head_block),
                         head_seen: Some(snapshot.head_seen),
+                        reth_connected,
+                        discovered,
+                        genesis_mismatches,
+                        sessions_established,
+                        sessions_closed,
                     });
                 }
                 debug!(
@@ -292,6 +309,11 @@ pub fn spawn_resource_logger(
                     peers_total = snapshot.peers_total,
                     head_block = snapshot.head_block,
                     head_seen = snapshot.head_seen,
+                    reth_connected,
+                    discovered,
+                    genesis_mismatches,
+                    sessions_established,
+                    sessions_closed,
                     "resources"
                 );
             } else {
@@ -315,6 +337,11 @@ pub fn spawn_resource_logger(
                         peers_total: None,
                         head_block: None,
                         head_seen: None,
+                        reth_connected,
+                        discovered,
+                        genesis_mismatches,
+                        sessions_established,
+                        sessions_closed,
                     });
                 }
                 debug!(
@@ -327,6 +354,11 @@ pub fn spawn_resource_logger(
                     cpu_iowait_pct,
                     disk_read_mib_s,
                     disk_write_mib_s,
+                    reth_connected,
+                    discovered,
+                    genesis_mismatches,
+                    sessions_established,
+                    sessions_closed,
                     "resources"
                 );
             }
@@ -346,6 +378,8 @@ pub fn spawn_resource_logger(
 pub fn spawn_resource_logger(
     stats: Option<Arc<SyncProgressStats>>,
     events: Option<Arc<BenchEventLogger>>,
+    network: Option<NetworkHandle<EthNetworkPrimitives>>,
+    p2p_stats: Option<Arc<P2pStats>>,
 ) {
     use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 
@@ -395,6 +429,12 @@ pub fn spawn_resource_logger(
             let disk_read_mib_s = disk_read_bytes as f64 / (1024.0 * 1024.0) / dt_s;
             let disk_write_mib_s = disk_write_bytes as f64 / (1024.0 * 1024.0) / dt_s;
 
+            let reth_connected = network.as_ref().map(|n| n.num_connected_peers());
+            let discovered = p2p_stats.as_ref().map(|s| s.discovered_count.load(Ordering::Relaxed));
+            let genesis_mismatches = p2p_stats.as_ref().map(|s| s.genesis_mismatch_count.load(Ordering::Relaxed));
+            let sessions_established = p2p_stats.as_ref().map(|s| s.sessions_established.load(Ordering::Relaxed));
+            let sessions_closed = p2p_stats.as_ref().map(|s| s.sessions_closed.load(Ordering::Relaxed));
+
             if let Some(stats) = stats.as_ref() {
                 let snapshot = stats.snapshot();
                 if let Some(events) = events.as_ref() {
@@ -417,6 +457,11 @@ pub fn spawn_resource_logger(
                         peers_total: Some(snapshot.peers_total),
                         head_block: Some(snapshot.head_block),
                         head_seen: Some(snapshot.head_seen),
+                        reth_connected,
+                        discovered,
+                        genesis_mismatches,
+                        sessions_established,
+                        sessions_closed,
                     });
                 }
                 debug!(
@@ -438,6 +483,11 @@ pub fn spawn_resource_logger(
                     peers_total = snapshot.peers_total,
                     head_block = snapshot.head_block,
                     head_seen = snapshot.head_seen,
+                    reth_connected,
+                    discovered,
+                    genesis_mismatches,
+                    sessions_established,
+                    sessions_closed,
                     "resources"
                 );
             } else {
@@ -461,6 +511,11 @@ pub fn spawn_resource_logger(
                         peers_total: None,
                         head_block: None,
                         head_seen: None,
+                        reth_connected,
+                        discovered,
+                        genesis_mismatches,
+                        sessions_established,
+                        sessions_closed,
                     });
                 }
                 debug!(
@@ -473,6 +528,11 @@ pub fn spawn_resource_logger(
                     cpu_iowait_pct,
                     disk_read_mib_s,
                     disk_write_mib_s,
+                    reth_connected,
+                    discovered,
+                    genesis_mismatches,
+                    sessions_established,
+                    sessions_closed,
                     "resources"
                 );
             }
@@ -522,17 +582,17 @@ pub fn spawn_usr1_state_logger(
             if let (Some(pool), Some(health)) = (peer_pool.as_ref(), peer_health.as_ref()) {
                 let peers = pool.snapshot();
                 let peer_ids: Vec<_> = peers.iter().map(|p| p.peer_id).collect();
-                let banned = health.count_banned_peers(&peer_ids).await;
+                let cooling_down = health.count_cooling_down_peers(&peer_ids).await;
                 info!(
                     connected = peers.len(),
-                    banned,
-                    available = peers.len().saturating_sub(banned as usize),
+                    cooling_down,
+                    available = peers.len().saturating_sub(cooling_down as usize),
                     "SIGUSR1: peer pool"
                 );
 
                 let dump = health.snapshot().await;
                 let total = dump.len();
-                let banned_total = dump.iter().filter(|p| p.is_banned).count();
+                let banned_total = dump.iter().filter(|p| p.is_cooling_down).count();
                 let top = dump.iter().take(3).collect::<Vec<_>>();
                 let worst = dump.iter().rev().take(3).collect::<Vec<_>>();
                 info!(total, banned_total, "SIGUSR1: peer health snapshot");
@@ -543,8 +603,8 @@ pub fn spawn_usr1_state_logger(
                         samples = entry.quality_samples,
                         batch_limit = entry.batch_limit,
                         inflight_blocks = entry.inflight_blocks,
-                        is_banned = entry.is_banned,
-                        ban_remaining_ms = entry.ban_remaining_ms,
+                        cooling_down = entry.is_cooling_down,
+                        backoff_remaining_ms = entry.backoff_remaining_ms,
                         "SIGUSR1: peer health (top)"
                     );
                 }
@@ -555,8 +615,8 @@ pub fn spawn_usr1_state_logger(
                         samples = entry.quality_samples,
                         batch_limit = entry.batch_limit,
                         inflight_blocks = entry.inflight_blocks,
-                        is_banned = entry.is_banned,
-                        ban_remaining_ms = entry.ban_remaining_ms,
+                        cooling_down = entry.is_cooling_down,
+                        backoff_remaining_ms = entry.backoff_remaining_ms,
                         last_error = entry.last_error.as_deref().unwrap_or(""),
                         "SIGUSR1: peer health (worst)"
                     );

@@ -90,8 +90,10 @@ pub struct P2pLimitsSummary {
 #[derive(Debug, Serialize)]
 pub struct PeerHealthSummary {
     pub peer_id: String,
-    pub is_banned: bool,
-    pub ban_remaining_ms: Option<u64>,
+    pub is_cooling_down: bool,
+    pub is_stale_head: bool,
+    pub backoff_remaining_ms: Option<u64>,
+    pub backoff_duration_ms: u64,
     pub consecutive_failures: u32,
     pub consecutive_partials: u32,
     pub successes: u64,
@@ -353,8 +355,10 @@ pub async fn generate_run_report(
             ($dump:expr) => {
                 PeerHealthSummary {
                     peer_id: format!("{:?}", $dump.peer_id),
-                    is_banned: $dump.is_banned,
-                    ban_remaining_ms: $dump.ban_remaining_ms,
+                    is_cooling_down: $dump.is_cooling_down,
+                    is_stale_head: $dump.is_stale_head,
+                    backoff_remaining_ms: $dump.backoff_remaining_ms,
+                    backoff_duration_ms: $dump.backoff_duration_ms,
                     consecutive_failures: $dump.consecutive_failures,
                     consecutive_partials: $dump.consecutive_partials,
                     successes: $dump.successes,

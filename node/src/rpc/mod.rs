@@ -7,6 +7,7 @@ use crate::{
         DEFAULT_RPC_MAX_REQUEST_BODY_BYTES, DEFAULT_RPC_MAX_RESPONSE_BODY_BYTES,
     },
     storage::Storage,
+    sync::SyncProgressStats,
 };
 use alloy_primitives::{Address, Bytes, B256};
 use eyre::{Result, WrapErr};
@@ -64,6 +65,17 @@ impl Default for RpcConfig {
 pub struct RpcContext {
     config: RpcConfig,
     storage: Arc<Storage>,
+    stats: Option<Arc<SyncProgressStats>>,
+}
+
+impl RpcContext {
+    /// Create an internal error and increment the RPC error counter.
+    fn internal_error(&self, err: impl std::fmt::Display) -> ErrorObjectOwned {
+        if let Some(s) = self.stats.as_ref() {
+            s.inc_rpc_errors();
+        }
+        internal_error(err)
+    }
 }
 
 /// Start the JSON-RPC server and return its handle.
@@ -71,6 +83,7 @@ pub async fn start(
     bind: SocketAddr,
     config: RpcConfig,
     storage: Arc<Storage>,
+    stats: Option<Arc<SyncProgressStats>>,
 ) -> Result<ServerHandle> {
     let batch_config = if config.max_batch_requests == 0 {
         BatchRequestConfig::Unlimited
@@ -89,7 +102,7 @@ pub async fn start(
         .await
         .wrap_err("failed to bind RPC server")?;
 
-    Ok(server.start(module(RpcContext { config, storage })?))
+    Ok(server.start(module(RpcContext { config, storage, stats })?))
 }
 
 #[expect(
@@ -103,6 +116,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_chainId",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
+                if let Some(s) = ctx.stats.as_ref() { s.inc_rpc_total(); }
                 let params: Option<Value> = params.parse()?;
                 ensure_empty_params(params, "eth_chainId expects no params")?;
 
@@ -116,6 +130,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_blockNumber",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
+                if let Some(s) = ctx.stats.as_ref() { s.inc_rpc_total(); }
                 let params: Option<Value> = params.parse()?;
                 ensure_empty_params(params, "eth_blockNumber expects no params")?;
 
@@ -123,7 +138,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let latest = ctx
                     .storage
                     .last_indexed_block()
-                    .map_err(internal_error)?
+                    .map_err(|e| ctx.internal_error(e))?
                     .unwrap_or(0);
                 info!(method = "eth_blockNumber", latest, "rpc response");
                 Ok(format!("0x{latest:x}"))
@@ -135,6 +150,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_getBlockByNumber",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
+                if let Some(s) = ctx.stats.as_ref() { s.inc_rpc_total(); s.inc_rpc_get_block(); }
                 let params: Vec<Value> = params.parse().map_err(|_| {
                     invalid_params("eth_getBlockByNumber expects [blockTag, includeTransactions]")
                 })?;
@@ -160,7 +176,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 }
 
                 let tag = parse_block_tag(&params[0])?;
-                let latest = ctx.storage.last_indexed_block().map_err(internal_error)?;
+                let latest = ctx.storage.last_indexed_block().map_err(|e| ctx.internal_error(e))?;
                 let Some(number) = resolve_block_tag_optional(tag, latest)? else {
                     info!(
                         method = "eth_getBlockByNumber",
@@ -170,7 +186,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     return Ok(Value::Null);
                 };
 
-                let Some(header) = ctx.storage.block_header(number).map_err(internal_error)? else {
+                let Some(header) = ctx.storage.block_header(number).map_err(|e| ctx.internal_error(e))? else {
                     info!(
                         method = "eth_getBlockByNumber",
                         found = false,
@@ -183,7 +199,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let tx_hashes = ctx
                     .storage
                     .block_tx_hashes(number)
-                    .map_err(internal_error)?
+                    .map_err(|e| ctx.internal_error(e))?
                     .map(|stored| stored.hashes)
                     .unwrap_or_default();
                 let txs = tx_hashes
@@ -193,7 +209,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let size = ctx
                     .storage
                     .block_size(number)
-                    .map_err(internal_error)?
+                    .map_err(|e| ctx.internal_error(e))?
                     .map_or(0, |stored| stored.size);
                 let withdrawals = None;
 
@@ -234,7 +250,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     number = header.number,
                     "rpc response"
                 );
-                serde_json::to_value(response).map_err(internal_error)
+                serde_json::to_value(response).map_err(|e| ctx.internal_error(e))
             },
         )
         .wrap_err("failed to register eth_getBlockByNumber")?;
@@ -243,6 +259,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
         .register_method(
             "eth_getLogs",
             |params, ctx, _| -> Result<_, ErrorObjectOwned> {
+                if let Some(s) = ctx.stats.as_ref() { s.inc_rpc_total(); s.inc_rpc_get_logs(); }
                 let params: Vec<Value> = params
                     .parse()
                     .map_err(|_| invalid_params("eth_getLogs expects a single filter object"))?;
@@ -259,7 +276,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let latest = ctx
                     .storage
                     .last_indexed_block()
-                    .map_err(internal_error)?
+                    .map_err(|e| ctx.internal_error(e))?
                     .unwrap_or(0);
                 let from_block = filter
                     .get("fromBlock")
@@ -301,7 +318,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 }
 
                 for block in from_block..=to_block {
-                    if !ctx.storage.has_block(block).map_err(internal_error)? {
+                    if !ctx.storage.has_block(block).map_err(|e| ctx.internal_error(e))? {
                         return Err(missing_block_error(block));
                     }
                 }
@@ -309,15 +326,15 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let headers = ctx
                     .storage
                     .block_headers_range(from_block..=to_block)
-                    .map_err(internal_error)?;
+                    .map_err(|e| ctx.internal_error(e))?;
                 let tx_hashes = ctx
                     .storage
                     .block_tx_hashes_range(from_block..=to_block)
-                    .map_err(internal_error)?;
+                    .map_err(|e| ctx.internal_error(e))?;
                 let receipts = ctx
                     .storage
                     .block_receipts_range(from_block..=to_block)
-                    .map_err(internal_error)?;
+                    .map_err(|e| ctx.internal_error(e))?;
                 let headers_by_number: HashMap<u64, _> = headers.into_iter().collect();
                 let tx_hashes_by_number: HashMap<u64, _> = tx_hashes.into_iter().collect();
 
@@ -379,7 +396,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                 let logs = out;
 
                 info!(method = "eth_getLogs", logs = logs.len(), "rpc response");
-                serde_json::to_value(logs).map_err(internal_error)
+                serde_json::to_value(logs).map_err(|e| ctx.internal_error(e))
             },
         )
         .wrap_err("failed to register eth_getLogs")?;
@@ -694,6 +711,7 @@ mod tests {
                     ..rpc_config
                 },
                 storage,
+                stats: None,
             })
             .expect("module"),
         );

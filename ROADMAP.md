@@ -56,10 +56,46 @@ Focus: stability and performance hardening for production use.
 - Modular codebase (run/, ui/, logging/ modules)
 - AIMD batch sizing per-peer (adaptive concurrency)
 - Peer quality scoring and temporary bans
+- LRU segment reader cache (fixes RPC performance regression)
 
 ---
 
-## Next: v0.3 - Testing & Observability
+## Done: v0.3.0-dev - TUI Dashboard & Observability
+
+Focus: real-time operator visibility via fullscreen terminal dashboard.
+
+### Completed
+
+- **Fullscreen ratatui TUI dashboard** (default; disable with `--no-tui`)
+  - Phase indicator: Startup > Sync > Retry > Compact > Seal > Follow
+  - Progress bar with percentage and block/shard counts
+  - Blocks coverage map (braille characters with color gradient)
+  - Speed chart (braille line graph with 1-minute history, current/avg/peak/ETA)
+  - Network panel (peer dots: active/idle/stale/gone, never-shrinking visualization)
+  - Queue panel (remaining/inflight/retry counts)
+  - Storage panel (per-segment size breakdown, total GiB, write rate MB/s)
+  - DB panel (blocks/txns/logs counts, shards compacted/total)
+  - RPC panel (follow mode: status, req/s, method counters, errors)
+  - Log viewer (real-time tracing events with level coloring)
+  - DOS-style splash screen on startup with animated connection status
+- **TUI log capture** (circular buffer, suppresses stdout in TUI mode)
+- **Per-shard compaction during fast-sync** (shards compact as they fill, not at end)
+- **ShardMeta enhancements**: `total_logs`, `total_transactions`, `total_receipts`, `disk_bytes_*`
+- **StorageAggregateStats**: cheap cross-shard rollup (no disk I/O)
+- **Read-only segment readers** (prevents follow-mode file-lock crash)
+- **P2P stats tracking**: discovery count, genesis mismatches, sessions established/closed
+- **RPC stats tracking**: total requests, per-method counters, error counts
+- **Coverage tracker**: bucket-based visualization for blocks map
+- **Peak speed tracking** and follow-mode staleness detection (30s threshold)
+- **Stale-peer banning** with 120s cooldown and async re-probe
+- **Peer feeder rotation** for fairness
+- **Stall detection** with peer health dump (30s threshold)
+- Follow-mode fixes: stale-peer spin-loop, head desync, log dedup
+- Demo binaries: `color-test` (splash screen), `ui-mock` (TUI preview)
+
+---
+
+## Next: v0.4 - Testing & Metrics
 
 - [ ] Integration tests for sync loop + reorg handling
 - [ ] Metrics export (Prometheus/OTel)
@@ -114,4 +150,3 @@ Ponder compatibility and additional endpoints:
 
 - Full execution / state / traces
 - **OP Stack L2s (Base, Optimism):** These chains use libp2p (not devp2p) with a different protocol. P2P does not serve receipts directly; blocks must be executed to derive them.
-

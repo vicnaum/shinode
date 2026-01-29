@@ -32,8 +32,10 @@ use super::cleanup::{apply_cached_peer_limits, finalize_session, flush_peer_cach
 use super::session::{FollowModeResources, IngestProgress};
 use super::startup::{
     build_run_context, connect_p2p, init_storage, setup_ui, wait_for_min_peers, wait_for_peer_head,
-    UiSetup,
+    EarlyTui, UiSetup,
 };
+use crate::ui::tui::TuiController;
+use parking_lot::Mutex;
 use super::trackers::{build_tail_config, spawn_head_tracker, spawn_tail_feeder};
 
 /// Default peer cache directory.
@@ -48,6 +50,9 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
     reason = "main sync orchestration has sequential setup phases that are clearer inline"
 )]
 pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
+    // Number of coverage buckets for TUI blocks map visualization
+    const COVERAGE_BUCKETS: usize = 200;
+
     // Validate and normalize chunk sizes
     let chunk_max = config
         .fast_sync_chunk_max
@@ -71,7 +76,11 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         config.peer_cache_dir = default_peer_cache_dir();
     }
 
-    // Initialize tracing
+    // Determine TUI mode early for tracing init
+    let is_tty = std::io::stderr().is_terminal();
+    let use_tui = !config.no_tui && is_tty;
+
+    // Initialize tracing (suppress stdout fmt_layer in TUI mode)
     let mut tracing_guards = init_tracing(
         &config,
         run_context
@@ -83,6 +92,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         run_context
             .as_ref()
             .and_then(|ctx| ctx.resources_tmp_path.clone()),
+        use_tui,
     );
 
     // Main ingest path
@@ -95,15 +105,70 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         return Err(eyre::eyre!("ingest requires --head-source p2p"));
     }
 
+    // Set TUI mode flag early so startup status bars are suppressed in TUI mode
+    crate::ui::set_tui_mode(use_tui);
+
+    // Create early TUI for startup phase display (before storage init)
+    // Use a placeholder end_block of 0 - will be updated once we know the actual range
+    let early_tui: Option<EarlyTui> = if use_tui {
+        match TuiController::new(config.start_block, 0) {
+            Ok(tui) => {
+                let tui_arc = Arc::new(Mutex::new(tui));
+                // Draw initial startup screen with config info
+                {
+                    let mut guard = tui_arc.lock();
+                    guard.state.startup_status = "Connecting to Ethereum P2P network...".to_string();
+                    // Set config values for display
+                    guard.state.set_config(
+                        &config.data_dir.display().to_string(),
+                        config.shard_size,
+                        &config.rpc_bind.to_string(),
+                        config.rollback_window,
+                    );
+                    let _ = guard.draw();
+                }
+                Some(tui_arc)
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to create early TUI, falling back to status bars");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Spawn background redraw ticker so splash animations run while startup blocks
+    let redraw_handle = early_tui.as_ref().map(|tui| {
+        let tui = Arc::clone(tui);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let mut guard = tui.lock();
+                let _ = guard.draw();
+            }
+        })
+    });
+
+    // Get log buffer reference for startup TUI updates
+    let log_buffer = &tracing_guards.tui_log_buffer;
+
     // Initialize storage
-    let storage = init_storage(&config).await?;
+    let storage = init_storage(&config, early_tui.as_ref(), log_buffer).await?;
+
+    // Seed storage/DB stats into early TUI so panels show data during startup
+    if let Some(tui) = early_tui.as_ref() {
+        let agg = storage.aggregate_stats();
+        tui.lock().state.seed_storage_stats(&agg);
+    }
 
     // Connect to P2P network
-    let session = connect_p2p(Arc::clone(&storage)).await?;
+    let session = connect_p2p(Arc::clone(&storage), early_tui.as_ref(), log_buffer).await?;
 
     // Wait for minimum peers
     let min_peers = config.min_peers as usize;
-    wait_for_min_peers(&session.pool, min_peers).await;
+    wait_for_min_peers(&session.pool, min_peers, early_tui.as_ref(), log_buffer).await;
     info!(
         peers = session.pool.len(),
         min_peers, "peer warmup complete"
@@ -117,6 +182,8 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         config.start_block,
         config.end_block,
         config.rollback_window,
+        early_tui.as_ref(),
+        log_buffer,
     )
     .await;
 
@@ -151,6 +218,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         );
     }
     let total_len = missing_total;
+    let missing_ranges_for_coverage = missing_ranges.clone();
     let blocks = MissingBlocks::Ranges {
         ranges: missing_ranges,
         total: missing_total,
@@ -163,7 +231,56 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         None
     };
     if let Some(stats) = progress_stats.as_ref() {
+        // Push initial DB/storage stats from existing data
+        let agg = storage.aggregate_stats();
+        stats.set_db_blocks(agg.total_blocks);
+        stats.set_db_transactions(agg.total_transactions);
+        stats.set_db_logs(agg.total_logs);
+        stats.set_db_shards(agg.total_shards, agg.compacted_shards);
+        stats.set_storage_bytes(
+            agg.disk_bytes_headers,
+            agg.disk_bytes_transactions,
+            agg.disk_bytes_receipts,
+            agg.disk_bytes_total,
+        );
         stats.set_head_seen(head_at_startup);
+
+        // Initialize coverage tracking for TUI blocks map
+        stats.init_coverage(*range.start(), *range.end(), COVERAGE_BUCKETS);
+
+        // Pre-fill coverage with blocks already in DB (computed from missing ranges)
+        // For each bucket, we count how many blocks are NOT missing (= already present)
+        let range_size = range.end() - range.start();
+        let blocks_per_bucket = (range_size as f64 / COVERAGE_BUCKETS as f64).max(1.0);
+
+        for bucket_idx in 0..COVERAGE_BUCKETS {
+            let bucket_start = *range.start() + (bucket_idx as f64 * blocks_per_bucket) as u64;
+            let bucket_end = *range.start() + ((bucket_idx + 1) as f64 * blocks_per_bucket) as u64;
+            let bucket_size = bucket_end.saturating_sub(bucket_start);
+
+            // Count missing blocks in this bucket
+            let mut missing_in_bucket = 0u64;
+            for missing_range in &missing_ranges_for_coverage {
+                // Calculate overlap between bucket and missing range
+                let overlap_start = bucket_start.max(*missing_range.start());
+                let overlap_end = bucket_end.min(missing_range.end().saturating_add(1));
+                if overlap_end > overlap_start {
+                    missing_in_bucket += overlap_end - overlap_start;
+                }
+            }
+
+            // Blocks already present = bucket_size - missing_in_bucket
+            let already_present_in_bucket = bucket_size.saturating_sub(missing_in_bucket);
+
+            // Record these as "pre-completed" by creating synthetic completed blocks
+            // (We don't have the actual block numbers, so we generate representative ones)
+            let present_blocks: Vec<u64> = (0..already_present_in_bucket)
+                .map(|i| bucket_start + i)
+                .collect();
+            if !present_blocks.is_empty() {
+                stats.record_coverage_completed(&present_blocks);
+            }
+        }
     }
 
     // Build peer health tracker
@@ -173,21 +290,48 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Setup resource logger and SIGUSR1 handler
     let run_ctx = run_context.as_ref();
 
-    // Setup UI
+    // Create shutdown channel early so TUI can signal quit
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    // Create completion channel so TUI waits for sync to finish before exiting
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+
+    // Setup UI (pass shutdown_tx for TUI quit handling, and early_tui to reuse)
+    let log_writers = super::startup::LogWriters {
+        log_writer: tracing_guards.log_writer.clone(),
+        resources_writer: tracing_guards.resources_writer.clone(),
+    };
+    // Stop background splash redraw ticker before main UI takes over
+    if let Some(handle) = redraw_handle {
+        handle.abort();
+    }
+
     let UiSetup {
         ui_controller: _,
+        tui_controller: _,
         progress,
         events,
     } = setup_ui(
         &config,
         run_ctx,
-        total_len,
+        *range.start(),
+        *range.end(),
         progress_stats.as_ref(),
         &peer_health,
         &session.pool,
+        Some(stop_tx.clone()),
+        Some(completion_rx),
+        early_tui,
+        tracing_guards.tui_log_buffer.clone(),
+        Some(log_writers),
     )?;
 
-    spawn_resource_logger(progress_stats.clone(), events.clone());
+    spawn_resource_logger(
+        progress_stats.clone(),
+        events.clone(),
+        Some(session.handle.clone()),
+        Some(Arc::clone(&session.p2p_stats)),
+    );
 
     #[cfg(unix)]
     spawn_usr1_state_logger(
@@ -235,7 +379,6 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     let progress_ref = progress
         .as_ref()
         .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
-    let (stop_tx, stop_rx) = watch::channel(false);
     let head_stop_tx_for_shutdown = follow_resources.head_stop_tx.clone();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutdown_requested);
@@ -278,6 +421,9 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         Arc::clone(&peer_health),
     )
     .await?;
+
+    // Signal TUI that sync is complete (for clean quit handling)
+    let _ = completion_tx.send(());
 
     // Log finalize stats for follow mode transition
     let finalize_stats = match &outcome {
@@ -490,6 +636,8 @@ async fn run_follow_mode(
         .as_ref()
         .map(|tracker| Arc::clone(tracker) as Arc<dyn ProgressReporter>);
     let (synced_tx, synced_rx) = tokio::sync::oneshot::channel();
+    // Clone progress_stats so we can set rpc_active when RPC starts
+    let stats_for_rpc = progress_stats.clone();
     let follow_future = run_follow_loop(
         Arc::clone(storage),
         Arc::clone(&session.pool),
@@ -527,9 +675,14 @@ async fn run_follow_mode(
                         config.rpc_bind,
                         rpc::RpcConfig::from(config),
                         Arc::clone(storage),
+                        stats_for_rpc.clone(),
                     )
                     .await?;
                     info!(rpc_bind = %config.rpc_bind, "rpc server started");
+                    // Signal to UI that RPC is now active
+                    if let Some(stats) = stats_for_rpc.as_ref() {
+                        stats.set_rpc_active(true);
+                    }
                     rpc_handle = Some(handle);
                 }
             }

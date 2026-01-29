@@ -1,9 +1,13 @@
 //! Main progress tracking and UIController.
 
+// Allow process::exit for TUI quit functionality - needed to force exit after user presses 'q'
+#![expect(clippy::exit, reason = "intentional exit on user quit request")]
+
 use crate::p2p::PeerPool;
 use crate::sync::historical::PeerHealthTracker;
 use crate::sync::{format_eta_seconds, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
 use indicatif::{MultiProgress, ProgressBar};
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +17,7 @@ use super::bars::{
     create_sync_bar, format_follow_segment,
 };
 use super::state::UIState;
+use super::tui::TuiController;
 
 /// Main UI controller that manages all progress bars and state transitions.
 pub struct UIController {
@@ -353,7 +358,7 @@ fn format_progress_message(snapshot: &SyncProgressSnapshot, speed: f64, eta: &st
 
 /// Spawn the background task that updates progress bars.
 pub fn spawn_progress_updater(
-    ui: Arc<parking_lot::Mutex<UIController>>,
+    ui: Arc<Mutex<UIController>>,
     stats: Arc<SyncProgressStats>,
     peer_pool: Arc<PeerPool>,
     peer_health: Option<Arc<PeerHealthTracker>>,
@@ -375,8 +380,10 @@ pub fn spawn_progress_updater(
                 let available = if let Some(peer_health) = peer_health.as_ref() {
                     let peers = peer_pool.snapshot();
                     let peer_ids: Vec<_> = peers.iter().map(|peer| peer.peer_id).collect();
-                    let banned = peer_health.count_banned_peers(&peer_ids).await;
-                    connected.saturating_sub(banned)
+                    let banned = peer_health.count_cooling_down_peers(&peer_ids).await;
+                    let stale = peer_health.count_stale_head_peers(&peer_ids).await;
+                    stats.set_peers_stale(stale);
+                    connected.saturating_sub(banned).saturating_sub(stale)
                 } else {
                     connected
                 };
@@ -392,6 +399,174 @@ pub fn spawn_progress_updater(
     });
 }
 
+/// Spawn the background task that updates the TUI dashboard.
+///
+/// If `shutdown_tx` is provided, it will be used to signal the sync runner
+/// to stop when the user presses 'q' to quit.
+///
+/// If `completion_rx` is provided, the TUI will wait for sync completion
+/// (or timeout) before exiting after user presses 'q'.
+///
+/// If `log_writer` or `resources_writer` is provided, they will be flushed
+/// before exiting to prevent log truncation.
+#[expect(clippy::too_many_arguments, reason = "TUI updater needs all sync state")]
+pub fn spawn_tui_progress_updater(
+    tui: Arc<Mutex<TuiController>>,
+    stats: Arc<SyncProgressStats>,
+    peer_pool: Arc<PeerPool>,
+    peer_health: Option<Arc<PeerHealthTracker>>,
+    end_block: u64,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
+    log_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+    resources_writer: Option<Arc<crate::logging::JsonLogWriter>>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        let mut last_peer_update = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        let mut last_coverage_update = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+
+        // Speed calculation state
+        let mut speed_window: VecDeque<(Instant, u64)> = VecDeque::new();
+
+        // Hold completion_rx for later use when quitting
+        let mut completion_rx = completion_rx;
+
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+
+            // Update peer counts periodically
+            if now.duration_since(last_peer_update) >= Duration::from_millis(500) {
+                last_peer_update = now;
+                let connected = peer_pool.len() as u64;
+                let available = if let Some(peer_health) = peer_health.as_ref() {
+                    let peers = peer_pool.snapshot();
+                    let peer_ids: Vec<_> = peers.iter().map(|peer| peer.peer_id).collect();
+                    let banned = peer_health.count_cooling_down_peers(&peer_ids).await;
+                    let stale = peer_health.count_stale_head_peers(&peer_ids).await;
+                    stats.set_peers_stale(stale);
+                    connected.saturating_sub(banned).saturating_sub(stale)
+                } else {
+                    connected
+                };
+                stats.set_peers_total(available);
+            }
+
+            let snapshot = stats.snapshot();
+
+            // Calculate current speed from window
+            speed_window.push_back((now, snapshot.processed));
+            while let Some((t, _)) = speed_window.front() {
+                if now.duration_since(*t) > Duration::from_secs(1) && speed_window.len() > 1 {
+                    speed_window.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            let current_speed = if let (Some((t0, v0)), Some((t1, v1))) =
+                (speed_window.front(), speed_window.back())
+            {
+                let dt = t1.duration_since(*t0).as_secs_f64();
+                if dt > 0.0 && v1 >= v0 {
+                    ((v1 - v0) as f64 / dt) as u64
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            // Update peak speed
+            stats.update_peak_speed_max(current_speed);
+
+            // Update coverage map frequently (every 100ms) - reads from in-memory coverage tracker
+            let should_update_coverage = now.duration_since(last_coverage_update) >= Duration::from_millis(100);
+
+            // Update TUI state and render
+            let should_quit = {
+                let mut tui_guard = tui.lock();
+
+                // Check for quit
+                let quit_detected = tui_guard.poll_quit().unwrap_or(false) || tui_guard.should_quit;
+                if quit_detected {
+                    // Signal shutdown to sync runner
+                    if let Some(tx) = shutdown_tx.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                    // Set quitting state, draw once to show overlay
+                    tui_guard.state.quitting = true;
+                    let _ = tui_guard.draw();
+                    true
+                } else {
+                    // Update end_block if not set
+                    if tui_guard.state.end_block == 0 {
+                        tui_guard.state.end_block = end_block;
+                    }
+
+                    // Update state from snapshot
+                    tui_guard.state.update_from_snapshot(&snapshot, current_speed);
+
+                    // Update coverage if due - read directly from stats (instant updates)
+                    if should_update_coverage {
+                        let coverage = stats.get_coverage_percentages();
+                        if !coverage.is_empty() {
+                            tui_guard.state.coverage_buckets = coverage;
+                        }
+                        // Note: we update the timestamp outside the lock below
+                    }
+
+                    // Drain logs from buffer and add to TUI state
+                    if let Some(buffer) = log_buffer.as_ref() {
+                        for entry in buffer.drain() {
+                            tui_guard.state.add_log(entry.level, entry.message, entry.timestamp_ms);
+                        }
+                    }
+
+                    // Draw
+                    let _ = tui_guard.draw();
+                    false
+                }
+            };  // tui_guard dropped here before await
+
+            // Update coverage timestamp after lock is released
+            if should_update_coverage {
+                last_coverage_update = now;
+            }
+
+            if should_quit {
+                // Wait for completion or timeout (3 seconds)
+                if let Some(rx) = completion_rx.take() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        rx,
+                    ).await;
+                    // Timeout or completion - either way, force exit now
+                }
+
+                // Flush log writers before exit to prevent log truncation
+                // (std::process::exit doesn't run destructors)
+                if let Some(writer) = &log_writer {
+                    let _ = writer.finish();
+                }
+                if let Some(writer) = &resources_writer {
+                    let _ = writer.finish();
+                }
+
+                // Restore terminal and force exit
+                let _ = tui.lock().restore();
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,16 +578,36 @@ mod tests {
             status: SyncStatus::Fetching,
             peers_active: 2,
             peers_total: 5,
+            peers_stale: 0,
             queue: 10,
             inflight: 1,
             escalation: 0,
             compactions_done: 0,
             compactions_total: 0,
+            sealings_done: 0,
+            sealings_total: 0,
             processed: 0,
             head_block: 0,
             head_seen: 0,
             fetch_complete: false,
             finalize_phase: FinalizePhase::default(),
+            start_block: 0,
+            peak_speed: 0,
+            last_block_received_ms: 0,
+            rpc_active: false,
+            rpc_total_requests: 0,
+            rpc_get_logs: 0,
+            rpc_get_block: 0,
+            rpc_errors: 0,
+            db_blocks: 0,
+            db_transactions: 0,
+            db_logs: 0,
+            db_shards: 0,
+            db_shards_compacted: 0,
+            storage_bytes_headers: 0,
+            storage_bytes_transactions: 0,
+            storage_bytes_receipts: 0,
+            storage_bytes_total: 0,
         };
         assert_eq!(
             format_progress_message(&snapshot, 1.5, "12s"),

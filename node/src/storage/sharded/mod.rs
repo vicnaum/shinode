@@ -21,11 +21,13 @@ use reth_nippy_jar::{
     NippyJar, NippyJarCursor, NippyJarWriter, CONFIG_FILE_EXTENSION,
 };
 use reth_primitives_traits::{serde_bincode_compat::SerdeBincodeCompat, Header};
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -33,6 +35,7 @@ use wal::{append_records, build_slice_index, WalRecord};
 use zstd::bulk::Compressor;
 
 const SCHEMA_VERSION: u64 = 2;
+const SEGMENT_CACHE_SIZE: usize = 20; // Cache up to 20 shards worth of segment readers
 const META_FILE_NAME: &str = "meta.json";
 const PEER_FILE_NAME: &str = "peers.json";
 const STATIC_DIR_NAME: &str = "static";
@@ -147,6 +150,21 @@ fn create_compaction_writers(
     })
 }
 
+/// Aggregate statistics across all shards, computed from in-memory shard metadata.
+#[derive(Debug, Clone, Default)]
+pub struct StorageAggregateStats {
+    pub total_blocks: u64,
+    pub total_transactions: u64,
+    pub total_receipts: u64,
+    pub total_logs: u64,
+    pub total_shards: u64,
+    pub compacted_shards: u64,
+    pub disk_bytes_headers: u64,
+    pub disk_bytes_transactions: u64,
+    pub disk_bytes_receipts: u64,
+    pub disk_bytes_total: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
     schema_version: u64,
@@ -173,6 +191,29 @@ struct ShardMeta {
     /// Values: None (idle), "writing", "swapping", "cleanup"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_phase: Option<String>,
+    /// Total transaction count across all blocks in this shard.
+    #[serde(default)]
+    total_transactions: u64,
+    /// Total receipt count across all blocks in this shard.
+    #[serde(default)]
+    total_receipts: u64,
+    /// Total log count across all blocks in this shard.
+    /// Accumulated during follow-mode writes; preserved (not recomputed) during compaction
+    /// because receipts are zstd-compressed and decoding just to count logs is expensive.
+    #[serde(default)]
+    total_logs: u64,
+    /// On-disk bytes for headers segment files.
+    #[serde(default)]
+    disk_bytes_headers: u64,
+    /// On-disk bytes for transaction segment files (tx_hashes + tx_meta).
+    #[serde(default)]
+    disk_bytes_transactions: u64,
+    /// On-disk bytes for receipts segment files.
+    #[serde(default)]
+    disk_bytes_receipts: u64,
+    /// Total on-disk bytes for all segment files in this shard.
+    #[serde(default)]
+    disk_bytes_total: u64,
 }
 
 struct ShardState {
@@ -351,54 +392,6 @@ impl SegmentWriter {
         Ok(())
     }
 
-    fn read_row_raw(&self, block_number: u64) -> Result<Option<Vec<u8>>> {
-        let jar = NippyJar::<SegmentHeader>::load(&self.path)
-            .wrap_err("failed to load static segment")?;
-        let header = jar.user_header();
-        if block_number < header.start_block {
-            return Ok(None);
-        }
-        let row = block_number.saturating_sub(header.start_block) as usize;
-        if row >= jar.rows() {
-            return Ok(None);
-        }
-        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
-        let Some(row_vals) = cursor.row_by_number(row)? else {
-            return Ok(None);
-        };
-        let bytes = row_vals
-            .first()
-            .ok_or_else(|| eyre!("missing column data"))?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(bytes.to_vec()))
-    }
-
-    fn read_row_compat<T>(&self, block_number: u64) -> Result<Option<T>>
-    where
-        T: SerdeBincodeCompat,
-        <T as SerdeBincodeCompat>::BincodeRepr<'static>: serde::de::DeserializeOwned,
-    {
-        let Some(bytes) = self.read_row_raw(block_number)? else {
-            return Ok(None);
-        };
-        decode_bincode_compat_value(&bytes).map(Some)
-    }
-
-    fn read_row<T: serde::de::DeserializeOwned>(&self, block_number: u64) -> Result<Option<T>> {
-        let Some(bytes) = self.read_row_raw(block_number)? else {
-            return Ok(None);
-        };
-        decode_bincode(&bytes).map(Some)
-    }
-
-    fn read_row_u64(&self, block_number: u64) -> Result<Option<u64>> {
-        let Some(bytes) = self.read_row_raw(block_number)? else {
-            return Ok(None);
-        };
-        decode_u64(&bytes).map(Some)
-    }
 }
 
 pub struct Storage {
@@ -407,6 +400,9 @@ pub struct Storage {
     meta: Mutex<MetaState>,
     shards: Mutex<HashMap<u64, Arc<Mutex<ShardState>>>>,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
+    /// LRU cache for read-only segment handles, keyed by shard_start.
+    /// Avoids reopening 5 segment files on every block read.
+    segment_cache: Mutex<LruCache<u64, Arc<ShardSegmentReaders>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +501,13 @@ impl Storage {
             repair_shard_from_wal(&mut state)?;
             reconcile_shard_meta(&mut state);
 
+            // Recompute disk sizes from segment files on startup
+            let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+            state.meta.disk_bytes_headers = dh;
+            state.meta.disk_bytes_transactions = dt;
+            state.meta.disk_bytes_receipts = dr;
+            state.meta.disk_bytes_total = dtotal;
+
             let max_present = max_present_in_bitset(&state, meta.shard_size);
             if let Some(max_block) = max_present {
                 meta.max_present_block = Some(meta.max_present_block.unwrap_or(0).max(max_block));
@@ -514,12 +517,17 @@ impl Storage {
         persist_meta(&meta_path, &meta)?;
 
         let peer_cache = load_peer_cache(&peer_cache_dir)?;
+        let segment_cache = LruCache::new(
+            NonZeroUsize::new(SEGMENT_CACHE_SIZE)
+                .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero")),
+        );
         Ok(Self {
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
             meta: Mutex::new(meta),
             shards: Mutex::new(shards),
             peer_cache: Mutex::new(peer_cache),
+            segment_cache: Mutex::new(segment_cache),
         })
     }
 
@@ -594,6 +602,29 @@ impl Storage {
 
     pub fn disk_usage(&self) -> Result<StorageDiskStats> {
         Self::disk_usage_at(&self.data_dir)
+    }
+
+    /// Aggregate stats across all shards from in-memory shard metadata.
+    /// This is cheap — no disk I/O, just iterates locked shard meta.
+    pub fn aggregate_stats(&self) -> StorageAggregateStats {
+        let shards = self.shards.lock();
+        let mut stats = StorageAggregateStats::default();
+        stats.total_shards = shards.len() as u64;
+        for shard in shards.values() {
+            let state = shard.lock();
+            stats.total_blocks += u64::from(state.meta.present_count);
+            stats.total_transactions += state.meta.total_transactions;
+            stats.total_receipts += state.meta.total_receipts;
+            stats.total_logs += state.meta.total_logs;
+            if state.meta.sorted {
+                stats.compacted_shards += 1;
+            }
+            stats.disk_bytes_headers += state.meta.disk_bytes_headers;
+            stats.disk_bytes_transactions += state.meta.disk_bytes_transactions;
+            stats.disk_bytes_receipts += state.meta.disk_bytes_receipts;
+            stats.disk_bytes_total += state.meta.disk_bytes_total;
+        }
+        stats
     }
 
     pub fn disk_usage_at(data_dir: &Path) -> Result<StorageDiskStats> {
@@ -790,8 +821,14 @@ impl Storage {
         }
         let mut zstd = Compressor::new(0).wrap_err("failed to init zstd compressor")?;
         let mut per_shard: HashMap<u64, Vec<WalRecord>> = HashMap::new();
+        let mut block_log_counts: HashMap<u64, u64> = HashMap::new();
         for bundle in bundles {
             let shard_start = shard_start(bundle.number, self.shard_size());
+            // Remember log count per block while we still have decoded receipts
+            block_log_counts.insert(
+                bundle.number,
+                bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>(),
+            );
             let tx_meta_uncompressed = encode_bincode_value(&bundle.transactions)?;
             let tx_meta_uncompressed_len = tx_meta_uncompressed.len() as u32;
             let receipts_uncompressed = encode_bincode_compat_value(&bundle.receipts)?;
@@ -851,11 +888,20 @@ impl Storage {
                 );
             }
 
-            // Mark shard as not sorted (has pending WAL data)
+            // Accumulate log counts for actually appended blocks
+            let logs_delta: u64 = to_append
+                .iter()
+                .map(|r| block_log_counts.get(&r.block_number).copied().unwrap_or(0))
+                .sum();
+            state.meta.total_logs += logs_delta;
+
+            // Mark shard as not sorted (has pending WAL data) and persist
             if !to_append.is_empty() && state.meta.sorted {
                 state.meta.sorted = false;
                 state.meta.sealed = false;
                 state.meta.content_hash = None;
+                persist_shard_meta(&state.dir, &state.meta)?;
+            } else if logs_delta > 0 {
                 persist_shard_meta(&state.dir, &state.meta)?;
             }
 
@@ -876,6 +922,9 @@ impl Storage {
         }
         let sorted_dir = sorted_dir(&state.dir);
         fs::create_dir_all(&sorted_dir).wrap_err("failed to create sorted dir")?;
+
+        // Invalidate cache since we're writing to sorted segments
+        self.invalidate_segment_cache(shard_start);
 
         let segments = shard_segment_writers(&sorted_dir, shard_start)?;
         segments.headers.append_rows(
@@ -898,6 +947,9 @@ impl Storage {
 
         if state.bitset.set(offset) {
             state.meta.present_count = state.meta.present_count.saturating_add(1);
+            state.meta.total_transactions += bundle.tx_hashes.hashes.len() as u64;
+            state.meta.total_receipts += bundle.receipts.receipts.len() as u64;
+            state.meta.total_logs += bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>();
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         }
         state.meta.sorted = true;
@@ -910,6 +962,12 @@ impl Storage {
                 .unwrap_or(shard_start)
                 .max(bundle.number),
         );
+        // Update disk sizes from sorted segment files
+        let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+        state.meta.disk_bytes_headers = dh;
+        state.meta.disk_bytes_transactions = dt;
+        state.meta.disk_bytes_receipts = dr;
+        state.meta.disk_bytes_total = dtotal;
         persist_shard_meta(&state.dir, &state.meta)?;
         state.bitset.flush(&bitset_path(&state.dir))?;
         self.bump_max_present(bundle.number)?;
@@ -1002,6 +1060,10 @@ impl Storage {
 
         let total_rows = max_offset.saturating_add(1);
 
+        // Accumulators for tx/receipt counts (recomputed authoritatively at compaction)
+        let mut total_tx: u64 = 0;
+        let mut total_receipt_count: u64 = 0;
+
         // Create segment writers
         let mut writers = create_compaction_writers(&temp_dir, shard_start, existing.as_ref())?;
 
@@ -1058,6 +1120,11 @@ impl Storage {
                 let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
                 let size_bytes = &wal.mmap[slices.size.as_range()];
 
+                // Count txs from bincode-encoded StoredTxHashes (uncompressed, Vec<B256> prefix is u64 len)
+                let tx_count = bincode_vec_len(tx_hash_bytes);
+                total_tx += tx_count;
+                total_receipt_count += tx_count; // receipts == transactions in Ethereum
+
                 writers.headers.push_bytes(header_bytes, slices.header.len())?;
                 writers.tx_hashes.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
                 writers.tx_meta.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
@@ -1080,6 +1147,11 @@ impl Storage {
                     .ok_or_else(|| eyre!("missing receipts for block {}", block_number))?;
                 let size_bytes = ex.sizes.row_bytes(local_offset)?
                     .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
+
+                // Count txs from bincode-encoded StoredTxHashes (uncompressed)
+                let tx_count = bincode_vec_len(tx_hash_bytes);
+                total_tx += tx_count;
+                total_receipt_count += tx_count;
 
                 writers.headers.push_bytes(header_bytes, header_bytes.len())?;
                 writers.tx_hashes.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
@@ -1145,6 +1217,9 @@ impl Storage {
             fs::remove_file(&wal_p).wrap_err("failed to remove staging.wal")?;
         }
 
+        // Invalidate segment cache since segments were rewritten
+        self.invalidate_segment_cache(shard_start);
+
         // Update in-memory state with the new bitset
         state.bitset = new_bitset;
         state.meta.present_count = state.bitset.count_ones();
@@ -1154,6 +1229,17 @@ impl Storage {
         state.meta.content_hash = None;
         state.meta.tail_block = Some(tail_block);
         state.meta.compaction_phase = None;
+        // Authoritative tx/receipt counts recomputed during compaction
+        state.meta.total_transactions = total_tx;
+        state.meta.total_receipts = total_receipt_count;
+        // Note: total_logs is NOT recomputed here (receipts are zstd-compressed).
+        // It is preserved from WAL writes or set to 0 for fresh shards.
+        // Recompute disk sizes from the freshly written segment files
+        let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+        state.meta.disk_bytes_headers = dh;
+        state.meta.disk_bytes_transactions = dt;
+        state.meta.disk_bytes_receipts = dr;
+        state.meta.disk_bytes_total = dtotal;
         persist_shard_meta(&state.dir, &state.meta)?;
 
         if state.meta.complete && !state.meta.sealed {
@@ -1297,6 +1383,8 @@ impl Storage {
             let mut state = shard.lock();
             let sorted_dir = sorted_dir(&state.dir);
             if sorted_dir.exists() {
+                // Invalidate cache before pruning since segments will change
+                self.invalidate_segment_cache(shard_start);
                 let segments = shard_segment_writers(&sorted_dir, shard_start)?;
                 segments.headers.prune_to(ancestor_number)?;
                 segments.tx_hashes.prune_to(ancestor_number)?;
@@ -1331,26 +1419,69 @@ impl Storage {
         Ok(())
     }
 
-    fn with_readers_for_present_block<T>(
+    /// Invalidate the segment cache for a specific shard.
+    /// Call this after any operation that modifies segment files.
+    fn invalidate_segment_cache(&self, shard_start: u64) {
+        let mut cache = self.segment_cache.lock();
+        cache.pop(&shard_start);
+    }
+
+    /// Get cached segment readers for a shard, opening them if not cached.
+    fn get_cached_segments(
         &self,
-        number: u64,
-        f: impl FnOnce(&ShardSegments) -> Result<Option<T>>,
-    ) -> Result<Option<T>> {
-        let shard_start = shard_start(number, self.shard_size());
-        let shard = self.get_shard(shard_start)?;
-        let Some(shard) = shard else {
-            return Ok(None);
-        };
-        let state = shard.lock();
-        let offset = (number - shard_start) as usize;
-        if !state.bitset.is_set(offset) {
-            return Ok(None);
+        shard_start: u64,
+        sorted_dir: &Path,
+    ) -> Result<Option<Arc<ShardSegmentReaders>>> {
+        // Check cache first
+        {
+            let mut cache = self.segment_cache.lock();
+            if let Some(segments) = cache.get(&shard_start) {
+                return Ok(Some(Arc::clone(segments)));
+            }
         }
-        let sorted_dir = sorted_dir(&state.dir);
-        let segments = shard_segment_readers(&sorted_dir, shard_start)?;
+
+        // Cache miss - open segments (read-only, no file locks)
+        let segments = shard_segment_readers(sorted_dir, shard_start)?;
         let Some(segments) = segments else {
             return Ok(None);
         };
+
+        // Cache and return
+        let segments = Arc::new(segments);
+        {
+            let mut cache = self.segment_cache.lock();
+            cache.put(shard_start, Arc::clone(&segments));
+        }
+        Ok(Some(segments))
+    }
+
+    fn with_readers_for_present_block<T>(
+        &self,
+        number: u64,
+        f: impl FnOnce(&ShardSegmentReaders) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let shard_start = shard_start(number, self.shard_size());
+
+        // Check bitset first (fast path) and get sorted_dir
+        let sorted_dir = {
+            let shard = self.get_shard(shard_start)?;
+            let Some(shard) = shard else {
+                return Ok(None);
+            };
+            let state = shard.lock();
+            let offset = (number - shard_start) as usize;
+            if !state.bitset.is_set(offset) {
+                return Ok(None);
+            }
+            sorted_dir(&state.dir)
+        }; // Release shard lock before cache access
+
+        // Get cached segments
+        let segments = self.get_cached_segments(shard_start, &sorted_dir)?;
+        let Some(segments) = segments else {
+            return Ok(None);
+        };
+
         f(&segments)
     }
 
@@ -1509,6 +1640,13 @@ impl Storage {
             content_hash: None,
             content_hash_algo: "sha256".to_string(),
             compaction_phase: None,
+            total_transactions: 0,
+            total_receipts: 0,
+            total_logs: 0,
+            disk_bytes_headers: 0,
+            disk_bytes_transactions: 0,
+            disk_bytes_receipts: 0,
+            disk_bytes_total: 0,
         };
         persist_shard_meta(&dir, &meta)?;
         let state = ShardState { dir, meta, bitset };
@@ -1577,6 +1715,93 @@ struct ShardSegments {
     sizes: SegmentWriter,
 }
 
+/// Read-only segment handle. Unlike `SegmentWriter`, this does NOT open a
+/// `NippyJarWriter` (which takes an exclusive file lock). Each read loads the
+/// jar fresh – the same thing `SegmentWriter::read_row_raw` already does – so
+/// multiple `SegmentReader`s can coexist with an active writer.
+struct SegmentReader {
+    path: PathBuf,
+}
+
+impl SegmentReader {
+    fn open(path: PathBuf, start_block: u64) -> Result<Self> {
+        if !segment_exists(&path) {
+            return Err(eyre!("segment not found: {}", path.display()));
+        }
+        let jar = NippyJar::<SegmentHeader>::load(&path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if header.start_block != start_block {
+            return Err(eyre!(
+                "segment start mismatch for {} (expected {}, got {})",
+                path.display(),
+                start_block,
+                header.start_block
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    fn read_row_raw(&self, block_number: u64) -> Result<Option<Vec<u8>>> {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if block_number < header.start_block {
+            return Ok(None);
+        }
+        let row = block_number.saturating_sub(header.start_block) as usize;
+        if row >= jar.rows() {
+            return Ok(None);
+        }
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let Some(row_vals) = cursor.row_by_number(row)? else {
+            return Ok(None);
+        };
+        let bytes = row_vals
+            .first()
+            .ok_or_else(|| eyre!("missing column data"))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
+    fn read_row_compat<T>(&self, block_number: u64) -> Result<Option<T>>
+    where
+        T: SerdeBincodeCompat,
+        <T as SerdeBincodeCompat>::BincodeRepr<'static>: serde::de::DeserializeOwned,
+    {
+        let Some(bytes) = self.read_row_raw(block_number)? else {
+            return Ok(None);
+        };
+        decode_bincode_compat_value(&bytes).map(Some)
+    }
+
+    fn read_row<T: serde::de::DeserializeOwned>(&self, block_number: u64) -> Result<Option<T>> {
+        let Some(bytes) = self.read_row_raw(block_number)? else {
+            return Ok(None);
+        };
+        decode_bincode(&bytes).map(Some)
+    }
+
+    fn read_row_u64(&self, block_number: u64) -> Result<Option<u64>> {
+        let Some(bytes) = self.read_row_raw(block_number)? else {
+            return Ok(None);
+        };
+        decode_u64(&bytes).map(Some)
+    }
+}
+
+/// Container for read-only segment handles for a single shard.
+#[expect(dead_code, reason = "tx_meta included for completeness; reads not yet wired")]
+struct ShardSegmentReaders {
+    headers: SegmentReader,
+    tx_hashes: SegmentReader,
+    tx_meta: SegmentReader,
+    receipts: SegmentReader,
+    sizes: SegmentReader,
+}
+
 fn shard_segment_writers(sorted_dir: &Path, shard_start: u64) -> Result<ShardSegments> {
     Ok(ShardSegments {
         headers: SegmentWriter::open(
@@ -1613,7 +1838,7 @@ fn shard_segment_writers(sorted_dir: &Path, shard_start: u64) -> Result<ShardSeg
     })
 }
 
-fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<ShardSegments>> {
+fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<ShardSegmentReaders>> {
     if !sorted_dir.exists() {
         return Ok(None);
     }
@@ -1624,7 +1849,13 @@ fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<S
             return Err(eyre!("missing segment {}", base.display()));
         }
     }
-    Ok(Some(shard_segment_writers(sorted_dir, shard_start)?))
+    Ok(Some(ShardSegmentReaders {
+        headers: SegmentReader::open(sorted_dir.join("headers"), shard_start)?,
+        tx_hashes: SegmentReader::open(sorted_dir.join("tx_hashes"), shard_start)?,
+        tx_meta: SegmentReader::open(sorted_dir.join("tx_meta"), shard_start)?,
+        receipts: SegmentReader::open(sorted_dir.join("receipts"), shard_start)?,
+        sizes: SegmentReader::open(sorted_dir.join("block_sizes"), shard_start)?,
+    }))
 }
 
 const fn shard_start(block_number: u64, shard_size: u64) -> u64 {
@@ -1791,6 +2022,39 @@ fn shard_segment_stats(data_dir: &Path) -> Result<Vec<SegmentDiskStats>> {
         });
     }
     Ok(out)
+}
+
+/// Compute per-segment and total disk bytes for a shard directory.
+/// Returns `(headers, transactions, receipts, total)` byte counts.
+fn compute_shard_disk_bytes(shard_dir: &Path) -> (u64, u64, u64, u64) {
+    let sorted = sorted_dir(shard_dir);
+    if !sorted.exists() {
+        return (0, 0, 0, 0);
+    }
+    let headers = segment_disk_size(&sorted.join("headers")).unwrap_or(0);
+    let tx_hashes = segment_disk_size(&sorted.join("tx_hashes")).unwrap_or(0);
+    let tx_meta = segment_disk_size(&sorted.join("tx_meta")).unwrap_or(0);
+    let receipts = segment_disk_size(&sorted.join("receipts")).unwrap_or(0);
+    let block_sizes = segment_disk_size(&sorted.join("block_sizes")).unwrap_or(0);
+    let transactions = tx_hashes.saturating_add(tx_meta);
+    let total = headers
+        .saturating_add(transactions)
+        .saturating_add(receipts)
+        .saturating_add(block_sizes);
+    (headers, transactions, receipts, total)
+}
+
+/// Extract the vector length from a bincode-encoded `Vec<T>`.
+/// Bincode encodes a Vec as a u64 length prefix (little-endian) followed by elements.
+/// Returns 0 if the bytes are too short.
+fn bincode_vec_len(bytes: &[u8]) -> u64 {
+    if bytes.len() < 8 {
+        return 0;
+    }
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 fn load_peer_cache(data_dir: &Path) -> Result<HashMap<String, StoredPeer>> {
@@ -2089,6 +2353,7 @@ mod tests {
             log_resources: false,
             min_peers: 1,
             repair: false,
+            no_tui: false,
             command: None,
             rpc_max_request_body_bytes: 0,
             rpc_max_response_body_bytes: 0,
@@ -2099,7 +2364,6 @@ mod tests {
             fast_sync_chunk_size: 16,
             fast_sync_chunk_max: None,
             fast_sync_max_inflight: 2,
-            fast_sync_batch_timeout_ms: crate::cli::DEFAULT_FAST_SYNC_BATCH_TIMEOUT_MS,
             fast_sync_max_buffered_blocks: 64,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,

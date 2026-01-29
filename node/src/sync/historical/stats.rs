@@ -646,6 +646,11 @@ pub enum BenchEvent {
         peers_total: Option<u64>,
         head_block: Option<u64>,
         head_seen: Option<u64>,
+        reth_connected: Option<usize>,
+        discovered: Option<usize>,
+        genesis_mismatches: Option<usize>,
+        sessions_established: Option<usize>,
+        sessions_closed: Option<usize>,
     },
     SchedulerGaugeSample {
         pending_total: u64,
@@ -693,14 +698,6 @@ pub enum BenchEvent {
         headers_requests: u64,
         bodies_requests: u64,
         receipts_requests: u64,
-    },
-    FetchTimeout {
-        peer_id: String,
-        range_start: u64,
-        range_end: u64,
-        blocks: u64,
-        batch_limit: u64,
-        timeout_ms: u64,
     },
     ProcessStart {
         block: u64,

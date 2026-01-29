@@ -29,12 +29,23 @@ cargo run --release --manifest-path node/Cargo.toml
 ```
 
 The node will:
-1. Connect to Ethereum mainnet peers via devp2p
-2. Begin backfilling blocks from 10,000,000 to head
-3. Start the RPC server on `127.0.0.1:8545`
-4. Switch to follow mode once caught up
+1. Show a DOS-style splash screen while connecting to Ethereum mainnet peers
+2. Display a fullscreen TUI dashboard with real-time sync progress
+3. Begin backfilling blocks from 10,000,000 to head
+4. Start the RPC server on `127.0.0.1:8545` once synced
+5. Switch to follow mode once caught up
 
-Stop with Ctrl+C. The node persists checkpoints and resumes on restart.
+Press `q` to quit gracefully. The node persists checkpoints and resumes on restart.
+
+### Headless / CI environments
+
+If you don't want the fullscreen TUI (e.g., running in a script or pipe):
+
+```bash
+cargo run --release --manifest-path node/Cargo.toml -- --no-tui
+```
+
+This falls back to legacy indicatif progress bars on stderr.
 
 ## Basic Usage
 
@@ -81,6 +92,17 @@ curl -s -X POST -H "Content-Type: application/json" \
   http://127.0.0.1:8545
 ```
 
+## TUI Dashboard
+
+The default UI is a fullscreen terminal dashboard showing:
+- Sync phase and progress
+- Blocks coverage map (braille visualization)
+- Speed chart with current/average/peak
+- Network, queue, storage, and DB panels
+- Real-time log viewer
+
+Press `q` to quit. The dashboard requires a terminal with UTF-8 support.
+
 ## Debugging
 
 ### Increase verbosity
@@ -116,3 +138,4 @@ cargo run --release --manifest-path node/Cargo.toml -- \
 - See [Configuration](configuration.md) for all CLI options
 - See [Architecture](../ARCHITECTURE.md) for system internals
 - See [SPEC.md](../SPEC.md) for RPC semantics and error codes
+- See [UI Designs](UI_DESIGNS.md) for TUI dashboard design reference

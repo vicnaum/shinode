@@ -82,6 +82,48 @@ pub fn format_eta_seconds(seconds: f64) -> String {
     }
 }
 
+/// Coverage tracking for the blocks map visualization.
+/// Stores (start_block, end_block, buckets) where each bucket is a count of synced blocks.
+#[derive(Debug, Default)]
+pub struct CoverageTracker {
+    /// Start block of the range being tracked.
+    start_block: u64,
+    /// End block of the range being tracked.
+    end_block: u64,
+    /// Number of synced blocks per bucket.
+    buckets: Vec<u16>,
+}
+
+impl CoverageTracker {
+    /// Initialize coverage tracking for a block range.
+    pub fn init(&mut self, start: u64, end: u64, num_buckets: usize) {
+        self.start_block = start;
+        self.end_block = end;
+        self.buckets = vec![0; num_buckets];
+    }
+
+    /// Record a completed block, incrementing the appropriate bucket.
+    pub fn record_completed(&mut self, block: u64) {
+        if block < self.start_block || block >= self.end_block || self.buckets.is_empty() {
+            return;
+        }
+        let range = self.end_block - self.start_block;
+        let offset = block - self.start_block;
+        let bucket_idx = ((offset as f64 / range as f64) * self.buckets.len() as f64) as usize;
+        if bucket_idx < self.buckets.len() {
+            self.buckets[bucket_idx] = self.buckets[bucket_idx].saturating_add(1);
+        }
+    }
+
+    /// Record multiple completed blocks.
+    pub fn record_completed_batch(&mut self, blocks: &[u64]) {
+        for &block in blocks {
+            self.record_completed(block);
+        }
+    }
+
+}
+
 #[derive(Debug, Default)]
 pub struct SyncProgressStats {
     processed: std::sync::atomic::AtomicU64,
@@ -89,8 +131,12 @@ pub struct SyncProgressStats {
     inflight: std::sync::atomic::AtomicU64,
     compactions_done: std::sync::atomic::AtomicU64,
     compactions_total: std::sync::atomic::AtomicU64,
+    /// Separate counters for sealing phase (distinct from compaction).
+    sealings_done: std::sync::atomic::AtomicU64,
+    sealings_total: std::sync::atomic::AtomicU64,
     peers_active: std::sync::atomic::AtomicU64,
     peers_total: std::sync::atomic::AtomicU64,
+    peers_stale: std::sync::atomic::AtomicU64,
     status: std::sync::atomic::AtomicU8,
     head_block: std::sync::atomic::AtomicU64,
     head_seen: std::sync::atomic::AtomicU64,
@@ -100,6 +146,39 @@ pub struct SyncProgressStats {
     escalation: std::sync::atomic::AtomicU64,
     /// Current finalize sub-phase (compacting or sealing).
     finalize_phase: std::sync::atomic::AtomicU8,
+    /// First block of the sync range (from CLI).
+    start_block: std::sync::atomic::AtomicU64,
+    /// Peak speed observed during this session (blocks/s).
+    peak_speed: std::sync::atomic::AtomicU64,
+    /// Timestamp (ms since epoch) when last block was received. Used for "Xs ago" display.
+    last_block_received_ms: std::sync::atomic::AtomicU64,
+    /// True when RPC server has been started and is serving requests.
+    rpc_active: std::sync::atomic::AtomicBool,
+    /// RPC counters for TUI display.
+    rpc_total_requests: std::sync::atomic::AtomicU64,
+    rpc_get_logs: std::sync::atomic::AtomicU64,
+    rpc_get_block: std::sync::atomic::AtomicU64,
+    rpc_errors: std::sync::atomic::AtomicU64,
+    /// Coverage tracking for blocks map visualization.
+    coverage: parking_lot::Mutex<CoverageTracker>,
+    /// DB counters: total blocks in storage.
+    db_blocks: std::sync::atomic::AtomicU64,
+    /// DB counters: total transactions in storage.
+    db_transactions: std::sync::atomic::AtomicU64,
+    /// DB counters: total logs processed.
+    db_logs: std::sync::atomic::AtomicU64,
+    /// DB counters: total shards.
+    db_shards: std::sync::atomic::AtomicU64,
+    /// DB counters: compacted (sorted, no WAL) shards.
+    db_shards_compacted: std::sync::atomic::AtomicU64,
+    /// Storage bytes for headers segment.
+    storage_bytes_headers: std::sync::atomic::AtomicU64,
+    /// Storage bytes for transactions segment.
+    storage_bytes_transactions: std::sync::atomic::AtomicU64,
+    /// Storage bytes for receipts segment.
+    storage_bytes_receipts: std::sync::atomic::AtomicU64,
+    /// Storage total bytes across all segments.
+    storage_bytes_total: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,8 +188,12 @@ pub struct SyncProgressSnapshot {
     pub inflight: u64,
     pub compactions_done: u64,
     pub compactions_total: u64,
+    /// Separate counters for sealing phase (distinct from compaction).
+    pub sealings_done: u64,
+    pub sealings_total: u64,
     pub peers_active: u64,
     pub peers_total: u64,
+    pub peers_stale: u64,
     pub status: SyncStatus,
     pub head_block: u64,
     pub head_seen: u64,
@@ -120,6 +203,30 @@ pub struct SyncProgressSnapshot {
     pub escalation: u64,
     /// Current finalize sub-phase.
     pub finalize_phase: FinalizePhase,
+    /// First block of the sync range (from CLI).
+    pub start_block: u64,
+    /// Peak speed observed during this session (blocks/s).
+    pub peak_speed: u64,
+    /// Timestamp (ms since epoch) when last block was received.
+    pub last_block_received_ms: u64,
+    /// True when RPC server has been started and is serving requests.
+    pub rpc_active: bool,
+    /// RPC counters for TUI display.
+    pub rpc_total_requests: u64,
+    pub rpc_get_logs: u64,
+    pub rpc_get_block: u64,
+    pub rpc_errors: u64,
+    /// DB counters.
+    pub db_blocks: u64,
+    pub db_transactions: u64,
+    pub db_logs: u64,
+    pub db_shards: u64,
+    pub db_shards_compacted: u64,
+    /// Per-segment storage sizes in bytes.
+    pub storage_bytes_headers: u64,
+    pub storage_bytes_transactions: u64,
+    pub storage_bytes_receipts: u64,
+    pub storage_bytes_total: u64,
 }
 
 impl SyncProgressStats {
@@ -134,8 +241,15 @@ impl SyncProgressStats {
             compactions_total: self
                 .compactions_total
                 .load(std::sync::atomic::Ordering::SeqCst),
+            sealings_done: self
+                .sealings_done
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sealings_total: self
+                .sealings_total
+                .load(std::sync::atomic::Ordering::SeqCst),
             peers_active: self.peers_active.load(std::sync::atomic::Ordering::SeqCst),
             peers_total: self.peers_total.load(std::sync::atomic::Ordering::SeqCst),
+            peers_stale: self.peers_stale.load(std::sync::atomic::Ordering::SeqCst),
             status: match self.status.load(std::sync::atomic::Ordering::SeqCst) {
                 1 => SyncStatus::Fetching,
                 2 => SyncStatus::Finalizing,
@@ -153,6 +267,47 @@ impl SyncProgressStats {
                 1 => FinalizePhase::Sealing,
                 _ => FinalizePhase::Compacting,
             },
+            start_block: self.start_block.load(std::sync::atomic::Ordering::SeqCst),
+            peak_speed: self.peak_speed.load(std::sync::atomic::Ordering::SeqCst),
+            last_block_received_ms: self
+                .last_block_received_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_active: self
+                .rpc_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_total_requests: self
+                .rpc_total_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_get_logs: self
+                .rpc_get_logs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_get_block: self
+                .rpc_get_block
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_errors: self
+                .rpc_errors
+                .load(std::sync::atomic::Ordering::SeqCst),
+            db_blocks: self.db_blocks.load(std::sync::atomic::Ordering::SeqCst),
+            db_transactions: self
+                .db_transactions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            db_logs: self.db_logs.load(std::sync::atomic::Ordering::SeqCst),
+            db_shards: self.db_shards.load(std::sync::atomic::Ordering::SeqCst),
+            db_shards_compacted: self
+                .db_shards_compacted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_headers: self
+                .storage_bytes_headers
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_transactions: self
+                .storage_bytes_transactions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_receipts: self
+                .storage_bytes_receipts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_total: self
+                .storage_bytes_total
+                .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -200,6 +355,24 @@ impl SyncProgressStats {
             .store(done, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub fn set_sealings_total(&self, total: u64) {
+        self.sealings_total
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn inc_sealings_done(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        self.sealings_done
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_sealings_done(&self, done: u64) {
+        self.sealings_done
+            .store(done, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn set_peers_active(&self, active: u64) {
         self.peers_active
             .store(active, std::sync::atomic::Ordering::SeqCst);
@@ -208,6 +381,11 @@ impl SyncProgressStats {
     pub fn set_peers_total(&self, total: u64) {
         self.peers_total
             .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_peers_stale(&self, stale: u64) {
+        self.peers_stale
+            .store(stale, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_head_block(&self, block: u64) {
@@ -245,5 +423,147 @@ impl SyncProgressStats {
         };
         self.finalize_phase
             .store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_start_block(&self, block: u64) {
+        self.start_block
+            .store(block, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[expect(dead_code, reason = "API for direct setting")]
+    pub fn set_peak_speed(&self, speed: u64) {
+        self.peak_speed
+            .store(speed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Update peak speed if the new value is higher.
+    pub fn update_peak_speed_max(&self, speed: u64) {
+        let _ = self.peak_speed.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| Some(current.max(speed)),
+        );
+    }
+
+    /// Set the timestamp of the last block received (for "Xs ago" display).
+    pub fn set_last_block_received_ms(&self, ms: u64) {
+        self.last_block_received_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set whether the RPC server is active (started and serving requests).
+    pub fn set_rpc_active(&self, active: bool) {
+        self.rpc_active
+            .store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment total RPC request counter.
+    pub fn inc_rpc_total(&self) {
+        self.rpc_total_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment RPC `eth_getLogs` counter.
+    pub fn inc_rpc_get_logs(&self) {
+        self.rpc_get_logs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment RPC `eth_getBlockByNumber` counter.
+    pub fn inc_rpc_get_block(&self) {
+        self.rpc_get_block
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment RPC error counter.
+    pub fn inc_rpc_errors(&self) {
+        self.rpc_errors
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB block count.
+    pub fn set_db_blocks(&self, count: u64) {
+        self.db_blocks
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB transaction count.
+    pub fn set_db_transactions(&self, count: u64) {
+        self.db_transactions
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB log count.
+    pub fn set_db_logs(&self, count: u64) {
+        self.db_logs
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB shard counts (total and compacted).
+    pub fn set_db_shards(&self, total: u64, compacted: u64) {
+        self.db_shards
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+        self.db_shards_compacted
+            .store(compacted, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment DB counters for a single processed block.
+    pub fn inc_db_counters(&self, transactions: u64, logs: u64) {
+        self.db_blocks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.db_transactions
+            .fetch_add(transactions, std::sync::atomic::Ordering::SeqCst);
+        self.db_logs
+            .fetch_add(logs, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set storage byte sizes for all segments.
+    pub fn set_storage_bytes(&self, headers: u64, transactions: u64, receipts: u64, total: u64) {
+        self.storage_bytes_headers
+            .store(headers, std::sync::atomic::Ordering::SeqCst);
+        self.storage_bytes_transactions
+            .store(transactions, std::sync::atomic::Ordering::SeqCst);
+        self.storage_bytes_receipts
+            .store(receipts, std::sync::atomic::Ordering::SeqCst);
+        self.storage_bytes_total
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Initialize coverage tracking for a block range.
+    pub fn init_coverage(&self, start: u64, end: u64, num_buckets: usize) {
+        let mut coverage = self.coverage.lock();
+        coverage.init(start, end, num_buckets);
+    }
+
+    /// Record completed blocks for coverage tracking.
+    pub fn record_coverage_completed(&self, blocks: &[u64]) {
+        let mut coverage = self.coverage.lock();
+        coverage.record_completed_batch(blocks);
+    }
+
+    /// Get coverage buckets as percentages (0-100).
+    pub fn get_coverage_percentages(&self) -> Vec<u8> {
+        let coverage = self.coverage.lock();
+        let range = coverage.end_block.saturating_sub(coverage.start_block);
+        let n = coverage.buckets.len() as u64;
+        if n == 0 {
+            return Vec::new();
+        }
+        coverage
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(i, &count)| {
+                let lo = i as u64 * range / n;
+                let hi = (i as u64 + 1) * range / n;
+                let bucket_size = hi - lo;
+                if bucket_size == 0 {
+                    100
+                } else {
+                    let pct = (u64::from(count) * 100 / bucket_size).min(100);
+                    pct as u8
+                }
+            })
+            .collect()
     }
 }

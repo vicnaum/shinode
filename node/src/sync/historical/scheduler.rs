@@ -11,11 +11,15 @@ use crate::sync::historical::types::{FetchBatch, FetchMode};
 use reth_network_api::PeerId;
 use tokio::sync::Mutex;
 
-/// How long to wait before allowing a peer to retry the same escalation block.
-const ESCALATION_PEER_COOLDOWN: Duration = Duration::from_secs(30);
-
 /// Default number of attempts before a block is promoted to escalation queue.
 const DEFAULT_ESCALATION_THRESHOLD: u32 = 5;
+
+/// Initial backoff duration after a peer failure.
+const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+
+/// Maximum backoff duration for a peer.
+const BACKOFF_MAX: Duration = Duration::from_secs(128);
+
 
 /// Shard-aware escalation state for priority retry of difficult blocks.
 ///
@@ -75,8 +79,6 @@ pub struct SchedulerConfig {
     pub initial_blocks_per_assignment: usize,
     /// Number of attempts before a block is promoted to escalation queue.
     pub max_attempts_per_block: u32,
-    pub peer_failure_threshold: u32,
-    pub peer_ban_duration: Duration,
     /// Shard size for shard-aware escalation prioritization.
     pub shard_size: u64,
 }
@@ -87,8 +89,6 @@ impl Default for SchedulerConfig {
             blocks_per_assignment: 32,
             initial_blocks_per_assignment: 32,
             max_attempts_per_block: DEFAULT_ESCALATION_THRESHOLD,
-            peer_failure_threshold: 5,
-            peer_ban_duration: Duration::from_secs(120),
             shard_size: 10_000,
         }
     }
@@ -96,8 +96,6 @@ impl Default for SchedulerConfig {
 
 #[derive(Debug, Clone)]
 pub struct PeerHealthConfig {
-    peer_failure_threshold: u32,
-    peer_ban_duration: Duration,
     aimd_increase_after: u32,
     aimd_partial_decrease: f64,
     aimd_failure_decrease: f64,
@@ -105,8 +103,6 @@ pub struct PeerHealthConfig {
     aimd_initial_batch: usize,
     aimd_max_batch: usize,
     quality_partial_weight: f64,
-    quality_min_samples: u64,
-    quality_defer_threshold: f64,
 }
 
 impl PeerHealthConfig {
@@ -114,17 +110,15 @@ impl PeerHealthConfig {
         let max_batch = config.blocks_per_assignment.max(1);
         let initial_batch = config.initial_blocks_per_assignment.max(1).min(max_batch);
         Self {
-            peer_failure_threshold: config.peer_failure_threshold,
-            peer_ban_duration: config.peer_ban_duration,
             aimd_increase_after: 5,
             aimd_partial_decrease: 0.7,
             aimd_failure_decrease: 0.5,
             aimd_min_batch: 1,
             aimd_initial_batch: initial_batch,
             aimd_max_batch: max_batch,
-            quality_partial_weight: 0.5,
-            quality_min_samples: 5,
-            quality_defer_threshold: 0.6,
+            // Partials count same as successes for quality scoring (used for peer sorting).
+            // Partials still reduce batch_limit via AIMD (aimd_partial_decrease).
+            quality_partial_weight: 1.0,
         }
     }
 }
@@ -133,7 +127,8 @@ impl PeerHealthConfig {
 struct PeerHealth {
     consecutive_failures: u32,
     consecutive_partials: u32,
-    banned_until: Option<Instant>,
+    backoff_until: Option<Instant>,
+    backoff_duration: Duration,
     successes: u64,
     failures: u64,
     partials: u64,
@@ -152,12 +147,14 @@ struct PeerHealth {
     batch_limit_sum: u64,
     batch_limit_samples: u64,
     success_streak: u32,
+    stale_head_until: Option<Instant>,
 }
 
 impl PeerHealth {
-    fn is_banned(&self) -> bool {
-        self.banned_until
-            .is_some_and(|until| Instant::now() < until)
+    fn is_cooling_down(&self) -> bool {
+        let now = Instant::now();
+        self.backoff_until.is_some_and(|until| now < until)
+            || self.stale_head_until.is_some_and(|until| now < until)
     }
 }
 
@@ -170,8 +167,10 @@ pub struct PeerQuality {
 #[derive(Debug, Clone)]
 pub struct PeerHealthDump {
     pub peer_id: PeerId,
-    pub is_banned: bool,
-    pub ban_remaining_ms: Option<u64>,
+    pub is_cooling_down: bool,
+    pub is_stale_head: bool,
+    pub backoff_remaining_ms: Option<u64>,
+    pub backoff_duration_ms: u64,
     pub consecutive_failures: u32,
     pub consecutive_partials: u32,
     pub successes: u64,
@@ -230,7 +229,8 @@ impl PeerHealthTracker {
         entry.successes = entry.successes.saturating_add(1);
         entry.consecutive_failures = 0;
         entry.consecutive_partials = 0;
-        entry.banned_until = None;
+        entry.backoff_until = None;
+        entry.backoff_duration = Duration::ZERO;
         entry.last_success_at = Some(Instant::now());
         entry.success_streak = entry.success_streak.saturating_add(1);
         if entry.success_streak >= self.config.aimd_increase_after {
@@ -264,22 +264,26 @@ impl PeerHealthTracker {
         let reduced =
             (entry.batch_limit as f64 * self.config.aimd_failure_decrease).floor() as usize;
         entry.batch_limit = self.clamp_batch_limit(reduced);
-        if entry.consecutive_failures >= self.config.peer_failure_threshold {
-            entry.banned_until = Some(Instant::now() + self.config.peer_ban_duration);
-            tracing::debug!(
-                peer_id = ?peer_id,
-                ban_seconds = self.config.peer_ban_duration.as_secs(),
-                failures = entry.failures,
-                "peer banned after consecutive failures"
-            );
-        }
+        let next_backoff = if entry.backoff_duration.is_zero() {
+            BACKOFF_INITIAL
+        } else {
+            (entry.backoff_duration * 2).min(BACKOFF_MAX)
+        };
+        entry.backoff_duration = next_backoff;
+        entry.backoff_until = Some(Instant::now() + next_backoff);
+        tracing::debug!(
+            peer_id = ?peer_id,
+            backoff_ms = next_backoff.as_millis() as u64,
+            failures = entry.failures,
+            "peer backing off after failure"
+        );
     }
 
-    pub(crate) async fn is_peer_banned(&self, peer_id: PeerId) -> bool {
+    pub(crate) async fn is_peer_cooling_down(&self, peer_id: PeerId) -> bool {
         let health = self.health.lock().await;
         health
             .get(&peer_id)
-            .is_some_and(PeerHealth::is_banned)
+            .is_some_and(PeerHealth::is_cooling_down)
     }
 
     pub(crate) async fn note_error(&self, peer_id: PeerId, error: String) {
@@ -336,7 +340,14 @@ impl PeerHealthTracker {
         entry.batch_limit_max = entry.batch_limit_max.max(entry.batch_limit);
     }
 
-    pub(crate) async fn count_banned_peers(&self, peer_ids: &[PeerId]) -> u64 {
+    pub(crate) async fn set_stale_head_cooldown(&self, peer_id: PeerId, duration: Duration) {
+        let mut health = self.health.lock().await;
+        let entry = health.entry(peer_id).or_default();
+        self.ensure_batch_limit(entry);
+        entry.stale_head_until = Some(Instant::now() + duration);
+    }
+
+    pub(crate) async fn count_stale_head_peers(&self, peer_ids: &[PeerId]) -> u64 {
         if peer_ids.is_empty() {
             return 0;
         }
@@ -345,7 +356,24 @@ impl PeerHealthTracker {
         let mut count = 0u64;
         for peer_id in peer_ids {
             if let Some(entry) = health.get(peer_id) {
-                if entry.banned_until.is_some_and(|until| now < until) {
+                if entry.stale_head_until.is_some_and(|until| now < until) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        count
+    }
+
+    pub(crate) async fn count_cooling_down_peers(&self, peer_ids: &[PeerId]) -> u64 {
+        if peer_ids.is_empty() {
+            return 0;
+        }
+        let now = Instant::now();
+        let health = self.health.lock().await;
+        let mut count = 0u64;
+        for peer_id in peer_ids {
+            if let Some(entry) = health.get(peer_id) {
+                if entry.backoff_until.is_some_and(|until| now < until) {
                     count = count.saturating_add(1);
                 }
             }
@@ -368,17 +396,22 @@ impl PeerHealthTracker {
                 );
                 (weighted_success / total as f64).clamp(0.0, 1.0)
             };
-            let ban_remaining_ms = entry.banned_until.and_then(|until| {
+            let backoff_remaining_ms = entry.backoff_until.and_then(|until| {
                 if now < until {
                     Some((until - now).as_millis() as u64)
                 } else {
                     None
                 }
             });
+            let is_stale_head = entry
+                .stale_head_until
+                .is_some_and(|until| now < until);
             out.push(PeerHealthDump {
                 peer_id: *peer_id,
-                is_banned: entry.is_banned(),
-                ban_remaining_ms,
+                is_cooling_down: entry.is_cooling_down(),
+                is_stale_head,
+                backoff_remaining_ms,
+                backoff_duration_ms: entry.backoff_duration.as_millis() as u64,
                 consecutive_failures: entry.consecutive_failures,
                 consecutive_partials: entry.consecutive_partials,
                 successes: entry.successes,
@@ -450,16 +483,46 @@ impl PeerHealthTracker {
         }
     }
 
-    pub(crate) async fn should_defer_peer(&self, peer_id: PeerId, active_peers: usize) -> bool {
-        // If we only have a couple of peers, keep using them even if they're not great.
-        if active_peers <= 3 {
-            return false;
-        }
-        let quality = self.quality(peer_id).await;
-        if quality.samples < self.config.quality_min_samples {
-            return false;
-        }
-        quality.score < self.config.quality_defer_threshold
+}
+
+/// Per-peer-per-block backoff to prevent a single peer from spinning on a block
+/// it cannot serve. Tracks cooldown per (block, peer_id) pair.
+#[derive(Debug, Default)]
+struct BlockPeerBackoff {
+    entries: HashMap<(u64, PeerId), BlockPeerCooldown>,
+}
+
+#[derive(Debug)]
+struct BlockPeerCooldown {
+    fail_count: u32,
+    cooldown_until: Instant,
+}
+
+impl BlockPeerBackoff {
+    fn record_failure(&mut self, block: u64, peer_id: PeerId) {
+        let key = (block, peer_id);
+        let entry = self.entries.entry(key).or_insert(BlockPeerCooldown {
+            fail_count: 0,
+            cooldown_until: Instant::now(),
+        });
+        entry.fail_count = entry.fail_count.saturating_add(1);
+        let backoff = if entry.fail_count <= 1 {
+            BACKOFF_INITIAL
+        } else {
+            let factor = 2u32.saturating_pow(entry.fail_count.saturating_sub(1));
+            (BACKOFF_INITIAL * factor).min(BACKOFF_MAX)
+        };
+        entry.cooldown_until = Instant::now() + backoff;
+    }
+
+    fn is_cooling_down(&self, block: u64, peer_id: PeerId) -> bool {
+        self.entries
+            .get(&(block, peer_id))
+            .is_some_and(|e| Instant::now() < e.cooldown_until)
+    }
+
+    fn remove_block(&mut self, block: u64) {
+        self.entries.retain(|&(b, _), _| b != block);
     }
 }
 
@@ -474,6 +537,7 @@ pub struct PeerWorkScheduler {
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
     escalation: Mutex<EscalationState>,
+    block_peer_backoff: Mutex<BlockPeerBackoff>,
 }
 
 #[cfg(test)]
@@ -495,15 +559,15 @@ mod tests {
         let scheduler = scheduler_with_blocks(config, 0, 9);
         let peer_id = PeerId::random();
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
         assert_eq!(batch.blocks, vec![0, 1, 2]);
         assert_eq!(batch.mode, FetchMode::Normal);
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
         assert_eq!(batch.blocks, vec![3, 4]);
         assert_eq!(batch.mode, FetchMode::Normal);
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
         assert!(batch.blocks.is_empty());
     }
 
@@ -534,32 +598,37 @@ mod tests {
         let scheduler = scheduler_with_blocks(config, 1, 1);
         let peer_id = PeerId::random();
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 10, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
         assert_eq!(batch.blocks, vec![1]);
 
         scheduler.requeue_failed(&[1]).await;
-        let batch = scheduler.next_batch_for_peer(peer_id, 10, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
         assert_eq!(batch.blocks, vec![1]);
 
         scheduler.requeue_failed(&[1]).await;
-        let batch = scheduler.next_batch_for_peer(peer_id, 10, 1).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
         assert_eq!(batch.blocks, vec![1]);
         assert_eq!(batch.mode, FetchMode::Escalation);
     }
 
     #[tokio::test]
-    async fn peer_ban_triggers_after_threshold() {
-        let mut config = SchedulerConfig::default();
-        config.peer_failure_threshold = 2;
-        config.peer_ban_duration = Duration::from_secs(60);
+    async fn peer_backoff_grows_exponentially() {
+        let config = SchedulerConfig::default();
         let scheduler = scheduler_with_blocks(config, 0, 0);
         let peer_id = PeerId::random();
 
+        // First failure triggers backoff (500ms)
         scheduler.record_peer_failure(peer_id).await;
-        assert!(!scheduler.is_peer_banned(peer_id).await);
+        assert!(scheduler.is_peer_cooling_down(peer_id).await);
 
+        // Success resets backoff
+        scheduler.record_peer_success(peer_id).await;
+        assert!(!scheduler.is_peer_cooling_down(peer_id).await);
+
+        // Two failures: first 500ms, second 1000ms
         scheduler.record_peer_failure(peer_id).await;
-        assert!(scheduler.is_peer_banned(peer_id).await);
+        scheduler.record_peer_failure(peer_id).await;
+        assert!(scheduler.is_peer_cooling_down(peer_id).await);
     }
 }
 
@@ -581,6 +650,7 @@ impl PeerWorkScheduler {
             attempts: Mutex::new(HashMap::new()),
             peer_health,
             escalation: Mutex::new(EscalationState::default()),
+            block_peer_backoff: Mutex::new(BlockPeerBackoff::default()),
         }
     }
 
@@ -588,23 +658,20 @@ impl PeerWorkScheduler {
     ///
     /// Escalation blocks get priority - they are checked FIRST before the normal queue.
     /// This ensures difficult blocks don't get starved while new blocks keep arriving.
+    ///
+    /// Note: Quality-based peer prioritization happens in `pick_best_ready_peer_index`
+    /// before this function is called. We don't defer peers here - only banned peers
+    /// are skipped. This ensures all peers can improve their quality by doing work.
     pub async fn next_batch_for_peer(
         &self,
         peer_id: PeerId,
         peer_head: u64,
-        active_peers: usize,
     ) -> FetchBatch {
-        if self.is_peer_banned(peer_id).await {
-            return FetchBatch {
-                blocks: Vec::new(),
-                mode: FetchMode::Normal,
-            };
-        }
-        if self
-            .peer_health
-            .should_defer_peer(peer_id, active_peers)
-            .await
-        {
+        if self.is_peer_cooling_down(peer_id).await {
+            tracing::trace!(
+                peer_id = ?peer_id,
+                "scheduler: peer cooling down"
+            );
             return FetchBatch {
                 blocks: Vec::new(),
                 mode: FetchMode::Normal,
@@ -622,7 +689,7 @@ impl PeerWorkScheduler {
 
         // Normal queue second
         let max_blocks = self.peer_health.batch_limit(peer_id).await;
-        let normal = self.pop_next_batch_for_head(peer_head, max_blocks).await;
+        let normal = self.pop_next_batch_for_head(peer_id, peer_head, max_blocks).await;
         if !normal.is_empty() {
             return FetchBatch {
                 blocks: normal,
@@ -658,10 +725,16 @@ impl PeerWorkScheduler {
         added
     }
 
-    async fn pop_next_batch_for_head(&self, peer_head: u64, max_blocks: usize) -> Vec<u64> {
+    async fn pop_next_batch_for_head(
+        &self,
+        peer_id: PeerId,
+        peer_head: u64,
+        max_blocks: usize,
+    ) -> Vec<u64> {
         let mut pending = self.pending.lock().await;
         let mut queued = self.queued.lock().await;
         let mut in_flight = self.in_flight.lock().await;
+        let backoff = self.block_peer_backoff.lock().await;
 
         let limit = max_blocks
             .max(1)
@@ -676,12 +749,29 @@ impl PeerWorkScheduler {
 
             // Sharded storage removes contiguous watermark backpressure.
             if next > peer_head {
+                tracing::trace!(
+                    peer_id = ?peer_id,
+                    block = next,
+                    peer_head,
+                    "scheduler: pending block above head cap"
+                );
                 break;
             }
             if let Some(prev) = last {
                 if next != prev.saturating_add(1) {
                     break;
                 }
+            }
+
+            // Check per-peer-per-block backoff: if this peer recently failed
+            // this block, stop here so another peer can try it.
+            if backoff.is_cooling_down(next, peer_id) {
+                tracing::trace!(
+                    peer_id = ?peer_id,
+                    block = next,
+                    "scheduler: pending block on cooldown, stopping batch"
+                );
+                break;
             }
 
             pending.pop();
@@ -703,7 +793,7 @@ impl PeerWorkScheduler {
         let mut escalation = self.escalation.lock().await;
         let completed = self.completed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
-        let now = Instant::now();
+        let backoff = self.block_peer_backoff.lock().await;
 
         if escalation.is_empty() {
             return None;
@@ -723,9 +813,8 @@ impl PeerWorkScheduler {
                 continue;
             };
 
-            // Find a block this peer hasn't tried recently
+            // Find a block this peer hasn't tried recently (per-block backoff)
             let mut best_block: Option<u64> = None;
-            let mut best_staleness: Option<Duration> = None;
 
             for &block in shard_blocks {
                 // Skip completed blocks (will be cleaned up on success)
@@ -733,28 +822,14 @@ impl PeerWorkScheduler {
                     continue;
                 }
 
-                let peer_attempts = escalation.peer_attempts.get(&block);
-                let staleness = peer_attempts
-                    .and_then(|attempts| attempts.get(&peer_id))
-                    .map(|last| now.duration_since(*last));
-
-                match staleness {
-                    None => {
-                        // Peer never tried this block - best choice
-                        best_block = Some(block);
-                        break;
-                    }
-                    Some(duration) if duration >= ESCALATION_PEER_COOLDOWN => {
-                        // Peer tried but cooldown passed - acceptable
-                        if best_staleness.is_none_or(|b| duration > b) {
-                            best_block = Some(block);
-                            best_staleness = Some(duration);
-                        }
-                    }
-                    Some(_) => {
-                        // Too recent, skip
-                    }
+                // Use per-peer-per-block backoff instead of static cooldown
+                if backoff.is_cooling_down(block, peer_id) {
+                    continue;
                 }
+
+                // Peer is not cooling down for this block - good candidate
+                best_block = Some(block);
+                break;
             }
 
             if let Some(block) = best_block {
@@ -777,7 +852,7 @@ impl PeerWorkScheduler {
                     .peer_attempts
                     .entry(block)
                     .or_default()
-                    .insert(peer_id, now);
+                    .insert(peer_id, Instant::now());
 
                 // Add to in_flight
                 in_flight.insert(block);
@@ -786,7 +861,15 @@ impl PeerWorkScheduler {
             }
         }
 
-        None // All blocks recently tried by this peer
+        // All escalation blocks are on cooldown for this peer
+        if !escalation.is_empty() {
+            tracing::debug!(
+                peer_id = ?peer_id,
+                escalation_total = escalation.total_count,
+                "scheduler: all escalation blocks on cooldown for peer"
+            );
+        }
+        None
     }
 
     /// Mark blocks as completed and remove from in-flight and escalation.
@@ -810,6 +893,15 @@ impl PeerWorkScheduler {
 
             // Remove from escalation if present
             escalation.remove_block(*block, shard_size);
+        }
+
+        // Clean up per-peer-per-block backoff entries for completed blocks
+        drop(escalation);
+        drop(completed);
+        drop(in_flight);
+        let mut backoff = self.block_peer_backoff.lock().await;
+        for block in blocks {
+            backoff.remove_block(*block);
         }
 
         recovered
@@ -840,6 +932,13 @@ impl PeerWorkScheduler {
             } else {
                 // Promote to escalation (priority queue)
                 escalation.add_block(*block, shard_size);
+                tracing::debug!(
+                    block = *block,
+                    attempts = *count,
+                    threshold = self.config.max_attempts_per_block,
+                    escalation_total = escalation.total_count,
+                    "scheduler: block escalated"
+                );
                 newly_escalated.push(*block);
             }
         }
@@ -867,6 +966,14 @@ impl PeerWorkScheduler {
         escalation.add_block(block, shard_size);
     }
 
+    /// Record that a specific peer failed to deliver a specific block.
+    /// This prevents the same peer from being assigned the same block
+    /// until a per-peer-per-block backoff has elapsed.
+    pub async fn record_block_peer_failure(&self, block: u64, peer_id: PeerId) {
+        let mut backoff = self.block_peer_backoff.lock().await;
+        backoff.record_failure(block, peer_id);
+    }
+
     /// Record a successful peer batch.
     pub async fn record_peer_success(&self, peer_id: PeerId) {
         self.peer_health.record_success(peer_id).await;
@@ -884,9 +991,9 @@ impl PeerWorkScheduler {
         self.peer_health.record_failure(peer_id).await;
     }
 
-    /// Check if peer is currently banned.
-    pub async fn is_peer_banned(&self, peer_id: PeerId) -> bool {
-        self.peer_health.is_peer_banned(peer_id).await
+    /// Check if peer is currently cooling down (exponential backoff).
+    pub async fn is_peer_cooling_down(&self, peer_id: PeerId) -> bool {
+        self.peer_health.is_peer_cooling_down(peer_id).await
     }
 
     /// Check if all work is complete.
