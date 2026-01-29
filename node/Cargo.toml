@@ -7,6 +7,10 @@ edition = "2021"
 name = "ui-mock"
 path = "src/bin/ui_mock.rs"
 
+[[bin]]
+name = "color-test"
+path = "src/bin/color_test.rs"
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]

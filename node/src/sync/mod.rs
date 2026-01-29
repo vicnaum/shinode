@@ -122,19 +122,6 @@ impl CoverageTracker {
         }
     }
 
-    /// Get the coverage buckets (clone for thread safety).
-    pub fn buckets(&self) -> Vec<u16> {
-        self.buckets.clone()
-    }
-
-    /// Get the blocks per bucket (for percentage calculation).
-    pub fn blocks_per_bucket(&self) -> u64 {
-        if self.buckets.is_empty() {
-            return 1;
-        }
-        let range = self.end_block.saturating_sub(self.start_block);
-        (range / self.buckets.len() as u64).max(1)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -413,13 +400,25 @@ impl SyncProgressStats {
     /// Get coverage buckets as percentages (0-100).
     pub fn get_coverage_percentages(&self) -> Vec<u8> {
         let coverage = self.coverage.lock();
-        let blocks_per_bucket = coverage.blocks_per_bucket();
+        let range = coverage.end_block.saturating_sub(coverage.start_block);
+        let n = coverage.buckets.len() as u64;
+        if n == 0 {
+            return Vec::new();
+        }
         coverage
-            .buckets()
+            .buckets
             .iter()
-            .map(|&count| {
-                let pct = (u64::from(count) * 100 / blocks_per_bucket).min(100);
-                pct as u8
+            .enumerate()
+            .map(|(i, &count)| {
+                let lo = i as u64 * range / n;
+                let hi = (i as u64 + 1) * range / n;
+                let bucket_size = hi - lo;
+                if bucket_size == 0 {
+                    100
+                } else {
+                    let pct = (u64::from(count) * 100 / bucket_size).min(100);
+                    pct as u8
+                }
             })
             .collect()
     }
