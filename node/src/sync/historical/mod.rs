@@ -179,6 +179,10 @@ async fn run_processor_worker(
                 if let Some(stats) = ctx.stats.as_ref() {
                     stats.inc_processed(1);
                     stats.update_head_block_max(bundle.number);
+                    stats.inc_db_counters(
+                        bundle.tx_hashes.hashes.len() as u64,
+                        bundle.receipts.receipts.len() as u64,
+                    );
                 }
                 if let Some(bench) = ctx.bench.as_ref() {
                     bench.record_logs(log_count);

@@ -172,12 +172,18 @@ pub struct TuiState {
     /// Once set, it doesn't change (represents the total work for this session).
     pub blocks_to_sync: u64,
 
-    // Placeholders (show "--" for now)
+    // Storage and DB stats (populated from SyncProgressStats)
     pub storage_total: Option<f64>,
     pub write_rate: Option<f64>,
     pub db_blocks: Option<u64>,
     pub db_transactions: Option<u64>,
     pub db_receipts: Option<u64>,
+    /// Per-segment storage sizes in bytes.
+    pub storage_bytes_headers: u64,
+    pub storage_bytes_transactions: u64,
+    pub storage_bytes_receipts: u64,
+    /// Previous storage_bytes_total for write rate computation.
+    prev_storage_bytes_total: u64,
     /// Coverage per bucket (0-100%) for blocks map visualization.
     /// Each bucket represents a range of blocks; value is percentage synced.
     pub coverage_buckets: Vec<u8>,
@@ -262,6 +268,10 @@ impl TuiState {
             db_blocks: None,
             db_transactions: None,
             db_receipts: None,
+            storage_bytes_headers: 0,
+            storage_bytes_transactions: 0,
+            storage_bytes_receipts: 0,
+            prev_storage_bytes_total: 0,
             coverage_buckets: Vec::new(),
             shards_status: Vec::new(),
             logs: VecDeque::new(),
@@ -426,6 +436,34 @@ impl TuiState {
         let rpc_delta = snapshot.rpc_total_requests.saturating_sub(prev_rpc_total);
         let elapsed = self.last_tick_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(1.0).max(0.001);
         self.rpc_requests_per_sec = rpc_delta as f64 / elapsed;
+
+        // DB counters
+        if snapshot.db_blocks > 0 {
+            self.db_blocks = Some(snapshot.db_blocks);
+        }
+        if snapshot.db_transactions > 0 {
+            self.db_transactions = Some(snapshot.db_transactions);
+        }
+        if snapshot.db_receipts > 0 {
+            self.db_receipts = Some(snapshot.db_receipts);
+        }
+
+        // Storage sizes
+        self.storage_bytes_headers = snapshot.storage_bytes_headers;
+        self.storage_bytes_transactions = snapshot.storage_bytes_transactions;
+        self.storage_bytes_receipts = snapshot.storage_bytes_receipts;
+        if snapshot.storage_bytes_total > 0 {
+            self.storage_total = Some(snapshot.storage_bytes_total as f64 / (1024.0 * 1024.0 * 1024.0));
+        }
+
+        // Compute write rate from storage_bytes_total delta between frames
+        let prev_total = self.prev_storage_bytes_total;
+        self.prev_storage_bytes_total = snapshot.storage_bytes_total;
+        if prev_total > 0 && snapshot.storage_bytes_total >= prev_total {
+            let write_delta = snapshot.storage_bytes_total.saturating_sub(prev_total);
+            let write_rate_mbs = write_delta as f64 / elapsed / (1024.0 * 1024.0);
+            self.write_rate = Some(write_rate_mbs);
+        }
 
         // Speed tracking
         self.current_speed = current_speed;
@@ -1828,11 +1866,20 @@ fn render_storage_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
     let value_col = inner.x + 14;
 
-    let items = [("Headers", "--"), ("Transactions", "--"), ("Receipts", "--")];
+    let headers_str = format_bytes_size(data.storage_bytes_headers);
+    let txns_str = format_bytes_size(data.storage_bytes_transactions);
+    let receipts_str = format_bytes_size(data.storage_bytes_receipts);
+
+    let items = [("Headers", &headers_str), ("Transactions", &txns_str), ("Receipts", &receipts_str)];
 
     for (i, (label, value)) in items.iter().enumerate() {
         buf.set_string(inner.x + 1, inner.y + i as u16, *label, Style::default().fg(Color::Gray));
-        buf.set_string(value_col, inner.y + i as u16, *value, Style::default().fg(Color::DarkGray));
+        let style = if data.storage_bytes_headers > 0 || data.storage_bytes_transactions > 0 || data.storage_bytes_receipts > 0 {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        buf.set_string(value_col, inner.y + i as u16, value.as_str(), style);
     }
 
     buf.set_string(
@@ -2253,6 +2300,26 @@ fn chrono_time() -> String {
     let mins = (secs / 60) % 60;
     let secs_only = secs % 60;
     format!("{hours:02}:{mins:02}:{secs_only:02}")
+}
+
+/// Format a byte count as a human-readable size string (e.g. "1.2 GiB", "456 MiB").
+fn format_bytes_size(bytes: u64) -> String {
+    if bytes == 0 {
+        return "--".to_string();
+    }
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn format_number(n: u64) -> String {

@@ -599,6 +599,13 @@ mod tests {
             rpc_get_logs: 0,
             rpc_get_block: 0,
             rpc_errors: 0,
+            db_blocks: 0,
+            db_transactions: 0,
+            db_receipts: 0,
+            storage_bytes_headers: 0,
+            storage_bytes_transactions: 0,
+            storage_bytes_receipts: 0,
+            storage_bytes_total: 0,
         };
         assert_eq!(
             format_progress_message(&snapshot, 1.5, "12s"),

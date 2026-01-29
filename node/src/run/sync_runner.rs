@@ -225,6 +225,17 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         None
     };
     if let Some(stats) = progress_stats.as_ref() {
+        // Push initial DB/storage stats from existing data
+        let agg = storage.aggregate_stats();
+        stats.set_db_blocks(agg.total_blocks);
+        stats.set_db_transactions(agg.total_transactions);
+        stats.set_db_receipts(agg.total_receipts);
+        stats.set_storage_bytes(
+            agg.disk_bytes_headers,
+            agg.disk_bytes_transactions,
+            agg.disk_bytes_receipts,
+            agg.disk_bytes_total,
+        );
         stats.set_head_seen(head_at_startup);
 
         // Initialize coverage tracking for TUI blocks map

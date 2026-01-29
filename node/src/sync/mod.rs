@@ -161,6 +161,20 @@ pub struct SyncProgressStats {
     rpc_errors: std::sync::atomic::AtomicU64,
     /// Coverage tracking for blocks map visualization.
     coverage: parking_lot::Mutex<CoverageTracker>,
+    /// DB counters: total blocks in storage.
+    db_blocks: std::sync::atomic::AtomicU64,
+    /// DB counters: total transactions in storage.
+    db_transactions: std::sync::atomic::AtomicU64,
+    /// DB counters: total receipts in storage.
+    db_receipts: std::sync::atomic::AtomicU64,
+    /// Storage bytes for headers segment.
+    storage_bytes_headers: std::sync::atomic::AtomicU64,
+    /// Storage bytes for transactions segment.
+    storage_bytes_transactions: std::sync::atomic::AtomicU64,
+    /// Storage bytes for receipts segment.
+    storage_bytes_receipts: std::sync::atomic::AtomicU64,
+    /// Storage total bytes across all segments.
+    storage_bytes_total: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +212,15 @@ pub struct SyncProgressSnapshot {
     pub rpc_get_logs: u64,
     pub rpc_get_block: u64,
     pub rpc_errors: u64,
+    /// DB counters.
+    pub db_blocks: u64,
+    pub db_transactions: u64,
+    pub db_receipts: u64,
+    /// Per-segment storage sizes in bytes.
+    pub storage_bytes_headers: u64,
+    pub storage_bytes_transactions: u64,
+    pub storage_bytes_receipts: u64,
+    pub storage_bytes_total: u64,
 }
 
 impl SyncProgressStats {
@@ -257,6 +280,25 @@ impl SyncProgressStats {
                 .load(std::sync::atomic::Ordering::SeqCst),
             rpc_errors: self
                 .rpc_errors
+                .load(std::sync::atomic::Ordering::SeqCst),
+            db_blocks: self.db_blocks.load(std::sync::atomic::Ordering::SeqCst),
+            db_transactions: self
+                .db_transactions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            db_receipts: self
+                .db_receipts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_headers: self
+                .storage_bytes_headers
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_transactions: self
+                .storage_bytes_transactions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_receipts: self
+                .storage_bytes_receipts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            storage_bytes_total: self
+                .storage_bytes_total
                 .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
@@ -429,6 +471,46 @@ impl SyncProgressStats {
     pub fn inc_rpc_errors(&self) {
         self.rpc_errors
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB block count.
+    pub fn set_db_blocks(&self, count: u64) {
+        self.db_blocks
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB transaction count.
+    pub fn set_db_transactions(&self, count: u64) {
+        self.db_transactions
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DB receipt count.
+    pub fn set_db_receipts(&self, count: u64) {
+        self.db_receipts
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment DB counters for a single processed block.
+    pub fn inc_db_counters(&self, transactions: u64, receipts: u64) {
+        self.db_blocks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.db_transactions
+            .fetch_add(transactions, std::sync::atomic::Ordering::SeqCst);
+        self.db_receipts
+            .fetch_add(receipts, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set storage byte sizes for all segments.
+    pub fn set_storage_bytes(&self, headers: u64, transactions: u64, receipts: u64, total: u64) {
+        self.storage_bytes_headers
+            .store(headers, std::sync::atomic::Ordering::SeqCst);
+        self.storage_bytes_transactions
+            .store(transactions, std::sync::atomic::Ordering::SeqCst);
+        self.storage_bytes_receipts
+            .store(receipts, std::sync::atomic::Ordering::SeqCst);
+        self.storage_bytes_total
+            .store(total, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Initialize coverage tracking for a block range.

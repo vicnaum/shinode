@@ -117,7 +117,19 @@ async fn flush_fast_sync_buffer(
                 // Note: We don't increment compactions_done here because sync-phase
                 // compactions are background work without a known total. The finalize
                 // phase tracks its own compactions with proper total/done counters.
-                let _ = progress_stats; // suppress unused warning
+                // Refresh storage byte stats after inline compaction
+                // (DB counters are updated incrementally at processing time)
+                if result.is_ok() {
+                    if let Some(stats) = progress_stats.as_ref() {
+                        let agg = storage.aggregate_stats();
+                        stats.set_storage_bytes(
+                            agg.disk_bytes_headers,
+                            agg.disk_bytes_transactions,
+                            agg.disk_bytes_receipts,
+                            agg.disk_bytes_total,
+                        );
+                    }
+                }
                 result
             }));
         }
@@ -235,6 +247,17 @@ pub async fn run_db_writer(
                 bytes_total,
                 duration_ms: elapsed_ms,
             });
+        }
+        // Refresh storage byte stats after follow-mode write
+        // (DB counters are updated incrementally at processing time)
+        if let Some(stats) = progress_stats.as_ref() {
+            let agg = storage.aggregate_stats();
+            stats.set_storage_bytes(
+                agg.disk_bytes_headers,
+                agg.disk_bytes_transactions,
+                agg.disk_bytes_receipts,
+                agg.disk_bytes_total,
+            );
         }
         Ok(())
     };
@@ -394,6 +417,18 @@ fn finalize_fast_sync(
         }
     })?;
     finalize_stats.compact_all_dirty_ms = compact_started.elapsed().as_millis() as u64;
+
+    // Refresh storage byte stats after compaction
+    // (DB counters are updated incrementally at processing time)
+    if let Some(stats) = progress_stats {
+        let agg = storage.aggregate_stats();
+        stats.set_storage_bytes(
+            agg.disk_bytes_headers,
+            agg.disk_bytes_transactions,
+            agg.disk_bytes_receipts,
+            agg.disk_bytes_total,
+        );
+    }
 
     if let Some(events) = events {
         events.record(BenchEvent::CompactAllDirtyEnd {

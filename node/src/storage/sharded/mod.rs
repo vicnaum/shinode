@@ -150,6 +150,18 @@ fn create_compaction_writers(
     })
 }
 
+/// Aggregate statistics across all shards, computed from in-memory shard metadata.
+#[derive(Debug, Clone, Default)]
+pub struct StorageAggregateStats {
+    pub total_blocks: u64,
+    pub total_transactions: u64,
+    pub total_receipts: u64,
+    pub disk_bytes_headers: u64,
+    pub disk_bytes_transactions: u64,
+    pub disk_bytes_receipts: u64,
+    pub disk_bytes_total: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
     schema_version: u64,
@@ -176,6 +188,24 @@ struct ShardMeta {
     /// Values: None (idle), "writing", "swapping", "cleanup"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_phase: Option<String>,
+    /// Total transaction count across all blocks in this shard.
+    #[serde(default)]
+    total_transactions: u64,
+    /// Total receipt count across all blocks in this shard.
+    #[serde(default)]
+    total_receipts: u64,
+    /// On-disk bytes for headers segment files.
+    #[serde(default)]
+    disk_bytes_headers: u64,
+    /// On-disk bytes for transaction segment files (tx_hashes + tx_meta).
+    #[serde(default)]
+    disk_bytes_transactions: u64,
+    /// On-disk bytes for receipts segment files.
+    #[serde(default)]
+    disk_bytes_receipts: u64,
+    /// Total on-disk bytes for all segment files in this shard.
+    #[serde(default)]
+    disk_bytes_total: u64,
 }
 
 struct ShardState {
@@ -463,6 +493,13 @@ impl Storage {
             repair_shard_from_wal(&mut state)?;
             reconcile_shard_meta(&mut state);
 
+            // Recompute disk sizes from segment files on startup
+            let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+            state.meta.disk_bytes_headers = dh;
+            state.meta.disk_bytes_transactions = dt;
+            state.meta.disk_bytes_receipts = dr;
+            state.meta.disk_bytes_total = dtotal;
+
             let max_present = max_present_in_bitset(&state, meta.shard_size);
             if let Some(max_block) = max_present {
                 meta.max_present_block = Some(meta.max_present_block.unwrap_or(0).max(max_block));
@@ -557,6 +594,24 @@ impl Storage {
 
     pub fn disk_usage(&self) -> Result<StorageDiskStats> {
         Self::disk_usage_at(&self.data_dir)
+    }
+
+    /// Aggregate stats across all shards from in-memory shard metadata.
+    /// This is cheap — no disk I/O, just iterates locked shard meta.
+    pub fn aggregate_stats(&self) -> StorageAggregateStats {
+        let shards = self.shards.lock();
+        let mut stats = StorageAggregateStats::default();
+        for shard in shards.values() {
+            let state = shard.lock();
+            stats.total_blocks += u64::from(state.meta.present_count);
+            stats.total_transactions += state.meta.total_transactions;
+            stats.total_receipts += state.meta.total_receipts;
+            stats.disk_bytes_headers += state.meta.disk_bytes_headers;
+            stats.disk_bytes_transactions += state.meta.disk_bytes_transactions;
+            stats.disk_bytes_receipts += state.meta.disk_bytes_receipts;
+            stats.disk_bytes_total += state.meta.disk_bytes_total;
+        }
+        stats
     }
 
     pub fn disk_usage_at(data_dir: &Path) -> Result<StorageDiskStats> {
@@ -864,6 +919,8 @@ impl Storage {
 
         if state.bitset.set(offset) {
             state.meta.present_count = state.meta.present_count.saturating_add(1);
+            state.meta.total_transactions += bundle.tx_hashes.hashes.len() as u64;
+            state.meta.total_receipts += bundle.receipts.receipts.len() as u64;
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         }
         state.meta.sorted = true;
@@ -876,6 +933,12 @@ impl Storage {
                 .unwrap_or(shard_start)
                 .max(bundle.number),
         );
+        // Update disk sizes from sorted segment files
+        let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+        state.meta.disk_bytes_headers = dh;
+        state.meta.disk_bytes_transactions = dt;
+        state.meta.disk_bytes_receipts = dr;
+        state.meta.disk_bytes_total = dtotal;
         persist_shard_meta(&state.dir, &state.meta)?;
         state.bitset.flush(&bitset_path(&state.dir))?;
         self.bump_max_present(bundle.number)?;
@@ -968,6 +1031,10 @@ impl Storage {
 
         let total_rows = max_offset.saturating_add(1);
 
+        // Accumulators for tx/receipt counts (recomputed authoritatively at compaction)
+        let mut total_tx: u64 = 0;
+        let mut total_receipt_count: u64 = 0;
+
         // Create segment writers
         let mut writers = create_compaction_writers(&temp_dir, shard_start, existing.as_ref())?;
 
@@ -1024,6 +1091,11 @@ impl Storage {
                 let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
                 let size_bytes = &wal.mmap[slices.size.as_range()];
 
+                // Count txs from bincode-encoded StoredTxHashes (uncompressed, Vec<B256> prefix is u64 len)
+                let tx_count = bincode_vec_len(tx_hash_bytes);
+                total_tx += tx_count;
+                total_receipt_count += tx_count; // receipts == transactions in Ethereum
+
                 writers.headers.push_bytes(header_bytes, slices.header.len())?;
                 writers.tx_hashes.push_bytes(tx_hash_bytes, slices.tx_hashes.len())?;
                 writers.tx_meta.push_bytes(tx_meta_bytes, slices.tx_meta_uncompressed_len as usize)?;
@@ -1046,6 +1118,11 @@ impl Storage {
                     .ok_or_else(|| eyre!("missing receipts for block {}", block_number))?;
                 let size_bytes = ex.sizes.row_bytes(local_offset)?
                     .ok_or_else(|| eyre!("missing size for block {}", block_number))?;
+
+                // Count txs from bincode-encoded StoredTxHashes (uncompressed)
+                let tx_count = bincode_vec_len(tx_hash_bytes);
+                total_tx += tx_count;
+                total_receipt_count += tx_count;
 
                 writers.headers.push_bytes(header_bytes, header_bytes.len())?;
                 writers.tx_hashes.push_bytes(tx_hash_bytes, tx_hash_bytes.len())?;
@@ -1123,6 +1200,15 @@ impl Storage {
         state.meta.content_hash = None;
         state.meta.tail_block = Some(tail_block);
         state.meta.compaction_phase = None;
+        // Authoritative tx/receipt counts recomputed during compaction
+        state.meta.total_transactions = total_tx;
+        state.meta.total_receipts = total_receipt_count;
+        // Recompute disk sizes from the freshly written segment files
+        let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+        state.meta.disk_bytes_headers = dh;
+        state.meta.disk_bytes_transactions = dt;
+        state.meta.disk_bytes_receipts = dr;
+        state.meta.disk_bytes_total = dtotal;
         persist_shard_meta(&state.dir, &state.meta)?;
 
         if state.meta.complete && !state.meta.sealed {
@@ -1523,6 +1609,12 @@ impl Storage {
             content_hash: None,
             content_hash_algo: "sha256".to_string(),
             compaction_phase: None,
+            total_transactions: 0,
+            total_receipts: 0,
+            disk_bytes_headers: 0,
+            disk_bytes_transactions: 0,
+            disk_bytes_receipts: 0,
+            disk_bytes_total: 0,
         };
         persist_shard_meta(&dir, &meta)?;
         let state = ShardState { dir, meta, bitset };
@@ -1898,6 +1990,39 @@ fn shard_segment_stats(data_dir: &Path) -> Result<Vec<SegmentDiskStats>> {
         });
     }
     Ok(out)
+}
+
+/// Compute per-segment and total disk bytes for a shard directory.
+/// Returns `(headers, transactions, receipts, total)` byte counts.
+fn compute_shard_disk_bytes(shard_dir: &Path) -> (u64, u64, u64, u64) {
+    let sorted = sorted_dir(shard_dir);
+    if !sorted.exists() {
+        return (0, 0, 0, 0);
+    }
+    let headers = segment_disk_size(&sorted.join("headers")).unwrap_or(0);
+    let tx_hashes = segment_disk_size(&sorted.join("tx_hashes")).unwrap_or(0);
+    let tx_meta = segment_disk_size(&sorted.join("tx_meta")).unwrap_or(0);
+    let receipts = segment_disk_size(&sorted.join("receipts")).unwrap_or(0);
+    let block_sizes = segment_disk_size(&sorted.join("block_sizes")).unwrap_or(0);
+    let transactions = tx_hashes.saturating_add(tx_meta);
+    let total = headers
+        .saturating_add(transactions)
+        .saturating_add(receipts)
+        .saturating_add(block_sizes);
+    (headers, transactions, receipts, total)
+}
+
+/// Extract the vector length from a bincode-encoded `Vec<T>`.
+/// Bincode encodes a Vec as a u64 length prefix (little-endian) followed by elements.
+/// Returns 0 if the bytes are too short.
+fn bincode_vec_len(bytes: &[u8]) -> u64 {
+    if bytes.len() < 8 {
+        return 0;
+    }
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 fn load_peer_cache(data_dir: &Path) -> Result<HashMap<String, StoredPeer>> {
