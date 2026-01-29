@@ -354,54 +354,6 @@ impl SegmentWriter {
         Ok(())
     }
 
-    fn read_row_raw(&self, block_number: u64) -> Result<Option<Vec<u8>>> {
-        let jar = NippyJar::<SegmentHeader>::load(&self.path)
-            .wrap_err("failed to load static segment")?;
-        let header = jar.user_header();
-        if block_number < header.start_block {
-            return Ok(None);
-        }
-        let row = block_number.saturating_sub(header.start_block) as usize;
-        if row >= jar.rows() {
-            return Ok(None);
-        }
-        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
-        let Some(row_vals) = cursor.row_by_number(row)? else {
-            return Ok(None);
-        };
-        let bytes = row_vals
-            .first()
-            .ok_or_else(|| eyre!("missing column data"))?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(bytes.to_vec()))
-    }
-
-    fn read_row_compat<T>(&self, block_number: u64) -> Result<Option<T>>
-    where
-        T: SerdeBincodeCompat,
-        <T as SerdeBincodeCompat>::BincodeRepr<'static>: serde::de::DeserializeOwned,
-    {
-        let Some(bytes) = self.read_row_raw(block_number)? else {
-            return Ok(None);
-        };
-        decode_bincode_compat_value(&bytes).map(Some)
-    }
-
-    fn read_row<T: serde::de::DeserializeOwned>(&self, block_number: u64) -> Result<Option<T>> {
-        let Some(bytes) = self.read_row_raw(block_number)? else {
-            return Ok(None);
-        };
-        decode_bincode(&bytes).map(Some)
-    }
-
-    fn read_row_u64(&self, block_number: u64) -> Result<Option<u64>> {
-        let Some(bytes) = self.read_row_raw(block_number)? else {
-            return Ok(None);
-        };
-        decode_u64(&bytes).map(Some)
-    }
 }
 
 pub struct Storage {
@@ -410,9 +362,9 @@ pub struct Storage {
     meta: Mutex<MetaState>,
     shards: Mutex<HashMap<u64, Arc<Mutex<ShardState>>>>,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
-    /// LRU cache for segment readers, keyed by shard_start.
+    /// LRU cache for read-only segment handles, keyed by shard_start.
     /// Avoids reopening 5 segment files on every block read.
-    segment_cache: Mutex<LruCache<u64, Arc<ShardSegments>>>,
+    segment_cache: Mutex<LruCache<u64, Arc<ShardSegmentReaders>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1362,7 +1314,7 @@ impl Storage {
         &self,
         shard_start: u64,
         sorted_dir: &Path,
-    ) -> Result<Option<Arc<ShardSegments>>> {
+    ) -> Result<Option<Arc<ShardSegmentReaders>>> {
         // Check cache first
         {
             let mut cache = self.segment_cache.lock();
@@ -1371,7 +1323,7 @@ impl Storage {
             }
         }
 
-        // Cache miss - open segments
+        // Cache miss - open segments (read-only, no file locks)
         let segments = shard_segment_readers(sorted_dir, shard_start)?;
         let Some(segments) = segments else {
             return Ok(None);
@@ -1389,7 +1341,7 @@ impl Storage {
     fn with_readers_for_present_block<T>(
         &self,
         number: u64,
-        f: impl FnOnce(&ShardSegments) -> Result<Option<T>>,
+        f: impl FnOnce(&ShardSegmentReaders) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
         let shard_start = shard_start(number, self.shard_size());
 
@@ -1639,6 +1591,93 @@ struct ShardSegments {
     sizes: SegmentWriter,
 }
 
+/// Read-only segment handle. Unlike `SegmentWriter`, this does NOT open a
+/// `NippyJarWriter` (which takes an exclusive file lock). Each read loads the
+/// jar fresh – the same thing `SegmentWriter::read_row_raw` already does – so
+/// multiple `SegmentReader`s can coexist with an active writer.
+struct SegmentReader {
+    path: PathBuf,
+}
+
+impl SegmentReader {
+    fn open(path: PathBuf, start_block: u64) -> Result<Self> {
+        if !segment_exists(&path) {
+            return Err(eyre!("segment not found: {}", path.display()));
+        }
+        let jar = NippyJar::<SegmentHeader>::load(&path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if header.start_block != start_block {
+            return Err(eyre!(
+                "segment start mismatch for {} (expected {}, got {})",
+                path.display(),
+                start_block,
+                header.start_block
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    fn read_row_raw(&self, block_number: u64) -> Result<Option<Vec<u8>>> {
+        let jar = NippyJar::<SegmentHeader>::load(&self.path)
+            .wrap_err("failed to load static segment")?;
+        let header = jar.user_header();
+        if block_number < header.start_block {
+            return Ok(None);
+        }
+        let row = block_number.saturating_sub(header.start_block) as usize;
+        if row >= jar.rows() {
+            return Ok(None);
+        }
+        let mut cursor = NippyJarCursor::new(&jar).wrap_err("failed to open segment cursor")?;
+        let Some(row_vals) = cursor.row_by_number(row)? else {
+            return Ok(None);
+        };
+        let bytes = row_vals
+            .first()
+            .ok_or_else(|| eyre!("missing column data"))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
+    fn read_row_compat<T>(&self, block_number: u64) -> Result<Option<T>>
+    where
+        T: SerdeBincodeCompat,
+        <T as SerdeBincodeCompat>::BincodeRepr<'static>: serde::de::DeserializeOwned,
+    {
+        let Some(bytes) = self.read_row_raw(block_number)? else {
+            return Ok(None);
+        };
+        decode_bincode_compat_value(&bytes).map(Some)
+    }
+
+    fn read_row<T: serde::de::DeserializeOwned>(&self, block_number: u64) -> Result<Option<T>> {
+        let Some(bytes) = self.read_row_raw(block_number)? else {
+            return Ok(None);
+        };
+        decode_bincode(&bytes).map(Some)
+    }
+
+    fn read_row_u64(&self, block_number: u64) -> Result<Option<u64>> {
+        let Some(bytes) = self.read_row_raw(block_number)? else {
+            return Ok(None);
+        };
+        decode_u64(&bytes).map(Some)
+    }
+}
+
+/// Container for read-only segment handles for a single shard.
+#[expect(dead_code, reason = "tx_meta included for completeness; reads not yet wired")]
+struct ShardSegmentReaders {
+    headers: SegmentReader,
+    tx_hashes: SegmentReader,
+    tx_meta: SegmentReader,
+    receipts: SegmentReader,
+    sizes: SegmentReader,
+}
+
 fn shard_segment_writers(sorted_dir: &Path, shard_start: u64) -> Result<ShardSegments> {
     Ok(ShardSegments {
         headers: SegmentWriter::open(
@@ -1675,7 +1714,7 @@ fn shard_segment_writers(sorted_dir: &Path, shard_start: u64) -> Result<ShardSeg
     })
 }
 
-fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<ShardSegments>> {
+fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<ShardSegmentReaders>> {
     if !sorted_dir.exists() {
         return Ok(None);
     }
@@ -1686,7 +1725,13 @@ fn shard_segment_readers(sorted_dir: &Path, shard_start: u64) -> Result<Option<S
             return Err(eyre!("missing segment {}", base.display()));
         }
     }
-    Ok(Some(shard_segment_writers(sorted_dir, shard_start)?))
+    Ok(Some(ShardSegmentReaders {
+        headers: SegmentReader::open(sorted_dir.join("headers"), shard_start)?,
+        tx_hashes: SegmentReader::open(sorted_dir.join("tx_hashes"), shard_start)?,
+        tx_meta: SegmentReader::open(sorted_dir.join("tx_meta"), shard_start)?,
+        receipts: SegmentReader::open(sorted_dir.join("receipts"), shard_start)?,
+        sizes: SegmentReader::open(sorted_dir.join("block_sizes"), shard_start)?,
+    }))
 }
 
 const fn shard_start(block_number: u64, shard_size: u64) -> u64 {

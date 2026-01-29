@@ -621,6 +621,14 @@ pub async fn run_ingest_pipeline(
     let mut last_progress_check = Instant::now();
     let mut last_progress_completed = 0u64;
     loop {
+        // Detect silent DB writer crash — if the task exited for any reason
+        // (e.g. file-lock contention, I/O error), break out so the error
+        // surfaces via `db_handle.await` in finalization.
+        if db_handle.is_finished() {
+            tracing::error!("DB writer exited unexpectedly during pipeline run");
+            break;
+        }
+
         while let Ok(mut peer) = ready_rx.try_recv() {
             if let Some(h) = pool.get_peer_head(peer.peer_id) {
                 peer.head_number = h;
