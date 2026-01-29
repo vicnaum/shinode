@@ -657,6 +657,7 @@ async fn run_follow_mode(
                         config.rpc_bind,
                         rpc::RpcConfig::from(config),
                         Arc::clone(storage),
+                        stats_for_rpc.clone(),
                     )
                     .await?;
                     info!(rpc_bind = %config.rpc_bind, "rpc server started");

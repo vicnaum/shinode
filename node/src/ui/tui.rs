@@ -148,6 +148,9 @@ pub struct TuiState {
     // 30-second windowed average tracking: (timestamp, processed_blocks)
     avg_speed_window: VecDeque<(Instant, u64)>,
 
+    // Timestamp of last update_from_snapshot call (for RPC req/s calculation)
+    last_tick_time: Option<Instant>,
+
     // Animation frame counter (incremented on each draw)
     pub animation_frame: u64,
 
@@ -244,6 +247,7 @@ impl TuiState {
             last_block_received_ms: 0,
             speed_history: VecDeque::with_capacity(60),
             avg_speed_window: VecDeque::with_capacity(300), // 30 seconds at 100ms intervals
+            last_tick_time: None,
             animation_frame: 0,
             startup_status: "Connecting to Ethereum P2P network...".to_string(),
             best_head_seen: 0,
@@ -411,6 +415,18 @@ impl TuiState {
         // RPC active flag is set from snapshot (signaled when RPC server starts)
         self.rpc_active = snapshot.rpc_active;
 
+        // RPC counters
+        let prev_rpc_total = self.rpc_total_requests;
+        self.rpc_total_requests = snapshot.rpc_total_requests;
+        self.rpc_get_logs = snapshot.rpc_get_logs;
+        self.rpc_get_block = snapshot.rpc_get_block;
+        self.rpc_errors = snapshot.rpc_errors;
+
+        // Compute RPC requests/sec from delta between frames
+        let rpc_delta = snapshot.rpc_total_requests.saturating_sub(prev_rpc_total);
+        let elapsed = self.last_tick_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(1.0).max(0.001);
+        self.rpc_requests_per_sec = rpc_delta as f64 / elapsed;
+
         // Speed tracking
         self.current_speed = current_speed;
         self.peak_speed = snapshot.peak_speed.max(self.peak_speed);
@@ -477,6 +493,9 @@ impl TuiState {
                 .unwrap_or(0);
             self.last_block_secs = now_ms.saturating_sub(snapshot.last_block_received_ms) / 1000;
         }
+
+        // Record tick time for next frame's RPC rate calculation
+        self.last_tick_time = Some(Instant::now());
     }
 
     /// Returns blocks processed in current sync session.

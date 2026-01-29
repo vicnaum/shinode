@@ -595,6 +595,10 @@ mod tests {
             peak_speed: 0,
             last_block_received_ms: 0,
             rpc_active: false,
+            rpc_total_requests: 0,
+            rpc_get_logs: 0,
+            rpc_get_block: 0,
+            rpc_errors: 0,
         };
         assert_eq!(
             format_progress_message(&snapshot, 1.5, "12s"),

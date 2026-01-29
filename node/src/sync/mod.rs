@@ -154,6 +154,11 @@ pub struct SyncProgressStats {
     last_block_received_ms: std::sync::atomic::AtomicU64,
     /// True when RPC server has been started and is serving requests.
     rpc_active: std::sync::atomic::AtomicBool,
+    /// RPC counters for TUI display.
+    rpc_total_requests: std::sync::atomic::AtomicU64,
+    rpc_get_logs: std::sync::atomic::AtomicU64,
+    rpc_get_block: std::sync::atomic::AtomicU64,
+    rpc_errors: std::sync::atomic::AtomicU64,
     /// Coverage tracking for blocks map visualization.
     coverage: parking_lot::Mutex<CoverageTracker>,
 }
@@ -188,6 +193,11 @@ pub struct SyncProgressSnapshot {
     pub last_block_received_ms: u64,
     /// True when RPC server has been started and is serving requests.
     pub rpc_active: bool,
+    /// RPC counters for TUI display.
+    pub rpc_total_requests: u64,
+    pub rpc_get_logs: u64,
+    pub rpc_get_block: u64,
+    pub rpc_errors: u64,
 }
 
 impl SyncProgressStats {
@@ -235,6 +245,18 @@ impl SyncProgressStats {
                 .load(std::sync::atomic::Ordering::SeqCst),
             rpc_active: self
                 .rpc_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_total_requests: self
+                .rpc_total_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_get_logs: self
+                .rpc_get_logs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_get_block: self
+                .rpc_get_block
+                .load(std::sync::atomic::Ordering::SeqCst),
+            rpc_errors: self
+                .rpc_errors
                 .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
@@ -383,6 +405,30 @@ impl SyncProgressStats {
     pub fn set_rpc_active(&self, active: bool) {
         self.rpc_active
             .store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment total RPC request counter.
+    pub fn inc_rpc_total(&self) {
+        self.rpc_total_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment RPC `eth_getLogs` counter.
+    pub fn inc_rpc_get_logs(&self) {
+        self.rpc_get_logs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment RPC `eth_getBlockByNumber` counter.
+    pub fn inc_rpc_get_block(&self) {
+        self.rpc_get_block
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Increment RPC error counter.
+    pub fn inc_rpc_errors(&self) {
+        self.rpc_errors
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Initialize coverage tracking for a block range.
