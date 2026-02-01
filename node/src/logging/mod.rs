@@ -79,9 +79,10 @@ pub fn init_tracing(
         1 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     };
+    let show_warn = config.verbosity >= 1;
     let tui_layer = tui_log_buffer
         .as_ref()
-        .map(|buffer| TuiLogLayer::new(Arc::clone(buffer), tui_min_level));
+        .map(|buffer| TuiLogLayer::new(Arc::clone(buffer), tui_min_level, show_warn));
 
     // JSON log file uses its own filter (defaults to DEBUG level).
     let json_log_filter = EnvFilter::try_new(&config.log_json_filter)

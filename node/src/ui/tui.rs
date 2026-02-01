@@ -127,7 +127,6 @@ pub struct TuiState {
     pub peers_connected: u64,
     pub peers_max: u64,
     pub peers_stale: u64,
-    pub peers_peak_total: u64,
     pub pending: u64,
     pub inflight: u64,
     pub retry: u64,
@@ -242,7 +241,6 @@ impl TuiState {
             peers_connected: 0,
             peers_max: 0,
             peers_stale: 0,
-            peers_peak_total: 0,
             pending: 0,
             inflight: 0,
             retry: 0,
@@ -539,10 +537,6 @@ impl TuiState {
         self.peers_connected = snapshot.peers_active;
         self.peers_max = snapshot.peers_total;
         self.peers_stale = snapshot.peers_stale;
-        let current_total = self.peers_connected
-            .saturating_add(self.peers_max.saturating_sub(self.peers_connected))
-            .saturating_add(self.peers_stale);
-        self.peers_peak_total = self.peers_peak_total.max(current_total);
 
         // Queue tracking
         self.pending = snapshot.queue;
@@ -1700,58 +1694,46 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
 
     let value_col = inner.x + 12;
 
-    // Peers visual: 1 peer = 1 character, never shrinks (uses peak high-water mark)
-    // ● = active (green, fetching), ○ = healthy idle (green),
-    // ⊘ = stale-head banned (dark gray), · = gone/disconnected (very dim)
-    let available_width = inner.width.saturating_sub(12) as u64;
+    // Peers visual: @ = active (green), o = idle (green), x = stale (dark gray)
+    // Leave 1 char padding before the right border.
+    let max_dots = (inner.x + inner.width).saturating_sub(value_col + 1) as u64;
     let active = data.peers_connected;
     let stale = data.peers_stale;
-    let connected_total = active.saturating_add(data.peers_max).saturating_add(stale);
     let healthy_idle = data.peers_max.saturating_sub(active);
-    let gone = data.peers_peak_total.saturating_sub(connected_total);
-    let display_total = data.peers_peak_total;
+    let display_total = active.saturating_add(healthy_idle).saturating_add(stale);
+    let needs_truncation = display_total > max_dots;
+    // Reserve 1 slot for ellipsis when truncating
+    let display_slots = if needs_truncation { max_dots.saturating_sub(1) } else { max_dots };
 
     buf.set_string(inner.x + 1, inner.y, "Peers", Style::default().fg(Color::Gray));
 
     if display_total == 0 {
         buf.set_string(value_col, inner.y, "—", Style::default().fg(Color::DarkGray));
-    } else if display_total <= available_width {
-        let mut col = value_col;
-        let active_chars: String = (0..active).map(|_| '\u{25CF}').collect(); // ●
-        buf.set_string(col, inner.y, &active_chars, Style::default().fg(Color::Green));
-        col += active_chars.len() as u16;
-        let idle_chars: String = (0..healthy_idle).map(|_| '\u{25CB}').collect(); // ○
-        buf.set_string(col, inner.y, &idle_chars, Style::default().fg(Color::Green));
-        col += idle_chars.len() as u16;
-        let stale_chars: String = (0..stale).map(|_| '\u{2298}').collect(); // ⊘
-        buf.set_string(col, inner.y, &stale_chars, Style::default().fg(Color::DarkGray));
-        col += stale_chars.len() as u16;
-        let gone_chars: String = (0..gone).map(|_| '\u{00B7}').collect(); // ·
-        buf.set_string(col, inner.y, &gone_chars, Style::default().fg(Color::Rgb(60, 60, 60)));
     } else {
-        let display_slots = available_width.saturating_sub(1);
         let active_to_show = active.min(display_slots);
         let remaining = display_slots.saturating_sub(active_to_show);
         let idle_to_show = healthy_idle.min(remaining);
         let remaining = remaining.saturating_sub(idle_to_show);
         let stale_to_show = stale.min(remaining);
-        let remaining = remaining.saturating_sub(stale_to_show);
-        let gone_to_show = gone.min(remaining);
 
-        let mut col = value_col;
-        let active_chars: String = (0..active_to_show).map(|_| '\u{25CF}').collect();
-        buf.set_string(col, inner.y, &active_chars, Style::default().fg(Color::Green));
-        col += active_chars.len() as u16;
-        let idle_chars: String = (0..idle_to_show).map(|_| '\u{25CB}').collect();
-        buf.set_string(col, inner.y, &idle_chars, Style::default().fg(Color::Green));
-        col += idle_chars.len() as u16;
-        let stale_chars: String = (0..stale_to_show).map(|_| '\u{2298}').collect();
-        buf.set_string(col, inner.y, &stale_chars, Style::default().fg(Color::DarkGray));
-        col += stale_chars.len() as u16;
-        let gone_chars: String = (0..gone_to_show).map(|_| '\u{00B7}').collect();
-        buf.set_string(col, inner.y, &gone_chars, Style::default().fg(Color::Rgb(60, 60, 60)));
-        col += gone_chars.len() as u16;
-        buf.set_string(col, inner.y, "\u{2026}", Style::default().fg(Color::DarkGray));
+        // Build as a single Line so ratatui handles Unicode width internally
+        let mut spans = Vec::new();
+        if active_to_show > 0 {
+            let s: String = (0..active_to_show).map(|_| '\u{25CF}').collect(); // ●
+            spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+        }
+        if idle_to_show > 0 {
+            let s: String = (0..idle_to_show).map(|_| '\u{25CB}').collect(); // ○
+            spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+        }
+        if stale_to_show > 0 {
+            let s: String = (0..stale_to_show).map(|_| '\u{2298}').collect(); // ⊘
+            spans.push(Span::styled(s, Style::default().fg(Color::DarkGray)));
+        }
+        if needs_truncation {
+            spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
+        }
+        buf.set_line(value_col, inner.y, &Line::from(spans), max_dots as u16);
     }
 
     // Active peers (currently fetching blocks)
@@ -1786,7 +1768,7 @@ fn render_network_panel(area: Rect, buf: &mut Buffer, data: &TuiState) {
     buf.set_string(
         value_col,
         inner.y + 4,
-        &connected_total.to_string(),
+        &data.peers_max.saturating_add(stale).to_string(),
         Style::default().fg(Color::White),
     );
 

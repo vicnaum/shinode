@@ -11,6 +11,10 @@ path = "src/bin/ui_mock.rs"
 name = "color-test"
 path = "src/bin/color_test.rs"
 
+[[bin]]
+name = "char-test"
+path = "src/bin/char_test.rs"
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]

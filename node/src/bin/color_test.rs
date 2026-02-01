@@ -8,7 +8,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear},
+    widgets::{Block, Clear},
 };
 use std::io;
 

@@ -387,12 +387,14 @@ pub struct TuiLogLayer {
     buffer: Arc<TuiLogBuffer>,
     /// Minimum level to capture (based on verbosity).
     min_level: tracing::Level,
+    /// Whether to display WARN-level events (requires `-v`).
+    show_warn: bool,
 }
 
 impl TuiLogLayer {
     /// Create a new TUI log layer with the given buffer and minimum level.
-    pub const fn new(buffer: Arc<TuiLogBuffer>, min_level: tracing::Level) -> Self {
-        Self { buffer, min_level }
+    pub const fn new(buffer: Arc<TuiLogBuffer>, min_level: tracing::Level, show_warn: bool) -> Self {
+        Self { buffer, min_level, show_warn }
     }
 }
 
@@ -425,6 +427,11 @@ where
 
         // Skip events below minimum level
         if level > self.min_level {
+            return;
+        }
+
+        // Skip WARN unless verbosity >= 1 (-v)
+        if level == tracing::Level::WARN && !self.show_warn {
             return;
         }
 
