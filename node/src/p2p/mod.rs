@@ -466,7 +466,7 @@ fn spawn_peer_discovery_watcher(
                 }
                 _ = log_interval.tick() => {
                     let count = p2p_stats.discovered_count.load(Ordering::Relaxed);
-                    info!(discovered = count, "DHT discovery progress");
+                    debug!(discovered = count, "DHT discovery progress");
                 }
             }
         }

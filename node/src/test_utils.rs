@@ -47,6 +47,7 @@ pub fn base_config(data_dir: PathBuf) -> NodeConfig {
         log_trace_include_args: false,
         log_trace_include_locations: false,
         log_events: false,
+        log_events_verbose: false,
         log_json: false,
         log_json_filter: DEFAULT_LOG_JSON_FILTER.to_string(),
         log_report: false,

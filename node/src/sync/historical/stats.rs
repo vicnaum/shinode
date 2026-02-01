@@ -746,6 +746,22 @@ pub enum BenchEvent {
     },
 }
 
+impl BenchEvent {
+    /// Returns `true` for high-volume events that dominate the events log.
+    ///
+    /// These are filtered out by default unless `--log-events-verbose` is set.
+    pub const fn is_high_volume(&self) -> bool {
+        matches!(
+            self,
+            Self::ProcessStart { .. }
+                | Self::ProcessEnd { .. }
+                | Self::FetchStart { .. }
+                | Self::FetchEnd { .. }
+                | Self::BatchAssigned { .. }
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct BenchEventRecord {
     pub t_ms: u64,
@@ -761,6 +777,7 @@ enum BenchEventMessage {
 #[derive(Debug)]
 pub struct BenchEventLogger {
     started_at: Instant,
+    verbose: bool,
     sender: Mutex<Option<mpsc::Sender<BenchEventMessage>>>,
     handle: Mutex<Option<JoinHandle<eyre::Result<()>>>>,
     dropped_events: AtomicU64,
@@ -768,7 +785,7 @@ pub struct BenchEventLogger {
 }
 
 impl BenchEventLogger {
-    pub fn new(path: &std::path::Path) -> eyre::Result<Self> {
+    pub fn new(path: &std::path::Path, verbose: bool) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -797,6 +814,7 @@ impl BenchEventLogger {
 
         Ok(Self {
             started_at: Instant::now(),
+            verbose,
             sender: Mutex::new(Some(tx)),
             handle: Mutex::new(Some(handle)),
             dropped_events: AtomicU64::new(0),
@@ -805,6 +823,9 @@ impl BenchEventLogger {
     }
 
     pub fn record(&self, event: BenchEvent) {
+        if !self.verbose && event.is_high_volume() {
+            return;
+        }
         let record = BenchEventRecord {
             t_ms: self.started_at.elapsed().as_millis() as u64,
             event,

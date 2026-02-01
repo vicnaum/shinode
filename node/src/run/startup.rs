@@ -359,7 +359,7 @@ pub fn setup_ui(
             .events_tmp_path
             .clone()
             .ok_or_else(|| eyre::eyre!("events tmp path required"))?;
-        Some(Arc::new(BenchEventLogger::new(&tmp_path)?))
+        Some(Arc::new(BenchEventLogger::new(&tmp_path, config.log_events_verbose)?))
     } else {
         None
     };

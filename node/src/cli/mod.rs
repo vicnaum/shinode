@@ -148,6 +148,9 @@ pub struct NodeConfig {
     /// Emit a JSONL event log during sync.
     #[arg(long, default_value_t = false)]
     pub log_events: bool,
+    /// Include high-volume events (ProcessStart/End, FetchStart/End, BatchAssigned) in the event log.
+    #[arg(long, default_value_t = false)]
+    pub log_events_verbose: bool,
     /// Emit a JSONL log file (tracing output) during sync.
     #[arg(long, default_value_t = false)]
     pub log_json: bool,
@@ -285,6 +288,7 @@ mod tests {
         assert!(config.log_trace_include_args);
         assert!(config.log_trace_include_locations);
         assert!(!config.log_events);
+        assert!(!config.log_events_verbose);
         assert!(!config.log_json);
         assert_eq!(config.log_json_filter, DEFAULT_LOG_JSON_FILTER);
         assert!(!config.log_report);
