@@ -36,6 +36,8 @@ What does not yet:
 
 ## Quick Start
 
+Requires Rust and a C toolchain. On Ubuntu/Debian: `apt install build-essential`. See [prerequisites](docs/getting-started.md#prerequisites) for details.
+
 ```bash
 # Build
 cargo build --manifest-path node/Cargo.toml --release

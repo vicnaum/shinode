@@ -3,7 +3,21 @@
 ## Prerequisites
 
 - Rust toolchain (1.70+)
+- C compiler and linker (for native dependencies)
 - Git access for Reth dependencies
+
+**Linux (Ubuntu/Debian):**
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Install build tools (gcc, make, linker)
+apt update && apt install -y build-essential
+```
+
+**macOS:** Xcode Command Line Tools (`xcode-select --install`) provides the compiler.
 
 ## Installation
 
