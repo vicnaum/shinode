@@ -85,6 +85,7 @@ Full reference for CLI options and environment variables.
 | Option | Description |
 |--------|-------------|
 | `--repair` | Run storage repair/recovery without starting sync |
+| `--defer-compaction` | Skip inline shard compaction during fast-sync; compact at finalize only (useful for HDD/slow storage) |
 
 ## Commands
 
@@ -104,6 +105,14 @@ cargo run --release --manifest-path node/Cargo.toml -- \
 # JSON output
 cargo run --release --manifest-path node/Cargo.toml -- \
   db stats --data-dir <path> --json
+```
+
+### DB Compact
+
+```bash
+# Compact all dirty shards and seal completed ones
+cargo run --release --manifest-path node/Cargo.toml -- \
+  db compact --data-dir <path>
 ```
 
 ### Repair

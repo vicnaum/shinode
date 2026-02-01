@@ -2367,6 +2367,7 @@ mod tests {
             fast_sync_max_buffered_blocks: 64,
             db_write_batch_blocks: 1,
             db_write_flush_interval_ms: None,
+            defer_compaction: false,
         }
     }
 

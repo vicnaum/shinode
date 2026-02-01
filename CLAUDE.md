@@ -103,8 +103,11 @@ The node is organized into subsystems in `node/src/`:
 - `--shard-size`: 10,000 blocks per shard
 - `--rollback-window`: 64 blocks
 - `--rpc-bind`: 127.0.0.1:8545
+- `--defer-compaction`: Skip inline shard compaction during fast-sync (compact at finalize or via `db compact`)
 - `--no-tui`: Disable fullscreen TUI (use legacy progress bars)
 - `-v`/`-vv`/`-vvv`: Increasing verbosity (default is errors only)
+- `db compact`: Standalone subcommand to compact dirty shards and seal completed ones
+- `db stats`: Print storage statistics
 
 ## Log Artifacts
 

@@ -17,6 +17,8 @@ What works:
 - DOS-style splash screen during startup with animated connection status.
 - Priority escalation queue for difficult blocks.
 - Atomic compaction with crash recovery and per-shard compaction during fast-sync.
+- `--defer-compaction` to skip inline compaction during sync (compact at finalize or manually).
+- `db compact` subcommand for standalone shard compaction.
 - `--repair` command for storage recovery.
 - `--log-resources` for CPU/memory/disk metrics.
 - LRU segment reader cache for RPC performance.
@@ -78,9 +80,17 @@ For detailed setup, see [docs/getting-started.md](docs/getting-started.md).
 --min-peers <u64>       Wait for N peers before sync (default: 1)
 --no-tui                Disable fullscreen TUI dashboard
 -v/-vv/-vvv             Verbosity levels
+--defer-compaction       Skip inline compaction during sync
 --repair                Repair storage (run as subcommand)
 --log                   Enable all log artifacts
 --log-resources         Include CPU/memory/disk metrics
+```
+
+Subcommands:
+
+```
+db stats                Print storage statistics
+db compact              Compact all dirty shards and seal completed ones
 ```
 
 See [docs/configuration.md](docs/configuration.md) for all options.

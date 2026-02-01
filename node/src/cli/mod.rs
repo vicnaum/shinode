@@ -58,6 +58,8 @@ pub enum Command {
 pub enum DbCommand {
     /// Print storage statistics.
     Stats(DbStatsArgs),
+    /// Compact all dirty shards and seal completed ones.
+    Compact(DbCompactArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -68,6 +70,13 @@ pub struct DbStatsArgs {
     /// Print JSON instead of a table.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DbCompactArgs {
+    /// Override data directory for compaction.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 /// Stateless history node configuration.
@@ -207,6 +216,10 @@ pub struct NodeConfig {
     /// Optional DB writer flush interval (ms) for ingest mode.
     #[arg(long)]
     pub db_write_flush_interval_ms: Option<u64>,
+    /// Defer shard compaction during fast-sync (compact at finalize only).
+    #[arg(long, default_value_t = false)]
+    #[serde(default)]
+    pub defer_compaction: bool,
 }
 
 impl NodeConfig {
@@ -311,6 +324,7 @@ mod tests {
         );
         assert_eq!(config.db_write_batch_blocks, DEFAULT_DB_WRITE_BATCH_BLOCKS);
         assert_eq!(config.db_write_flush_interval_ms, None);
+        assert!(!config.defer_compaction);
         assert!(!config.no_tui);
     }
 
@@ -320,6 +334,15 @@ mod tests {
         assert!(matches!(
             config.command,
             Some(Command::Db(DbCommand::Stats(_)))
+        ));
+    }
+
+    #[test]
+    fn parse_db_compact_command() {
+        let config = NodeConfig::parse_from(["stateless-history-node", "db", "compact"]);
+        assert!(matches!(
+            config.command,
+            Some(Command::Db(DbCommand::Compact(_)))
         ));
     }
 

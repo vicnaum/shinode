@@ -385,7 +385,7 @@ pub async fn run_ingest_pipeline(
     if db_mode == DbWriteMode::Follow {
         scheduler_config.max_attempts_per_block = 5;
     }
-    let remaining_per_shard = if db_mode == DbWriteMode::FastSync {
+    let remaining_per_shard = if db_mode == DbWriteMode::FastSync && !config.defer_compaction {
         let mut remaining: HashMap<u64, usize> = HashMap::new();
         let shard_size = storage.shard_size();
         if ranges.is_empty() {

@@ -40,6 +40,9 @@ async fn main() -> Result<()> {
             cli::Command::Db(cli::DbCommand::Stats(args)) => {
                 return run::handle_db_stats(args, &config);
             }
+            cli::Command::Db(cli::DbCommand::Compact(args)) => {
+                return run::handle_db_compact(args, &config);
+            }
         }
     }
 

@@ -3,7 +3,7 @@
 // CLI commands output directly to stdout for user feedback
 #![expect(clippy::print_stdout, reason = "CLI commands require stdout output")]
 
-use crate::cli::{DbStatsArgs, NodeConfig};
+use crate::cli::{DbCompactArgs, DbStatsArgs, NodeConfig};
 use crate::storage::Storage;
 use crate::ui;
 use eyre::Result;
@@ -16,6 +16,52 @@ pub fn handle_db_stats(args: &DbStatsArgs, config: &NodeConfig) -> Result<()> {
         .unwrap_or_else(|| config.data_dir.clone());
     let stats = Storage::disk_usage_at(&data_dir)?;
     ui::print_db_stats(&data_dir, &stats, args.json)?;
+    Ok(())
+}
+
+/// Handle the `db compact` subcommand.
+pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()> {
+    let mut config = config.clone();
+    if let Some(dir) = &args.data_dir {
+        config.data_dir = dir.clone();
+    }
+    let storage = Storage::open(&config)?;
+
+    let pre = storage.aggregate_stats();
+    let dirty = storage.dirty_shards()?;
+    println!(
+        "{} total shard(s), {} dirty, {} already compacted.\n",
+        pre.total_shards,
+        dirty.len(),
+        pre.compacted_shards
+    );
+
+    if dirty.is_empty() {
+        println!("Nothing to do.");
+        return Ok(());
+    }
+
+    let mut compacted = 0u64;
+    storage.compact_all_dirty_with_progress(|shard_start| {
+        compacted += 1;
+        println!("  Compacted shard {shard_start} ({compacted}/{})", dirty.len());
+    })?;
+
+    let mut sealed = 0u64;
+    storage.seal_completed_shards_with_progress(|shard_start| {
+        sealed += 1;
+        println!("  Sealed shard {shard_start}");
+    })?;
+
+    let post = storage.aggregate_stats();
+    println!("\nDone. Compacted {compacted} shard(s), sealed {sealed} shard(s).");
+    println!(
+        "Storage: {} blocks, {} txs, {} logs, {}",
+        post.total_blocks,
+        post.total_transactions,
+        post.total_logs,
+        ui::human_bytes(post.disk_bytes_total)
+    );
     Ok(())
 }
 

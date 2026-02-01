@@ -329,6 +329,12 @@ pub async fn run_db_writer(
                         compactions_inflight,
                     });
                 }
+                // Periodically refresh shard counts for TUI
+                // (covers deferred-compaction mode where inline compaction never fires)
+                if let Some(stats) = progress_stats.as_ref() {
+                    let agg = storage.aggregate_stats();
+                    stats.set_db_shards(agg.total_shards, agg.compacted_shards);
+                }
                 if mode == DbWriteMode::Follow && !follow_buffer.is_empty() {
                     let min_key = follow_buffer.keys().next().copied().unwrap_or(0);
                     let max_key = follow_buffer.keys().next_back().copied().unwrap_or(0);

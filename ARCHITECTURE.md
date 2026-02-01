@@ -116,6 +116,7 @@ For blocks older than `head - rollback_window`:
 - Write to per-shard WAL (out-of-order OK), accumulate log counts
 - Compact shards as they complete; seal completed shards with content hash
 - Per-shard compaction triggers during sync (not just at finalization)
+- `--defer-compaction`: skip inline compaction, compact all at finalize (better for HDD/slow storage)
 
 ### Follow Mode (Live)
 For blocks near head:
@@ -149,8 +150,10 @@ Key options:
 - `--shard-size` - Blocks per storage shard (recommend 1000+ for RPC workloads)
 - `--rollback-window` - Max reorg depth (default: 64)
 - `--rpc-bind` - RPC server address (default: localhost:8545)
+- `--defer-compaction` - Skip inline compaction during fast-sync
 - `--no-tui` - Disable fullscreen TUI dashboard
 - `-v`/`-vv`/`-vvv` - Verbosity levels
+- `db compact` - Compact dirty shards and seal completed ones (standalone)
 
 ## References
 

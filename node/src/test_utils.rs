@@ -67,5 +67,6 @@ pub fn base_config(data_dir: PathBuf) -> NodeConfig {
         fast_sync_max_buffered_blocks: DEFAULT_FAST_SYNC_MAX_BUFFERED_BLOCKS,
         db_write_batch_blocks: DEFAULT_DB_WRITE_BATCH_BLOCKS,
         db_write_flush_interval_ms: None,
+        defer_compaction: false,
     }
 }
