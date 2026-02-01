@@ -2,6 +2,7 @@
 name = "stateless-history-node"
 version = "0.3.0"
 edition = "2021"
+default-run = "stateless-history-node"
 
 [[bin]]
 name = "ui-mock"
