@@ -527,16 +527,19 @@ impl BlockPeerBackoff {
 }
 
 /// Peer-driven scheduler state.
+///
+/// # Lock ordering (acquire in this order to prevent deadlocks):
+///   pending -> queued -> attempts -> escalation -> completed -> in_flight -> block_peer_backoff
 #[derive(Debug)]
 pub struct PeerWorkScheduler {
     config: SchedulerConfig,
     pending: Mutex<BinaryHeap<Reverse<u64>>>,
     queued: Mutex<HashSet<u64>>,
-    in_flight: Mutex<HashSet<u64>>,
-    completed: Mutex<HashSet<u64>>,
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
     escalation: Mutex<EscalationState>,
+    completed: Mutex<HashSet<u64>>,
+    in_flight: Mutex<HashSet<u64>>,
     block_peer_backoff: Mutex<BlockPeerBackoff>,
 }
 
@@ -630,6 +633,34 @@ mod tests {
         scheduler.record_peer_failure(peer_id).await;
         assert!(scheduler.is_peer_cooling_down(peer_id).await);
     }
+
+    /// Regression test: concurrent mark_completed + requeue_failed must not deadlock.
+    #[tokio::test]
+    async fn no_deadlock_mark_completed_vs_requeue_failed() {
+        let config = SchedulerConfig::default();
+        let scheduler = Arc::new(scheduler_with_blocks(config, 0, 99));
+        let peer_id = PeerId::random();
+
+        // Move all blocks to in_flight
+        let batch = scheduler.next_batch_for_peer(peer_id, 200).await;
+        assert!(!batch.blocks.is_empty());
+
+        let even: Vec<u64> = batch.blocks.iter().copied().filter(|b| b % 2 == 0).collect();
+        let odd: Vec<u64> = batch.blocks.iter().copied().filter(|b| b % 2 != 0).collect();
+
+        let s1 = Arc::clone(&scheduler);
+        let s2 = Arc::clone(&scheduler);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let h1 = tokio::spawn(async move { s1.mark_completed(&even).await });
+            let h2 = tokio::spawn(async move { s2.requeue_failed(&odd).await });
+            h1.await.unwrap();
+            h2.await.unwrap();
+        })
+        .await;
+
+        assert!(result.is_ok(), "deadlock detected: concurrent mark_completed + requeue_failed timed out");
+    }
 }
 
 impl PeerWorkScheduler {
@@ -645,11 +676,11 @@ impl PeerWorkScheduler {
             config,
             pending: Mutex::new(pending),
             queued: Mutex::new(queued),
-            in_flight: Mutex::new(HashSet::new()),
-            completed: Mutex::new(HashSet::new()),
             attempts: Mutex::new(HashMap::new()),
             peer_health,
             escalation: Mutex::new(EscalationState::default()),
+            completed: Mutex::new(HashSet::new()),
+            in_flight: Mutex::new(HashSet::new()),
             block_peer_backoff: Mutex::new(BlockPeerBackoff::default()),
         }
     }
@@ -914,8 +945,8 @@ impl PeerWorkScheduler {
         let mut pending = self.pending.lock().await;
         let mut queued = self.queued.lock().await;
         let mut attempts = self.attempts.lock().await;
-        let mut in_flight = self.in_flight.lock().await;
         let mut escalation = self.escalation.lock().await;
+        let mut in_flight = self.in_flight.lock().await;
         let mut newly_escalated = Vec::new();
         let shard_size = self.config.shard_size;
 
