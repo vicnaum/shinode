@@ -27,33 +27,36 @@ const FOLLOW_STALENESS_THRESHOLD_MS: u64 = 30_000;
 // Splash screen constants
 // ============================================================================
 
-const SPLASH_ART: &str = r#" ██████\\████████  ██████\\████████ ████████ ██     | ████████  ██████\  ██████\
-██___\██  | ██  | ██__| ██  | ██  | ██__   | ██     | ██__   | ██___\██ ██___\██
-██    \   | ██  | ██    ██  | ██  | ██  \  | ██     | ██  \   \██    \ \██    \
-\██████\  | ██  | ████████  | ██  | █████  | ██     | █████   _\██████\_\██████\
- \__| ██  | ██  | ██  | ██  | ██  | ██_____| ██_____| ██_____|  \__| ██  \__| ██
-██    ██  | ██  | ██  | ██  | ██  | ██     \ ██     \ ██     \\██    ██\██    ██
-\██████    \██   \██   \██   \██   \████████\████████\████████ \██████  \██████
-        |  \  |  \      \/      \|        \/      \|       \|  \    /  \
-        | ██  | ██\██████  ██████\\████████  ██████\ ███████\\██\  /  ██
-        | ██__| ██ | ██ | ██___\██  | ██  | ██  | ██ ██__| ██ \██\/  ██
-        | ██    ██ | ██  \██    \   | ██  | ██  | ██ ██    ██  \██  ██
-        | ████████ | ██  _\██████\  | ██  | ██  | ██ ███████\   \████
-        | ██  | ██_| ██_|  \__| ██  | ██  | ██__/ ██ ██  | ██   | ██
-        | ██  | ██   ██ \\██    ██  | ██   \██    ██ ██  | ██   | ██
-         \██   \██\██████ \██████    \██    \██████ \██   \██    \██
-                      |  \  |  \/      \|       \|        \
-                     | ██\ | ██  ██████\ ███████\ ████████
-                     | ███\| ██ ██  | ██ ██  | ██ ██__
-                     | ████\ ██ ██  | ██ ██  | ██ ██  \
-                     | ██\██ ██ ██  | ██ ██  | ██ █████
-                     | ██ \████ ██__/ ██ ██__/ ██ ██_____
-                     | ██  \███\██    ██ ██    ██ ██     \
-                      \██   \██ \██████ \███████ \████████"#;
+const SPLASH_LOGO: &str = r#"   ▄████████    ▄█    █▄     ▄█  ███▄▄▄▄    ▄██████▄  ████████▄     ▄████████
+  ███    ███   ███    ███   ███  ███▀▀▀██▄ ███    ███ ███   ▀███   ███    ███
+  ███    █▀    ███    ███   ███▌ ███   ███ ███    ███ ███    ███   ███    █▀
+  ███         ▄███▄▄▄▄███▄▄ ███▌ ███   ███ ███    ███ ███    ███  ▄███▄▄▄
+▀███████████ ▀▀███▀▀▀▀███▀  ███▌ ███   ███ ███    ███ ███    ███ ▀▀███▀▀▀
+         ███   ███    ███   ███  ███   ███ ███    ███ ███    ███   ███    █▄
+   ▄█    ███   ███    ███   ███  ███   ███ ███    ███ ███   ▄███   ███    ███
+ ▄████████▀    ███    █▀    █▀    ▀█   █▀   ▀██████▀  ████████▀    ██████████"#;
+
+// Japanese mountain silhouette (right side, rendered first so grass can overlay)
+const SPLASH_JAPANESE: [&str; 4] = [
+    "                                                                \u{259D}\u{2584}     \u{2596} \u{2584}\u{2584}\u{259E}\u{259D}",
+    "                                                               \u{259D}\u{2584}  \u{2596}  \u{2597}\u{2598}\u{2584}\u{2584}\u{2584}\u{2584}\u{2596}",
+    "                                                                 \u{2584}\u{259E} \u{2597}\u{259E}\u{2598}   \u{2590}",
+    "                                                               \u{2580}\u{2580}  \u{2580}\u{2598}    \u{2584}\u{2598}",
+];
+
+// Grass + title (left/center side, rendered on top of japanese)
+const SPLASH_GRASS: [&str; 5] = [
+    r"       \/|\/               STATELESS HISTORY NODE",
+    r"       \\|//",
+    r"        \|/",
+    r"        \|/   |",
+    r"     |   |   \|/",
+];
 
 const CREDIT: &str = "2026 by @vicnaum";
+const VERSION: &str = "v0.3";
 const ART_WIDTH: u16 = 80;
-const ART_HEIGHT: u16 = 23;
+const DOS_HEIGHT: u16 = 25;
 
 use crossterm::{
     cursor::Show,
@@ -877,97 +880,124 @@ fn render_splash(frame: &mut Frame, data: &TuiState) {
     let dos_blue = Color::Rgb(0, 0, 170);
     let dos_gold = Color::Rgb(255, 255, 85);
 
-    // Fill entire screen with DOS blue
-    let bg = Block::default().style(Style::default().bg(dos_blue));
-    frame.render_widget(bg, area);
+    // Fill entire terminal with black, then overlay the DOS window
+    frame.render_widget(Clear, area);
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            frame.buffer_mut()[(x, y)].set_bg(Color::Black);
+        }
+    }
+
+    // Center the 80x25 DOS window on screen
+    let dos_x = area.x + area.width.saturating_sub(ART_WIDTH) / 2;
+    let dos_y = area.y + area.height.saturating_sub(DOS_HEIGHT) / 2;
 
     let buf = frame.buffer_mut();
-    let art_style = Style::default().fg(dos_gold).bg(dos_blue);
 
-    let lines: Vec<&str> = SPLASH_ART.lines().collect();
-
-    // Center the logo (art + 1 credit line = 24 lines total)
-    let total_height = ART_HEIGHT + 1;
-    let start_y = area.y + area.height.saturating_sub(total_height) / 2;
-    let start_x = area.x + area.width.saturating_sub(ART_WIDTH) / 2;
-
-    // Build status message with animated dots
-    let base_status = data.startup_status.trim_end_matches('.');
-    let max_dots: usize = 3;
-    let dot_count = (data.animation_frame / 5) % (max_dots as u64 + 1);
-    let dots = ".".repeat(dot_count as usize);
-    let padding = " ".repeat(max_dots - dot_count as usize);
-    let status_msg = format!("{}{}{}", base_status, dots, padding);
-    let status_style = Style::default().fg(Color::LightCyan).bg(dos_blue);
-
-    // Two modes: framed (big terminal) vs unframed (small terminal)
-    let framed = area.width >= ART_WIDTH + 4 && area.height >= total_height + 4;
-    let framed_with_status = framed && area.height >= total_height + 4 + 5;
-
-    let (art_x, art_y, frame_bottom_y) = if framed {
-        let frame_w = ART_WIDTH + 4;
-        let frame_h = total_height + 4;
-        let frame_x = area.x + area.width.saturating_sub(frame_w) / 2;
-        let frame_y = area.y + area.height.saturating_sub(frame_h) / 2;
-
-        let frame_style = Style::default().fg(dos_gold).bg(dos_blue);
-
-        // Draw double-line border
-        let horiz: String = "═".repeat(frame_w as usize - 2);
-        buf.set_string(frame_x, frame_y, format!("╔{}╗", horiz), frame_style);
-        buf.set_string(frame_x, frame_y + frame_h - 1, format!("╚{}╝", horiz), frame_style);
-        for row in 1..frame_h - 1 {
-            buf.set_string(frame_x, frame_y + row, "║", frame_style);
-            buf.set_string(frame_x + frame_w - 1, frame_y + row, "║", frame_style);
+    // Fill DOS window area with blue
+    for row in 0..DOS_HEIGHT.min(area.height) {
+        let y = dos_y + row;
+        if y >= area.y + area.height {
+            break;
         }
+        for col in 0..ART_WIDTH.min(area.width) {
+            let x = dos_x + col;
+            if x >= area.x + area.width {
+                break;
+            }
+            buf[(x, y)].set_bg(dos_blue);
+        }
+    }
 
-        (frame_x + 2, frame_y + 2, frame_y + frame_h - 1)
-    } else {
-        (start_x, start_y, 0)
-    };
+    let art_style = Style::default().fg(dos_gold).bg(dos_blue);
+    let frame_style = Style::default().fg(dos_gold).bg(dos_blue);
 
-    // Draw art lines
-    for (i, line) in lines.iter().enumerate() {
+    // Draw double-line border at the DOS window edges
+    let horiz: String = "═".repeat(ART_WIDTH as usize - 2);
+    buf.set_string(dos_x, dos_y, format!("╔{}╗", horiz), frame_style);
+    buf.set_string(
+        dos_x,
+        dos_y + DOS_HEIGHT - 1,
+        format!("╚{}╝", horiz),
+        frame_style,
+    );
+    for row in 1..DOS_HEIGHT - 1 {
+        let y = dos_y + row;
+        if y < area.y + area.height {
+            buf.set_string(dos_x, y, "║", frame_style);
+            buf.set_string(dos_x + ART_WIDTH - 1, y, "║", frame_style);
+        }
+    }
+
+    let art_x = dos_x + 1;
+    let art_y = dos_y + 1;
+
+    // Draw logo (8 lines)
+    for (i, line) in SPLASH_LOGO.lines().enumerate() {
         let y = art_y + i as u16;
+        if y < area.y + area.height {
+            buf.set_string(art_x, y, line, art_style);
+        }
+    }
+
+    // Japanese mountain silhouette — 1 line gap below logo, stays fixed
+    let japanese_y = art_y + 8 + 1;
+    for (i, line) in SPLASH_JAPANESE.iter().enumerate() {
+        let y = japanese_y + i as u16;
         if y < area.y + area.height {
             buf.set_string(art_x, y, *line, art_style);
         }
     }
 
-    // Version — gold, right-aligned on the last art line
-    let last_art_y = art_y + ART_HEIGHT - 1;
-    if last_art_y < area.y + area.height {
-        let version = "v0.3";
-        let version_x = art_x + ART_WIDTH - version.len() as u16;
-        buf.set_string(version_x, last_art_y, version, art_style);
+    // Grass + title — 3 lines below japanese start (overlaps rows, left side only)
+    let grass_y = japanese_y + 3;
+    for (i, line) in SPLASH_GRASS.iter().enumerate() {
+        let y = grass_y + i as u16;
+        if y < area.y + area.height {
+            buf.set_string(art_x, y, *line, art_style);
+        }
     }
 
-    // Credit line — white, right-aligned on the line after the art
-    let credit_y = art_y + ART_HEIGHT;
+    // Grass-integrated separator right after grass
+    let sep_y = grass_y + SPLASH_GRASS.len() as u16;
+    if sep_y < area.y + area.height {
+        let fill = "─".repeat(ART_WIDTH as usize - 2 - 16);
+        let separator = format!("║────\\|/──|───\\|/{}║", fill);
+        buf.set_string(dos_x, sep_y, &separator, frame_style);
+    }
+
+    // Status message with animated dots — cyan, centered below separator
+    let base_status = data.startup_status.trim_end_matches('.');
+    let max_dots: usize = 3;
+    let dot_count = (data.animation_frame / 5) % (max_dots as u64 + 1);
+    let dots = ".".repeat(dot_count as usize);
+    let pad = " ".repeat(max_dots - dot_count as usize);
+    let status_msg = format!("{}{}{}", base_status, dots, pad);
+    let status_style = Style::default().fg(Color::LightCyan).bg(dos_blue);
+
+    let status_y = sep_y + 3; // 2 blank lines below separator
+    if status_y < area.y + area.height {
+        let status_x = dos_x + (ART_WIDTH.saturating_sub(status_msg.len() as u16)) / 2;
+        buf.set_string(status_x, status_y, &status_msg, status_style);
+    }
+
+    // Version — gold, right-aligned
+    let ver_y = dos_y + DOS_HEIGHT - 3;
+    if ver_y < area.y + area.height {
+        let ver_x = dos_x + ART_WIDTH - 1 - VERSION.len() as u16 - 1;
+        buf.set_string(ver_x, ver_y, VERSION, art_style);
+    }
+
+    // Credit — white, right-aligned
+    let credit_y = dos_y + DOS_HEIGHT - 2;
     if credit_y < area.y + area.height {
-        let credit_x = art_x + ART_WIDTH - CREDIT.len() as u16;
+        let credit_x = dos_x + ART_WIDTH - 1 - CREDIT.len() as u16 - 1;
         buf.set_string(
             credit_x,
             credit_y,
             CREDIT,
             Style::default().fg(Color::White).bg(dos_blue),
         );
-    }
-
-    // Status message placement depends on mode
-    if framed_with_status {
-        // Big screen: centered below the frame, with 1 line padding
-        let status_x = area.x + area.width.saturating_sub(status_msg.len() as u16) / 2;
-        let status_y = frame_bottom_y + 2;
-        if status_y < area.y + area.height {
-            buf.set_string(status_x, status_y, &status_msg, status_style);
-        }
-    } else {
-        // Small screen: left-aligned on the credit line
-        let status_y = credit_y;
-        if status_y < area.y + area.height {
-            buf.set_string(art_x, status_y, &status_msg, status_style);
-        }
     }
 }
 
