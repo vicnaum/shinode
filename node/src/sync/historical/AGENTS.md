@@ -56,6 +56,7 @@ benchmark stats/event logging.
   - When `TailIngestConfig` is provided, enqueues appended ranges via `PeerWorkScheduler::enqueue_range()` and updates progress totals; head offset controls safe-head vs head tracking.
   - Peer feeder rotates peer list for fairness using atomic `PEER_FEEDER_CURSOR`.
   - Detects stalls (30s with no progress) and logs detailed peer health dump.
+  - Per-shard compaction tracker (`remaining_per_shard`) only built when `defer_compaction` is false; when deferred, inline compaction is skipped entirely.
 - **Knobs / invariants**:
   - Concurrency is bounded by `fast_sync_max_inflight`.
   - In follow mode, retries are unbounded to tolerate propagation lag near the tip.
@@ -63,7 +64,7 @@ benchmark stats/event logging.
   - In follow mode, "missing blocks" responses (including empty batches) are treated as partials to avoid banning peers for near-tip propagation lag.
   - Tail ingestion (when enabled) tracks `head_seen_rx` and stops scheduling once the safe head is caught up.
   - **Stale-peer handling**: Peers cooling down are recycled with a 500ms delay. Peers >10k blocks behind are dropped entirely. Peer `head_number` is refreshed from the pool at all receive sites.
-  - **Per-shard compaction**: `remaining_per_shard` tracker ensures shards compact as soon as all their blocks are written; compactions gated by `Semaphore(1)`.
+  - **Per-shard compaction**: `remaining_per_shard` tracker ensures shards compact as soon as all their blocks are written; compactions gated by `Semaphore(1)`. Skipped when `defer_compaction` is set (shards compacted later via finalize or `db compact` subcommand).
 
 ### `fetch_task.rs`
 - **Role**: Encapsulates fetch task execution for a single batch of blocks from a peer. Handles timeouts, success/failure outcomes, stats recording, and requeueing. Tracks active task count via `ActiveFetchTaskGuard`.
@@ -75,8 +76,9 @@ benchmark stats/event logging.
 - **Role**: Maintains the global work queue, priority escalation queue, and per-peer health/quality model so scheduling adapts to real-world peer behavior. Escalation queue uses shard-aware prioritization.
 - **Key items**: `SchedulerConfig`, `PeerWorkScheduler::next_batch_for_peer()`, `PeerWorkScheduler::enqueue_range()`, `PeerHealthTracker::record_success()`, `PeerHealthTracker::record_partial()`, `PeerHealthTracker::record_failure()`, `PeerHealthConfig` (pub), `PeerQuality` (pub), `PeerHealthDump` (pub), `EscalationState`, `completed_count()`, `escalation_len()`, `quality()`, `snapshot()`
 - **Interactions**: Called from `mod.rs` and `fetch_task.rs` for batch assignment, requeue, and peer health updates; consulted for "best peer" selection via quality scores.
-- **Escalation queue**: Blocks that fail N attempts (default: 5) are promoted to a priority escalation queue checked FIRST. Uses shard-aware prioritization (shards with fewer missing blocks get priority for faster compaction) and per-block per-peer cooldown tracking (30s `ESCALATION_PEER_COOLDOWN`). Blocks retry indefinitely until fetched.
-- **Knobs / invariants**: AIMD batch limit clamps between `aimd_min_batch` (1) and `aimd_max_batch`; partial responses trigger 0.7x reduction, failures 0.5x; bans trigger after `peer_failure_threshold`; `ESCALATION_THRESHOLD` (default: 5) controls promotion; `ESCALATION_PEER_COOLDOWN` (30s) prevents hammering same peer.
+- **Lock ordering** (documented in source, prevents deadlocks): `pending -> queued -> attempts -> escalation -> completed -> in_flight -> block_peer_backoff`. All lock acquisitions across PeerWorkScheduler must follow this order.
+- **Escalation queue**: Blocks that fail N attempts (default: 5) are promoted to a priority escalation queue checked FIRST. Uses shard-aware prioritization (shards with fewer missing blocks get priority for faster compaction) and per-peer-per-block exponential backoff tracking (`BACKOFF_INITIAL` = 500ms, `BACKOFF_MAX` = 128s). Blocks retry indefinitely until fetched.
+- **Knobs / invariants**: AIMD batch limit clamps between `aimd_min_batch` (1) and `aimd_max_batch`; increase by 1 every 5 successes; partial responses trigger 0.7x reduction, failures 0.5x; bans trigger after `peer_failure_threshold`; `ESCALATION_THRESHOLD` (default: 5) controls promotion; per-peer-per-block backoff prevents hammering same peer on same block.
 
 ### `fetch.rs`
 - **Role**: Wraps P2P requests into stage-friendly outcomes for ingest mode.
@@ -93,8 +95,8 @@ benchmark stats/event logging.
 ### `db_writer.rs`
 - **Role**: Applies `BlockBundle` writes to storage and manages compaction/sealing so reads work after ingest completes. Supports both fast-sync (WAL-based batched) and follow-mode (reorder buffer) writes.
 - **Key items**: `run_db_writer()`, `DbWriterParams`, `FlushContext`, `flush_fast_sync_buffer()`, `finalize_fast_sync()`, `DbWriteMode::{FastSync, Follow}`, `DbWriterMessage::{Block, Finalize}`, `DbWriterFinalizeStats`, `DbWriteConfig`, `ShardRemainingTracker`, `db_bytes_for_bundles()`
-- **Interactions**: Calls `Storage::write_block_bundles_wal()` (fast sync) or `Storage::write_block_bundle_follow()` (follow). Follow writes gated by `BTreeMap<u64, BlockBundle>` reorder buffer. Returns finalize timing stats. Spawns per-shard compaction tasks as shards complete.
-- **Knobs / invariants**: Compaction serialized with `Semaphore(1)`; finalize has two sub-phases (Compacting, Sealing) with separate progress counters; WAL writes accumulate `total_logs` in storage.
+- **Interactions**: Calls `Storage::write_block_bundles_wal()` (fast sync) or `Storage::write_block_bundle_follow()` (follow). Follow writes gated by `BTreeMap<u64, BlockBundle>` reorder buffer. Returns finalize timing stats. Spawns per-shard compaction tasks as shards complete (skipped when `defer_compaction` is set).
+- **Knobs / invariants**: Compaction serialized with `Semaphore(1)`; inline compaction skipped when `defer_compaction` is set (shards compacted at finalize or via `db compact` subcommand). Finalize has two sub-phases (Compacting, Sealing) with separate progress counters; WAL writes accumulate `total_logs` in storage. Gauge tick every 10s refreshes TUI shard counts (covers deferred-compaction mode where inline compaction never fires).
 
 ### `follow.rs`
 - **Role**: Runs an infinite loop to keep the store close to the network head, including reorg detection and bounded rollback.
@@ -112,6 +114,7 @@ benchmark stats/event logging.
 - **Role**: Aggregates ingest performance metrics and writes JSON summaries and JSONL event streams.
 - **Key items**: `IngestBenchStats`, `IngestBenchSummary`, `SummaryInput`, `BenchEvent`, `BenchEventLogger`, `ProcessTiming`, `RangeSummary`, `PeerSummary`, `FetchByteTotals`, `DbWriteByteTotals`
 - **Interactions**: Updated by fetch/process/db stages; `BenchEventLogger` is used by `mod.rs` and `main.rs` to emit structured time-series events. Uses `metrics::{rate_per_sec, percentile_triplet}` for calculations. Uses `parking_lot::Mutex` for performance.
+- **Event filtering**: `BenchEvent::is_high_volume()` identifies high-frequency events (ProcessStart/End, FetchStart/End, BatchAssigned) that are filtered out by default. The `verbose` field on `BenchEventLogger` controls whether these events are recorded; enabled via `--log-events-verbose` CLI flag.
 - **Knobs / invariants**: Sample vectors are capped (`SAMPLE_LIMIT` = 100k) to bound memory use during long runs; totals can grow when tail ranges are appended; gauge samples recorded every 10 seconds by scheduler and DB writer tasks.
 
 ### `types.rs`
@@ -128,5 +131,5 @@ benchmark stats/event logging.
 - Fetch loop: pick the best available peer (quality score), assign a consecutive batch, and fetch payloads with a hard timeout.
 - On success: send payloads to processing workers, mark blocks completed, record coverage/last-block-time, and update peer success.
 - Processing workers: `process_ingest()` builds `BlockBundle`s with tx hashes via zero-copy KeccakBuf and sends them to the DB writer channel.
-- DB writer: buffer + `write_block_bundles_wal()` (fast sync) or BTreeMap reorder buffer (follow), trigger per-shard compaction when complete, compact dirty shards and seal completed shards in finalize.
+- DB writer: buffer + `write_block_bundles_wal()` (fast sync) or BTreeMap reorder buffer (follow), trigger per-shard compaction when complete (unless `defer_compaction`), compact dirty shards and seal completed shards in finalize.
 - Follow mode: periodically observe head, preflight reorgs, rollback to common ancestor when needed, and re-run ingest for missing blocks near the tip.

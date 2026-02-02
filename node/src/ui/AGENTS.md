@@ -6,18 +6,51 @@ Terminal UI module providing two rendering modes:
 2. **TUI dashboard** (via ratatui) - Full-featured interactive dashboard with sync statistics,
    real-time speed chart, coverage map, and multiple information panels
 
-## Contents (one hop)
-### Files
-- `mod.rs` - Main module exposing TUI mode detection, status bars, and db stats output.
-  - **Key items**: `set_tui_mode()`, `is_tui_mode()`, `print_status_bar()`, `clear_status_bar()`, `print_db_stats()`, `human_bytes()`
-- `state.rs` - Legacy UI state enum for progress bar-based rendering.
-  - **Key items**: `UIState` (Startup, Syncing, Compacting, Sealing, Following)
-- `bars.rs` - Progress bar creation helpers and color definitions.
-  - **Key items**: `colors`, `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `format_colored_segment()`
-- `progress.rs` - Progress bar controller and background updater tasks.
-  - **Key items**: `UIController`, `spawn_progress_updater()`, `spawn_tui_progress_updater()`
-- `tui.rs` - Ratatui-based fullscreen TUI dashboard with comprehensive rendering system.
-  - **Key items**: `TuiState`, `TuiController`, `Phase`, `LogEntry`, `LogLevel`, rendering functions
+Phase-aware layouts adapt to sync/compact/seal/follow stages.
+
+## Files (detailed)
+
+### `mod.rs` (~127 lines)
+- **Role**: Module root, status bar utilities, DB stats output, TUI mode global flag.
+- **Key items**: `TUI_MODE_ACTIVE` (global `AtomicBool`), `set_tui_mode()`, `is_tui_mode()`, `print_status_bar()`, `clear_status_bar()`, `print_db_stats()`, `human_bytes()`
+- **Interactions**: Status bar functions no-op when TUI mode is active. `print_db_stats` formats `StorageDiskStats` as table or JSON.
+
+### `state.rs` (~47 lines)
+- **Role**: High-level UI state enum for phase tracking.
+- **Key items**: `UIState` (Startup, Syncing, Compacting, Sealing, Following), `from_sync_snapshot`
+- **Interactions**: Maps `SyncStatus` + `FinalizePhase` to `UIState`. Used by `UIController` and TUI for phase transitions.
+
+### `bars.rs` (~117 lines)
+- **Role**: indicatif progress bar factory functions and ANSI color formatting.
+- **Key items**: `create_sync_bar()`, `create_compacting_bar()`, `create_sealing_bar()`, `create_follow_bar()`, `create_failed_bar()`, `format_colored_segment()`, `format_follow_segment()`, `format_startup_segment()`
+- **Interactions**: Used by `UIController` to create bars for each phase.
+- **Knobs / invariants**: `BAR_WIDTH = 40`, themed colors per phase (cyan/magenta/green/red), 2-10 Hz refresh rates
+
+### `progress.rs` (~617 lines)
+- **Role**: Legacy progress bar controller and updater tasks.
+- **Key items**: `UIController`, `spawn_progress_updater()`, `spawn_tui_progress_updater()`, `format_progress_message()`
+- **Interactions**: `UIController` is the state machine for indicatif mode. `spawn_tui_progress_updater` drives TUI mode at 100ms ticks: updates state, polls keyboard, drains logs, handles quit with graceful shutdown (3s timeout, flush log writers).
+- **Knobs / invariants**:
+  - Update interval: 100ms
+  - Peer update interval: 500ms
+  - Speed window: 1s (current), 30s (avg)
+  - Quit timeout: 3s
+
+### `tui.rs` (~2407 lines, largest file in project)
+- **Role**: Ratatui fullscreen dashboard with comprehensive rendering system.
+- **Key items**:
+  - **State**: `Phase` (Startup/Sync/Retry/Compact/Seal/Follow with ordering), `TuiState`, `TuiController`, `LogEntry`, `LogLevel`
+  - **Rendering**: `render_ui`, `render_sync_ui`, `render_compact_ui`, `render_follow_ui`, `render_startup_ui`
+  - **Components**: `render_phase_indicator`, `render_blocks_map` (braille coverage), `render_shards_map` (block chars), `render_speed_chart` (gradient braille line graph), `render_network_panel` (peer dots), `render_synced_status` (big ASCII numbers + sparkle animation), `render_logs_panel`
+  - **Splash**: DOS-style blue/gold ASCII art with animated status dots
+- **Interactions**: `TuiController` manages alternate screen + raw mode. Consumes `TuiLogBuffer` for log panel. Phase enum ordering prevents backwards transitions.
+- **Knobs / invariants**:
+  - Speed history: 60 samples (1 minute)
+  - Avg speed window: 30 seconds (300 entries at 100ms)
+  - Log capacity: 100 entries
+  - Follow staleness threshold: 30s
+  - Chart height scales: 50/200/500/2000/5000+
+  - Braille: 4 vertical dots per character cell
 
 ## Key APIs (no snippets)
 - **Types**: `UIState`, `UIController`, `TuiState`, `TuiController`, `Phase`, `LogEntry`, `LogLevel`
@@ -98,6 +131,22 @@ Manages terminal I/O and rendering loop:
 | Recovery | Red | `[====..] 40% 4/10 \| Recovering failed blocks` |
 
 ## Relationships
-- **Used by**: `node/src/run/startup.rs` creates TUI early for splash; `node/src/run/sync_runner.rs` creates UI controller.
-- **Depends on**: `sync::SyncStatus`, `sync::SyncProgressStats`, `sync::SyncProgressSnapshot`, `logging::TuiLogBuffer` for log capture.
-- **Integrates with**: `indicatif::MultiProgress` (legacy mode), `ratatui` + `crossterm` (TUI mode).
+
+- **Depends on**: `sync::{SyncProgressStats, SyncProgressSnapshot, SyncStatus, FinalizePhase, CoverageTracker}`, `storage::StorageDiskStats`, `p2p::PeerPool`, `sync::historical::PeerHealthTracker`, `logging::{TuiLogBuffer, JsonLogWriter}`
+- **Used by**: `run/startup.rs` (initializes controllers, creates TUI early for splash), `run/sync_runner.rs` (spawns updater tasks)
+- **Integrates with**: `indicatif::MultiProgress` (legacy mode), `ratatui` + `crossterm` (TUI mode)
+- **Data/control flow**:
+  1. `SyncProgressStats` polled every 100ms for snapshot
+  2. Snapshot drives phase transitions and metric updates
+  3. TUI mode: renders to alternate screen via ratatui; drains `TuiLogBuffer` for log panel
+  4. Legacy mode: updates indicatif progress bars with phase-specific templates
+  5. Quit ('q'): signals shutdown, waits for completion, flushes log writers, restores terminal
+
+## End-to-end flow (high level)
+
+1. `run/startup.rs` determines TTY status and creates `TuiController` or `UIController`
+2. Spawns corresponding updater task (TUI or progress bar) at 100ms tick rate
+3. Updater polls `SyncProgressStats::snapshot()`, calculates speed, updates peer counts
+4. Phase transitions: Startup -> Sync -> Compact -> Seal -> Follow (no backwards)
+5. TUI renders phase-specific layout with appropriate panels (speed chart during sync, compaction panel during compact, big numbers during follow)
+6. On quit: send shutdown signal, wait for completion or 3s timeout, flush logs, restore terminal
