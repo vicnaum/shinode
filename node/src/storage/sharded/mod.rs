@@ -421,8 +421,18 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
-    #[expect(clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
+    /// Open storage without progress reporting.
     pub fn open(config: &NodeConfig) -> Result<Self> {
+        Self::open_with_progress(config, |_, _| {})
+    }
+
+    /// Open storage with a progress callback.
+    /// The callback receives (current_shard, total_shards) during shard scanning.
+    #[expect(clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
+    pub fn open_with_progress<F>(config: &NodeConfig, on_progress: F) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
         let peer_cache_dir = config
             .peer_cache_dir
@@ -460,17 +470,20 @@ impl Storage {
         let shards_root = shards_dir(&config.data_dir);
         fs::create_dir_all(&shards_root).wrap_err("failed to create shards dir")?;
 
+        // Pre-scan to collect shard directories and get total count for progress
+        let shard_entries: Vec<_> = fs::read_dir(&shards_root)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.metadata().ok().map_or(false, |m| m.is_dir()))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.parse::<u64>().ok().map(|start| (start, e.path()))
+            })
+            .collect();
+        let total_shards = shard_entries.len();
+
         let mut shards: HashMap<u64, Arc<Mutex<ShardState>>> = HashMap::new();
-        for entry in fs::read_dir(&shards_root)? {
-            let entry = entry?;
-            if !entry.metadata()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(shard_start) = name.parse::<u64>() else {
-                continue;
-            };
-            let shard_dir = entry.path();
+        for (idx, (shard_start, shard_dir)) in shard_entries.into_iter().enumerate() {
+            on_progress(idx, total_shards);
 
             // Load shard metadata
             let mut shard_meta = load_shard_meta(&shard_dir)?;
@@ -517,6 +530,7 @@ impl Storage {
             }
             shards.insert(shard_start, Arc::new(Mutex::new(state)));
         }
+        on_progress(total_shards, total_shards); // Signal completion
         persist_meta(&meta_path, &meta)?;
 
         let peer_cache = load_peer_cache(&peer_cache_dir)?;

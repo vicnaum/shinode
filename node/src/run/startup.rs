@@ -186,9 +186,27 @@ pub async fn init_storage(
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
 ) -> Result<Arc<Storage>> {
-    ui::print_status_bar("Opening storage...");
-    update_tui_startup(tui, "Opening storage...", log_buffer.as_ref());
-    let storage = Arc::new(Storage::open(config)?);
+    ui::print_status_bar("Opening storage");
+    update_tui_startup(tui, "Opening storage", log_buffer.as_ref());
+
+    // Clone Arcs for the progress callback (Storage::open is sync/blocking)
+    let tui_clone = tui.cloned();
+    let log_buffer_clone = log_buffer.clone();
+    let last_update = std::cell::Cell::new(std::time::Instant::now());
+    let storage = Arc::new(Storage::open_with_progress(config, move |current, total| {
+        if total == 0 {
+            return;
+        }
+        // Throttle updates by time (100ms) to avoid TUI overhead on fast storage,
+        // but always update on completion
+        let now = std::time::Instant::now();
+        if current == total || now.duration_since(last_update.get()).as_millis() >= 100 {
+            last_update.set(now);
+            let msg = format!("Opening storage ({}/{})", current, total);
+            ui::print_status_bar(&msg);
+            update_tui_startup(tui_clone.as_ref(), &msg, log_buffer_clone.as_ref());
+        }
+    })?);
 
     // Resume behavior: if the previous run exited before compaction finished, ensure we
     // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
