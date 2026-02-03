@@ -162,6 +162,8 @@ pub struct TuiState {
     pub best_head_seen: u64,
 
     // Config parameters (set once at startup)
+    /// Configured `--start-block` for this run (stable; not overwritten by snapshots).
+    pub config_start_block: u64,
     pub config_data_dir: String,
     pub config_shard_size: u64,
     pub config_rpc_bind: String,
@@ -262,6 +264,7 @@ impl TuiState {
             animation_frame: 0,
             startup_status: "Connecting to Ethereum P2P network...".to_string(),
             best_head_seen: 0,
+            config_start_block: start_block,
             config_data_dir: String::new(),
             config_shard_size: 0,
             config_rpc_bind: String::new(),
@@ -2288,6 +2291,98 @@ fn render_synced_status(area: Rect, buf: &mut Buffer, data: &TuiState) {
     buf.set_string(rx + 1, y, &format!("{}", s3), Style::default().fg(c3));
     buf.set_string(rx + 2, y, " ", Style::default());
     buf.set_string(rx + 3, y, &format!("{}", s2), Style::default().fg(c2));
+
+    // Calculate big number position (same formula as render_big_number)
+    let formatted_head = format_number(data.our_head);
+    let big_num_width = formatted_head.len() as u16 * 4;
+    let big_num_left_x = right.x + right.width.saturating_sub(big_num_width + 2);
+
+    // Start block label + range indicator (Follow mode only).
+    //
+    // Requirements:
+    // - "Start Block:" label in dim gray above the start block number (right-aligned).
+    // - Start block + dots + triangle on the SYNCED/CATCHING UP line, with the triangle ending
+    //   at the big number's left edge.
+    // - Dots clamped to 6-15 (excess space appears before the start block, keeping the arrow aligned).
+    let dim = Style::default().fg(Color::Rgb(100, 100, 100));
+    let start_style = Style::default().fg(Color::LightGreen);
+    let start_block_label = "Start Block:";
+    let formatted_start = format_number(data.config_start_block);
+    let start_len = formatted_start.len() as u16;
+
+    // Triangle sits left of the big number with a 1-space gap so it won't get overwritten.
+    let arrow_x = big_num_left_x.saturating_sub(2);
+    let range_y = left.y + 3;
+    let label_y = range_y.saturating_sub(1);
+    let gap_x = arrow_x.saturating_add(1);
+
+    // On smaller windows we shrink dots aggressively to keep the start number + label visible
+    // longer, but still keep a minimal visual "range" indicator.
+    const MIN_DOTS: u16 = 4;
+    const MAX_DOTS: u16 = 15;
+    // `render_synced_status` receives the inner rect (terminal width minus borders),
+    // so ~100 terminal columns is ~98 here.
+    const SHOW_LABEL_MIN_WIDTH: u16 = 98;
+
+    // Fit the range indicator into the horizontal space between:
+    // - the left status label (✓ SYNCED / CATCHING UP), and
+    // - the big number (our head).
+    //
+    // This lets the indicator use the "middle" space even on small windows.
+    let status_text = if data.is_synced() { "\u{2713} SYNCED" } else { "CATCHING UP" };
+    let status_x = left.x + 4;
+    let status_w = status_text.chars().count() as u16;
+    // Leave a 1-cell gap after the status text so it can "almost touch" before we hide it.
+    let min_start_x = status_x
+        .saturating_add(status_w)
+        .saturating_add(1);
+
+    // Compute how many dots would fit if we left-anchor at `min_start_x`.
+    let max_dots_possible = arrow_x.saturating_sub(
+        min_start_x
+            .saturating_add(start_len)
+            .saturating_add(1), // space between start block and dots
+    );
+
+    // If we can't fit at least MIN_DOTS without colliding with the status text, hide everything.
+    if max_dots_possible >= MIN_DOTS {
+        // Target dot count based on available width. This makes dots hit ~6 at ~100 columns
+        // and shrink down to 4 on tighter windows even if more could fit.
+        let desired_dots = (area.width.saturating_sub(68) / 5).clamp(MIN_DOTS, MAX_DOTS);
+        let dots_count = max_dots_possible.min(desired_dots).clamp(MIN_DOTS, MAX_DOTS);
+
+        // Right-align the whole "<start> <dots>▶" sequence to `arrow_x`.
+        let start_x = arrow_x.saturating_sub(
+            start_len
+                .saturating_add(1) // space
+                .saturating_add(dots_count),
+        );
+
+        // Hide the "Start Block:" label in cramped layouts to reduce clutter.
+        // Keep the number + dots + arrow until it would touch the status label.
+        let show_label = area.width >= SHOW_LABEL_MIN_WIDTH;
+        if show_label {
+            // "Start Block:" label above the start block number (right-aligned to the digits).
+            let label_x = start_x
+                .saturating_add(start_len)
+                .saturating_sub(start_block_label.len() as u16);
+            // Label sits directly above the small start block number.
+            buf.set_string(label_x, label_y, start_block_label, dim);
+        }
+
+        // Start block number (green)
+        buf.set_string(start_x, range_y, &formatted_start, start_style);
+        // Space after number (dim)
+        buf.set_string(start_x + start_len, range_y, " ", dim);
+
+        // Dots + arrow (dim)
+        let dots: String = std::iter::repeat('·').take(dots_count as usize).collect();
+        let dots_x = start_x + start_len + 1;
+        buf.set_string(dots_x, range_y, &dots, dim);
+        // Ensure a visible 1-cell gap between arrow and big number.
+        buf.set_string(gap_x, range_y, " ", dim);
+        buf.set_string(arrow_x, range_y, "▶", dim);
+    }
 
     if data.is_synced() {
         let synced_text = "\u{2713} SYNCED";
