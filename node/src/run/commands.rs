@@ -25,6 +25,12 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
     if let Some(dir) = &args.data_dir {
         config.data_dir = dir.clone();
     }
+
+    // Auto-detect shard size from existing storage
+    if let Some(stored_shard_size) = Storage::read_shard_size(&config.data_dir)? {
+        config.shard_size = stored_shard_size;
+    }
+
     let storage = Storage::open(&config)?;
 
     let pre = storage.aggregate_stats();

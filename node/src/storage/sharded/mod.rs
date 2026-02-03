@@ -425,6 +425,17 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
+    /// Read the shard size from an existing storage directory.
+    /// Returns `Ok(Some(shard_size))` if meta.json exists, `Ok(None)` if the storage is uninitialized.
+    pub fn read_shard_size(data_dir: &Path) -> Result<Option<u64>> {
+        let path = meta_path(data_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let meta = load_meta(&path)?;
+        Ok(Some(meta.shard_size))
+    }
+
     /// Open storage without progress reporting.
     pub fn open(config: &NodeConfig) -> Result<Self> {
         Self::open_with_progress(config, |_, _| {})
