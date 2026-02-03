@@ -192,8 +192,12 @@ pub async fn init_storage(
 
     // Resume behavior: if the previous run exited before compaction finished, ensure we
     // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
-    // across restarts.
-    let dirty_shards = storage.dirty_complete_shards()?;
+    // across restarts. Skip when --defer-compaction is set (user can run `db compact`).
+    let dirty_shards = if config.defer_compaction {
+        vec![]
+    } else {
+        storage.dirty_complete_shards()?
+    };
     if !dirty_shards.is_empty() {
         let shard_count = dirty_shards.len();
         let status_msg = format!("Compacting {shard_count} shards...");
