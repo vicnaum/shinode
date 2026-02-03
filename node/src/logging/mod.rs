@@ -12,7 +12,7 @@ mod resources;
 
 pub use json::{JsonLogFilter, JsonLogLayer, JsonLogWriter, TuiLogBuffer, TuiLogLayer, LOG_BUFFER};
 pub use report::{finalize_log_files, generate_run_report, run_timestamp_utc, RunContext};
-pub use resources::spawn_resource_logger;
+pub use resources::{spawn_resource_logger, ResourcesLogger};
 #[cfg(unix)]
 pub use resources::spawn_usr1_state_logger;
 
@@ -29,7 +29,6 @@ use tracing_subscriber::Layer;
 pub struct TracingGuards {
     pub chrome_guard: Option<tracing_chrome::FlushGuard>,
     pub log_writer: Option<Arc<JsonLogWriter>>,
-    pub resources_writer: Option<Arc<JsonLogWriter>>,
     /// Shared buffer for TUI log capture (only present when TUI mode is active).
     pub tui_log_buffer: Option<Arc<TuiLogBuffer>>,
 }
@@ -38,11 +37,13 @@ pub struct TracingGuards {
 ///
 /// When `tui_mode` is true, the stdout fmt_layer is suppressed to avoid
 /// corrupting the TUI display.
+///
+/// Note: Resource logging is handled separately by `ResourcesLogger` and
+/// `spawn_resource_logger`, not through the tracing system.
 pub fn init_tracing(
     config: &NodeConfig,
     chrome_trace_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
-    resources_path: Option<PathBuf>,
     tui_mode: bool,
 ) -> TracingGuards {
     // Default verbosity is now INFO level (previously required -v)
@@ -96,23 +97,6 @@ pub fn init_tracing(
         }
     });
 
-    // Resources log file writer (separate file for resource metrics).
-    let resources_writer =
-        resources_path.and_then(|path| match JsonLogWriter::new(&path, LOG_BUFFER) {
-            Ok(writer) => Some(Arc::new(writer)),
-            Err(err) => {
-                warn!(error = %err, "failed to initialize resources log writer");
-                None
-            }
-        });
-
-    // Determine JSON log filter mode: exclude resources if we have a separate resources file.
-    let json_filter_mode = if resources_writer.is_some() {
-        JsonLogFilter::ExcludeResources
-    } else {
-        JsonLogFilter::All
-    };
-
     let mut chrome_guard = None;
     if let Some(path) = chrome_trace_path {
         let trace_filter = EnvFilter::try_new(&config.log_trace_filter)
@@ -123,40 +107,29 @@ pub fn init_tracing(
             .include_locations(config.log_trace_include_locations)
             .build();
         let log_layer = log_writer.as_ref().map(|writer| {
-            JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode)
-                .with_filter(json_log_filter.clone())
-        });
-        let resources_layer = resources_writer.as_ref().map(|writer| {
-            JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly)
+            JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::All)
                 .with_filter(json_log_filter)
         });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(tui_layer)
-            .with(log_layer)
-            .with(resources_layer);
+            .with(log_layer);
         registry.with(chrome_layer.with_filter(trace_filter)).init();
         chrome_guard = Some(guard);
     } else {
         let log_layer = log_writer.as_ref().map(|writer| {
-            JsonLogLayer::with_filter(Arc::clone(writer), json_filter_mode)
-                .with_filter(json_log_filter.clone())
-        });
-        let resources_layer = resources_writer.as_ref().map(|writer| {
-            JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::ResourcesOnly)
+            JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::All)
                 .with_filter(json_log_filter)
         });
         let registry = tracing_subscriber::registry()
             .with(fmt_layer)
             .with(tui_layer)
-            .with(log_layer)
-            .with(resources_layer);
+            .with(log_layer);
         registry.init();
     }
     TracingGuards {
         chrome_guard,
         log_writer,
-        resources_writer,
         tui_log_buffer,
     }
 }

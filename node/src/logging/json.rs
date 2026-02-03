@@ -265,10 +265,6 @@ impl JsonLogWriter {
 pub enum JsonLogFilter {
     /// Accept all events.
     All,
-    /// Accept only events where message == "resources".
-    ResourcesOnly,
-    /// Accept all events except where message == "resources".
-    ExcludeResources,
 }
 
 /// A tracing layer that writes events as JSON to a file.
@@ -309,13 +305,9 @@ where
             None => None,
         };
 
-        // Apply filter based on message content
-        let is_resources = message.as_deref() == Some("resources");
+        // Apply filter (currently only All is used, but kept for future extensibility)
         match self.filter {
-            JsonLogFilter::ResourcesOnly if !is_resources => return,
-            JsonLogFilter::ExcludeResources if is_resources => return,
-            JsonLogFilter::All | JsonLogFilter::ResourcesOnly | JsonLogFilter::ExcludeResources => {
-            }
+            JsonLogFilter::All => {}
         }
 
         let record = LogRecord {

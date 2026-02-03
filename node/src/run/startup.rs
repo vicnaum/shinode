@@ -342,7 +342,6 @@ pub struct UiSetup {
 /// Log writers for TUI quit flushing.
 pub struct LogWriters {
     pub log_writer: Option<Arc<crate::logging::JsonLogWriter>>,
-    pub resources_writer: Option<Arc<crate::logging::JsonLogWriter>>,
 }
 
 /// Setup UI controller, progress bar, and event logger.
@@ -420,8 +419,7 @@ pub fn setup_ui(
             stats.set_start_block(start_block);
             stats.set_peers_active(0);
             stats.set_peers_total(pool.len() as u64);
-            let (log_writer, resources_writer) = log_writers
-                .map_or((None, None), |w| (w.log_writer, w.resources_writer));
+            let log_writer = log_writers.and_then(|w| w.log_writer);
             ui::spawn_tui_progress_updater(
                 Arc::clone(&tui_controller),
                 Arc::clone(stats),
@@ -432,7 +430,6 @@ pub fn setup_ui(
                 completion_rx,
                 tui_log_buffer,
                 log_writer,
-                resources_writer,
             );
         }
 

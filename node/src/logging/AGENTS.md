@@ -12,11 +12,10 @@ Integrates with `tracing`/`tracing-subscriber` for multi-layer log routing.
 ### `mod.rs`
 - **Role**: Public API and tracing subscriber initialization (~163 lines).
 - **Key items**: `TracingGuards`, `init_tracing`, `TuiLogBuffer`, `TuiLogLayer`
-- **Interactions**: Called by `run/sync_runner.rs` at startup. Returns `TracingGuards` that must be held until shutdown. Creates layered subscriber: fmt OR TUI layer (never both), JSON log layer, resources layer, optional Chrome trace layer.
+- **Interactions**: Called by `run/sync_runner.rs` at startup. Returns `TracingGuards` that must be held until shutdown. Creates layered subscriber: fmt OR TUI layer (never both), JSON log layer, optional Chrome trace layer. Resource logging is handled separately by `ResourcesLogger`.
 - **Knobs / invariants**:
   - Verbosity 0=INFO, 1=DEBUG, 2=TRACE, 3=verbose TRACE
   - TUI mode suppresses stdout (uses `TuiLogBuffer` instead)
-  - JSON and resources logs written to separate files via `JsonLogFilter`
 
 ### `json.rs`
 - **Role**: Async JSON log writer with deduplication, plus TUI log capture (~488 lines).
@@ -39,17 +38,18 @@ Integrates with `tracing`/`tracing-subscriber` for multi-layer log routing.
   - Atomic file renaming for crash safety
 
 ### `resources.rs`
-- **Role**: Platform-specific resource monitoring and SIGUSR1 handler (~628 lines).
-- **Key items**: `spawn_resource_logger`, `spawn_usr1_state_logger`, `ProcMemSample`, `CpuSample`, `DiskSample`, `read_proc_status_mem_kb`, `read_proc_cpu_sample`, `read_proc_disk_sample`
-- **Interactions**: Spawned by `run/sync_runner.rs`. Linux: parses `/proc/self/status`, `/proc/stat`, `/proc/diskstats`. Non-Linux: uses `sysinfo` crate. SIGUSR1 logs sync progress + top/worst 3 peers.
+- **Role**: Platform-specific resource monitoring and SIGUSR1 handler (~700 lines).
+- **Key items**: `ResourcesLogger`, `ResourcesSample`, `spawn_resource_logger`, `spawn_usr1_state_logger`, `ProcMemSample`, `CpuSample`, `DiskSample`, `read_proc_status_mem_kb`, `read_proc_cpu_sample`, `read_proc_disk_sample`
+- **Interactions**: `ResourcesLogger` created by `run/sync_runner.rs`, writes compact JSON directly to file (not via tracing). `spawn_resource_logger` samples every 1s. Linux: parses `/proc/self/status`, `/proc/stat`, `/proc/diskstats`. Non-Linux: uses `sysinfo` crate. SIGUSR1 logs sync progress + top/worst 3 peers.
 - **Knobs / invariants**:
   - Sampling interval: 1s
+  - Flush every 64 samples
   - Linux: zero-dependency proc parsing; non-Linux: sysinfo crate (no iowait, no RSS breakdown)
   - Disk device filtering: excludes loop, ram, dm-; supports nvme, sd, vd, xvd, md
 
 ## Key APIs (no snippets)
 
-- **Types**: `TracingGuards`, `JsonLogWriter`, `TuiLogBuffer`, `TuiLogLayer`, `TuiLogEntry`, `LogRecord`, `RunContext`, `RunReport`, `RunMeta`, `RunDerived`, `BuildInfo`, `EnvInfo`, `PeerHealthSummary`
+- **Types**: `TracingGuards`, `JsonLogWriter`, `TuiLogBuffer`, `TuiLogLayer`, `TuiLogEntry`, `LogRecord`, `ResourcesLogger`, `ResourcesSample`, `RunContext`, `RunReport`, `RunMeta`, `RunDerived`, `BuildInfo`, `EnvInfo`, `PeerHealthSummary`
 - **Functions**: `init_tracing()`, `generate_run_report()`, `finalize_log_files()`, `spawn_resource_logger()`, `spawn_usr1_state_logger()`, `hash_record()`, `format_tui_field_value()`
 
 ## Tracing Initialization
@@ -76,12 +76,14 @@ flush interval, and channel close.
 
 ## Resource Monitoring
 
+`ResourcesLogger` writes compact JSON samples directly to a JSONL file (not via the tracing system). This avoids
+the verbose tracing format overhead and produces clean, easily-parseable resource metrics.
+
 Platform-specific implementations:
 - **Linux**: Reads `/proc/self/status`, `/proc/stat`, `/proc/diskstats` for detailed memory breakdown (RSS, anon, file, shmem), CPU usage with iowait, and disk I/O rates.
 - **Non-Linux** (macOS, etc.): Uses `sysinfo` crate for cross-platform metrics with reduced granularity.
 
-Both emit `BenchEvent::ResourcesSample` events and `debug!("resources", ...)` log entries every second.
-Includes P2P network stats: reth connected peers, discovered count, genesis mismatches, sessions established/closed.
+Samples every 1 second. Includes sync status, queue/inflight counts, peer stats, and P2P network stats (reth connected peers, discovered count, genesis mismatches, sessions established/closed).
 
 ## SIGUSR1 Handler (Unix only)
 
@@ -98,18 +100,19 @@ Usage: `kill -USR1 <pid>`
 - **Used by**: `run/sync_runner.rs` (init + spawn), `run/cleanup.rs` (report + finalize), `ui/tui.rs` (reads `TuiLogBuffer`)
 - **Emits**: JSON log files (`.logs.jsonl`), resource logs (`.resources.jsonl`), run reports (`.json`), Chrome traces (`.trace.json`)
 - **Data/control flow**:
-  1. Tracing events flow through layers to multiple destinations (stdout/TUI, JSON file, resources file, Chrome trace)
-  2. Resource monitor emits `BenchEvent::ResourcesSample` every 1s
+  1. Tracing events flow through layers to multiple destinations (stdout/TUI, JSON file, Chrome trace)
+  2. `ResourcesLogger` writes compact JSON samples directly to file every 1s (not via tracing)
   3. SIGUSR1 handler dumps sync + peer state on demand
   4. Shutdown: generate report, flush writers, rename temp files to final names
 
 ## End-to-end flow (high level)
 
 1. `init_tracing()` creates layered subscriber with conditional layers based on config
-2. `spawn_resource_logger()` starts 1s sampling loop (CPU, memory, disk I/O)
-3. `spawn_usr1_state_logger()` registers Unix signal handler for debug dumps
-4. During runtime, all tracing events route through layers with filtering
-5. `JsonLogWriter` background thread batches and deduplicates log records
-6. `TuiLogBuffer` captures formatted entries for dashboard log panel
-7. On shutdown, `generate_run_report()` produces summary JSON with peer health
-8. `finalize_log_files()` flushes writers and renames temp files atomically
+2. `ResourcesLogger::new()` creates a dedicated logger for resource metrics
+3. `spawn_resource_logger()` starts 1s sampling loop that writes to `ResourcesLogger`
+4. `spawn_usr1_state_logger()` registers Unix signal handler for debug dumps
+5. During runtime, tracing events route through layers (stdout/TUI, JSON file, Chrome trace)
+6. `JsonLogWriter` background thread batches and deduplicates log records
+7. `TuiLogBuffer` captures formatted entries for dashboard log panel
+8. On shutdown, `generate_run_report()` produces summary JSON with peer health
+9. `finalize_log_files()` flushes all writers and renames temp files atomically

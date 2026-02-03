@@ -4,7 +4,7 @@
 #![expect(clippy::exit, reason = "SIGINT handler must terminate process")]
 
 use crate::cli::{compute_target_range, HeadSource, NodeConfig};
-use crate::logging::{init_tracing, spawn_resource_logger, TracingGuards};
+use crate::logging::{init_tracing, spawn_resource_logger, ResourcesLogger, TracingGuards};
 #[cfg(unix)]
 use crate::logging::spawn_usr1_state_logger;
 use crate::metrics::range_len;
@@ -89,11 +89,24 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         run_context
             .as_ref()
             .and_then(|ctx| ctx.logs_tmp_path.clone()),
-        run_context
-            .as_ref()
-            .and_then(|ctx| ctx.resources_tmp_path.clone()),
         use_tui,
     );
+
+    // Create resources logger if enabled (writes directly to file, not via tracing)
+    let resources_logger: Option<Arc<ResourcesLogger>> = if config.log_resources {
+        run_context
+            .as_ref()
+            .and_then(|ctx| ctx.resources_tmp_path.as_ref())
+            .and_then(|path| match ResourcesLogger::new(path) {
+                Ok(logger) => Some(Arc::new(logger)),
+                Err(err) => {
+                    warn!(error = %err, "failed to create resources logger");
+                    None
+                }
+            })
+    } else {
+        None
+    };
 
     // Main ingest path
     info!(
@@ -299,7 +312,6 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Setup UI (pass shutdown_tx for TUI quit handling, and early_tui to reuse)
     let log_writers = super::startup::LogWriters {
         log_writer: tracing_guards.log_writer.clone(),
-        resources_writer: tracing_guards.resources_writer.clone(),
     };
     // Stop background splash redraw ticker before main UI takes over
     if let Some(handle) = redraw_handle {
@@ -328,7 +340,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
 
     spawn_resource_logger(
         progress_stats.clone(),
-        events.clone(),
+        resources_logger.clone(),
         Some(session.handle.clone()),
         Some(Arc::clone(&session.p2p_stats)),
     );
@@ -455,6 +467,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
             FollowModeState {
                 follow_resources: &mut follow_resources,
                 run_context: run_context.as_ref(),
+                resources_logger: resources_logger.as_deref(),
                 tracing_guards: &mut tracing_guards,
             },
             &outcome,
@@ -489,6 +502,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
             storage: &storage,
             bench: &bench,
             events: events.as_deref(),
+            resources_logger: resources_logger.as_deref(),
             tracing_guards: &mut tracing_guards,
         },
         logs_total,
@@ -550,6 +564,7 @@ struct FollowModeTrackers<'a> {
 struct FollowModeState<'a> {
     follow_resources: &'a mut FollowModeResources,
     run_context: Option<&'a crate::logging::RunContext>,
+    resources_logger: Option<&'a ResourcesLogger>,
     tracing_guards: &'a mut TracingGuards,
 }
 
@@ -581,6 +596,7 @@ async fn run_follow_mode(
     let FollowModeState {
         follow_resources,
         run_context,
+        resources_logger,
         tracing_guards,
     } = state;
     info!("fast-sync complete; switching to follow mode");
@@ -716,7 +732,7 @@ async fn run_follow_mode(
                 base_name,
                 events.as_deref(),
                 tracing_guards.log_writer.as_deref(),
-                tracing_guards.resources_writer.as_deref(),
+                resources_logger,
                 &mut tracing_guards.chrome_guard,
             );
         }

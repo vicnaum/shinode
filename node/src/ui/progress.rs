@@ -407,8 +407,8 @@ pub fn spawn_progress_updater(
 /// If `completion_rx` is provided, the TUI will wait for sync completion
 /// (or timeout) before exiting after user presses 'q'.
 ///
-/// If `log_writer` or `resources_writer` is provided, they will be flushed
-/// before exiting to prevent log truncation.
+/// If `log_writer` is provided, it will be flushed before exiting to prevent
+/// log truncation.
 #[expect(clippy::too_many_arguments, reason = "TUI updater needs all sync state")]
 pub fn spawn_tui_progress_updater(
     tui: Arc<Mutex<TuiController>>,
@@ -420,7 +420,6 @@ pub fn spawn_tui_progress_updater(
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     log_buffer: Option<Arc<crate::logging::TuiLogBuffer>>,
     log_writer: Option<Arc<crate::logging::JsonLogWriter>>,
-    resources_writer: Option<Arc<crate::logging::JsonLogWriter>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -550,12 +549,9 @@ pub fn spawn_tui_progress_updater(
                     // Timeout or completion - either way, force exit now
                 }
 
-                // Flush log writers before exit to prevent log truncation
+                // Flush log writer before exit to prevent log truncation
                 // (std::process::exit doesn't run destructors)
                 if let Some(writer) = &log_writer {
-                    let _ = writer.finish();
-                }
-                if let Some(writer) = &resources_writer {
                     let _ = writer.finish();
                 }
 

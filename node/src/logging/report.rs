@@ -18,6 +18,7 @@ use std::{
 use tracing::{info, warn};
 
 use super::json::JsonLogWriter;
+use super::resources::ResourcesLogger;
 
 /// Complete run report containing metadata, config, and results.
 #[derive(Debug, Serialize)]
@@ -242,7 +243,7 @@ pub fn finalize_log_files(
     base_name: &str,
     events: Option<&BenchEventLogger>,
     log_writer: Option<&JsonLogWriter>,
-    resources_writer: Option<&JsonLogWriter>,
+    resources_logger: Option<&ResourcesLogger>,
     chrome_guard: &mut Option<tracing_chrome::FlushGuard>,
 ) {
     // Finalize events log
@@ -272,7 +273,7 @@ pub fn finalize_log_files(
     }
 
     // Finalize resources log
-    if let Some(logger) = resources_writer {
+    if let Some(logger) = resources_logger {
         if let Err(err) = logger.finish() {
             warn!(error = %err, "failed to finalize resources log");
         }

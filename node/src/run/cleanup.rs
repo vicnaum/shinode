@@ -4,7 +4,7 @@
 //! `finalize_session` function.
 
 use crate::cli::NodeConfig;
-use crate::logging::{finalize_log_files, generate_run_report, RunContext, TracingGuards};
+use crate::logging::{finalize_log_files, generate_run_report, ResourcesLogger, RunContext, TracingGuards};
 use crate::p2p;
 use crate::storage::Storage;
 use crate::sync::historical::{BenchEventLogger, IngestBenchStats, PeerHealthTracker, SummaryInput};
@@ -24,6 +24,7 @@ pub struct FinalizeContext<'a> {
     pub storage: &'a Storage,
     pub bench: &'a IngestBenchStats,
     pub events: Option<&'a BenchEventLogger>,
+    pub resources_logger: Option<&'a ResourcesLogger>,
     pub tracing_guards: &'a mut TracingGuards,
 }
 
@@ -82,7 +83,7 @@ pub async fn finalize_session(ctx: FinalizeContext<'_>, logs_total: u64) {
             &base_name,
             ctx.events,
             ctx.tracing_guards.log_writer.as_deref(),
-            ctx.tracing_guards.resources_writer.as_deref(),
+            ctx.resources_logger,
             &mut ctx.tracing_guards.chrome_guard,
         );
     }
