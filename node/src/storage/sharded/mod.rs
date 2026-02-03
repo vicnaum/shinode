@@ -481,15 +481,27 @@ impl Storage {
             .collect();
         let total_shards = shard_entries.len();
 
+        // Aggregate timing stats for debug logging
+        let mut total_load_meta_us: u128 = 0;
+        let mut total_recover_us: u128 = 0;
+        let mut total_load_bitset_us: u128 = 0;
+        let mut total_repair_wal_us: u128 = 0;
+        let mut total_disk_bytes_us: u128 = 0;
+
         let mut shards: HashMap<u64, Arc<Mutex<ShardState>>> = HashMap::new();
         for (idx, (shard_start, shard_dir)) in shard_entries.into_iter().enumerate() {
             on_progress(idx, total_shards);
+            let shard_start_time = std::time::Instant::now();
 
             // Load shard metadata
+            let t0 = std::time::Instant::now();
             let mut shard_meta = load_shard_meta(&shard_dir)?;
+            let load_meta_ms = t0.elapsed().as_micros();
 
             // Perform phase-aware recovery if needed
+            let t0 = std::time::Instant::now();
             let recovery_result = recover_shard(&shard_dir, &mut shard_meta)?;
+            let recover_ms = t0.elapsed().as_micros();
             match &recovery_result {
                 ShardRecoveryResult::Clean => {}
                 ShardRecoveryResult::CleanedOrphans => {
@@ -503,7 +515,9 @@ impl Storage {
             }
 
             // Load bitset (may have been restored by recovery)
+            let t0 = std::time::Instant::now();
             let bitset = Bitset::load(&bitset_path(&shard_dir), meta.shard_size as usize)?;
+            let load_bitset_ms = t0.elapsed().as_micros();
             let mut state = ShardState {
                 dir: shard_dir,
                 meta: shard_meta,
@@ -511,26 +525,64 @@ impl Storage {
             };
 
             // Mark as needing compaction if WAL exists
+            let t0 = std::time::Instant::now();
             repair_shard_from_wal(&mut state)?;
+            let repair_wal_ms = t0.elapsed().as_micros();
             reconcile_shard_meta(&mut state);
 
             // Only recompute disk sizes if shard has WAL data (not yet compacted).
             // For sorted shards, trust the persisted values from compaction/follow writes.
-            if !state.meta.sorted {
+            let disk_bytes_ms = if !state.meta.sorted {
+                let t0 = std::time::Instant::now();
                 let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
                 state.meta.disk_bytes_headers = dh;
                 state.meta.disk_bytes_transactions = dt;
                 state.meta.disk_bytes_receipts = dr;
                 state.meta.disk_bytes_total = dtotal;
-            }
+                t0.elapsed().as_micros()
+            } else {
+                0
+            };
 
             let max_present = max_present_in_bitset(&state, meta.shard_size);
             if let Some(max_block) = max_present {
                 meta.max_present_block = Some(meta.max_present_block.unwrap_or(0).max(max_block));
             }
             shards.insert(shard_start, Arc::new(Mutex::new(state)));
+
+            // Accumulate timing stats
+            total_load_meta_us += load_meta_ms;
+            total_recover_us += recover_ms;
+            total_load_bitset_us += load_bitset_ms;
+            total_repair_wal_us += repair_wal_ms;
+            total_disk_bytes_us += disk_bytes_ms;
+
+            let total_us = shard_start_time.elapsed().as_micros();
+            tracing::trace!(
+                shard = shard_start,
+                total_us,
+                load_meta_us = load_meta_ms,
+                recover_us = recover_ms,
+                load_bitset_us = load_bitset_ms,
+                repair_wal_us = repair_wal_ms,
+                disk_bytes_us = disk_bytes_ms,
+                "shard load timing"
+            );
         }
         on_progress(total_shards, total_shards); // Signal completion
+
+        // Log aggregate timing breakdown
+        if total_shards > 0 {
+            tracing::debug!(
+                shards = total_shards,
+                load_meta_ms = total_load_meta_us / 1000,
+                recover_ms = total_recover_us / 1000,
+                load_bitset_ms = total_load_bitset_us / 1000,
+                repair_wal_ms = total_repair_wal_us / 1000,
+                disk_bytes_ms = total_disk_bytes_us / 1000,
+                "storage open timing breakdown"
+            );
+        }
         persist_meta(&meta_path, &meta)?;
 
         let peer_cache = load_peer_cache(&peer_cache_dir)?;
