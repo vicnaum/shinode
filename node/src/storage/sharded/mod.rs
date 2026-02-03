@@ -501,12 +501,15 @@ impl Storage {
             repair_shard_from_wal(&mut state)?;
             reconcile_shard_meta(&mut state);
 
-            // Recompute disk sizes from segment files on startup
-            let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
-            state.meta.disk_bytes_headers = dh;
-            state.meta.disk_bytes_transactions = dt;
-            state.meta.disk_bytes_receipts = dr;
-            state.meta.disk_bytes_total = dtotal;
+            // Only recompute disk sizes if shard has WAL data (not yet compacted).
+            // For sorted shards, trust the persisted values from compaction/follow writes.
+            if !state.meta.sorted {
+                let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
+                state.meta.disk_bytes_headers = dh;
+                state.meta.disk_bytes_transactions = dt;
+                state.meta.disk_bytes_receipts = dr;
+                state.meta.disk_bytes_total = dtotal;
+            }
 
             let max_present = max_present_in_bitset(&state, meta.shard_size);
             if let Some(max_block) = max_present {
