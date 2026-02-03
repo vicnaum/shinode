@@ -31,7 +31,14 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
         config.shard_size = stored_shard_size;
     }
 
-    let storage = Storage::open(&config)?;
+    let storage = Storage::open_with_progress(&config, |current, total| {
+        if total > 0 {
+            print!("\rOpening storage... {current}/{total} shards");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    })?;
+    println!(); // newline after progress
 
     let pre = storage.aggregate_stats();
     let dirty = storage.dirty_shards()?;
