@@ -5,6 +5,10 @@ edition = "2021"
 default-run = "stateless-history-node"
 
 [[bin]]
+name = "beep-test"
+path = "src/bin/beep_test.rs"
+
+[[bin]]
 name = "ui-mock"
 path = "src/bin/ui_mock.rs"
 

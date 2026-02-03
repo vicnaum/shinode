@@ -205,6 +205,7 @@ pub struct TuiState {
     pub rpc_get_logs: u64,
     pub rpc_get_block: u64,
     pub rpc_errors: u64,
+
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -571,6 +572,7 @@ impl TuiState {
 
         // Record tick time for next frame's RPC rate calculation
         self.last_tick_time = Some(Instant::now());
+
     }
 
     /// Returns blocks processed in current sync session.
@@ -656,6 +658,9 @@ impl TuiController {
         enable_raw_mode()?;
         io::stdout().execute(EnterAlternateScreen)?;
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+
+        // Play IBM POST beep when TUI starts (splash screen)
+        super::beep::play_post_beep();
 
         Ok(Self {
             terminal,
