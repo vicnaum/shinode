@@ -88,11 +88,16 @@ Cheap aggregation across all shards via `Storage::aggregate_stats()` (no disk I/
 ### `bitset.rs`
 - **Role**: Dense bitarray for per-shard presence tracking (~128 lines). Tracks which block offsets within a shard are present.
 - **Key items**: `Bitset { bytes, size_bits }`, `new`, `load`, `flush`, `is_set`, `set`, `clear`, `count_ones`, `bytes`
-- **Interactions**: Persisted to `present.bitset`. Loaded on shard open; rebuilt during compaction. `set()` returns true if changed 0->1 (used in follow mode). Used by `Storage::has_block()` / `missing_blocks_in_range()` / `missing_ranges_in_range()`. Updated during follow writes (`write_block_bundle_follow`), rebuilt during compaction, and cleared during rollback. Not updated during WAL writes.
+- **Interactions**: Two bitsets per shard:
+  1. `present.bitset` - tracks blocks in sorted segment (compacted data)
+  2. `pending.bitset` - tracks blocks in WAL (pending compaction, for resume support)
+
+  Presence checks (`has_block`, `missing_*`) check BOTH bitsets. On startup, both are loaded. During WAL writes, `pending.bitset` is updated. During compaction, WAL data is merged into sorted segment and `pending.bitset` is deleted. During follow writes, only `present.bitset` is updated (data goes directly to sorted segment).
 - **Knobs / invariants**:
   - `size_bits = shard_size`; stored as `ceil(size_bits/8)` bytes
   - Bit indexing: `byte_idx = offset/8`, `bit = 1u8 << (offset%8)`
-  - On-disk size must match `shard_size` bits; mismatches are treated as corruption. Bitset only reflects what's in sorted segment, NOT WAL data.
+  - On-disk size must match `shard_size` bits; mismatches are treated as corruption.
+  - `present.bitset` reflects sorted segment data; `pending.bitset` reflects WAL data.
 
 ### `nippy_raw.rs`
 - **Role**: Low-level wrapper for `reth_nippy_jar` segment file handling (~166 lines). Provides a minimal, serializable mirror of NippyJar config plus low-level readers/writers for single-column jars.
@@ -133,8 +138,12 @@ To avoid reopening segment files on every block read, the storage maintains an L
 
 The storage uses a phase-based atomic compaction model to prevent data corruption:
 
-### Key Invariant
-The **bitset only reflects what's in the sorted segment**, never WAL data. WAL writes do NOT update the bitset. The bitset is rebuilt during compaction from actual segment data.
+### Key Invariant (Two-Bitset Model)
+The storage uses **two bitsets** per shard for resume support:
+- **`present.bitset`**: Tracks blocks in the sorted segment (compacted data). Rebuilt during compaction.
+- **`pending.bitset`**: Tracks blocks in WAL (pending compaction). Updated during WAL writes, deleted after compaction.
+
+Presence checks (`has_block`, `missing_ranges_in_range`) check BOTH bitsets. This allows resume to correctly skip blocks that are in WAL but not yet compacted, avoiding re-fetching data that already exists.
 
 ### Compaction Phases
 Tracked in `shard.json.compaction_phase`:
@@ -159,28 +168,29 @@ During compaction, the code verifies ALL segment files (headers, tx_hashes, tx_m
 ```
 shards/<shard_start>/
 +-- shard.json           # metadata + compaction_phase
-+-- present.bitset       # live bitset (only reflects sorted segment)
++-- present.bitset       # live bitset (reflects sorted segment)
++-- pending.bitset       # WAL bitset (reflects staging.wal blocks, for resume)
 +-- bitset.tmp           # new bitset during compaction
 +-- bitset.old           # backup during swap
 +-- state/
-|   +-- staging.wal      # pending blocks (NOT in bitset)
+|   +-- staging.wal      # pending blocks (tracked in pending.bitset)
 +-- sorted/              # live segment files
 +-- sorted.tmp/          # new segments during compaction
 +-- sorted.old/          # backup during swap
 ```
 
 ## End-to-end flow (high level)
-1. **Open**: `Storage::open` loads `meta.json`, validates against `NodeConfig`, discovers shard dirs, loads `shard.json` + `present.bitset`, runs phase-aware `recover_shard()`, marks `sorted=false` if WAL exists, and initializes LRU cache.
-2. **Write (fast sync)**: `write_block_bundles_wal` groups blocks by shard, compresses tx_meta/receipts with zstd, appends CRC32-checksummed WAL records, accumulates log counts, updates `total_logs`. Bitset is NOT updated here.
+1. **Open**: `Storage::open` loads `meta.json`, validates against `NodeConfig`, discovers shard dirs, loads `shard.json` + `present.bitset` + `pending.bitset` (if exists), runs phase-aware `recover_shard()`, marks `sorted=false` if WAL exists, and initializes LRU cache.
+2. **Write (fast sync)**: `write_block_bundles_wal` groups blocks by shard, compresses tx_meta/receipts with zstd, appends CRC32-checksummed WAL records, accumulates log counts, updates `total_logs`. Updates `pending.bitset` (for resume support) but NOT `present.bitset`.
 3. **Compact**:
    1. Phase WRITING: Set `compaction_phase="writing"`, persist. Build `sorted.tmp/` segments and `bitset.tmp` from sorted + WAL data (memory-maps WAL via `build_slice_index`, merges WAL + existing segments into new sorted segments). Recompute `total_transactions` and `total_receipts` from actual segment data; preserve `total_logs`.
    2. Phase SWAPPING: Set `compaction_phase="swapping"`, persist. Atomic swaps with `.old` backups: `sorted/` -> `sorted.old/`, `sorted.tmp/` -> `sorted/`; same for bitset.
-   3. Phase CLEANUP: Set `compaction_phase="cleanup"`, persist. Delete backups and WAL. Update `sorted=true`, clear `compaction_phase`.
+   3. Phase CLEANUP: Set `compaction_phase="cleanup"`, persist. Delete backups, WAL, and `pending.bitset`. Update `sorted=true`, clear `compaction_phase`.
 4. **Follow**: `write_block_bundle_follow` directly appends to sorted segments (head-following mode, already sorted).
 5. **Seal**: when a shard becomes complete and sorted, `seal_shard_locked` computes and persists a SHA256 content hash in `shard.json`.
 6. **Read**: check the bitset (fast path), then LRU segment cache, then open NippyJar fresh on cache miss. Read rows from cached segment readers (headers/tx hashes/receipts/sizes) by block number.
 7. **Rollback**: prune sorted segments, clear bitset entries above an ancestor, and recompute `max_present_block` for the store.
-8. **Gap detection**: `missing_ranges_in_range` scans bitsets in chunks for gap detection.
+8. **Gap detection**: `missing_ranges_in_range` scans BOTH bitsets (present + pending) in chunks for gap detection, ensuring blocks in WAL are not re-fetched.
 9. **Repair**: standalone operation that scans all shards, performs phase-aware recovery, and returns a detailed `RepairReport`.
 10. **Aggregate stats**: cheap in-memory aggregation from shard metadata via `aggregate_stats()` (no disk I/O).
 11. **Peer cache**: load/update/persist `peers.json` for the P2P static peer seeding path.

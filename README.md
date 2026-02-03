@@ -120,6 +120,41 @@ Send `SIGUSR1` to print sync + peer-health debug dump:
 kill -USR1 <pid>
 ```
 
+## Deferred Compaction
+
+By default, shards are compacted inline during sync (WAL data merged into sorted segments). This is safe but can slow down sync due to I/O contention.
+
+Use `--defer-compaction` to skip inline compaction and compact later:
+
+```bash
+# Sync without inline compaction (faster but uses more disk for WAL)
+cargo run --release --manifest-path node/Cargo.toml -- --defer-compaction
+
+# Later: compact all dirty shards manually
+cargo run --release --manifest-path node/Cargo.toml -- db compact
+```
+
+**How it works:**
+- Block data is written to WAL files (`staging.wal`) during sync
+- A `pending.bitset` tracks which blocks are in WAL (for resume support)
+- On restart, blocks in WAL are correctly detected as "present" and won't be re-fetched
+- Compaction merges WAL data into sorted segments and deletes `pending.bitset`
+
+**When to use:**
+- Large initial syncs where you want maximum fetch speed
+- Systems with fast network but slower disk I/O
+- When you plan to compact during off-peak hours
+
+**Trade-offs:**
+- WAL files use more disk space than compacted segments
+- Reads from WAL are slower than from sorted segments
+- Must run `db compact` before sealing shards or if WAL grows too large
+
+**Resume behavior:**
+- Safe to quit at any time, even during compaction
+- On restart, sync resumes from where it left off
+- Blocks in WAL are not re-fetched (tracked via `pending.bitset`)
+
 ## RPC Support
 
 Implemented:

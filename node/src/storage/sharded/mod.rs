@@ -44,6 +44,7 @@ const SHARD_META_NAME: &str = "shard.json";
 const BITSET_NAME: &str = "present.bitset";
 const BITSET_TMP_NAME: &str = "bitset.tmp";
 const BITSET_OLD_NAME: &str = "bitset.old";
+const PENDING_BITSET_NAME: &str = "pending.bitset";
 const WAL_NAME: &str = "staging.wal";
 
 // Compaction phase constants
@@ -219,7 +220,10 @@ struct ShardMeta {
 struct ShardState {
     dir: PathBuf,
     meta: ShardMeta,
+    /// Bitset tracking blocks in sorted segment (compacted data).
     bitset: Bitset,
+    /// Bitset tracking blocks in WAL (pending compaction). Used for resume.
+    pending_bitset: Option<Bitset>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,11 +521,19 @@ impl Storage {
             // Load bitset (may have been restored by recovery)
             let t0 = std::time::Instant::now();
             let bitset = Bitset::load(&bitset_path(&shard_dir), meta.shard_size as usize)?;
+            // Load pending bitset if it exists (tracks WAL blocks for resume)
+            let pending_path = pending_bitset_path(&shard_dir);
+            let pending_bitset = if pending_path.exists() {
+                Some(Bitset::load(&pending_path, meta.shard_size as usize)?)
+            } else {
+                None
+            };
             let load_bitset_ms = t0.elapsed().as_micros();
             let mut state = ShardState {
                 dir: shard_dir,
                 meta: shard_meta,
                 bitset,
+                pending_bitset,
             };
 
             // Mark as needing compaction if WAL exists
@@ -749,7 +761,13 @@ impl Storage {
         };
         let state = shard.lock();
         let offset = (number - shard_start) as usize;
-        Ok(state.bitset.is_set(offset))
+        // Check both sorted bitset AND pending bitset (WAL blocks)
+        let in_sorted = state.bitset.is_set(offset);
+        let in_pending = state
+            .pending_bitset
+            .as_ref()
+            .is_some_and(|pb| pb.is_set(offset));
+        Ok(in_sorted || in_pending)
     }
 
     pub fn missing_blocks_in_range(
@@ -789,7 +807,8 @@ impl Storage {
                 continue;
             }
 
-            let bytes = state.bitset.bytes();
+            let sorted_bytes = state.bitset.bytes();
+            let pending_bytes = state.pending_bitset.as_ref().map(|pb| pb.bytes());
             let start_byte = off_start / 8;
             let end_byte = off_end / 8;
             for byte_idx in start_byte..=end_byte {
@@ -807,8 +826,13 @@ impl Storage {
                     };
                 }
 
-                let byte = bytes.get(byte_idx).copied().unwrap_or_default();
-                let mut missing = (!byte) & mask;
+                // Combine sorted and pending bitsets (OR them together)
+                let sorted_byte = sorted_bytes.get(byte_idx).copied().unwrap_or_default();
+                let pending_byte = pending_bytes
+                    .and_then(|pb| pb.get(byte_idx).copied())
+                    .unwrap_or_default();
+                let combined_byte = sorted_byte | pending_byte;
+                let mut missing = (!combined_byte) & mask;
                 while missing != 0 {
                     let bit = missing.trailing_zeros() as usize;
                     let offset = byte_idx * 8 + bit;
@@ -863,7 +887,13 @@ impl Storage {
 
             let mut current_start: Option<u64> = None;
             for offset in off_start..=off_end {
-                let present = state.bitset.is_set(offset);
+                // Check both sorted bitset AND pending bitset (WAL blocks)
+                let in_sorted = state.bitset.is_set(offset);
+                let in_pending = state
+                    .pending_bitset
+                    .as_ref()
+                    .is_some_and(|pb| pb.is_set(offset));
+                let present = in_sorted || in_pending;
                 if !present {
                     missing = missing.saturating_add(1);
                     if current_start.is_none() {
@@ -932,7 +962,12 @@ impl Storage {
 
             for record in records {
                 let offset = (record.block_number - shard_start) as usize;
-                if state.bitset.is_set(offset) || !seen_offsets.insert(offset) {
+                // Skip if already in sorted segment OR already in pending WAL
+                let in_pending = state
+                    .pending_bitset
+                    .as_ref()
+                    .is_some_and(|pb| pb.is_set(offset));
+                if state.bitset.is_set(offset) || in_pending || !seen_offsets.insert(offset) {
                     continue;
                 }
                 to_append.push(record);
@@ -944,11 +979,18 @@ impl Storage {
 
             append_records(&wal_path(&state.dir), &to_append)?;
 
-            // Track written blocks and mark shard as needing compaction
-            // NOTE: We do NOT update the bitset here - it only reflects what's in the sorted segment.
-            // The bitset will be rebuilt from actual data during compaction.
+            // Track written blocks in pending_bitset for resume support
+            // NOTE: The main bitset only reflects sorted segment data.
+            // pending_bitset tracks WAL data so resume can skip already-fetched blocks.
+            let shard_size = state.meta.shard_size as usize;
+            let pending_path = pending_bitset_path(&state.dir);
+            let pending = state
+                .pending_bitset
+                .get_or_insert_with(|| Bitset::new(shard_size));
             let mut max_written: Option<u64> = None;
             for record in &to_append {
+                let offset = (record.block_number - shard_start) as usize;
+                pending.set(offset);
                 written_blocks.push(record.block_number);
                 max_written = Some(
                     max_written
@@ -956,6 +998,8 @@ impl Storage {
                         .max(record.block_number),
                 );
             }
+            // Flush pending_bitset to disk for crash recovery
+            pending.flush(&pending_path)?;
 
             // Accumulate log counts for actually appended blocks
             let logs_delta: u64 = to_append
@@ -1275,7 +1319,7 @@ impl Storage {
         state.meta.compaction_phase = Some(PHASE_CLEANUP.to_string());
         persist_shard_meta(&state.dir, &state.meta)?;
 
-        // Delete backups and WAL
+        // Delete backups, WAL, and pending_bitset
         if backup_dir.exists() {
             fs::remove_dir_all(&backup_dir).wrap_err("failed to remove sorted.old")?;
         }
@@ -1285,12 +1329,18 @@ impl Storage {
         if wal_p.exists() {
             fs::remove_file(&wal_p).wrap_err("failed to remove staging.wal")?;
         }
+        // Delete pending.bitset - WAL data is now in sorted segment
+        let pending_p = pending_bitset_path(&state.dir);
+        if pending_p.exists() {
+            fs::remove_file(&pending_p).wrap_err("failed to remove pending.bitset")?;
+        }
 
         // Invalidate segment cache since segments were rewritten
         self.invalidate_segment_cache(shard_start);
 
         // Update in-memory state with the new bitset
         state.bitset = new_bitset;
+        state.pending_bitset = None; // WAL data merged into sorted, no pending blocks
         state.meta.present_count = state.bitset.count_ones();
         state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         state.meta.sorted = true;
@@ -1718,7 +1768,12 @@ impl Storage {
             disk_bytes_total: 0,
         };
         persist_shard_meta(&dir, &meta)?;
-        let state = ShardState { dir, meta, bitset };
+        let state = ShardState {
+            dir,
+            meta,
+            bitset,
+            pending_bitset: None,
+        };
         let shard = Arc::new(Mutex::new(state));
         shards.insert(shard_start, Arc::clone(&shard));
         Ok(shard)
@@ -1965,6 +2020,10 @@ fn bitset_tmp_path(shard_dir: &Path) -> PathBuf {
 
 fn bitset_old_path(shard_dir: &Path) -> PathBuf {
     shard_dir.join(BITSET_OLD_NAME)
+}
+
+fn pending_bitset_path(shard_dir: &Path) -> PathBuf {
+    shard_dir.join(PENDING_BITSET_NAME)
 }
 
 fn wal_path(shard_dir: &Path) -> PathBuf {
@@ -2308,6 +2367,11 @@ fn recover_shard(shard_dir: &Path, meta: &mut ShardMeta) -> Result<ShardRecovery
             if wal.exists() {
                 fs::remove_file(&wal).wrap_err("failed to remove staging.wal")?;
             }
+            // Also delete pending.bitset - WAL data is now in sorted segment
+            let pending = pending_bitset_path(shard_dir);
+            if pending.exists() {
+                fs::remove_file(&pending).wrap_err("failed to remove pending.bitset")?;
+            }
             // Complete the phase
             meta.compaction_phase = None;
             meta.sorted = true;
@@ -2462,9 +2526,10 @@ mod tests {
 
     #[test]
     fn wal_replay_triggers_compaction() {
-        // With the new atomic compaction model, WAL writes don't update the bitset.
-        // The bitset is rebuilt during compaction from actual segment data.
-        // This test verifies that after reopen + compact, the block is visible.
+        // WAL writes update the pending_bitset for resume support.
+        // The main bitset is rebuilt during compaction from actual segment data.
+        // This test verifies that blocks are visible both before (via pending_bitset)
+        // and after compaction (via main bitset).
         let dir = temp_dir();
         let config = base_config(dir.clone());
         let storage = Storage::open(&config).expect("open storage");
@@ -2475,10 +2540,10 @@ mod tests {
         drop(storage);
 
         let reopened = Storage::open(&config).expect("reopen storage");
-        // Before compaction, block is not visible (only in WAL)
-        assert!(!reopened.has_block(5).expect("has block before compact"));
+        // Before compaction, block IS visible via pending_bitset (for resume support)
+        assert!(reopened.has_block(5).expect("has block before compact"));
 
-        // After compaction, block should be visible
+        // After compaction, block should still be visible (now via main bitset)
         reopened.compact_shard(0).expect("compact shard");
         assert!(reopened.has_block(5).expect("has block after compact"));
 
