@@ -53,30 +53,36 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
 
     let pre = storage.aggregate_stats();
     let dirty = storage.dirty_shards()?;
+    let to_seal = storage.count_shards_to_seal()?;
     info!(
         total_shards = pre.total_shards,
         dirty_count = dirty.len(),
         compacted_count = pre.compacted_shards,
+        to_seal_count = to_seal,
         "storage opened"
     );
     println!(
-        "{} total shard(s), {} dirty, {} already compacted.\n",
+        "{} total shard(s), {} dirty, {} already compacted, {} to seal.\n",
         pre.total_shards,
         dirty.len(),
-        pre.compacted_shards
+        pre.compacted_shards,
+        to_seal
     );
 
-    if dirty.is_empty() {
+    if dirty.is_empty() && to_seal == 0 {
         println!("Nothing to do.");
         return Ok(());
     }
 
     let mut compacted = 0u64;
-    storage.compact_all_dirty_with_progress(|shard_start| {
-        compacted += 1;
-        println!("  Compacted shard {shard_start} ({compacted}/{})", dirty.len());
-    })?;
+    if !dirty.is_empty() {
+        storage.compact_all_dirty_with_progress(|shard_start| {
+            compacted += 1;
+            println!("  Compacted shard {shard_start} ({compacted}/{})", dirty.len());
+        })?;
+    }
 
+    // Re-check after compaction (newly compacted shards may now be sealable)
     let to_seal = storage.count_shards_to_seal()?;
     if to_seal > 0 {
         println!("\n{to_seal} shard(s) to seal.\n");
@@ -152,7 +158,8 @@ fn init_compact_tracing(args: &DbCompactArgs) -> Option<Arc<JsonLogWriter>> {
         .with_writer(std::io::stdout)
         .with_filter(log_filter);
 
-    let json_filter = EnvFilter::new("warn,stateless_history_node=debug");
+    // Capture trace level for per-shard timing during opening
+    let json_filter = EnvFilter::new("warn,stateless_history_node=trace");
     let log_layer = log_writer.as_ref().map(|writer| {
         JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::All).with_filter(json_filter)
     });
