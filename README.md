@@ -91,7 +91,18 @@ Subcommands:
 ```
 db stats                Print storage statistics
 db compact              Compact all dirty shards and seal completed ones
+  --log-json <path>     Write JSON logs to file for debugging
+  -v/-vv/-vvv           Verbosity (info/debug/trace)
 ```
+
+Example: debug slow compaction on USB HDD:
+
+```bash
+cargo run --release --manifest-path node/Cargo.toml -- \
+  db compact --log-json compact.jsonl -v
+```
+
+The JSON log includes per-shard timing breakdown (WAL index, segment I/O, fsync, swap, cleanup).
 
 See [docs/configuration.md](docs/configuration.md) for all options.
 

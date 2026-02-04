@@ -4,9 +4,15 @@
 #![expect(clippy::print_stdout, reason = "CLI commands require stdout output")]
 
 use crate::cli::{DbCompactArgs, DbStatsArgs, NodeConfig};
+use crate::logging::{JsonLogFilter, JsonLogLayer, JsonLogWriter, LOG_BUFFER};
 use crate::storage::Storage;
 use crate::ui;
 use eyre::Result;
+use std::sync::Arc;
+use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 /// Handle the `db stats` subcommand.
 pub fn handle_db_stats(args: &DbStatsArgs, config: &NodeConfig) -> Result<()> {
@@ -21,6 +27,9 @@ pub fn handle_db_stats(args: &DbStatsArgs, config: &NodeConfig) -> Result<()> {
 
 /// Handle the `db compact` subcommand.
 pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()> {
+    // Initialize tracing if --log-json is specified
+    let _log_writer = init_compact_tracing(args);
+
     let mut config = config.clone();
     if let Some(dir) = &args.data_dir {
         config.data_dir = dir.clone();
@@ -30,6 +39,8 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
     if let Some(stored_shard_size) = Storage::read_shard_size(&config.data_dir)? {
         config.shard_size = stored_shard_size;
     }
+
+    info!(data_dir = %config.data_dir.display(), shard_size = config.shard_size, "starting db compact");
 
     let storage = Storage::open_with_progress(&config, |current, total| {
         if total > 0 {
@@ -42,6 +53,12 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
 
     let pre = storage.aggregate_stats();
     let dirty = storage.dirty_shards()?;
+    info!(
+        total_shards = pre.total_shards,
+        dirty_count = dirty.len(),
+        compacted_count = pre.compacted_shards,
+        "storage opened"
+    );
     println!(
         "{} total shard(s), {} dirty, {} already compacted.\n",
         pre.total_shards,
@@ -67,6 +84,15 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
     })?;
 
     let post = storage.aggregate_stats();
+    info!(
+        compacted_count = compacted,
+        sealed_count = sealed,
+        total_blocks = post.total_blocks,
+        total_txs = post.total_transactions,
+        total_logs = post.total_logs,
+        disk_bytes = post.disk_bytes_total,
+        "db compact complete"
+    );
     println!("\nDone. Compacted {compacted} shard(s), sealed {sealed} shard(s).");
     println!(
         "Storage: {} blocks, {} txs, {} logs, {}",
@@ -76,6 +102,51 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
         ui::human_bytes(post.disk_bytes_total)
     );
     Ok(())
+}
+
+/// Initialize tracing for db compact command.
+/// Returns the log writer guard (must be kept alive for logging to work).
+fn init_compact_tracing(args: &DbCompactArgs) -> Option<Arc<JsonLogWriter>> {
+    // Determine log level from verbosity
+    let (global, local) = match args.verbose {
+        0 => ("warn", "info"),
+        1 => ("warn", "debug"),
+        2 => ("info", "trace"),
+        _ => ("debug", "trace"),
+    };
+    let log_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("{global},stateless_history_node={local}")));
+
+    // Create JSON log writer if path specified
+    let log_writer = args.log_json.as_ref().and_then(|path| {
+        match JsonLogWriter::new(path, LOG_BUFFER) {
+            Ok(writer) => {
+                println!("Writing logs to: {}", path.display());
+                Some(Arc::new(writer))
+            }
+            Err(err) => {
+                eprintln!("Warning: failed to initialize log writer: {err}");
+                None
+            }
+        }
+    });
+
+    // Build tracing subscriber
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(log_filter);
+
+    let json_filter = EnvFilter::new("warn,stateless_history_node=debug");
+    let log_layer = log_writer.as_ref().map(|writer| {
+        JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::All).with_filter(json_filter)
+    });
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(log_layer)
+        .init();
+
+    log_writer
 }
 
 /// Handle the `--repair` flag.

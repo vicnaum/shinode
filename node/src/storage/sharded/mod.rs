@@ -1104,17 +1104,31 @@ impl Storage {
         reason = "compaction has atomic phases (write/swap/cleanup) that must stay in sync"
     )]
     pub fn compact_shard(&self, shard_start: u64) -> Result<()> {
+        let compact_start = std::time::Instant::now();
+        tracing::info!(shard = shard_start, "compact_shard: starting");
+
         let shard = self.get_shard(shard_start)?;
         let Some(shard) = shard else {
             return Ok(());
         };
         let mut state = shard.lock();
         let wal_p = wal_path(&state.dir);
+
+        let t0 = std::time::Instant::now();
         let wal_slices = build_slice_index(&wal_p, shard_start, state.meta.shard_size as usize)?;
         let has_wal = wal_slices.is_some();
+        let wal_size_bytes = wal_slices.as_ref().map_or(0, |w| w.mmap.len());
+        tracing::debug!(
+            shard = shard_start,
+            has_wal,
+            wal_size_bytes,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: built WAL slice index"
+        );
 
         // If no WAL and already sorted, nothing to do
         if !has_wal && state.meta.sorted {
+            tracing::debug!(shard = shard_start, "compact_shard: already sorted, skipping");
             return Ok(());
         }
 
@@ -1127,8 +1141,14 @@ impl Storage {
 
         // ========== PHASE: WRITING ==========
         // Set phase and persist before making any changes
+        let t0 = std::time::Instant::now();
         state.meta.compaction_phase = Some(PHASE_WRITING.to_string());
         persist_shard_meta(&state.dir, &state.meta)?;
+        tracing::debug!(
+            shard = shard_start,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: persisted WRITING phase"
+        );
 
         // Clean up any leftover tmp files from previous interrupted compaction
         if temp_dir.exists() {
@@ -1140,6 +1160,7 @@ impl Storage {
         fs::create_dir_all(&temp_dir).wrap_err("failed to create sorted.tmp")?;
 
         // Open existing segment if it exists
+        let t0 = std::time::Instant::now();
         let existing = if sorted_dir.exists() {
             Some(ShardRawSegments {
                 headers: SegmentRawSource::<SegmentHeader>::open(&sorted_dir.join("headers"))?,
@@ -1151,6 +1172,13 @@ impl Storage {
         } else {
             None
         };
+        let has_existing = existing.is_some();
+        tracing::debug!(
+            shard = shard_start,
+            has_existing,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: opened existing segments"
+        );
 
         // Create new bitset to track what we actually write (NOT based on old bitset)
         let shard_size = state.meta.shard_size as usize;
@@ -1183,16 +1211,33 @@ impl Storage {
         }
 
         let total_rows = max_offset.saturating_add(1);
+        tracing::debug!(
+            shard = shard_start,
+            total_rows,
+            existing_rows,
+            wal_max_offset = wal_max_offset.unwrap_or(0),
+            "compact_shard: determined row range"
+        );
 
         // Accumulators for tx/receipt counts (recomputed authoritatively at compaction)
         let mut total_tx: u64 = 0;
         let mut total_receipt_count: u64 = 0;
 
         // Create segment writers
+        let t0 = std::time::Instant::now();
         let mut writers = create_compaction_writers(&temp_dir, shard_start, existing.as_ref())?;
+        tracing::debug!(
+            shard = shard_start,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: created writers"
+        );
 
         // Iterate over all rows, checking WAL and existing segment for actual data
         // DO NOT use the old bitset - it may be out of sync
+        let t_rows = std::time::Instant::now();
+        let mut rows_from_wal = 0u64;
+        let mut rows_from_existing = 0u64;
+        let mut rows_empty = 0u64;
         for local_offset in 0..total_rows {
             // Check if this row has data in WAL
             let wal_data = wal_slices.as_ref().and_then(|w| w.entries.get(local_offset).copied().flatten());
@@ -1224,6 +1269,7 @@ impl Storage {
             if wal_data.is_none() && !has_existing_data {
                 // No data for this row - write empty
                 writers.push_empty()?;
+                rows_empty += 1;
                 continue;
             }
 
@@ -1234,6 +1280,7 @@ impl Storage {
 
             // Prefer WAL data over existing segment data
             if let Some(slices) = wal_data {
+                rows_from_wal += 1;
                 // SAFETY: wal_slices is always Some when we have wal_data
                 let wal = wal_slices
                     .as_ref()
@@ -1255,6 +1302,7 @@ impl Storage {
                 writers.receipts.push_bytes(receipt_bytes, slices.receipts_uncompressed_len as usize)?;
                 writers.sizes.push_bytes(size_bytes, slices.size.len())?;
             } else {
+                rows_from_existing += 1;
                 // Copy from existing segment (we verified all fields exist above)
                 let ex = existing
                     .as_ref()
@@ -1285,11 +1333,32 @@ impl Storage {
                 writers.sizes.push_bytes(size_bytes, size_bytes.len())?;
             }
         }
+        tracing::debug!(
+            shard = shard_start,
+            rows_from_wal,
+            rows_from_existing,
+            rows_empty,
+            total_tx,
+            elapsed_ms = t_rows.elapsed().as_millis() as u64,
+            "compact_shard: finished row iteration"
+        );
 
+        let t0 = std::time::Instant::now();
         writers.finish()?;
+        tracing::debug!(
+            shard = shard_start,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: writers.finish() (fsync)"
+        );
 
         // Write new bitset to tmp file
+        let t0 = std::time::Instant::now();
         new_bitset.flush(&bitset_tmp)?;
+        tracing::debug!(
+            shard = shard_start,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: bitset flush"
+        );
 
         // If no data was found at all, clean up and return
         let Some(tail_block) = actual_tail_block else {
@@ -1305,6 +1374,7 @@ impl Storage {
         };
 
         // ========== PHASE: SWAPPING ==========
+        let t_swap = std::time::Instant::now();
         state.meta.compaction_phase = Some(PHASE_SWAPPING.to_string());
         persist_shard_meta(&state.dir, &state.meta)?;
 
@@ -1325,8 +1395,14 @@ impl Storage {
             fs::rename(&bitset_live, &bitset_old).wrap_err("failed to backup old bitset")?;
         }
         fs::rename(&bitset_tmp, &bitset_live).wrap_err("failed to swap bitset")?;
+        tracing::debug!(
+            shard = shard_start,
+            elapsed_ms = t_swap.elapsed().as_millis() as u64,
+            "compact_shard: SWAPPING phase complete"
+        );
 
         // ========== PHASE: CLEANUP ==========
+        let t_cleanup = std::time::Instant::now();
         state.meta.compaction_phase = Some(PHASE_CLEANUP.to_string());
         persist_shard_meta(&state.dir, &state.meta)?;
 
@@ -1345,6 +1421,11 @@ impl Storage {
         if pending_p.exists() {
             fs::remove_file(&pending_p).wrap_err("failed to remove pending.bitset")?;
         }
+        tracing::debug!(
+            shard = shard_start,
+            elapsed_ms = t_cleanup.elapsed().as_millis() as u64,
+            "compact_shard: CLEANUP phase complete"
+        );
 
         // Invalidate segment cache since segments were rewritten
         self.invalidate_segment_cache(shard_start);
@@ -1365,16 +1446,42 @@ impl Storage {
         // Note: total_logs is NOT recomputed here (receipts are zstd-compressed).
         // It is preserved from WAL writes or set to 0 for fresh shards.
         // Recompute disk sizes from the freshly written segment files
+        let t0 = std::time::Instant::now();
         let (dh, dt, dr, dtotal) = compute_shard_disk_bytes(&state.dir);
         state.meta.disk_bytes_headers = dh;
         state.meta.disk_bytes_transactions = dt;
         state.meta.disk_bytes_receipts = dr;
         state.meta.disk_bytes_total = dtotal;
         persist_shard_meta(&state.dir, &state.meta)?;
+        tracing::debug!(
+            shard = shard_start,
+            disk_bytes = dtotal,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "compact_shard: final meta persist"
+        );
 
-        if state.meta.complete && !state.meta.sealed {
+        let will_seal = state.meta.complete && !state.meta.sealed;
+        if will_seal {
+            let t0 = std::time::Instant::now();
             self.seal_shard_locked(&mut state)?;
+            tracing::debug!(
+                shard = shard_start,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "compact_shard: sealed"
+            );
         }
+
+        tracing::info!(
+            shard = shard_start,
+            total_ms = compact_start.elapsed().as_millis() as u64,
+            rows_from_wal,
+            rows_from_existing,
+            rows_empty,
+            total_tx,
+            disk_bytes = dtotal,
+            sealed = will_seal,
+            "compact_shard: complete"
+        );
 
         Ok(())
     }

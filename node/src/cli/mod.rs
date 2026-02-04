@@ -77,6 +77,12 @@ pub struct DbCompactArgs {
     /// Override data directory for compaction.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+    /// Write JSON logs to file for debugging slow compaction.
+    #[arg(long)]
+    pub log_json: Option<PathBuf>,
+    /// Verbose logging level (0=info, 1=debug, 2+=trace).
+    #[arg(short, long, action = ArgAction::Count, default_value_t = 0)]
+    pub verbose: u8,
 }
 
 /// Stateless history node configuration.
