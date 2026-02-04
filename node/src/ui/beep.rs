@@ -3,6 +3,8 @@
 
 use std::io::Write;
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 /// IBM POST beep: 896.46 Hz square wave, ~230ms, embedded at compile time.
 const POST_BEEP_WAV: &[u8] = include_bytes!("../../assets/post_beep.wav");
