@@ -448,6 +448,9 @@ impl Storage {
     where
         F: Fn(usize, usize),
     {
+        let open_start = std::time::Instant::now();
+        tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
+
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
         let peer_cache_dir = config
             .peer_cache_dir
@@ -595,16 +598,20 @@ impl Storage {
         on_progress(total_shards, total_shards); // Signal completion
 
         // Log aggregate timing breakdown
+        let total_open_ms = open_start.elapsed().as_millis();
         if total_shards > 0 {
-            tracing::debug!(
+            tracing::info!(
                 shards = total_shards,
+                total_ms = total_open_ms,
                 load_meta_ms = total_load_meta_us / 1000,
                 recover_ms = total_recover_us / 1000,
                 load_bitset_ms = total_load_bitset_us / 1000,
                 repair_wal_ms = total_repair_wal_us / 1000,
                 disk_bytes_ms = total_disk_bytes_us / 1000,
-                "storage open timing breakdown"
+                "storage open: complete"
             );
+        } else {
+            tracing::info!(total_ms = total_open_ms, "storage open: complete (no shards)");
         }
         persist_meta(&meta_path, &meta)?;
 
@@ -1568,10 +1575,14 @@ impl Storage {
     where
         F: FnMut(u64),
     {
+        let seal_start = std::time::Instant::now();
         let shard_starts: Vec<u64> = {
             let shards = self.shards.lock();
             shards.keys().copied().collect()
         };
+        let mut sealed_count = 0u64;
+        let mut total_hash_ms = 0u128;
+        let mut total_persist_ms = 0u128;
         for shard_start in shard_starts {
             let shard = self.get_shard(shard_start)?;
             let Some(shard) = shard else {
@@ -1579,10 +1590,40 @@ impl Storage {
             };
             let mut state = shard.lock();
             if state.meta.complete && state.meta.sorted && !state.meta.sealed {
+                let shard_seal_start = std::time::Instant::now();
+
+                let t0 = std::time::Instant::now();
                 self.seal_shard_locked(&mut state)?;
+                let hash_ms = t0.elapsed().as_millis();
+                total_hash_ms += hash_ms;
+
+                let t0 = std::time::Instant::now();
                 persist_shard_meta(&state.dir, &state.meta)?;
+                let persist_ms = t0.elapsed().as_millis();
+                total_persist_ms += persist_ms;
+
+                let total_ms = shard_seal_start.elapsed().as_millis();
+                tracing::debug!(
+                    shard = shard_start,
+                    hash_ms,
+                    persist_ms,
+                    total_ms,
+                    "seal_shard: complete"
+                );
+
+                sealed_count += 1;
                 on_sealed(shard_start);
             }
+        }
+        if sealed_count > 0 {
+            let total_ms = seal_start.elapsed().as_millis();
+            tracing::info!(
+                sealed_count,
+                total_hash_ms,
+                total_persist_ms,
+                total_ms,
+                "seal_completed_shards: done"
+            );
         }
         Ok(())
     }
