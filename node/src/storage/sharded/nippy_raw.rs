@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 const OFFSETS_FILE_EXTENSION: &str = "off";
 const OFFSET_SIZE_BYTES: u8 = 8;
 
+/// Buffer size for segment writers (8MB).
+/// Large buffer reduces syscall overhead on slow storage (USB HDDs).
+/// With 5 segments per shard, this uses ~40MB RAM during compaction.
+const WRITER_BUF_SIZE: usize = 8 * 1024 * 1024;
+
 /// Minimal mirror of `reth_nippy_jar::NippyJar` config as it is serialized in `.conf`.
 ///
 /// We need this because the upstream `NippyJar` struct has private fields and no public API to
@@ -107,11 +112,13 @@ impl<H: Serialize> SegmentRawWriter<H> {
                 .wrap_err_with(|| format!("failed to remove {}", config_path.display()))?;
         }
 
-        let data_file = BufWriter::new(
+        let data_file = BufWriter::with_capacity(
+            WRITER_BUF_SIZE,
             File::create(data_path)
                 .wrap_err_with(|| format!("failed to create {}", data_path.display()))?,
         );
-        let mut offsets_file = BufWriter::new(
+        let mut offsets_file = BufWriter::with_capacity(
+            WRITER_BUF_SIZE,
             File::create(&offsets_path)
                 .wrap_err_with(|| format!("failed to create {}", offsets_path.display()))?,
         );
