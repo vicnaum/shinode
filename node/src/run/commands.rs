@@ -121,19 +121,31 @@ fn init_compact_tracing(args: &DbCompactArgs) -> Option<Arc<JsonLogWriter>> {
     let log_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("{global},stateless_history_node={local}")));
 
-    // Create JSON log writer if path specified
-    let log_writer = args.log_json.as_ref().and_then(|path| {
-        match JsonLogWriter::new(path, LOG_BUFFER) {
-            Ok(writer) => {
-                println!("Writing logs to: {}", path.display());
-                Some(Arc::new(writer))
-            }
-            Err(err) => {
-                eprintln!("Warning: failed to initialize log writer: {err}");
-                None
+    // Create JSON log writer if enabled
+    let log_writer = if args.log_json {
+        // Generate timestamped filename in logs directory
+        let timestamp = crate::logging::run_timestamp_utc(std::time::SystemTime::now());
+        let log_path = args.log_output_dir.join(format!("compact-{timestamp}.logs.jsonl"));
+
+        // Create output directory if needed
+        if let Err(err) = std::fs::create_dir_all(&args.log_output_dir) {
+            eprintln!("Warning: failed to create log directory: {err}");
+            None
+        } else {
+            match JsonLogWriter::new(&log_path, LOG_BUFFER) {
+                Ok(writer) => {
+                    println!("Writing logs to: {}", log_path.display());
+                    Some(Arc::new(writer))
+                }
+                Err(err) => {
+                    eprintln!("Warning: failed to initialize log writer: {err}");
+                    None
+                }
             }
         }
-    });
+    } else {
+        None
+    };
 
     // Build tracing subscriber
     let fmt_layer = tracing_subscriber::fmt::layer()

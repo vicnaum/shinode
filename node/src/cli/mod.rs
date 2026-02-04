@@ -78,8 +78,11 @@ pub struct DbCompactArgs {
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
     /// Write JSON logs to file for debugging slow compaction.
-    #[arg(long)]
-    pub log_json: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    pub log_json: bool,
+    /// Output directory for log artifacts.
+    #[arg(long, default_value = DEFAULT_LOG_OUTPUT_DIR)]
+    pub log_output_dir: PathBuf,
     /// Verbose logging level (0=info, 1=debug, 2+=trace).
     #[arg(short, long, action = ArgAction::Count, default_value_t = 0)]
     pub verbose: u8,
