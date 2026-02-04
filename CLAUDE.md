@@ -26,9 +26,6 @@ cargo test --manifest-path node/Cargo.toml <test_name>
 # Build without jemalloc (default feature)
 cargo build --manifest-path node/Cargo.toml --no-default-features
 
-# Run demo binaries
-cargo run --manifest-path node/Cargo.toml --bin ui-mock
-cargo run --manifest-path node/Cargo.toml --bin color-test
 ```
 
 ## Architecture

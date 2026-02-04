@@ -54,7 +54,7 @@ pub fn init_tracing(
             2 => ("info", "trace"),  // -vv = trace (was debug)
             _ => ("debug", "trace"), // -vvv = verbose trace
         };
-        EnvFilter::new(format!("{global},stateless_history_node={local}"))
+        EnvFilter::new(format!("{global},shinode={local}"))
     });
 
     // When TUI mode is active, suppress stdout logging to avoid corrupting display

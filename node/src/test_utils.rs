@@ -19,7 +19,7 @@ pub fn temp_dir(prefix: &str) -> PathBuf {
     let suffix = COUNTER.fetch_add(1, Ordering::SeqCst);
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "stateless-history-node-{prefix}-test-{now}-{}-{suffix}",
+        "shinode-{prefix}-test-{now}-{}-{suffix}",
         std::process::id()
     ));
     path

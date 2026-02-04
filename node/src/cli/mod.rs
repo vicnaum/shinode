@@ -18,9 +18,9 @@ pub const DEFAULT_DB_WRITE_BATCH_BLOCKS: u64 = 512;
 pub const DEFAULT_SHARD_SIZE: u64 = 10_000;
 pub const DEFAULT_LOG_OUTPUT_DIR: &str = "logs";
 pub const DEFAULT_LOG_TRACE_FILTER: &str =
-    "off,stateless_history_node=trace,reth_eth_wire::p2pstream=trace";
+    "off,shinode=trace,reth_eth_wire::p2pstream=trace";
 /// Default filter for JSON log output (DEBUG level for node, WARN for externals).
-pub const DEFAULT_LOG_JSON_FILTER: &str = "warn,stateless_history_node=debug";
+pub const DEFAULT_LOG_JSON_FILTER: &str = "warn,shinode=debug";
 
 /// Retention mode for stored history.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub struct DbCompactArgs {
     /// Write JSON logs to file for debugging slow compaction.
     #[arg(long, default_value_t = false)]
     pub log_json: bool,
-    /// EnvFilter for JSON log level (e.g. "warn,stateless_history_node=trace").
+    /// EnvFilter for JSON log level (e.g. "warn,shinode=trace").
     #[arg(long, default_value = DEFAULT_LOG_JSON_FILTER)]
     pub log_json_filter: String,
     /// Output directory for log artifacts.
@@ -102,7 +102,7 @@ pub struct DbRebuildCacheArgs {
 
 /// Stateless history node configuration.
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
-#[command(name = "stateless-history-node", about = "Stateless history node v0.2.0")]
+#[command(name = "shinode", about = "SHiNode – Stateless History Node v0.3.0")]
 #[expect(clippy::struct_excessive_bools, reason = "CLI config needs many boolean flags")]
 pub struct NodeConfig {
     /// Chain ID to expose over RPC.
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn defaults_match_contract() {
-        let config = NodeConfig::parse_from(["stateless-history-node"]);
+        let config = NodeConfig::parse_from(["shinode"]);
 
         assert_eq!(config.chain_id, 1);
         assert_eq!(config.data_dir, PathBuf::from("data"));
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn parse_db_stats_command() {
-        let config = NodeConfig::parse_from(["stateless-history-node", "db", "stats"]);
+        let config = NodeConfig::parse_from(["shinode", "db", "stats"]);
         assert!(matches!(
             config.command,
             Some(Command::Db(DbCommand::Stats(_)))
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn parse_db_compact_command() {
-        let config = NodeConfig::parse_from(["stateless-history-node", "db", "compact"]);
+        let config = NodeConfig::parse_from(["shinode", "db", "compact"]);
         assert!(matches!(
             config.command,
             Some(Command::Db(DbCommand::Compact(_)))
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn parse_db_rebuild_cache_command() {
-        let config = NodeConfig::parse_from(["stateless-history-node", "db", "rebuild-cache"]);
+        let config = NodeConfig::parse_from(["shinode", "db", "rebuild-cache"]);
         assert!(matches!(
             config.command,
             Some(Command::Db(DbCommand::RebuildCache(_)))
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn log_flag_enables_all_log_outputs() {
-        let mut config = NodeConfig::parse_from(["stateless-history-node", "--log"]);
+        let mut config = NodeConfig::parse_from(["shinode", "--log"]);
         config.normalize();
         assert!(config.log);
         assert!(config.log_trace);
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn repair_flag_parses() {
-        let config = NodeConfig::parse_from(["stateless-history-node", "--repair"]);
+        let config = NodeConfig::parse_from(["shinode", "--repair"]);
         assert!(config.repair);
     }
 }

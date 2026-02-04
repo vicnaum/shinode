@@ -5976,6 +5976,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "shinode"
+version = "0.3.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "async-trait",
+ "bincode",
+ "bytes",
+ "clap",
+ "crc32fast",
+ "crossterm",
+ "eyre",
+ "futures",
+ "indicatif",
+ "jsonrpsee",
+ "lru 0.12.5",
+ "modular-bitfield",
+ "parking_lot",
+ "rand 0.8.5",
+ "ratatui",
+ "reth-chainspec",
+ "reth-eth-wire",
+ "reth-eth-wire-types",
+ "reth-ethereum-primitives",
+ "reth-network",
+ "reth-network-api",
+ "reth-nippy-jar",
+ "reth-primitives-traits",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "tikv-jemallocator",
+ "tokio",
+ "tracing",
+ "tracing-chrome",
+ "tracing-subscriber 0.3.22",
+ "zstd",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6100,48 +6142,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "stateless-history-node"
-version = "0.3.0"
-dependencies = [
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "async-trait",
- "bincode",
- "bytes",
- "clap",
- "crc32fast",
- "crossterm",
- "eyre",
- "futures",
- "indicatif",
- "jsonrpsee",
- "lru 0.12.5",
- "modular-bitfield",
- "parking_lot",
- "rand 0.8.5",
- "ratatui",
- "reth-chainspec",
- "reth-eth-wire",
- "reth-eth-wire-types",
- "reth-ethereum-primitives",
- "reth-network",
- "reth-network-api",
- "reth-nippy-jar",
- "reth-primitives-traits",
- "serde",
- "serde_json",
- "sha2",
- "sysinfo",
- "tikv-jemallocator",
- "tokio",
- "tracing",
- "tracing-chrome",
- "tracing-subscriber 0.3.22",
- "zstd",
-]
 
 [[package]]
 name = "static_assertions"

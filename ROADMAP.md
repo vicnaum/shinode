@@ -60,7 +60,7 @@ Focus: stability and performance hardening for production use.
 
 ---
 
-## Done: v0.3.0-dev - TUI Dashboard & Observability
+## Done: v0.3.0 - TUI Dashboard & Observability
 
 Focus: real-time operator visibility via fullscreen terminal dashboard.
 
@@ -91,15 +91,23 @@ Focus: real-time operator visibility via fullscreen terminal dashboard.
 - **Peer feeder rotation** for fairness
 - **Stall detection** with peer health dump (30s threshold)
 - Follow-mode fixes: stale-peer spin-loop, head desync, log dedup
-- Demo binaries: `color-test` (splash screen), `ui-mock` (TUI preview)
+- **Sealed shard cache** for fast startup on slow storage (`sealed_shards.cache`)
+- **`db compact`** subcommand with progress bars, JSON logging, per-shard timing
+- **`db rebuild-cache`** subcommand to rebuild sealed shard cache
+- **`--defer-compaction`** flag to skip inline compaction during fast-sync
+- **Storage open performance**: 8MB read buffers, in-memory WAL reads, cached disk stats
+- **SHiNode branding**: renamed binary (`shinode`), website (shinode.rs), landing page
+- **MIT/Apache-2.0 dual licensing**, workspace `Cargo.toml`
+- **Release polish**: CHANGELOG, ROADMAP updates, docs refresh
 
 ---
 
-## Next: v0.4 - Testing & Metrics
+## Next: v0.4 - Testing & Refactoring
 
+- [ ] Comprehensive test coverage across all subsystems (P2P, sync, storage, RPC, UI)
 - [ ] Integration tests for sync loop + reorg handling
-- [ ] Metrics export (Prometheus/OTel)
-- [ ] Deep reorg recovery (auto-rebootstrap policy)
+- [ ] Codebase refactor: clean up dead/duplicated code, reorganize modules
+- [ ] Separate into library crate (`shinode-core`) and CLI/TUI binary
 
 ---
 
@@ -117,6 +125,7 @@ Focus: real-time operator visibility via fullscreen terminal dashboard.
 
 ## Future: Correctness & Trust
 
+- Deep reorg recovery (auto-rebootstrap policy)
 - Receipts root validation (verify against header `receiptsRoot`)
 - Multi-peer cross-check (majority header hash / receiptsRoot)
 - Stronger head source (beacon API / CL integration)
@@ -125,8 +134,9 @@ Focus: real-time operator visibility via fullscreen terminal dashboard.
 
 ---
 
-## Future: Network & Fallbacks
+## Future: Network & Observability
 
+- Metrics export (Prometheus/OTel)
 - Serve `GetBlockHeaders` / `GetReceipts` for retained ranges
 - Rate limiting + abuse protection
 - ETH: era1 / Portal for old ranges

@@ -147,7 +147,7 @@ cargo run --release --manifest-path node/Cargo.toml -- -vvv
 Send `SIGUSR1` to print sync + peer-health status:
 
 ```bash
-kill -USR1 $(pgrep stateless-history)
+kill -USR1 $(pgrep shinode)
 ```
 
 ### Check storage stats

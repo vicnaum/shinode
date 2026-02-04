@@ -71,12 +71,12 @@ Full reference for CLI options and environment variables.
 | `--run-name <string>` | Label for output filenames (default: timestamp) |
 | `--log-output-dir <path>` | Output directory for log artifacts (default: `logs`) |
 | `--log-trace` | Emit Chrome trace (`.trace.json`) for timeline inspection |
-| `--log-trace-filter <filter>` | Trace filter (default: `off,stateless_history_node=trace,...`) |
+| `--log-trace-filter <filter>` | Trace filter (default: `off,shinode=trace,...`) |
 | `--log-trace-include-args` | Include span/event args in trace output (default: true) |
 | `--log-trace-include-locations` | Include file+line info in trace output (default: true) |
 | `--log-events` | Emit JSONL event log (`.events.jsonl`) for analysis |
 | `--log-json` | Emit JSON structured logs (`.logs.jsonl`) |
-| `--log-json-filter <filter>` | JSON log filter (default: `warn,stateless_history_node=debug`) |
+| `--log-json-filter <filter>` | JSON log filter (default: `warn,shinode=debug`) |
 | `--log-report` | Emit run summary report (`.report.json`) |
 | `--log-resources` | Emit separate resource metrics JSONL file (CPU/memory/disk) |
 
@@ -132,7 +132,7 @@ cargo run --release -- --repair --data-dir <path>
 
 | Variable | Description |
 |----------|-------------|
-| `RUST_LOG` | Override log filter (e.g., `stateless_history_node=debug`) |
+| `RUST_LOG` | Override log filter (e.g., `shinode=debug`) |
 | `MALLOC_ARENA_MAX` | Limit glibc malloc arenas (Linux; e.g., `2`) |
 
 ## Deferred Compaction

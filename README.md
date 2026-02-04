@@ -29,6 +29,8 @@ Think of it as an **alternative to running a full node** when all you need is ev
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)](ROADMAP.md)
 [![Built with AI](https://img.shields.io/badge/built%20with-Cursor%20%7C%20Claude%20%7C%20Codex-blueviolet.svg)](https://cursor.com/)
 
+> **100% AI-coded.** Every line of code, documentation, and infrastructure in this project was written by AI (Claude / Codex via Cursor and Claude Code). Human role: product direction, testing, and code review.
+
 ![SHiNode Demo](shinode_960.gif)
 
 ### Why SHiNode?

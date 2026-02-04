@@ -12,8 +12,8 @@ Rust crate for the Stateless History Node -- a minimal Ethereum history indexer 
 - [x] `tests/` - Integration test scaffolding with placeholder stubs for RPC contract probe and reorg rollback tests. See `tests/AGENTS.md`.
 
 ### Files
-- `Cargo.toml` - Crate manifest. Defines dependencies (Reth crates pinned to git revision, tokio, jsonrpsee, ratatui, clap, serde, bincode, zstd), features (jemalloc default), and binary targets (stateless-history-node, ui-mock, color-test, char-test).
-  - **Key items**: `default-run = "stateless-history-node"`, `[features] default = ["jemalloc"]`, 3 `[[bin]]` entries for demo binaries
+- `Cargo.toml` - Crate manifest. Defines dependencies (Reth crates pinned to git revision, tokio, jsonrpsee, ratatui, clap, serde, bincode, zstd), features (jemalloc default), and binary target (`shinode`).
+  - **Key items**: `name = "shinode"`, `[features] default = ["jemalloc"]`
 - `Cargo.lock` - Pinned dependency versions.
 - `clippy.toml` - Clippy linting configuration.
 - `FILE_ID.DIZ` - ASCII art project identifier.
