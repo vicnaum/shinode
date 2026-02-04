@@ -6,10 +6,10 @@ Stateless History Node is a minimal Ethereum history indexer that backfills head
 
 - [Getting Started](getting-started.md) - Installation and first run
 - [Configuration](configuration.md) - Full CLI options reference
-- [Architecture](../ARCHITECTURE.md) - System overview and module structure
-- [Specification](../SPEC.md) - Detailed system specification
+- [Architecture](architecture.md) - System overview, design, and data model
 - [Roadmap](../ROADMAP.md) - Current and planned features
 - [UI Designs](UI_DESIGNS.md) - TUI dashboard design reference
+- [Spec Archive](spec/) - Research docs and development history
 
 ## Key Concepts
 

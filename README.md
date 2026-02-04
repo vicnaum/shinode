@@ -83,8 +83,7 @@ For detailed setup, see [docs/getting-started.md](docs/getting-started.md).
 
 - [Getting Started](docs/getting-started.md) - Installation and first run
 - [Configuration](docs/configuration.md) - Full CLI options reference
-- [Architecture](ARCHITECTURE.md) - System overview and module structure
-- [Specification](SPEC.md) - Detailed system specification
+- [Architecture](docs/architecture.md) - System overview and design
 - [Roadmap](ROADMAP.md) - Current and planned features
 - [UI Designs](docs/UI_DESIGNS.md) - TUI dashboard design reference
 
@@ -119,7 +118,7 @@ db rebuild-cache        Rebuild sealed shard cache for faster startup
 Example: debug slow compaction on USB HDD:
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- \
+cargo run --release -- \
   db compact --log-json compact.jsonl -v
 ```
 
@@ -160,10 +159,10 @@ Use `--defer-compaction` to skip inline compaction and compact later:
 
 ```bash
 # Sync without inline compaction (faster but uses more disk for WAL)
-cargo run --release --manifest-path node/Cargo.toml -- --defer-compaction
+cargo run --release -- --defer-compaction
 
 # Later: compact all dirty shards manually
-cargo run --release --manifest-path node/Cargo.toml -- db compact
+cargo run --release -- db compact
 ```
 
 **How it works:**
@@ -201,7 +200,7 @@ The sealed shard cache stores all sealed shard metadata in a single file (`seale
 
 **Manual rebuild:**
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- db rebuild-cache
+cargo run --release -- db rebuild-cache
 ```
 
 **Performance:**
@@ -241,7 +240,7 @@ node/           Stateless history node implementation
     ui/         TUI dashboard and progress bars
     logging/    JSON logs, reports, metrics
 docs/           User-facing documentation
-spec/           Supporting docs (worklogs, research)
+  spec/         Research docs and development history
 ```
 
 ## Profiling
@@ -250,14 +249,14 @@ CPU sampling (macOS: use Instruments; Linux: use samply):
 
 ```bash
 samply record -- \
-  cargo run --release --manifest-path node/Cargo.toml -- \
+  cargo run --release -- \
   --start-block 10_000_000 --end-block 10_010_000
 ```
 
 Timeline artifacts:
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- \
+cargo run --release -- \
   --start-block 10_000_000 --end-block 10_010_000 --log-trace
 ```
 
@@ -266,7 +265,7 @@ cargo run --release --manifest-path node/Cargo.toml -- \
 Jemalloc is enabled by default. To disable:
 
 ```bash
-cargo build --manifest-path node/Cargo.toml --no-default-features
+cargo build --no-default-features
 ```
 
 On Linux/glibc, you can also tune malloc arenas:

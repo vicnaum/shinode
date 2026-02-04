@@ -92,34 +92,40 @@ Full reference for CLI options and environment variables.
 ### Sync (default)
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- [OPTIONS]
+cargo run --release -- [OPTIONS]
 ```
 
 ### DB Stats
 
 ```bash
 # Human-readable output
-cargo run --release --manifest-path node/Cargo.toml -- \
-  db stats --data-dir <path>
+cargo run --release -- db stats --data-dir <path>
 
 # JSON output
-cargo run --release --manifest-path node/Cargo.toml -- \
-  db stats --data-dir <path> --json
+cargo run --release -- db stats --data-dir <path> --json
 ```
 
 ### DB Compact
 
 ```bash
 # Compact all dirty shards and seal completed ones
-cargo run --release --manifest-path node/Cargo.toml -- \
-  db compact --data-dir <path>
+cargo run --release -- db compact --data-dir <path>
+
+# With debug logging
+cargo run --release -- db compact --data-dir <path> --log-json -v
+```
+
+### DB Rebuild Cache
+
+```bash
+# Rebuild sealed shard cache for faster startup (useful for HDDs)
+cargo run --release -- db rebuild-cache --data-dir <path>
 ```
 
 ### Repair
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- \
-  --repair --data-dir <path>
+cargo run --release -- --repair --data-dir <path>
 ```
 
 ## Environment Variables
@@ -129,12 +135,69 @@ cargo run --release --manifest-path node/Cargo.toml -- \
 | `RUST_LOG` | Override log filter (e.g., `stateless_history_node=debug`) |
 | `MALLOC_ARENA_MAX` | Limit glibc malloc arenas (Linux; e.g., `2`) |
 
+## Deferred Compaction
+
+By default, shards are compacted inline during sync. Use `--defer-compaction` to skip this and compact later:
+
+```bash
+# Sync without inline compaction (faster, uses more disk for WAL)
+cargo run --release -- --defer-compaction
+
+# Later: compact all dirty shards
+cargo run --release -- db compact
+```
+
+**When to use:**
+- Large initial syncs where you want maximum fetch speed
+- Systems with fast network but slower disk I/O
+- When you plan to compact during off-peak hours
+
+**Trade-offs:**
+- WAL files use more disk space than compacted segments
+- Reads from WAL are slower than from sorted segments
+- Safe to quit at any time; resume works correctly
+
+## Sealed Shard Cache
+
+On slow storage (USB HDDs), opening a large database can take 20+ minutes. The sealed shard cache stores metadata in a single file for faster startup.
+
+```bash
+# Manual rebuild (automatic after sealing)
+cargo run --release -- db rebuild-cache
+```
+
+**Performance:** ~26 min → ~1-2 min for 24k shards on USB HDD
+
+**Cache invalidation:** Ignored if `shard_size` or `chain_id` mismatch. Missing/corrupt cache falls back to per-shard loading.
+
 ## Allocator
 
 Jemalloc is enabled by default. To disable:
 
 ```bash
-cargo build --manifest-path node/Cargo.toml --no-default-features
+cargo build --no-default-features
+```
+
+On Linux/glibc, you can also tune malloc arenas:
+
+```bash
+MALLOC_ARENA_MAX=2 cargo run --release
+```
+
+## Profiling
+
+CPU sampling (macOS: use Instruments; Linux: use samply):
+
+```bash
+samply record -- cargo run --release -- \
+  --start-block 10_000_000 --end-block 10_010_000
+```
+
+Timeline artifacts:
+
+```bash
+cargo run --release -- \
+  --start-block 10_000_000 --end-block 10_010_000 --log-trace
 ```
 
 ## Storage Layout
