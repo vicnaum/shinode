@@ -93,10 +93,33 @@ See [ROADMAP.md](ROADMAP.md) for detailed version history and planned features.
 
 ## Quick Start
 
+### Option 1: Download a binary
+
+Grab a pre-built binary from the [latest release](https://github.com/vicnaum/shinode/releases/latest) (Linux x86_64, macOS ARM, macOS x86_64).
+
+```bash
+# Make it executable and run
+chmod +x shinode
+./shinode
+```
+
+### Option 2: Install from source
+
 Requires Rust and a C toolchain. On Ubuntu/Debian: `apt install build-essential`. See [prerequisites](docs/getting-started.md#prerequisites) for details.
 
 ```bash
-# Build
+# Install directly (builds from source)
+cargo install --git https://github.com/vicnaum/shinode.git --path node
+
+# Then run from anywhere
+shinode
+```
+
+### Option 3: Clone and build
+
+```bash
+git clone https://github.com/vicnaum/shinode.git
+cd shinode
 cargo build --release
 
 # Run (syncs from block 10M to head)

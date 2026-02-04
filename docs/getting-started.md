@@ -21,7 +21,24 @@ apt update && apt install -y build-essential
 
 ## Installation
 
-Clone the repository and build:
+### Pre-built binaries
+
+Download from the [latest release](https://github.com/vicnaum/shinode/releases/latest):
+
+```bash
+# Download, extract, and make executable
+tar xzf shinode-linux-x86_64.tar.gz
+chmod +x shinode-linux-x86_64
+./shinode-linux-x86_64
+```
+
+### Install from source
+
+```bash
+cargo install --git https://github.com/vicnaum/shinode.git --path node
+```
+
+### Clone and build
 
 ```bash
 git clone https://github.com/vicnaum/shinode.git
