@@ -260,6 +260,14 @@ impl JsonLogWriter {
     }
 }
 
+impl Drop for JsonLogWriter {
+    fn drop(&mut self) {
+        // Ensure all pending log records are flushed on drop (including Ctrl-C).
+        // We ignore errors here since we're in a destructor.
+        let _ = self.finish();
+    }
+}
+
 /// Filter mode for JSON log layers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JsonLogFilter {
