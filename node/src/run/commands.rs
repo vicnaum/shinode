@@ -158,9 +158,7 @@ fn init_compact_tracing(args: &DbCompactArgs) -> Option<Arc<JsonLogWriter>> {
         .with_writer(std::io::stdout)
         .with_filter(log_filter);
 
-    // JSON filter level based on verbosity: -vv or higher enables trace (per-shard timing)
-    let json_level = if args.verbose >= 2 { "trace" } else { "debug" };
-    let json_filter = EnvFilter::new(format!("warn,stateless_history_node={json_level}"));
+    let json_filter = EnvFilter::new(&args.log_json_filter);
     let log_layer = log_writer.as_ref().map(|writer| {
         JsonLogLayer::with_filter(Arc::clone(writer), JsonLogFilter::All).with_filter(json_filter)
     });

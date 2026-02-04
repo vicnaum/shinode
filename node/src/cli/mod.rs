@@ -80,6 +80,9 @@ pub struct DbCompactArgs {
     /// Write JSON logs to file for debugging slow compaction.
     #[arg(long, default_value_t = false)]
     pub log_json: bool,
+    /// EnvFilter for JSON log level (e.g. "warn,stateless_history_node=trace").
+    #[arg(long, default_value = DEFAULT_LOG_JSON_FILTER)]
+    pub log_json_filter: String,
     /// Output directory for log artifacts.
     #[arg(long, default_value = DEFAULT_LOG_OUTPUT_DIR)]
     pub log_output_dir: PathBuf,
