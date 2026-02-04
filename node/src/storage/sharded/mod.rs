@@ -436,7 +436,8 @@ impl Storage {
         Ok(Some(meta.shard_size))
     }
 
-    /// Open storage without progress reporting.
+    /// Open storage without progress reporting (test convenience wrapper).
+    #[cfg(test)]
     pub fn open(config: &NodeConfig) -> Result<Self> {
         Self::open_with_progress(config, |_, _| {})
     }
