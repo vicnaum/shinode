@@ -68,6 +68,18 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     }
     config.fast_sync_chunk_max = Some(chunk_max);
 
+    // Auto-detect shard size from existing storage (if any)
+    if let Some(stored_shard_size) = Storage::read_shard_size(&config.data_dir)? {
+        if stored_shard_size != config.shard_size {
+            info!(
+                stored = stored_shard_size,
+                cli = config.shard_size,
+                "auto-detected shard size from existing storage"
+            );
+        }
+        config.shard_size = stored_shard_size;
+    }
+
     // Build run context for log artifacts
     let run_context = build_run_context(&config, argv);
 
