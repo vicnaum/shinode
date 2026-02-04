@@ -18,42 +18,55 @@
 ────\|/──|───\|/─────────────────────────────────────────────────────────────
 ````
 
-A minimal, stateless Ethereum history indexer that backfills headers, receipts,
-and logs from the EL P2P network and serves a small, indexer-friendly RPC
-subset. It does not execute transactions or keep state.
+A lightweight Ethereum history node that syncs headers, transactions, receipts, and logs directly from the P2P network and serves them via JSON-RPC.
+Think of it as an **alternative to running a full node** when all you need is event logs for indexing.
+
+**Use case:** Run indexers like [rindexer](https://github.com/joshstevens19/rindexer) against your own local node instead of paying for RPC services.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust](https://img.shields.io/badge/rust-1.82+-orange.svg)](https://www.rust-lang.org/)
+[![Ethereum](https://img.shields.io/badge/network-ETH%20Mainnet-627eea.svg)](https://ethereum.org/)
+[![Status](https://img.shields.io/badge/status-beta-yellow.svg)](ROADMAP.md)
+[![Built with AI](https://img.shields.io/badge/built%20with-Cursor%20%7C%20Claude%20%7C%20Codex-blueviolet.svg)](https://cursor.com/)
 
-## Status (v0.3.0-dev)
+![SHiNode Demo](shinode_960.gif)
 
-What works:
-- P2P range backfill from `start_block..head` and continuous follow mode.
-- Live reorg handling within `--rollback-window` (delete-on-rollback).
-- Sharded static-file persistence (Storage v2) with WAL staging and compaction.
-- Logs derived on-demand from receipts; withdrawals not stored.
-- RPC subset: `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`, `eth_getLogs`.
-- Graceful shutdown, restart-safe checkpoints, resume without redownload.
-- **Fullscreen ratatui TUI dashboard** with real-time speed chart, coverage map, peer/storage/DB/RPC panels, and log viewer (disable with `--no-tui`).
-- DOS-style splash screen during startup with animated connection status.
-- Priority escalation queue for difficult blocks.
-- Atomic compaction with crash recovery and per-shard compaction during fast-sync.
-- `--defer-compaction` to skip inline compaction during sync (compact at finalize or manually).
-- `db compact` subcommand for standalone shard compaction.
-- `db rebuild-cache` for faster startup on slow storage (HDDs).
-- `--repair` command for storage recovery.
-- `--log-resources` for CPU/memory/disk metrics.
-- LRU segment reader cache for RPC performance.
-- Peer stats tracking (discovery, sessions, genesis mismatches).
-- RPC request metrics displayed in TUI (follow mode).
+### What It Can Do
 
-What does not yet:
-- Additional RPC methods (`eth_getBlockByHash`, receipts endpoints, WS).
-- Stateful calls (`eth_call`) or traces.
-- Metrics export (Prometheus/OTel).
+- **Sync ETH Mainnet** — any block range from the Ethereum P2P network — no RPC provider needed, no beacon node required
+- **Follow the chain head** — stay synced with new blocks and handle reorgs automatically
+- **Serve event logs** — `eth_getLogs` with filtering by block range, address, and topics
+- **Serve block data** — `eth_getBlockByNumber` with transaction hashes
+- **Run indefinitely** — graceful shutdown, restart-safe checkpoints, resumes where it left off
+- **Visualize progress** — fullscreen TUI dashboard with sync speed, coverage map, and real-time stats
+
+### What It Cannot Do
+
+**By design (stateless architecture):**
+- **No `eth_call`** — requires EVM execution and state trie, which we intentionally don't maintain
+- **No traces** — same reason, requires execution
+- **No state queries** — balances, storage, contract reads all require state
+
+**Not yet implemented:**
+- **`eth_getBlockByHash`** — planned
+- **Transaction receipts endpoints** — `eth_getTransactionReceipt`, `eth_getBlockReceipts` are planned
+- **WebSocket subscriptions** — polling only for now
+- **Calldata storage** — we store all transaction fields except `input` data (to save space); planned as optional
+- **Prometheus/OpenTelemetry metrics** — planned
+
+### Current Status (v0.3.0)
+
+Core sync and RPC functionality is **stable and usable for testing indexing workloads**.
+
+SHiNode should be able to sync tens of millions of blocks and serve `eth_getLogs` queries reliably.
+
+See [ROADMAP.md](ROADMAP.md) for detailed version history and planned features.
 
 ## Philosophy
 
-- **Stateless by design**: no EVM execution or state trie.
+![Splash Screen](splash.png)
+
+- **Stateless by design**: no EVM execution or state trie. No caring about EVM upgrades and forks.
 - **Small, auditable surface**: minimal persistence and RPC for indexers.
 - **Reuse Reth primitives**: networking, static-file storage, and safety defaults.
 
@@ -94,12 +107,12 @@ For detailed setup, see [docs/getting-started.md](docs/getting-started.md).
 --end-block <u64>       Optional final block to stop at
 --data-dir <path>       Data directory (default: data)
 --rpc-bind <ip:port>    RPC bind address (default: 127.0.0.1:8545)
---shard-size <u64>      Blocks per shard (default: 10_000)
+--shard-size <u64>      Blocks per shard (default: 10_000, for slow HDDs use 1_000)
 --rollback-window <u64> Max reorg depth (default: 64)
 --min-peers <u64>       Wait for N peers before sync (default: 1)
 --no-tui                Disable fullscreen TUI dashboard
 -v/-vv/-vvv             Verbosity levels
---defer-compaction       Skip inline compaction during sync
+--defer-compaction       Skip inline compaction during sync (good for slow HDDs)
 --repair                Repair storage (run as subcommand)
 --log                   Enable all log artifacts
 --log-resources         Include CPU/memory/disk metrics
@@ -128,6 +141,8 @@ See [docs/configuration.md](docs/configuration.md) for all options.
 
 ## TUI Dashboard
 
+![TUI](tui.png)
+
 The node features a fullscreen terminal dashboard (powered by ratatui) that shows:
 
 - **Phase indicator**: Startup > Sync > Retry > Compact > Seal > Follow
@@ -150,67 +165,6 @@ Send `SIGUSR1` to print sync + peer-health debug dump:
 ```bash
 kill -USR1 <pid>
 ```
-
-## Deferred Compaction
-
-By default, shards are compacted inline during sync (WAL data merged into sorted segments). This is safe but can slow down sync due to I/O contention.
-
-Use `--defer-compaction` to skip inline compaction and compact later:
-
-```bash
-# Sync without inline compaction (faster but uses more disk for WAL)
-cargo run --release -- --defer-compaction
-
-# Later: compact all dirty shards manually
-cargo run --release -- db compact
-```
-
-**How it works:**
-- Block data is written to WAL files (`staging.wal`) during sync
-- A `pending.bitset` tracks which blocks are in WAL (for resume support)
-- On restart, blocks in WAL are correctly detected as "present" and won't be re-fetched
-- Compaction merges WAL data into sorted segments and deletes `pending.bitset`
-
-**When to use:**
-- Large initial syncs where you want maximum fetch speed
-- Systems with fast network but slower disk I/O
-- When you plan to compact during off-peak hours
-
-**Trade-offs:**
-- WAL files use more disk space than compacted segments
-- Reads from WAL are slower than from sorted segments
-- Must run `db compact` before sealing shards or if WAL grows too large
-
-**Resume behavior:**
-- Safe to quit at any time, even during compaction
-- On restart, sync resumes from where it left off
-- Blocks in WAL are not re-fetched (tracked via `pending.bitset`)
-
-## Sealed Shard Cache
-
-On slow storage (USB HDDs), opening a large database can take 20+ minutes due to per-shard file I/O (reading `shard.json` and `present.bitset` for each shard).
-
-The sealed shard cache stores all sealed shard metadata in a single file (`sealed_shards.cache`), reducing startup time dramatically.
-
-**How it works:**
-- Sealed shards are immutable (complete, compacted, content-hashed)
-- On startup, the cache is loaded with a single file read
-- Cached shards skip per-shard file I/O entirely
-- The cache is automatically updated when shards are sealed
-
-**Manual rebuild:**
-```bash
-cargo run --release -- db rebuild-cache
-```
-
-**Performance:**
-- Without cache: ~26 min for 24k shards on USB HDD
-- With cache: ~1-2 min (10-20x faster)
-
-**Cache invalidation:**
-- Cache is ignored if `shard_size` or `chain_id` don't match
-- Missing/corrupt cache falls back to per-shard loading
-- No action needed after normal operations
 
 ## RPC Support
 
@@ -243,32 +197,3 @@ docs/           User-facing documentation
   spec/         Research docs and development history
 ```
 
-## Profiling
-
-CPU sampling (macOS: use Instruments; Linux: use samply):
-
-```bash
-samply record -- \
-  cargo run --release -- \
-  --start-block 10_000_000 --end-block 10_010_000
-```
-
-Timeline artifacts:
-
-```bash
-cargo run --release -- \
-  --start-block 10_000_000 --end-block 10_010_000 --log-trace
-```
-
-## Allocator
-
-Jemalloc is enabled by default. To disable:
-
-```bash
-cargo build --no-default-features
-```
-
-On Linux/glibc, you can also tune malloc arenas:
-
-```bash
-MALLOC_ARENA_MAX=2 cargo run --release ```
