@@ -1,8 +1,28 @@
-# Stateless History Node
+# SHiNode (Stateless History Node)
+
+````
+   ▄████████    ▄█    █▄     ▄█  ███▄▄▄▄    ▄██████▄  ████████▄     ▄████████ 
+  ███    ███   ███    ███   ███  ███▀▀▀██▄ ███    ███ ███   ▀███   ███    ███ 
+  ███    █▀    ███    ███   ███▌ ███   ███ ███    ███ ███    ███   ███    █▀  
+  ███         ▄███▄▄▄▄███▄▄ ███▌ ███   ███ ███    ███ ███    ███  ▄███▄▄▄     
+▀███████████ ▀▀███▀▀▀▀███▀  ███▌ ███   ███ ███    ███ ███    ███ ▀▀███▀▀▀     
+         ███   ███    ███   ███  ███   ███ ███    ███ ███    ███   ███    █▄  
+   ▄█    ███   ███    ███   ███  ███   ███ ███    ███ ███   ▄███   ███    ███ 
+ ▄████████▀    ███    █▀    █▀    ▀█   █▀   ▀██████▀  ████████▀    ██████████ 
+
+       \/|\/                                                    ▝▄     ▖ ▄▄▞▝
+       \\|//               STATELESS HISTORY NODE              ▝▄  ▖  ▗▘▄▄▄▄▖
+        \|/                                                      ▄▞ ▗▞▘   ▐  
+        \|/   |                                                ▀▀  ▀▘    ▄▘  
+     |   |   \|/         
+────\|/──|───\|/─────────────────────────────────────────────────────────────
+````
 
 A minimal, stateless Ethereum history indexer that backfills headers, receipts,
 and logs from the EL P2P network and serves a small, indexer-friendly RPC
 subset. It does not execute transactions or keep state.
+
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 ## Status (v0.3.0-dev)
 
