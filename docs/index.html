@@ -221,14 +221,31 @@
                 <img src="https://img.shields.io/badge/status-beta-yellow.svg" alt="Status">
             </div>
             <div class="cta">
-                <a href="https://github.com/vicnaum/stateless-history-node" class="btn btn-primary">GitHub</a>
-                <a href="https://github.com/vicnaum/stateless-history-node/blob/master/docs/getting-started.md" class="btn btn-secondary">Get Started</a>
+                <a href="https://github.com/vicnaum/shinode" class="btn btn-primary">GitHub</a>
+                <a href="https://github.com/vicnaum/shinode/blob/master/docs/getting-started.md" class="btn btn-secondary">Get Started</a>
             </div>
         </header>
 
         <div class="demo">
-            <img src="https://raw.githubusercontent.com/vicnaum/stateless-history-node/master/shinode_960.gif" alt="SHiNode Demo">
+            <img src="https://raw.githubusercontent.com/vicnaum/shinode/master/shinode_960.gif" alt="SHiNode Demo">
         </div>
+
+        <section>
+            <h2>Why SHiNode?</h2>
+            <p style="color: var(--dim); margin-bottom: 1rem;">
+                Running a full node just to index events is expensive — terabytes of state, constant maintenance through forks, slow sync.
+                Paying for RPC providers costs even more. SHiNode gives you a free, local, unlimited RPC for event indexing without any of that.
+            </p>
+            <ul>
+                <li><strong>Fast sync</strong> — over 1,000 blocks/sec. Full Mainnet in ~6 hours on SSD, under a day on HDD</li>
+                <li><strong>Runs on anything</strong> — low CPU, low memory, works on HDDs. A Mac Mini, a VPS, or that old PC in the closet</li>
+                <li><strong>Small footprint</strong> — under 800 GB for full Mainnet, or ~250 GB for events only</li>
+                <li><strong>Partial sync</strong> — start from any block, sync only what you need (default: block 10M, Uniswap V2 deployment)</li>
+                <li><strong>Indexer-compatible</strong> — plug in <a href="https://github.com/joshstevens19/rindexer">rindexer</a>, Ponder, or any <code>eth_getLogs</code> indexer</li>
+                <li><strong>Zero maintenance</strong> — no EVM upgrades, no fork management, no pruning</li>
+                <li><strong>Free local RPC</strong> — no rate limits, no API keys, no monthly bills</li>
+            </ul>
+        </section>
 
         <section>
             <h2>What It Can Do</h2>
@@ -242,11 +259,12 @@
         </section>
 
         <section>
-            <h2>What It Cannot Do (By Design)</h2>
+            <h2>Known Limitations</h2>
             <ul>
-                <li class="no"><strong>No <code>eth_call</code></strong> — requires EVM state, which we don't maintain</li>
-                <li class="no"><strong>No traces</strong> — requires execution</li>
-                <li class="no"><strong>No state queries</strong> — balances, storage reads require state</li>
+                <li class="no"><strong>Ethereum Mainnet only</strong> — L2s don't expose receipts over P2P yet</li>
+                <li class="no"><strong>No verification yet</strong> — receipt hash verification and CL integration are planned</li>
+                <li class="no"><strong>No <code>eth_call</code></strong> — requires EVM state (by design)</li>
+                <li class="no"><strong>No traces or state queries</strong> — requires execution (by design)</li>
             </ul>
         </section>
 
@@ -266,7 +284,7 @@ cargo run --release -- --start-block 18000000 --end-block 18100000</code></pre>
             <h2>Use Case</h2>
             <p>
                 Run indexers like <a href="https://github.com/joshstevens19/rindexer">rindexer</a>
-                against your own local node instead of paying for RPC services.
+                against your own local node instead of paying for RPC providers.
                 SHiNode serves the minimal RPC surface needed for event indexing.
             </p>
         </section>

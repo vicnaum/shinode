@@ -24,14 +24,14 @@ apt update && apt install -y build-essential
 Clone the repository and build:
 
 ```bash
-git clone https://github.com/vicnaum/stateless-history-node.git
-cd stateless-history-node
+git clone https://github.com/vicnaum/shinode.git
+cd shinode
 
 # Development build
-cargo build --manifest-path node/Cargo.toml
+cargo build
 
 # Production build (recommended)
-cargo build --manifest-path node/Cargo.toml --release
+cargo build --release
 ```
 
 ## First Run
@@ -39,7 +39,7 @@ cargo build --manifest-path node/Cargo.toml --release
 Start syncing from Uniswap V2 deployment (block 10,000,000):
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml
+cargo run --release
 ```
 
 The node will:
@@ -66,13 +66,23 @@ This falls back to legacy indicatif progress bars on stderr.
 ### Custom start block
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- --start-block 15000000
+cargo run --release -- --start-block 15000000
 ```
+
+The default start block is 10,000,000 (Uniswap V2 Factory deployment). Here are deployment blocks for popular protocols you might want to index from:
+
+| Protocol | Contract | Block | Date (UTC) |
+|----------|----------|------:|------------|
+| Uniswap V2 | Factory | 10,000,835 | 2020-05-04 |
+| Aave V2 | LendingPool | 11,362,579 | 2020-12-03 |
+| Uniswap V3 | Factory | 12,369,621 | 2021-05-04 |
+| Aave V3 | Pool | 16,291,127 | 2022-12-29 |
+| Uniswap V4 | PoolManager | 21,688,329 | 2025-01-23 |
 
 ### Sync a specific range
 
 ```bash
-cargo run --release --manifest-path node/Cargo.toml -- \
+cargo run --release -- \
   --start-block 18000000 --end-block 18100000
 ```
 
@@ -150,6 +160,5 @@ cargo run --release --manifest-path node/Cargo.toml -- \
 ## Next Steps
 
 - See [Configuration](configuration.md) for all CLI options
-- See [Architecture](../ARCHITECTURE.md) for system internals
-- See [SPEC.md](../SPEC.md) for RPC semantics and error codes
+- See [Architecture](architecture.md) for system internals
 - See [UI Designs](UI_DESIGNS.md) for TUI dashboard design reference

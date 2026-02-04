@@ -31,6 +31,25 @@ Think of it as an **alternative to running a full node** when all you need is ev
 
 ![SHiNode Demo](shinode_960.gif)
 
+### Why SHiNode?
+
+Running a full Ethereum node just to index events is expensive — terabytes of state, constant maintenance through forks, and slow sync times. Paying for RPC providers costs even more. SHiNode gives you a **free, local, unlimited RPC** for event indexing without any of that.
+
+- **Fast sync** — over 1,000 blocks/sec. Full Mainnet history in ~6 hours on modern hardware with SSD, under a day even on older machines or HDDs
+- **Runs on anything** — low CPU, low memory, works on HDDs. A Mac Mini, a Hetzner VPS, or that old PC in the closet
+- **Small footprint** — full Mainnet sync is under 800 GB with transactions, or ~250 GB for events only
+- **Partial sync** — start from any block. Only need Uniswap V3? Start from its deployment block (default start is block 10M — Uniswap V2 deployment)
+- **Indexer-compatible** — plug in [rindexer](https://github.com/joshstevens19/rindexer), Ponder, or any indexer that uses `eth_getLogs`
+- **Zero maintenance** — no EVM upgrades, no fork management, no pruning. Just run it
+- **Free local RPC** — no rate limits, no API keys, no monthly bills. Your data, on your machine
+
+### Known Limitations
+
+- **Ethereum Mainnet only** — L2s don't expose receipts over P2P yet. Hoping that changes
+- **No verification yet** — data is fetched from P2P peers without proof validation. Planned: receipt hash verification, and optional CL node for full integrity
+- **History may thin out** — with EIP-4444 and The Purge, historical P2P data isn't guaranteed forever. Planned: [era1](https://github.com/ethereum/go-ethereum/pull/26621) archive and [Portal Network](https://www.ethportal.net/) support
+- **No SHiNode-to-SHiNode sync yet** — planned: sync sealed shards between nodes via P2P, torrents, or HTTP archives
+
 ### What It Can Do
 
 - **Sync ETH Mainnet** — any block range from the Ethereum P2P network — no RPC provider needed, no beacon node required
@@ -184,7 +203,7 @@ Notes:
 ```
 node/           Stateless history node implementation
   src/
-    bin/        Demo binaries (color-test, ui-mock)
+    bin/        Main binary
     cli/        CLI and config
     run/        Orchestration (startup, sync, cleanup)
     p2p/        devp2p networking
