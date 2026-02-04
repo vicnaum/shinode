@@ -1,5 +1,0 @@
-Filename				Type		Size		Used		Priority
-/dev/md0                                partition	33519612	3025192		-2
-
-NAME     TYPE      SIZE USED PRIO
-/dev/md0 partition  32G 2.9G   -2

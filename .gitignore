@@ -1,9 +1,9 @@
-./rindexer/
-./reth/
 target/
 data*/
+logs*/
 .DS_Store
 harness/output/
-/repomix*.*
 benchmarks/
-logs/
+
+# Development artifacts (moved outside repo for release)
+dev/
