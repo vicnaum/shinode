@@ -77,10 +77,14 @@ pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()
         println!("  Compacted shard {shard_start} ({compacted}/{})", dirty.len());
     })?;
 
+    let to_seal = storage.count_shards_to_seal()?;
+    if to_seal > 0 {
+        println!("\n{to_seal} shard(s) to seal.\n");
+    }
     let mut sealed = 0u64;
     storage.seal_completed_shards_with_progress(|shard_start| {
         sealed += 1;
-        println!("  Sealed shard {shard_start}");
+        println!("  Sealed shard {shard_start} ({sealed}/{to_seal})");
     })?;
 
     let post = storage.aggregate_stats();
