@@ -1,0 +1,226 @@
+{
+  "runSettings": {
+    "temperature": 1.0,
+    "model": "models/gemini-3-pro-preview",
+    "topP": 0.95,
+    "topK": 64,
+    "maxOutputTokens": 65536,
+    "safetySettings": [{
+      "category": "HARM_CATEGORY_HARASSMENT",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_HATE_SPEECH",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+      "threshold": "OFF"
+    }, {
+      "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+      "threshold": "OFF"
+    }],
+    "enableCodeExecution": false,
+    "enableSearchAsATool": false,
+    "enableBrowseAsATool": false,
+    "enableAutoFunctionResponse": false,
+    "thinkingBudget": -1,
+    "outputResolution": "1K",
+    "thinkingLevel": "THINKING_HIGH"
+  },
+  "systemInstruction": {
+  },
+  "chunkedPrompt": {
+    "chunks": [{
+      "driveDocument": {
+        "id": "1BXm--Xf8O8X7hYP3HPjco0pWZborwpkM"
+      },
+      "role": "user",
+      "tokenCount": 107211
+    }, {
+      "driveDocument": {
+        "id": "1zZ4DPi7q0s-cMJwjfHGmARwe42EB5ZFo"
+      },
+      "role": "user",
+      "tokenCount": 1499
+    }, {
+      "driveDocument": {
+        "id": "1-MV-RNzWyyA-HvaF5Yg5Rgyo5VN3_XBR"
+      },
+      "role": "user",
+      "tokenCount": 1588
+    }, {
+      "driveDocument": {
+        "id": "1Yw59aX0BQiH2OSJ3HLvoVzQ6XQ45OhaA"
+      },
+      "role": "user",
+      "tokenCount": 3271
+    }, {
+      "driveDocument": {
+        "id": "1va-X4JCQsCHVEqYiLtnIQFY6b10n-EtC"
+      },
+      "role": "user",
+      "tokenCount": 774
+    }, {
+      "text": "Please tell me, if this reth kb is helpful and fully fulfills all the questions of the project, and has answers to everything from the SPEC and ROADMAP. If it\u0027s missing something please let me know which things are still left uncovered and which parts of `reth` we should explore more to help us build this project?",
+      "role": "user",
+      "tokenCount": 68
+    }, {
+      "text": "**Analyzing Sufficiency of Data**\n\nI\u0027m now zeroing in on the core goal: assessing if the Reth Knowledge Base is adequate for the specified project. Specifically, I\u0027m cross-referencing `reth-kb.xml` against the requirements outlined in `SPEC.md` and `ROADMAP.md`. My focus is on identifying any gaps or discrepancies.\n\n\n**Evaluating KB Adequacy**\n\nI\u0027m now conducting a detailed comparison, focusing on whether the Reth Knowledge Base provides sufficient information for the project. I\u0027m cross-referencing `reth-kb.xml` with `SPEC.md` and `ROADMAP.md` to identify any gaps. My assessment now concentrates on the P2P networking aspects. The specification requires discovery, dialing, and the `eth` handshake, and I\u0027m correlating this with existing QA pairs.\n\n\n**Identifying Protocol Coverage**\n\nI\u0027ve made significant progress, focusing on how the Reth Knowledge Base handles core protocol interactions. I\u0027ve found strong coverage for network configuration and starting the network (Q002, Q016). My focus has shifted to the fetching headers and receipts. While the KB covers the high-level downloaders used for syncing (Q012, Q013, Q022, Q024), there\u0027s a clear gap in lower-level \"probing\" methods. I\u0027m specifically investigating how to manually construct and send `GetReceipts` requests via `FetchClient` without initiating a full sync, particularly regarding the different request types, and whether Q015 is relevant.\n\n\n**Defining Feature Completeness**\n\nI\u0027m now zeroing in on defining the completeness of features for the MVP. The knowledge base demonstrates a strong understanding of storage via MDBX and static files (Q004, Q006, Q007, Q008, Q009, Q010), including table definitions and codecs. Canonical chain and reorgs are well-covered (Q018, Q019, Q020), showing a good grasp of concepts, including `TreeState`. Finally, the RPC implementation appears strong (Q005, Q021, Q022), providing a clear path for wiring up the server. I have not yet assessed the \"harness\" element outlined.\n\n\n**Clarifying Component Interactions**\n\nI\u0027m now focused on understanding how to leverage Reth components as a library. I\u0027ve realized the Knowledge Base focuses on Reth as a full node. I\u0027m trying to figure out how to instantiate the `NetworkManager` without the full suite of components like `ChainOrchestrator`. Q002 suggests `NetworkConfigBuilder`, but it might require a full `Provider` implementation. I\u0027m exploring if a mock or no provider would work for the network stack, given we\u0027re initially without a DB. The current question is how to use Reth components as a library (no execution/state).\n\n\n**Defining Core Protocol Implementations**\n\nI\u0027m now zeroing in on defining the exact implementation of core protocol features. I\u0027m focusing on the specifics of receipt fetching, specifically the difference between serving and sending requests. The Knowledge Base lacks detail on explicitly sending receipt requests outside of a downloader. I\u0027m also examining how to instantiate a minimal `NetworkManager` without a full database, considering dummy or no-op providers. I\u0027m also noting a significant gap around how the eth protocol versions (68, 69, 70) are handled, particularly the capability negotiation.\n\n\n**Detailing Network Handshake Logic**\n\nI\u0027m now focusing on the handshake process within the network stack. Specifically, I\u0027m trying to identify where the logic resides that determines a peer\u0027s supported `eth` protocol version (e.g., 68, 69). Furthermore, I\u0027m investigating the possibility of bootstrapping the networking components without an active MDBX environment, perhaps using a minimal or mock provider for the initial phase.\n\n\n**Confirming RPC Coverage**\n\nI\u0027m verifying that the RPC implementation in Reth is sufficient for the MVP. Specifically, the Knowledge Base entry Q022 covering `eth_getLogs` is proving valuable, and I\u0027m confident it will be a key piece of the final output.\n\n\n",
+      "role": "model",
+      "isThought": true,
+      "parts": [{
+        "text": "**Analyzing Sufficiency of Data**\n\nI\u0027m now zeroing in on the core goal: assessing if the Reth Knowledge Base is adequate for the specified project. Specifically, I\u0027m cross-referencing `reth-kb.xml` against the requirements outlined in `SPEC.md` and `ROADMAP.md`. My focus is on identifying any gaps or discrepancies.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Evaluating KB Adequacy**\n\nI\u0027m now conducting a detailed comparison, focusing on whether the Reth Knowledge Base provides sufficient information for the project. I\u0027m cross-referencing `reth-kb.xml` with `SPEC.md` and `ROADMAP.md` to identify any gaps. My assessment now concentrates on the P2P networking aspects. The specification requires discovery, dialing, and the `eth` handshake, and I\u0027m correlating this with existing QA pairs.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Identifying Protocol Coverage**\n\nI\u0027ve made significant progress, focusing on how the Reth Knowledge Base handles core protocol interactions. I\u0027ve found strong coverage for network configuration and starting the network (Q002, Q016). My focus has shifted to the fetching headers and receipts. While the KB covers the high-level downloaders used for syncing (Q012, Q013, Q022, Q024), there\u0027s a clear gap in lower-level \"probing\" methods. I\u0027m specifically investigating how to manually construct and send `GetReceipts` requests via `FetchClient` without initiating a full sync, particularly regarding the different request types, and whether Q015 is relevant.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Defining Feature Completeness**\n\nI\u0027m now zeroing in on defining the completeness of features for the MVP. The knowledge base demonstrates a strong understanding of storage via MDBX and static files (Q004, Q006, Q007, Q008, Q009, Q010), including table definitions and codecs. Canonical chain and reorgs are well-covered (Q018, Q019, Q020), showing a good grasp of concepts, including `TreeState`. Finally, the RPC implementation appears strong (Q005, Q021, Q022), providing a clear path for wiring up the server. I have not yet assessed the \"harness\" element outlined.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Clarifying Component Interactions**\n\nI\u0027m now focused on understanding how to leverage Reth components as a library. I\u0027ve realized the Knowledge Base focuses on Reth as a full node. I\u0027m trying to figure out how to instantiate the `NetworkManager` without the full suite of components like `ChainOrchestrator`. Q002 suggests `NetworkConfigBuilder`, but it might require a full `Provider` implementation. I\u0027m exploring if a mock or no provider would work for the network stack, given we\u0027re initially without a DB. The current question is how to use Reth components as a library (no execution/state).\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Defining Core Protocol Implementations**\n\nI\u0027m now zeroing in on defining the exact implementation of core protocol features. I\u0027m focusing on the specifics of receipt fetching, specifically the difference between serving and sending requests. The Knowledge Base lacks detail on explicitly sending receipt requests outside of a downloader. I\u0027m also examining how to instantiate a minimal `NetworkManager` without a full database, considering dummy or no-op providers. I\u0027m also noting a significant gap around how the eth protocol versions (68, 69, 70) are handled, particularly the capability negotiation.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Detailing Network Handshake Logic**\n\nI\u0027m now focusing on the handshake process within the network stack. Specifically, I\u0027m trying to identify where the logic resides that determines a peer\u0027s supported `eth` protocol version (e.g., 68, 69). Furthermore, I\u0027m investigating the possibility of bootstrapping the networking components without an active MDBX environment, perhaps using a minimal or mock provider for the initial phase.\n\n\n",
+        "thought": true
+      }, {
+        "text": "**Confirming RPC Coverage**\n\nI\u0027m verifying that the RPC implementation in Reth is sufficient for the MVP. Specifically, the Knowledge Base entry Q022 covering `eth_getLogs` is proving valuable, and I\u0027m confident it will be a key piece of the final output.\n\n\n",
+        "thought": true
+      }]
+    }, {
+      "text": "This Knowledge Base is **exceptionally helpful** and covers about **90%** of the architectural knowledge needed to build both the Harness and the eventual MVP. It provides a solid mental model of how Reth works as a full node.\n\nHowever, because your project goal is to use Reth **\"as a library\"** (for the Harness) and then build a **stateless/minimal storage node** (for the MVP), there are specific \"low-level\" gaps. The KB explains how the *standard* Reth node works, but you need to know how to *break* that standard flow to build your custom tool.\n\nHere is the breakdown of what is covered vs. what you need to explore.\n\n---\n\n### ✅ What is Fully Covered (Green Light)\n\nThe KB gives you everything needed for the **Roadmap MVP** (the storage and RPC layer):\n\n1.  **Storage Engine (MVP Phase 2):**\n    *   **Q004, Q006, Q007, Q008:** You have a complete map of MDBX, how to define tables (`tables!`), and how to encode data (`Compact`). This is perfect for building your custom schema for Headers/Receipts/Logs.\n    *   **Q009 (Static Files):** You know how Reth splits hot/cold data. For your MVP, you can likely skip Static Files and stick to MDBX for simplicity (as per your Roadmap), or adopt NippyJar if you want compression.\n\n2.  **RPC Layer (MVP Phase 3):**\n    *   **Q005, Q021:** You have the exact recipe to spin up an RPC server (`RpcModuleBuilder`) and wire it.\n    *   **Q022 (`eth_getLogs`):** This is critical for your \"Indexer-compatible\" goal. The KB details the Bloom Filter + Receipt lookup flow. You will essentially re-implement a simplified version of this using your custom DB schema.\n\n3.  **Networking Setup (Harness \u0026 MVP):**\n    *   **Q002, Q016:** You know how to configure the `NetworkConfigBuilder`, manage connection limits, and understand the `NetworkManager` lifecycle.\n    *   **Q015:** You understand the peer reputation system, which helps with your \"Soft ban\" requirement in the Spec.\n\n---\n\n### ⚠️ What is Missing / Needs Exploration (The Gaps)\n\nTo build the **Harness** (the immediate next step), you need to interact with the P2P layer at a lower level than the standard Sync Pipeline does.\n\n#### 1. Sending Manual `GetReceipts` Requests\n*   **The Gap:** The KB covers high-level downloaders (`BodiesDownloader`, `ReverseHeadersDownloader`) in Q012/Q013. However, your Spec requires fetching **Receipts** specifically. The standard Reth Sync pipeline fetches *Bodies* (Transactions), and executes them to generate receipts. It typically does *not* download receipts via P2P (except for specific light client use cases or backfilling).\n*   **The Spec Requirement:** \"GetReceipts(Vec\u003cblockHash\u003e) → Vec\u003cVec\u003cReceipt\u003e\u003e\"\n*   **What to Explore:**\n    *   Look at `crates/net/network/src/fetch/client.rs`. Does the `FetchClient` expose a `get_receipts` method?\n    *   Check `crates/net/eth-wire-types` for `GetReceipts` and `Receipts` message structs.\n    *   **Crucial:** You need to confirm if the `FetchClient` exposes a way to send raw `EthMessage`s or if you need to implement a custom `ReceiptsClient` trait.\n\n#### 2. Protocol Version Negotiation (`eth/68` vs `69` vs `70`)\n*   **The Gap:** The Spec explicitly mentions handling `eth/69` and `eth/70` for receipts. The KB mentions these in Q001 and Q024 (Serving), but doesn\u0027t explain how *your* client determines which version a connected peer speaks to construct the correct request.\n*   **What to Explore:**\n    *   Examine `crates/net/network/src/session/active.rs` or `crates/net/eth-wire/src/capability.rs`.\n    *   Find where the negotiated capabilities are stored for a peer session so your Scheduler knows whether to send `GetReceipts` (old) or `GetReceipts70` (new).\n\n#### 3. Instantiating \"Brainless\" Networking\n*   **The Gap:** Q004 describes the `ProviderFactory` which requires an MDBX instance. The Harness is supposed to be stateless (no DB).\n*   **The Spec Requirement:** \"Scaffold harness... no execution/state\".\n*   **What to Explore:**\n    *   Can you initialize `NetworkManager` with a `NoopProvider` or `MockProvider`?\n    *   Look at `crates/primitives-traits/src/node.rs` or test utilities in `reth-network` to see how to spawn the network stack without attaching a real database on disk.\n\n#### 4. The \"DeFi Anchor\" Logic\n*   **The Gap:** This is specific to your project logic, so naturally, it\u0027s not in the Reth KB.\n*   **Action:** You will need to write the `Scheduler` logic from scratch. Reth provides the pipe (`FetchClient`), but you must write the logic that decides *what* to ask for (the Anchors + Windowing described in the Spec).\n\n### Recommendation on Next Steps\n\n1.  **Verify Receipt Fetching:** Open `crates/net/network/src/fetch/client.rs` immediately. If Reth doesn\u0027t have a built-in \"Download Receipts\" function (because it usually derives them), you will have to implement a custom request handler using the `eth-wire` crate.\n2.  **Mock the DB:** Look for `NoopBlockReader` or similar mocks in `crates/storage/provider` to allow booting the `NetworkManager` without a data directory.\n3.  **Map Capabilities:** Find the `Capabilities` struct in `reth-network` to ensure you can distinguish `eth/66` peers from `eth/70` peers.\n\n**Conclusion:** The KB is a fantastic map for the territory, but for the **Harness**, you are going \"off-road\" (downloading receipts P2P is non-standard for full nodes). You will need to dig into the `eth-wire` definitions to build that specific feature.",
+      "role": "model",
+      "finishReason": "STOP",
+      "tokenCount": 1442,
+      "parts": [{
+        "text": "This Knowledge Base is **exception"
+      }, {
+        "text": "ally helpful** and covers about **90%** of the architectural knowledge needed to build both the Harness and the eventual MVP. It"
+      }, {
+        "text": " provides a solid mental model of how Reth works as a full node.\n\nHowever, because your project goal is to use"
+      }, {
+        "text": " Reth **\"as a library\"** (for the Harness) and then build a **stateless/minimal storage node** (for"
+      }, {
+        "text": " the MVP), there are specific \"low-level\" gaps. The KB explains how the *standard* Reth node works,"
+      }, {
+        "text": " but you need to know how to *break* that standard flow to build your custom tool.\n\nHere is the breakdown of what is"
+      }, {
+        "text": " covered vs. what you need to explore.\n\n---\n\n### ✅ What is Fully Covered (Green Light)\n\nThe"
+      }, {
+        "text": " KB gives you everything needed for the **Roadmap MVP** (the storage and RPC layer):\n\n1.  **Storage Engine"
+      }, {
+        "text": " (MVP Phase 2):**\n    *   **Q004, Q006, Q0"
+      }, {
+        "text": "07, Q008:** You have a complete map of MDBX, how to define tables (`tables!`), and"
+      }, {
+        "text": " how to encode data (`Compact`). This is perfect for building your custom schema for Headers/Receipts/Logs.\n    "
+      }, {
+        "text": "*   **Q009 (Static Files):** You know how Reth splits hot/cold data. For your MVP"
+      }, {
+        "text": ", you can likely skip Static Files and stick to MDBX for simplicity (as per your Roadmap), or adopt Nipp"
+      }, {
+        "text": "yJar if you want compression.\n\n2.  **RPC Layer (MVP Phase 3):**\n    *"
+      }, {
+        "text": "   **Q005, Q021:** You have the exact recipe to spin up an RPC server (`Rpc"
+      }, {
+        "text": "ModuleBuilder`) and wire it.\n    *   **Q022 (`eth_getLogs`):** This"
+      }, {
+        "text": " is critical for your \"Indexer-compatible\" goal. The KB details the Bloom Filter + Receipt lookup flow. You will"
+      }, {
+        "text": " essentially re-implement a simplified version of this using your custom DB schema.\n\n3.  **Networking Setup (Harness \u0026"
+      }, {
+        "text": " MVP):**\n    *   **Q002, Q016:** You know how to configure the"
+      }, {
+        "text": " `NetworkConfigBuilder`, manage connection limits, and understand the `NetworkManager` lifecycle.\n    *   **Q015"
+      }, {
+        "text": ":** You understand the peer reputation system, which helps with your \"Soft ban\" requirement in the Spec.\n\n---\n\n"
+      }, {
+        "text": "### ⚠️ What is Missing / Needs Exploration (The Gaps)\n\nTo build the **Harness** (the immediate"
+      }, {
+        "text": " next step), you need to interact with the P2P layer at a lower level than the standard Sync Pipeline does.\n\n"
+      }, {
+        "text": "#### 1. Sending Manual `GetReceipts` Requests\n*   **The Gap:** The KB covers high-level downloaders"
+      }, {
+        "text": " (`BodiesDownloader`, `ReverseHeadersDownloader`) in Q012/Q013. However, your Spec"
+      }, {
+        "text": " requires fetching **Receipts** specifically. The standard Reth Sync pipeline fetches *Bodies* (Transactions), and executes them to generate"
+      }, {
+        "text": " receipts. It typically does *not* download receipts via P2P (except for specific light client use cases or back"
+      }, {
+        "text": "filling).\n*   **The Spec Requirement:** \"GetReceipts(Vec\u003cblockHash\u003e) → Vec\u003cVec\u003c"
+      }, {
+        "text": "Receipt\u003e\u003e\"\n*   **What to Explore:**\n    *   Look at `crates/net/network/"
+      }, {
+        "text": "src/fetch/client.rs`. Does the `FetchClient` expose a `get_receipts` method?\n    "
+      }, {
+        "text": "*   Check `crates/net/eth-wire-types` for `GetReceipts` and `Receipts"
+      }, {
+        "text": "` message structs.\n    *   **Crucial:** You need to confirm if the `FetchClient` exposes a way to send raw"
+      }, {
+        "text": " `EthMessage`s or if you need to implement a custom `ReceiptsClient` trait.\n\n#### 2. Protocol"
+      }, {
+        "text": " Version Negotiation (`eth/68` vs `69` vs `70`)\n*   **The Gap:** The Spec"
+      }, {
+        "text": " explicitly mentions handling `eth/69` and `eth/70` for receipts. The KB mentions these in Q0"
+      }, {
+        "text": "01 and Q024 (Serving), but doesn\u0027t explain how *your* client determines which version a"
+      }, {
+        "text": " connected peer speaks to construct the correct request.\n*   **What to Explore:**\n    *   Examine `crates/"
+      }, {
+        "text": "net/network/src/session/active.rs` or `crates/net/eth-wire/src/capability"
+      }, {
+        "text": ".rs`.\n    *   Find where the negotiated capabilities are stored for a peer session so your Scheduler knows whether to send `Get"
+      }, {
+        "text": "Receipts` (old) or `GetReceipts70` (new).\n\n#### 3. Instantiating \"Brain"
+      }, {
+        "text": "less\" Networking\n*   **The Gap:** Q004 describes the `ProviderFactory` which requires an MDBX instance"
+      }, {
+        "text": ". The Harness is supposed to be stateless (no DB).\n*   **The Spec Requirement:** \"Scaffold harness..."
+      }, {
+        "text": " no execution/state\".\n*   **What to Explore:**\n    *   Can you initialize `NetworkManager` with a "
+      }, {
+        "text": "`NoopProvider` or `MockProvider`?\n    *   Look at `crates/primitives-traits/src/"
+      }, {
+        "text": "node.rs` or test utilities in `reth-network` to see how to spawn the network stack without attaching a real"
+      }, {
+        "text": " database on disk.\n\n#### 4. The \"DeFi Anchor\" Logic\n*   **The Gap:** This"
+      }, {
+        "text": " is specific to your project logic, so naturally, it\u0027s not in the Reth KB.\n*   **Action"
+      }, {
+        "text": ":** You will need to write the `Scheduler` logic from scratch. Reth provides the pipe (`FetchClient`), but you"
+      }, {
+        "text": " must write the logic that decides *what* to ask for (the Anchors + Windowing described in the Spec).\n\n###"
+      }, {
+        "text": " Recommendation on Next Steps\n\n1.  **Verify Receipt Fetching:** Open `crates/net/network/src/fetch/client"
+      }, {
+        "text": ".rs` immediately. If Reth doesn\u0027t have a built-in \"Download Receipts\" function (because it usually"
+      }, {
+        "text": " derives them), you will have to implement a custom request handler using the `eth-wire` crate.\n2."
+      }, {
+        "text": "  **Mock the DB:** Look for `NoopBlockReader` or similar mocks in `crates/storage/provider"
+      }, {
+        "text": "` to allow booting the `NetworkManager` without a data directory.\n3.  **Map Capabilities:** Find the "
+      }, {
+        "text": "`Capabilities` struct in `reth-network` to ensure you can distinguish `eth/66` peers from `eth/"
+      }, {
+        "text": "70` peers.\n\n**Conclusion:** The KB is a fantastic map for the territory, but for the **Harness**, you"
+      }, {
+        "text": " are going \"off-road\" (downloading receipts P2P is non-standard for full nodes). You will"
+      }, {
+        "text": " need to dig into the `eth-wire` definitions to build that specific feature."
+      }, {
+        "text": "",
+        "thoughtSignature": "EvI+Cu8+AXLI2nyNVQX0WxZTJyyhO8Lk59KX0sP5Hdyyr5jbg05rnXCmV3r8WUBfH3d2DVCYepW4dlH/nTM3MROS8/Fa7D01mK/0L4/gHwu0iBzvfZPAGejaPGQrW8bP1TvyoR8GNx571WorxD3jkpCZ82l+qp/vZOdakzLqEgxkyASH0SXNHgStwLvIDx5nWB1HgRb2Bg0atAd1xjTdgYNf/YfzTXbQcqDS6tsVr5EDwiENIoVqN7Mt3q/wHzxFAqOTxsZBNvb0jIy8DbfmsJSxj7V89ONc/cboIEI/WDqLlzLGMArZMvWzdZnLtI/G/fqsx3JAhirGxwxwoUdGqNOX7E8rinBGQr+MmHAZqXhv3TZOPz3t0S/0RIgD25AkMIJFAfYWWPVuLY8VfsEom2+rRjLpVmqMpP/tN2GMrnqtBNcaNWoGSNVAeF8Y5iRLuPmejTunViAzKj6rCldNDkr8rveQsddEmoGMNppzfflfAGIgpTBEt6dnb0Luz1aIvoCbhbVo/j9sG30nSzZkoYSwPGZoIPcn0m7h1gyF4siknQq32zp7r8GN8UExkzcbGoFZ20MoC3c3dBwbMqaOOSWeS0q3J5YMaZ4CimDdCImLo2Jxadslimk3UA3/jGa2EToMxZ58J18l/1U8OKxsXmotj08wEHK50rqhE2mzwoGC3jBXUr85z9hWLmo8miGqk9AvO8OaTEclhQV1LkzZsz0Eu60u9H3ogX+D2ESMqTIErlmrOcEnB/SExvcuubCk/3aZq6cyvrQyRAgk1C7r3cfT0tKAHRSk9lyyA0tpfwOMR1f8xj+7oEPEAhe3B7Io12LPaXSHtV2Tc4BSMuoy2WFtc0wo0mYh9Ls6vTMT7KhvxJXSIa/70OIFifs2w5qtBH44Uaq22ksYe24bzr47+YKUaH5MWFpqQ08MTu3PzE3ASxFVmFyiQKMaTqlBNDPnIHafd2SH7A6rqvX0vkj1XGz7RaPzqY9nC7UmvPfpXc+CVALQAbkN4ch1YM/aCaKgP6xBtyWsrh5Hg0aMetKo3eEo9AtJgDPy571tNK33Ka59jrMYhuWfUDk9PvBvSZ53yy+bw3Coe57oySI/kUjjtwoxssP/faQN5mI4H20ZnxyyopzlB1ZfvbaY6AvxmJqMUwKr2JQvz1TyQWFtzdB0TKvTLQYxIEcRLIINHnT8IJOH5lz3GXlBam4YTaEyxt9iqYNH7s0rIA5peaSDmrDEwesxBBDTdmnagMvy1+U4eyY7qOeL6xDeiob2u8FkXWy8qWWCn/RbB6N8m1+Ms5rmRttZZO4+L7hJq68QGK/vuNrsFynk11w92MPJvggNg3k3Vg3Tv0MYqSS35yHQqNKZsAP7k89rjt6X755188F5QtBbfXUmouikSBil7wH+WkpPA5r69upHC/M6n+34vbXe4j32A4bHYlR4MrGYIsf/2VvJWTGiWk/i94s9MgHgTDHvL9Wybv7UX+kpyp7ex9ijuB6gjVNdBGJ4FsrSFY56S5mpnmYhN73PbkgdWWO4ZCM5Yc2CzSDdCyl7IkpDAwNMv7zO3qK5n2DUlUEDm48cJd0RmxSfwNSTIoq5RnQOnVnCNT2H8WtZA57hmdNmbGVTaoQa4nZFMS9E86kyfApRCnQHjZJlLfM3eEZOam1l0jzjWPOtw3h11nf3bVo7kgwXK5lPfhTWoYyY3mDIasyQtA2YvYPbt5nJVgpdS1z1BZSw7z7xceclGRxDCk89ENME/QXpC01glzZm6vmeBrFeAKFt/looVJkaxwO0OyFGlOiFNN5muR0zs89KJ3SUoY7TORjxWJKbvd3iqZ46XMimE+Odkg5uIu3WPO9b9zYki70wJwYXsX2Y3Szg4CXEh1iRTFOzxLAKNc0yjukdF09prLLloYqDWUh2WUwN+nZ5LeM0gzOi2V2iLqgbVq1eIIAkUDZZSU/2F8C/ofJNEF2JOYMcjWScDGjqU3bdqDcIMGdF6+c7dzc//KRPlYLI+XNRKePfq7bixc6w14DiUpOwf6PDz+5/cC1aLEQXrOYaJwcMysZtCLgU8IKwuOOlTzbhmWsVrVoGj7gh9/uAQF2DxwOgnXWo3uNIINIDpPgBxA/UYHsoGQb9hb48MH14PNyA9DklRBOJHaEeBlbL2YhlABswyIa/FUnS6Umwhu7rGMwR07EBV8M3M93GJGjkUspkKF1RtmMh3ai7PpmYIQSjXd6vfD/syNNo7DaOWTiHhlrGuXWhIvd6uWk612LnnRUp05RtirSVbs6WO/6QhXkBX5IvBn1zsmJgB41oyJnA6fV8ypyamAaH08D6kX0bQ/gkUz1zwYsFtzZ71M0ATRL2DMR0IBxocFQS9Xb6V3jSffh8kL2QH5uH6r5LFL3yptZ8SkM+U14aGCVor1AmeuoBI8KzfafPh0FDcvQqYKr9VNMi5HuzomAEMYb4G8gpKvhSrJPf2li/vbe5iowDIqDYXrW8nM+p9X9IukRFdytonn8CjJgH6Njo/2xzZbc/VBlhVH/qKsi3X75pf5brEQMdqttuKw8o1c2GR/JRh58J1rixE/Ct96nBYQsH7RasFfwPJy9QSAUfbkS6tWWnYR5lNt+kBf7WAlrlxTUg3SZ+hbXzEIRrIxl2FiFyTqwa0N3j3TIS65w8IbtiqECJyKlcOSgBKBhtzc2D9q4NqIbxUkdJStgtiRReEYOur8qhblN3HKiJbBRLJpU+dKu3mjP+8Z9KChsXPIMTO5uby+2Pc8Sgytmofo7wslzbPoPTEhjdV3/Npf2oc8nlQbIAB9OqBrA+hh3ITFKXjtOWE9Gbpi4unBMzWP0tXuqJ1mYFIWUk3Q8HrI8FeB45+HKfl/2wsPHOMiIOTcdPhd/Q+uXi7fhOzJy3CkhaIgzK7cGzYpohcFpj8t9MXO6MeI/22MC7HdPH+iubTzjFDUzVbSBYB1zPf8dfwbQ+LyTvmWwflv3S7bDxIAcuCKrIThKpkigpNP3kJvxImvBL/2xXtPjpvQKrVcl0s8i7x61Z9anN5tFQHs/+fB1R7RIjbaniPSdGAXH2LWqZ3kBOdzqw7n5kr1WcFlIWqgKdzpDtIanUlqSomGB789v+qnqjWCQlLB5eq/YrlqN7snL/bo+/xzh1Xj0VJwZiaoavv02R/wt01w+ayEBFPejnHFZnPVpLwckzUkutIH6ufzZ1bORUPdbbfTcgtWwJHxQOV/2QtbVsjeJ9Z6CcLTCgHhj4amDjQgjPGMTniTWnI/yOEhoLG9Gaejt6yHLn9XrXui39RmMRwLKKsCE4wYxOkEmhkqwiyqx5SpnHKL5y5dduXcNqvH7eYXhtG8CRAGQqt6Sf4GdLPPWwjDcJJWhVDa25yykP/9A/cFqwWUCjfxFjUn1naIrxA1A7fuLUZVXas2o1KoIuC/YVXqsS7HAU1WCFiyizhBXVIh6VadOmnRatLgtyuGE2VYlcXBpGdhleKCw3bfPGdhP/76tfvOcm9XTYIw5QYBM9m1szB1FwKAEbl0ycaQJcrm9BM9tquqm57Fkb1mYQB1S/wyjJIKgsewkFsi2r/jVXSsTc52TWzKwHKOpACkTC6VU/dmvGEyTeOmWsKE9kb6F8RChaI/pxFCKq3O1wooHYdd0AMIvwjDv6x49nDpd9nSGC/ywPUJN49gjb0BmQp2fcB4kX6CgKD2W5xBKlrj0aiihJ12fWmENjtk4/lLD38hOfTi8wiK+ISd6gcYJnc/GChn++GwXDRlLI96z1kZEq+fw0+Bqs9M1IeKfRzdVQkEHSseux6lb79YQsEF4fs+gwFE4UIn18ptwM+dI4o8kh8kZKN+3f4K+0RLEBDcTkoptCRBMBUHi/XKN/0CuNtMdCjpkvJlfQRK/9hCFuC8g069fRlNA29OcdoB+BnweYgUko/rnTdwo5UCxjmasb28S6QZNT5d8apdSqgE58g2H990PKV/BjZu52P8dk+PQTgMe9pAMdXvv64OR7Ex0Ww8g+4kNQ5nNlr97fj4k4OYse/e67G7RdfkPiJlp0bQ7N9z9JkXbATq9a4YizaqQPMZTI6gzGw9TYjjOSizWuXe2MdVpszTB6w9yBpb5DSAVOW07AHpixZVLUBfAV0zZKUYzY9fQaZH/Z7f3+LGvEt+EBIV/I20t9X3JOl2vSoWhhluso1jtTPgSi8X/XCgu1LHASk9wAQZlfwp/f+EWo+fJgI5IotN97PJglJCALfAGS78yveKerbC6+BbNwWhStejaO9X1bMPa0uzsyaSW+BDhYk7G+2U0hjJrre7tYq4VCVHRT8toGgXnIWixrGuTMpGAEfs/MxLTxwBZukE+7SuIIo2X9Lulj/B21UisSc8fl6XfnFMT6yt37Scx2TAKp3bErt3WQbexiB1TO2YuWcpgfokoYSGMSE4z31Nek/zEBYI2HL/wnerLOQyPJ2ozNLhe1YxklFxw86a8el2JI//M5IzkIYziQq5Ia98mWQT23CqjXYotySgvcRquBsuicl2xhi9iTq74PxvuycppCIZ1CZOMraqW8hz7zeql4gZKWsfwATvWDosGBer5AZfwct4sMt77u5thPMDNrkL3M/2whC53gH8zwFG0hUnfrALxrafTP1UUl7YUU8CSkebxJCmg1fGQsGeXhQEuqHl8Y+XGPckvujKizEm9/0G9r+BGV4h/gv9Fl1hq7BaEWg/Rz1jk7vxFL9HIhSwCxbGXUNTCbN/TtjKOqHcqtmMKB7g2Zd/FmDco6OTP5zNKirSDH6RKBDijHWOga7da0Uns8/tt3hNzFbbmPGanAfMFyoBrOHKjznbo4jo+wK0CqFlGaGDTwiBni2RU6/zpbSfBPRSreaXphiEWdjN30Cg+qEYDtaxL0sLqVXuXuqGKGqevQahSBa5JdF2w9UI+OhpBYhoZVW1ruzRbNxvpDoW5VENAdJAOkExY1C7MK+UxH7fIffLV4nEwmlIj8+qCN9i6GgGsEp030Rcy/EVOYGm35GdeJX6R1vNNFSnilmwFEb2t5a4yYkgawEtshpdQKF+8o6QBiPt2pRlH4rJHYHC1uO92uoIZw8TvTd1QV6l7DFeZJwN/5nfWDCAAbB2xB3ppJcVDDw4YCinfIueRhAV7s0Y9wSFAZIzxsAxTqG6npgCaSLJhPb4pEKL4FZ3ENMLtQgG3l1ChyJoA14orvkPaYjsxYr0pFJxAUqWgIcyO1f2rdIM1lyJOOyKN56CoUkIyyhAZbkmmbjhoQTrsDZUToPPEldIdHphB9HnKop7yD6lp5ntkPZTSQlrj1qP/5nYkpPKr5M/RBClGjd9V7h/7nvToBs7kBeume6j5W8ORqK0xKE6PgUFHbFRgFoJQLB1XGRssUN+EWUyQzNddzMrZz5zCPDsV3/dYQs9RrJdSJ7HqIK3tHg01qkg8mjKQIQKdg4SylXJ77v6P8T2YBq4gb8jF46T8sS3bopD7NLg2S9orj8GMVVo5rKGY9inbCBWAFaDUs8Gbf4VdgMnl02ZIDnWrBUpM0ORw2+cYIhlspBfK8mYt61JILuVXV7sbvI8B7wI26WaTbsLYPjrRZjFQde6LUEogpoaw/gbCxlvkZ1BeSGzPawqIHGZrZ8oS4HOnpAX3bHn++Amp6OXDU4/qjmVIOi46LaW6ez82ytTOPqbrqpH8WDTG1ZQuJ89y7VDNEGyggjdHrN7YtNGWRljMBnZRD7K4//qYBtWQEcyP6JNPW5XLN3XiQ8LsnusrAJmJOaHv0UHI0sAXhfOrB7OgRmDfZCuI+YKxzYjy68mtCQfRY1e626/OYEChXEpjxb1No2QaidPlnae+vM5+jQOAokd7+EzNih+iVLuwGxRaj5XlnwvR+kd8xUu2qK0ObBEac8oa5HeqHtudD6iD3BtXYc6xHs9YEGK2bx9PAeQvnEs6QRoWaLFNDVX1O0Z4HDSL2iOttGYWXLvJUVjSp0MscCRQ06cM4eXdCXUwlaDKF8LGncLHlFkkRA1af9JXtYaEcxgr+bY0+dyjxOa6P/0P2YcNIxaGSnv1/EXbf+Ss9RMZQIQeN3KfFJzCOqFOfxN85vix6tyanWIp25t/m0gEN0yvr+h8+h+CCWTz9tNy4W5EU11Z7ZX7+x+56BBP9WUs5wyYdeIOpZT37NH7GUzULR6Cq9MtptuP6IRCDROudxFRy/dIeTXIh61ay3562/Hat03oEQJRD2LdivsuVgUoAcBRVo27Q2FkUzbVOJLL8jMPMkB0k8XOuEAPBB5BHp3w0am1JYcOSWCv33DsWb3s98UlMTrikfcFQm+KtYGvBQPkHFVO1UC+8lt3r76HE90jmoMm2dfXkSi52feNzMwIhnuj0IS/842KY3VTO8a8MvYz6RSpkiVNAGqMe7Xomi756BrlF7y1HUqHTEQfImT4wYZ5w9RsUNDxZiXAMQ3i/i6jI9VopnHqJZDz5SbtKiCsGDm4VJgbpL0AQIPU160Xxc1pYhTE/kUEksEz6g+T/kE7elNnPi/gaB9OL6yZoI2BBuhY/C7zGZm1+RemB2JnFGgo7gmf4eO2Tu+jitdrSezKLTJv/PYTjXC3hKuWzLKuHzYK052gfTBNPOGiX2wHoMxE3mohQor564J75LACu7auIrlCvdIATVqRQDavD+B62mSO1BcrxvTpY8A5zyzGezgTL4/q+/N9DOHsS1zKkX1GcSYVJSd+gk/dREVLUMa0uytFOwMWU3BYuY8TEBhKBWmufn6Ze8y4LbFlwQkcB0hV2cs1a/3nAItiSMTqDDR2xYD/jlOtCWnSlZ6j1JkHQUXYCS3tj0Kb65NEh2SZAZ6ldXyHSosHCa4F/mhD3yJi60VXeSvLiNp3OAs63K3MNw2PRcJCAWB5j79mnVqKyN+gUi9UKexkBPZ/kl+1jUZ3pb4YUUnn1DRtXs1/3W0OEmeNwlBlEp1esSA4AWdVsRJmorpAQgt+v2KfHkgcAGTJ7kFfWrWHImeF6Ptb0gIQON61E8BaGkEv7s0f8RQUlxyDX1WDMJfudV1EU+/tppUR3LFPHFCIsBEI21Uw5dO9wjvWfE6AtmbYa7d6Sj/VSYIinmaq8QtDBntRXRVQ31eUr7G76KogUrFpHfAnnn4QabNeLHOwYOwUC2+rSihcikE/Q7Nov2ZiQporysKfamqSlfLGIvwVIMOxOzeNRlD2PX4+cg+qY4rltbzAzvJgWkuAQNIDGL0s1rRlO18MtEq02yYEd0EgojMN2w/XcbrCGxWKudQ6EN5EqYsx1YcLgZo7dsO0sLsvbWm6J98mlFLwi/xdRH6wUkr/RFTojl/20o60umNrt8Il+cPglVYY5Zzy3H4FJuYxuAm91eBKl9gw1pvuXLu06wprOhOpzQZC/UTfY3W94MjNZSkXiMeE9kSQbGmd+T18P1HZKIbgg31n9eTYBXRm4hOvHeL2tjUgjuNLPoSCsDZbnpSVtA0WMH+vP2FTu3mQ/X6QkrPsQXU/TgMbPWjQseFIbO0HJCSTvrHFGY4uEkoRHX0a+hkuzZ/Xs/C8VRnk90/8LgEFB6Smbn7TfbDQe0gB/+2br3siRALY7+nqfc1UodNBNHWqeGDnI7mxWxb9NKzYcdd/IEwpaGes6AI9FttyiStjfVJYdEhMlMUql29dZFm4sqjg3MrCcOGfIGH8aedzfSXKNzG10b5z6HlANNTU81M4rRCSgZK5i59ynvR+jp6+EysP8l/N+fpiEekruC6bcONqvc0fbW3z97T6raEVU+9yJrGR2mUbrloSojb7D5+t2LbJUFDKIpvO9Fg0FKieHfC9bKXrTmXByKChTaQtyjuxtb7/0EmLX/L/5gyJzZ4tGkRbranqRlk9AgXFoOtrs6GfOpwavK+5ciYO15WnEKNCj9iwDbxh+QmkKP3gXkCPbq28A+2EJqbuoL8cYU7xrBQvffgzQK1eJgx2XVUxIVi0orXfxKEjWXlOx+Tldc0V8bqfUgWHxh/xS+3VYJEKtOGRQ5OtRvG9TbpABwgTxM0DkE1YXtCCK7Tu1DPqpCqez3UdZfNw2hLc2b0GK5ie1ZJNsl0IEUDfQlF/FArh50keG3anH+mrCTISEh4IHdrh4WazkV6nlLiAzx9vf9S86tXZQxt7d/zwFqgiL+ye1X81Ype3mtkAHXzlzz6/ckIUU0EcUCuZWg6zn71vWhLd3gj/8vJUOwzscMam4T5Jighxu6fst1W1g8yxVRQUfvLhsTKO1Kr6qxGGiX9HAzK9b7BQ7qu8nxIBZyfTRD+PUy34nHKgji7epsRRwhuc48xkjEG6cx80hSBK+uTiOeyNBG/CGGHsDOd2Fm3vM63RE8EdQ4eMcUufDl2AjrjSHNLIRah00x3Kf0cIjmvdrmzTAXCpWmHWfuZWDURpQwBVD2vGnsQKQ431MphDVc4IA+gtXZgdVnwBX90Ob2+o9NtdV731nHCGQfsrWmLTjYyFvkFWa0shkPK0ZAA9ZTHpOKtkhLCg5txnM1pNrIKXNnzDSfrcUskQILbLC5eXu1yUXTk2Q/2hquuRhQdlSwG1nvXzl0nSkPR1dZQwsYbxpZUgRM9SpLZ6FB2D7qHVE9UB/QIrOdm+YolrPar+H8zh4/XW4Z67DekFrTzxdj+qBbApWPJI/ZqWogLi0pnmR26E12KT1Ushou/DBuBjpIfiCUPbl5GxZw70Prl4Di32HzUPqvxgq0f8pb9HftHXqeAgnhZvJyDZzrKLnquEPoLgvW1273NHM4XuIRn/ULN4jIbaYhnHQEEU4m4cCReC5+/dwJnqQoURlqbWzcBHlChfOY/AMIcHw+x0paPInxLmXcA+r1bLe1aJT7I9K/xngB3qMLFfKauUGsR/dUxOGapfpm6+5AL31qa4a4wkjbFfQxh/Iw9iYWF7VcMecooiDx1uOk8gHEeBddycNGFQBCABOYzry0b2J5z2TOgMVf4v4wOldgjyC4iwNBoPTJwOQLj6Vwar46oNCs4AZyb6nQT4NGDxfmXI/wo3wl109bW3cL/8RvLdrlynmDVhNrsoYvZwGlBr2okTUXGaFFC6QvbJFfhw3P7Qcs+mQBDcMjFfisdvBaCgy97M9X4w6IsX1sclKdixmP2ObhlFdVv5YGX9OXQdnx5oN6KqB3/6CZXVKfltp2DtNIIZ+DBO0s2lNo7FdhZk3G23hzi5wi80xUoMhI/qSqyq3jkgw0msXA3MJzYdb++wtew7SbneUrlbsux0ftiXiFkSiLJXMIan3TtM3CdAJ6IqxJdIoN7mkpsHsBxMVAAF2PP1eLKM2Sk20UcvRLK/LglGBCJTTfsN+l/o3S6GXfWQqVWUJLsRMXj5WqyMxs2C7/4gZuXIwXdRWgfn7CKVhtIA0vyFR0UpibjyJ/PXf+jEA2TPgDZvoc34OjOyhEKueZxoT+aWYHaRdY5LFqOs//8So9wW2waf15hjZSykuzOMiEGXLG34qjStvYLJYqElAX2oQOC/eehOaVxHxaewKYtvQ++qofDEoamrHt3OLBKscusO1RYCplRNAiy0h4GWYtNGzdQUE/4O/HzeuDf5fT7kkyKwWHqknZDqSBVGnSfCfB9bAb2ifEzyKEBrNXdu7c4mIzSv8Ii6juah4sgS645OhV6oNNVYzhbuYAF9yvXnLg8FLLKHUR62/G2k3+q1Ldq4e1GwlCQXTuUwt+TRDMeLyReEDU5+CcID56PAZG8utz3SLf3tHHxAsmlVxpbiYrpxiLXh9eKVsV0MP47ZUMWH/4lljj9konXIHrZkw9PlWs//dOySsYIn9Y2zSKhcl91+0Bfv6BwZUOy1mUy+5sn3tw9FFtH346QBqOdfPZa2ZJ40DBttA+ScmJ5Hd2tXOTjFY/93yYaeJicMaX6z13eZxT+/dl2tUourX/q+7N7t9s1TURY/ynCUOtpF38N57MceN8lGsjv5mIXDS+fPgtRBTF9WCkg2R/uL4tDZDt2jA2/ER3m74+kDK/WO7hwc+2QlbNNXVdsOEfLFrAOOZjPL3GkGptmkS0fxfbbNzfQB5OFyQYJoaKmCJf0IWu2rtet2qogRBdz37Um0YhVPnRiEPVx8JdSwcvtKeK9H5BXTq0nx2/YVmMVWL4CpHpSX3e3vGBoPvzdY5N8gpUsPrkZGQDPhnbbAtLz6VgxOI97eEH3tOmzaeN2HAiWy+KV2vibtoRUtHWHt4wR+EYZw4raDdvji81WoaDWky5Oxcyok9rX0ZG3/dJAt0dMgWbvmZ69n1idmDOAUC+4vKXjNPuoxddo2etXG2CCj+auRpDUJdK+eJpX1ovgKm1E5W7BPb7phj3g4vH7m8erqI0m06UWN29D73B+CmxdQRn9fux41PfF6zHCP7nkeiE9Hthp6KjbrX4TNnVQuMB/HiDA+hdO4sExE0RifWV84ah7gqZikaxBjrRreF8tEgKS0jf3LiAiTsJMCYl+LEKOazOQFz24eDwqUGsReUTLeh3o496Q2xNk3uIeBl+hEgh5Z14frQQOcG7u/qz0EsnpWHiqooU4h9Ol1DQTZtp+p8SCV0lcYVJToT+eB0uoDdZ27MW/pwmxmod11n05Mj0t7tvYH3BwXe06mJA/BFIqCu6KAjG7IVRMaevNX4OBXMTizERoF67O7tBPp5oY31pRci+tJtR6iRMQ95RHYWz3IgVDVmysPgOuuhfc8itTAfzceMFMzqyArAUAtGcAnFMXviIsSUDl+h8tmevbSs3x2PkQ/1lUq4SO7Pqf6LvEY2IHlqNaN+tF6GqJFvBgFFR66gPQ=="
+      }]
+    }],
+    "pendingInputs": [{
+      "text": "",
+      "role": "user"
+    }]
+  }
+}

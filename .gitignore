@@ -1,9 +1,4 @@
+.DS_Store
 target/
 data*/
 logs*/
-.DS_Store
-harness/output/
-benchmarks/
-
-# Development artifacts (moved outside repo for release)
-dev/
