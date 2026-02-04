@@ -1117,7 +1117,7 @@ impl Storage {
         let t0 = std::time::Instant::now();
         let wal_slices = build_slice_index(&wal_p, shard_start, state.meta.shard_size as usize)?;
         let has_wal = wal_slices.is_some();
-        let wal_size_bytes = wal_slices.as_ref().map_or(0, |w| w.mmap.len());
+        let wal_size_bytes = wal_slices.as_ref().map_or(0, |w| w.data.len());
         tracing::debug!(
             shard = shard_start,
             has_wal,
@@ -1285,11 +1285,11 @@ impl Storage {
                 let wal = wal_slices
                     .as_ref()
                     .ok_or_else(|| eyre!("wal_slices missing when wal_data present"))?;
-                let header_bytes = &wal.mmap[slices.header.as_range()];
-                let tx_hash_bytes = &wal.mmap[slices.tx_hashes.as_range()];
-                let tx_meta_bytes = &wal.mmap[slices.tx_meta.as_range()];
-                let receipt_bytes = &wal.mmap[slices.receipts.as_range()];
-                let size_bytes = &wal.mmap[slices.size.as_range()];
+                let header_bytes = &wal.data[slices.header.as_range()];
+                let tx_hash_bytes = &wal.data[slices.tx_hashes.as_range()];
+                let tx_meta_bytes = &wal.data[slices.tx_meta.as_range()];
+                let receipt_bytes = &wal.data[slices.receipts.as_range()];
+                let size_bytes = &wal.data[slices.size.as_range()];
 
                 // Count txs from bincode-encoded StoredTxHashes (uncompressed, Vec<B256> prefix is u64 len)
                 let tx_count = bincode_vec_len(tx_hash_bytes);

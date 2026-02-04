@@ -1,6 +1,5 @@
 use crc32fast::Hasher;
 use eyre::{Result, WrapErr};
-use memmap2::Mmap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -13,8 +12,8 @@ pub struct WalRecord {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct WalIndexEntry {
-    #[expect(dead_code, reason = "kept for debugging and future use")]
     pub block_number: u64,
 }
 
@@ -111,6 +110,7 @@ pub fn read_records(path: &Path) -> Result<Vec<WalRecord>> {
 ///
 /// This also truncates an invalid / partial tail (same behavior as [`read_records`]), but it does
 /// NOT validate per-record CRCs.
+#[allow(dead_code)]
 pub fn build_index(path: &Path) -> Result<Vec<WalIndexEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -195,7 +195,8 @@ pub struct WalBundleSlices {
 }
 
 pub struct WalSliceIndex {
-    pub mmap: Mmap,
+    /// WAL file contents read into memory (one sequential read, faster than mmap on slow storage).
+    pub data: Vec<u8>,
     /// Indexed by local offset within a shard.
     pub entries: Vec<Option<WalBundleSlices>>,
 }
@@ -240,8 +241,11 @@ fn read_bytes_range(bytes: &[u8], pos: &mut usize, end: usize) -> Result<ByteRan
 /// Builds an in-memory index of WAL record slices for a given shard.
 ///
 /// This is a fast-path for compaction: instead of deserializing each record into fresh `Vec<u8>`
-/// buffers, we memory-map the WAL file and parse the bincode payload layout to obtain byte ranges
-/// for each segment.
+/// buffers, we read the entire WAL file into memory and parse the bincode payload layout to
+/// obtain byte ranges for each segment.
+///
+/// Uses a single sequential read instead of mmap to avoid page fault overhead on slow storage
+/// (USB HDDs). The WAL file is typically 20-300MB which fits comfortably in memory.
 ///
 /// Payload format MUST match the bincode encoding of `WalBundleRecord` in `mod.rs`.
 pub fn build_slice_index(
@@ -253,16 +257,11 @@ pub fn build_slice_index(
         return Ok(None);
     }
 
-    // Ensure we don't have a partial tail record.
-    let _ = build_index(path)?;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .wrap_err("failed to open staging.wal for mmap")?;
-    // SAFETY: read-only mapping; file handle outlives mmap via ownership in WalSliceIndex.
-    let mmap = unsafe { Mmap::map(&file).wrap_err("failed to mmap staging.wal")? };
-    let bytes: &[u8] = &mmap;
+    // Read entire WAL into memory with one sequential read.
+    // This is much faster than mmap on slow storage (USB HDDs) where each page fault
+    // would trigger a separate disk read.
+    let data = fs::read(path).wrap_err("failed to read staging.wal")?;
+    let bytes: &[u8] = &data;
 
     let mut entries: Vec<Option<WalBundleSlices>> = vec![None; shard_size];
     let mut pos: usize = 0;
@@ -357,7 +356,7 @@ pub fn build_slice_index(
     if !any {
         return Ok(None);
     }
-    Ok(Some(WalSliceIndex { mmap, entries }))
+    Ok(Some(WalSliceIndex { data, entries }))
 }
 
 #[cfg(test)]
