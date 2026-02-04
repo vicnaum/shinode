@@ -43,6 +43,9 @@ async fn main() -> Result<()> {
             cli::Command::Db(cli::DbCommand::Compact(args)) => {
                 return run::handle_db_compact(args, &config);
             }
+            cli::Command::Db(cli::DbCommand::RebuildCache(args)) => {
+                return run::handle_db_rebuild_cache(args, &config);
+            }
         }
     }
 

@@ -46,6 +46,8 @@ const BITSET_TMP_NAME: &str = "bitset.tmp";
 const BITSET_OLD_NAME: &str = "bitset.old";
 const PENDING_BITSET_NAME: &str = "pending.bitset";
 const WAL_NAME: &str = "staging.wal";
+const SEALED_CACHE_FILE_NAME: &str = "sealed_shards.cache";
+const SEALED_CACHE_VERSION: u32 = 1;
 
 // Compaction phase constants
 const PHASE_WRITING: &str = "writing";
@@ -224,6 +226,35 @@ struct ShardState {
     bitset: Bitset,
     /// Bitset tracking blocks in WAL (pending compaction). Used for resume.
     pending_bitset: Option<Bitset>,
+}
+
+/// Entry for a single sealed shard in the cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SealedShardEntry {
+    /// Shard start block number (key).
+    shard_start: u64,
+    /// Full shard metadata (from shard.json).
+    meta: ShardMeta,
+    /// Bitset bytes (raw bytes from present.bitset).
+    bitset_bytes: Vec<u8>,
+}
+
+/// The complete sealed shard cache file.
+///
+/// This cache stores metadata and bitsets for all sealed shards in a single file,
+/// dramatically reducing the number of file reads on startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SealedShardCache {
+    /// Cache format version for forward compatibility.
+    version: u32,
+    /// Shard size (must match storage shard_size to be valid).
+    shard_size: u64,
+    /// Chain ID (must match storage chain_id to be valid).
+    chain_id: u64,
+    /// Timestamp when cache was last written (Unix millis).
+    written_at_ms: u64,
+    /// All sealed shard entries.
+    entries: Vec<SealedShardEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,61 +531,112 @@ impl Storage {
             .collect();
         let total_shards = shard_entries.len();
 
+        // Try to load sealed shard cache for fast startup
+        let sealed_cache_path = sealed_cache_path(&config.data_dir);
+        let mut cached_entries: HashMap<u64, SealedShardEntry> =
+            match load_sealed_cache(&sealed_cache_path, meta.shard_size, meta.chain_id) {
+                Some(cache) => {
+                    tracing::info!(
+                        entries = cache.entries.len(),
+                        written_at_ms = cache.written_at_ms,
+                        "loaded sealed shard cache"
+                    );
+                    cache
+                        .entries
+                        .into_iter()
+                        .map(|e| (e.shard_start, e))
+                        .collect()
+                }
+                None => {
+                    tracing::debug!("no sealed shard cache found, loading all shards from disk");
+                    HashMap::new()
+                }
+            };
+
         // Aggregate timing stats for debug logging
         let mut total_load_meta_us: u128 = 0;
         let mut total_recover_us: u128 = 0;
         let mut total_load_bitset_us: u128 = 0;
         let mut total_repair_wal_us: u128 = 0;
         let mut total_disk_bytes_us: u128 = 0;
+        let mut cache_hits: u64 = 0;
+        let mut cache_misses: u64 = 0;
 
         let mut shards: HashMap<u64, Arc<Mutex<ShardState>>> = HashMap::new();
         for (idx, (shard_start, shard_dir)) in shard_entries.into_iter().enumerate() {
             on_progress(idx, total_shards);
             let shard_start_time = std::time::Instant::now();
 
-            // Load shard metadata
-            let t0 = std::time::Instant::now();
-            let mut shard_meta = load_shard_meta(&shard_dir)?;
-            let load_meta_ms = t0.elapsed().as_micros();
+            // Check if we have a valid cached entry for this sealed shard
+            let from_cache = cached_entries.remove(&shard_start).filter(|cached| {
+                // Only use cache if the entry is marked as sealed
+                cached.meta.sealed
+            });
 
-            // Perform phase-aware recovery if needed
-            let t0 = std::time::Instant::now();
-            let recovery_result = recover_shard(&shard_dir, &mut shard_meta)?;
-            let recover_ms = t0.elapsed().as_micros();
-            match &recovery_result {
-                ShardRecoveryResult::Clean => {}
-                ShardRecoveryResult::CleanedOrphans => {
-                    tracing::info!(shard = shard_start, "cleaned orphan files");
-                }
-                result => {
-                    tracing::info!(shard = shard_start, recovery = ?result, "recovered shard from interrupted compaction");
-                    // Persist the updated metadata after recovery
-                    persist_shard_meta(&shard_dir, &shard_meta)?;
-                }
-            }
+            let (mut state, load_meta_ms, recover_ms, load_bitset_ms, repair_wal_ms) =
+                if let Some(cached) = from_cache {
+                    // Fast path: use cached data, no disk I/O needed
+                    cache_hits += 1;
+                    let bitset =
+                        Bitset::from_bytes(cached.bitset_bytes, meta.shard_size as usize);
+                    let state = ShardState {
+                        dir: shard_dir,
+                        meta: cached.meta,
+                        bitset,
+                        pending_bitset: None, // Sealed shards have no pending WAL
+                    };
+                    (state, 0, 0, 0, 0)
+                } else {
+                    // Slow path: load from disk (existing logic)
+                    cache_misses += 1;
 
-            // Load bitset (may have been restored by recovery)
-            let t0 = std::time::Instant::now();
-            let bitset = Bitset::load(&bitset_path(&shard_dir), meta.shard_size as usize)?;
-            // Load pending bitset if it exists (tracks WAL blocks for resume)
-            let pending_path = pending_bitset_path(&shard_dir);
-            let pending_bitset = if pending_path.exists() {
-                Some(Bitset::load(&pending_path, meta.shard_size as usize)?)
-            } else {
-                None
-            };
-            let load_bitset_ms = t0.elapsed().as_micros();
-            let mut state = ShardState {
-                dir: shard_dir,
-                meta: shard_meta,
-                bitset,
-                pending_bitset,
-            };
+                    // Load shard metadata
+                    let t0 = std::time::Instant::now();
+                    let mut shard_meta = load_shard_meta(&shard_dir)?;
+                    let load_meta_ms = t0.elapsed().as_micros();
 
-            // Mark as needing compaction if WAL exists
-            let t0 = std::time::Instant::now();
-            repair_shard_from_wal(&mut state)?;
-            let repair_wal_ms = t0.elapsed().as_micros();
+                    // Perform phase-aware recovery if needed
+                    let t0 = std::time::Instant::now();
+                    let recovery_result = recover_shard(&shard_dir, &mut shard_meta)?;
+                    let recover_ms = t0.elapsed().as_micros();
+                    match &recovery_result {
+                        ShardRecoveryResult::Clean => {}
+                        ShardRecoveryResult::CleanedOrphans => {
+                            tracing::info!(shard = shard_start, "cleaned orphan files");
+                        }
+                        result => {
+                            tracing::info!(shard = shard_start, recovery = ?result, "recovered shard from interrupted compaction");
+                            // Persist the updated metadata after recovery
+                            persist_shard_meta(&shard_dir, &shard_meta)?;
+                        }
+                    }
+
+                    // Load bitset (may have been restored by recovery)
+                    let t0 = std::time::Instant::now();
+                    let bitset = Bitset::load(&bitset_path(&shard_dir), meta.shard_size as usize)?;
+                    // Load pending bitset if it exists (tracks WAL blocks for resume)
+                    let pending_path = pending_bitset_path(&shard_dir);
+                    let pending_bitset = if pending_path.exists() {
+                        Some(Bitset::load(&pending_path, meta.shard_size as usize)?)
+                    } else {
+                        None
+                    };
+                    let load_bitset_ms = t0.elapsed().as_micros();
+                    let mut state = ShardState {
+                        dir: shard_dir,
+                        meta: shard_meta,
+                        bitset,
+                        pending_bitset,
+                    };
+
+                    // Mark as needing compaction if WAL exists
+                    let t0 = std::time::Instant::now();
+                    repair_shard_from_wal(&mut state)?;
+                    let repair_wal_ms = t0.elapsed().as_micros();
+
+                    (state, load_meta_ms, recover_ms, load_bitset_ms, repair_wal_ms)
+                };
+
             reconcile_shard_meta(&mut state);
 
             // Only recompute disk sizes if shard has WAL data (not yet compacted).
@@ -604,6 +686,8 @@ impl Storage {
             tracing::info!(
                 shards = total_shards,
                 total_ms = total_open_ms,
+                cache_hits,
+                cache_misses,
                 load_meta_ms = total_load_meta_us / 1000,
                 recover_ms = total_recover_us / 1000,
                 load_bitset_ms = total_load_bitset_us / 1000,
@@ -700,6 +784,10 @@ impl Storage {
         Ok(RepairReport { shards: results })
     }
 
+    /// Collect disk usage by scanning all shard directories (slow, but accurate).
+    ///
+    /// Consider using `disk_usage_cached()` for faster results from in-memory metadata.
+    #[allow(dead_code)]
     pub fn disk_usage(&self) -> Result<StorageDiskStats> {
         Self::disk_usage_at(&self.data_dir)
     }
@@ -1668,6 +1756,11 @@ impl Storage {
                 total_ms,
                 "seal_completed_shards: done"
             );
+
+            // Update the sealed shard cache
+            if let Err(err) = self.update_sealed_cache() {
+                tracing::warn!(error = %err, "failed to update sealed shard cache");
+            }
         }
         Ok(())
     }
@@ -1688,6 +1781,51 @@ impl Storage {
             }
         }
         Ok(count)
+    }
+
+    /// Update the sealed shard cache with all currently sealed shards.
+    ///
+    /// Called internally after sealing operations complete.
+    fn update_sealed_cache(&self) -> Result<()> {
+        let meta = self.meta.lock();
+        let shard_size = meta.shard_size;
+        let chain_id = meta.chain_id;
+        drop(meta);
+
+        let shards = self.shards.lock();
+        let mut entries = Vec::with_capacity(shards.len());
+
+        for (shard_start, shard) in shards.iter() {
+            let state = shard.lock();
+            if state.meta.sealed {
+                entries.push(SealedShardEntry {
+                    shard_start: *shard_start,
+                    meta: state.meta.clone(),
+                    bitset_bytes: state.bitset.bytes().to_vec(),
+                });
+            }
+        }
+        drop(shards);
+
+        // Sort by shard_start for deterministic ordering
+        entries.sort_by_key(|e| e.shard_start);
+
+        let cache = SealedShardCache {
+            version: SEALED_CACHE_VERSION,
+            shard_size,
+            chain_id,
+            written_at_ms: now_ms(),
+            entries,
+        };
+
+        persist_sealed_cache(&sealed_cache_path(&self.data_dir), &cache)
+    }
+
+    /// Rebuild the sealed shard cache from scratch.
+    ///
+    /// Public method for CLI `db rebuild-cache` command.
+    pub fn rebuild_sealed_cache(&self) -> Result<()> {
+        self.update_sealed_cache()
     }
 
     pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
@@ -2239,6 +2377,99 @@ fn sorted_dir(shard_dir: &Path) -> PathBuf {
 
 fn peer_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PEER_FILE_NAME)
+}
+
+fn sealed_cache_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SEALED_CACHE_FILE_NAME)
+}
+
+/// Load the sealed shard cache from disk.
+///
+/// Returns `Ok(None)` if the cache file doesn't exist or is invalid (wrong version, shard_size, or chain_id).
+/// Any errors during loading are logged and result in `Ok(None)` to fall back to per-shard loading.
+fn load_sealed_cache(
+    path: &Path,
+    expected_shard_size: u64,
+    expected_chain_id: u64,
+) -> Option<SealedShardCache> {
+    if !path.exists() {
+        return None;
+    }
+
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to read sealed shard cache");
+            return None;
+        }
+    };
+
+    let cache: SealedShardCache = match bincode::deserialize(&bytes) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to decode sealed shard cache");
+            return None;
+        }
+    };
+
+    // Validate version
+    if cache.version != SEALED_CACHE_VERSION {
+        tracing::warn!(
+            expected = SEALED_CACHE_VERSION,
+            found = cache.version,
+            "sealed cache version mismatch, ignoring"
+        );
+        return None;
+    }
+
+    // Validate shard_size matches
+    if cache.shard_size != expected_shard_size {
+        tracing::warn!(
+            expected = expected_shard_size,
+            found = cache.shard_size,
+            "sealed cache shard_size mismatch, ignoring"
+        );
+        return None;
+    }
+
+    // Validate chain_id matches
+    if cache.chain_id != expected_chain_id {
+        tracing::warn!(
+            expected = expected_chain_id,
+            found = cache.chain_id,
+            "sealed cache chain_id mismatch, ignoring"
+        );
+        return None;
+    }
+
+    Some(cache)
+}
+
+/// Persist the sealed shard cache to disk.
+///
+/// Uses atomic write (temp file + rename) to avoid corruption on crash.
+fn persist_sealed_cache(path: &Path, cache: &SealedShardCache) -> Result<()> {
+    let bytes = bincode::serialize(cache).wrap_err("failed to encode sealed cache")?;
+
+    // Atomic write: write to temp file, then rename
+    let tmp_path = path.with_extension("cache.tmp");
+    fs::write(&tmp_path, &bytes).wrap_err("failed to write sealed cache temp file")?;
+    fs::rename(&tmp_path, path).wrap_err("failed to rename sealed cache")?;
+
+    tracing::debug!(
+        entries = cache.entries.len(),
+        bytes = bytes.len(),
+        "persisted sealed cache"
+    );
+    Ok(())
+}
+
+/// Get current time in milliseconds since Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn load_meta(path: &Path) -> Result<MetaState> {

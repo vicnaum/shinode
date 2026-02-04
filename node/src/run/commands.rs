@@ -3,7 +3,7 @@
 // CLI commands output directly to stdout for user feedback
 #![expect(clippy::print_stdout, reason = "CLI commands require stdout output")]
 
-use crate::cli::{DbCompactArgs, DbStatsArgs, NodeConfig};
+use crate::cli::{DbCompactArgs, DbRebuildCacheArgs, DbStatsArgs, NodeConfig};
 use crate::logging::{JsonLogFilter, JsonLogLayer, JsonLogWriter, LOG_BUFFER};
 use crate::storage::Storage;
 use crate::ui;
@@ -204,6 +204,39 @@ pub fn handle_repair(config: &NodeConfig) -> Result<()> {
         report.repaired_count(),
         report.total_count(),
         report.clean_count()
+    );
+    Ok(())
+}
+
+/// Handle the `db rebuild-cache` subcommand.
+pub fn handle_db_rebuild_cache(args: &DbRebuildCacheArgs, config: &NodeConfig) -> Result<()> {
+    let mut config = config.clone();
+    if let Some(dir) = &args.data_dir {
+        config.data_dir = dir.clone();
+    }
+
+    // Auto-detect shard size from existing storage
+    if let Some(stored_shard_size) = Storage::read_shard_size(&config.data_dir)? {
+        config.shard_size = stored_shard_size;
+    }
+
+    println!("Opening storage...");
+    let storage = Storage::open_with_progress(&config, |current, total| {
+        if total > 0 {
+            print!("\rLoading shards... {current}/{total}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    })?;
+    println!(); // newline after progress
+
+    println!("Rebuilding sealed shard cache...");
+    storage.rebuild_sealed_cache()?;
+
+    let stats = storage.aggregate_stats();
+    println!(
+        "Done. Cache rebuilt with {} sealed shards.",
+        stats.compacted_shards
     );
     Ok(())
 }

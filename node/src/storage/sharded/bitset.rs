@@ -33,6 +33,21 @@ impl Bitset {
         Ok(Self { bytes, size_bits })
     }
 
+    /// Create a bitset from raw bytes (for cache loading).
+    ///
+    /// # Panics
+    /// Panics if `bytes.len()` does not match `size_bits.div_ceil(8)`.
+    pub fn from_bytes(bytes: Vec<u8>, size_bits: usize) -> Self {
+        let expected_len = size_bits.div_ceil(8);
+        assert_eq!(
+            bytes.len(),
+            expected_len,
+            "bitset size mismatch: expected {expected_len}, got {}",
+            bytes.len()
+        );
+        Self { bytes, size_bits }
+    }
+
     pub fn flush(&self, path: &Path) -> Result<()> {
         fs::write(path, &self.bytes).wrap_err("failed to write present.bitset")
     }

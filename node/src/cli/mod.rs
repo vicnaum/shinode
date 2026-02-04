@@ -60,6 +60,8 @@ pub enum DbCommand {
     Stats(DbStatsArgs),
     /// Compact all dirty shards and seal completed ones.
     Compact(DbCompactArgs),
+    /// Rebuild the sealed shard cache for faster startup.
+    RebuildCache(DbRebuildCacheArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -89,6 +91,13 @@ pub struct DbCompactArgs {
     /// Verbose logging level (0=info, 1=debug, 2+=trace).
     #[arg(short, long, action = ArgAction::Count, default_value_t = 0)]
     pub verbose: u8,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DbRebuildCacheArgs {
+    /// Override data directory.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 /// Stateless history node configuration.
@@ -359,6 +368,15 @@ mod tests {
         assert!(matches!(
             config.command,
             Some(Command::Db(DbCommand::Compact(_)))
+        ));
+    }
+
+    #[test]
+    fn parse_db_rebuild_cache_command() {
+        let config = NodeConfig::parse_from(["stateless-history-node", "db", "rebuild-cache"]);
+        assert!(matches!(
+            config.command,
+            Some(Command::Db(DbCommand::RebuildCache(_)))
         ));
     }
 
