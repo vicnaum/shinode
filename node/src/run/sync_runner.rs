@@ -619,7 +619,8 @@ async fn run_follow_mode(
         IngestPipelineOutcome::UpToDate { .. } => 0,
     };
 
-    let storage_stats = match storage.disk_usage() {
+    // Use cached disk stats (fast, no directory traversal)
+    let storage_stats = match storage.disk_usage_cached() {
         Ok(stats) => Some(stats),
         Err(err) => {
             warn!(error = %err, "failed to collect storage disk stats");

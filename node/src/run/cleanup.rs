@@ -33,8 +33,8 @@ pub struct FinalizeContext<'a> {
 /// This generates the run report (if enabled), finalizes log files, and flushes the peer cache.
 #[expect(clippy::cognitive_complexity, reason = "cleanup orchestrates report, logs, and cache")]
 pub async fn finalize_session(ctx: FinalizeContext<'_>, logs_total: u64) {
-    // Build summary from bench stats
-    let storage_stats = match ctx.storage.disk_usage() {
+    // Build summary from bench stats (use cached disk stats, no directory traversal)
+    let storage_stats = match ctx.storage.disk_usage_cached() {
         Ok(stats) => Some(stats),
         Err(err) => {
             warn!(error = %err, "failed to collect storage disk stats");

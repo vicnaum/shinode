@@ -704,6 +704,49 @@ impl Storage {
         Self::disk_usage_at(&self.data_dir)
     }
 
+    /// Fast disk usage from cached shard metadata (no directory traversal).
+    /// Only does 2 file stats (meta.json, peers.json) plus in-memory iteration.
+    /// Use this instead of `disk_usage()` when you don't need to audit disk vs cached values.
+    pub fn disk_usage_cached(&self) -> Result<StorageDiskStats> {
+        let meta_bytes = file_size(&meta_path(&self.data_dir)).unwrap_or(0);
+        let peers_bytes = file_size(&peer_path(&self.data_dir)).unwrap_or(0);
+
+        // Compute per-segment totals from in-memory shard metadata
+        let shards = self.shards.lock();
+        let mut headers_bytes: u64 = 0;
+        let mut tx_bytes: u64 = 0;
+        let mut receipts_bytes: u64 = 0;
+        let mut total_bytes: u64 = 0;
+
+        for shard in shards.values() {
+            let state = shard.lock();
+            headers_bytes += state.meta.disk_bytes_headers;
+            tx_bytes += state.meta.disk_bytes_transactions;
+            receipts_bytes += state.meta.disk_bytes_receipts;
+            total_bytes += state.meta.disk_bytes_total;
+        }
+        drop(shards);
+
+        // Add meta and peers to total
+        total_bytes += meta_bytes + peers_bytes;
+
+        let segments = vec![
+            SegmentDiskStats { name: "headers".to_string(), bytes: headers_bytes },
+            SegmentDiskStats { name: "tx_hashes".to_string(), bytes: tx_bytes / 2 }, // estimate split
+            SegmentDiskStats { name: "tx_meta".to_string(), bytes: tx_bytes / 2 },
+            SegmentDiskStats { name: "receipts".to_string(), bytes: receipts_bytes },
+            SegmentDiskStats { name: "block_sizes".to_string(), bytes: 0 }, // negligible
+        ];
+
+        Ok(StorageDiskStats {
+            total_bytes,
+            meta_bytes,
+            peers_bytes,
+            static_total_bytes: total_bytes - meta_bytes - peers_bytes,
+            segments,
+        })
+    }
+
     /// Aggregate stats across all shards from in-memory shard metadata.
     /// This is cheap — no disk I/O, just iterates locked shard meta.
     pub fn aggregate_stats(&self) -> StorageAggregateStats {
