@@ -19,6 +19,7 @@ What works:
 - Atomic compaction with crash recovery and per-shard compaction during fast-sync.
 - `--defer-compaction` to skip inline compaction during sync (compact at finalize or manually).
 - `db compact` subcommand for standalone shard compaction.
+- `db rebuild-cache` for faster startup on slow storage (HDDs).
 - `--repair` command for storage recovery.
 - `--log-resources` for CPU/memory/disk metrics.
 - LRU segment reader cache for RPC performance.
@@ -91,8 +92,9 @@ Subcommands:
 ```
 db stats                Print storage statistics
 db compact              Compact all dirty shards and seal completed ones
-  --log-json <path>     Write JSON logs to file for debugging
+  --log-json            Write JSON logs to file for debugging
   -v/-vv/-vvv           Verbosity (info/debug/trace)
+db rebuild-cache        Rebuild sealed shard cache for faster startup
 ```
 
 Example: debug slow compaction on USB HDD:
@@ -165,6 +167,32 @@ cargo run --release --manifest-path node/Cargo.toml -- db compact
 - Safe to quit at any time, even during compaction
 - On restart, sync resumes from where it left off
 - Blocks in WAL are not re-fetched (tracked via `pending.bitset`)
+
+## Sealed Shard Cache
+
+On slow storage (USB HDDs), opening a large database can take 20+ minutes due to per-shard file I/O (reading `shard.json` and `present.bitset` for each shard).
+
+The sealed shard cache stores all sealed shard metadata in a single file (`sealed_shards.cache`), reducing startup time dramatically.
+
+**How it works:**
+- Sealed shards are immutable (complete, compacted, content-hashed)
+- On startup, the cache is loaded with a single file read
+- Cached shards skip per-shard file I/O entirely
+- The cache is automatically updated when shards are sealed
+
+**Manual rebuild:**
+```bash
+cargo run --release --manifest-path node/Cargo.toml -- db rebuild-cache
+```
+
+**Performance:**
+- Without cache: ~26 min for 24k shards on USB HDD
+- With cache: ~1-2 min (10-20x faster)
+
+**Cache invalidation:**
+- Cache is ignored if `shard_size` or `chain_id` don't match
+- Missing/corrupt cache falls back to per-shard loading
+- No action needed after normal operations
 
 ## RPC Support
 

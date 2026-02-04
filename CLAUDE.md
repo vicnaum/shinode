@@ -62,12 +62,13 @@ The node is organized into subsystems in `node/src/`:
 ### Storage (`storage/`)
 - `storage/mod.rs`: Types for stored data (headers, tx hashes, receipts, logs)
 - `storage/sharded/`: Sharded static-file backend (Storage v2)
-  - `mod.rs`: Main `Storage` struct with read/write operations, aggregate stats, repair
+  - `mod.rs`: Main `Storage` struct with read/write operations, aggregate stats, repair, sealed cache
   - `wal.rs`: Write-ahead log for out-of-order ingestion
   - `bitset.rs`: Per-shard presence tracking
   - `nippy_raw.rs`: Low-level segment file handling
   - `hash.rs`: Content hash for sealed shards
 - Storage layout: `data_dir/static/shards/<shard_start>/`
+- Sealed shard cache: `data_dir/sealed_shards.cache` (speeds up startup on slow storage)
 - Segments: `headers`, `tx_hashes`, `tx_meta`, `receipts`, `block_sizes`
 - `ShardMeta` tracks: `total_transactions`, `total_receipts`, `total_logs`, `disk_bytes_*`
 - LRU segment reader cache (read-only, no file locks)
@@ -108,6 +109,7 @@ The node is organized into subsystems in `node/src/`:
 - `-v`/`-vv`/`-vvv`: Increasing verbosity (default is errors only)
 - `db compact`: Standalone subcommand to compact dirty shards and seal completed ones
 - `db stats`: Print storage statistics
+- `db rebuild-cache`: Rebuild sealed shard cache for faster startup
 
 ## Log Artifacts
 
