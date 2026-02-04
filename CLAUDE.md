@@ -10,20 +10,16 @@ Stateless History Node is a minimal Ethereum history indexer that backfills head
 
 ```bash
 # Development build
-cargo build --manifest-path node/Cargo.toml
-
+cargo build
 # Release build (production)
 cargo build --manifest-path node/Cargo.toml --release
 
 # Run (debug)
-cargo run --manifest-path node/Cargo.toml
-
+cargo run
 # Run (release)
-cargo run --release --manifest-path node/Cargo.toml
-
+cargo run --release
 # Run tests
-cargo test --manifest-path node/Cargo.toml
-
+cargo test
 # Run a single test
 cargo test --manifest-path node/Cargo.toml <test_name>
 

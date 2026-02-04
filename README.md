@@ -63,17 +63,16 @@ Requires Rust and a C toolchain. On Ubuntu/Debian: `apt install build-essential`
 
 ```bash
 # Build
-cargo build --manifest-path node/Cargo.toml --release
+cargo build --release
 
 # Run (syncs from block 10M to head)
-cargo run --release --manifest-path node/Cargo.toml
+cargo run --release
 
 # Custom range
-cargo run --release --manifest-path node/Cargo.toml -- \
-  --start-block 18000000 --end-block 18100000
+cargo run --release -- --start-block 18000000 --end-block 18100000
 
 # Disable TUI (use legacy progress bars)
-cargo run --release --manifest-path node/Cargo.toml -- --no-tui
+cargo run --release -- --no-tui
 ```
 
 Stop with Ctrl+C. The node persists checkpoints and resumes on restart.
@@ -273,5 +272,4 @@ cargo build --manifest-path node/Cargo.toml --no-default-features
 On Linux/glibc, you can also tune malloc arenas:
 
 ```bash
-MALLOC_ARENA_MAX=2 cargo run --release --manifest-path node/Cargo.toml
-```
+MALLOC_ARENA_MAX=2 cargo run --release ```
