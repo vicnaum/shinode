@@ -2,7 +2,7 @@
 //! Zero external dependencies - embedded WAV played via system player.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// IBM POST beep: 896.46 Hz square wave, ~230ms, embedded at compile time.
 const POST_BEEP_WAV: &[u8] = include_bytes!("../../assets/post_beep.wav");

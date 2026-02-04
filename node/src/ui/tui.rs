@@ -46,7 +46,7 @@ const SPLASH_JAPANESE: [&str; 4] = [
 
 // Grass + title (left/center side, rendered on top of japanese)
 const SPLASH_GRASS: [&str; 5] = [
-    r"       \/|\/               STATELESS HISTORY NODE",
+    r"       \/|\/         SHiNode - Stateless History Node",
     r"       \\|//",
     r"        \|/",
     r"        \|/   |",
@@ -54,7 +54,7 @@ const SPLASH_GRASS: [&str; 5] = [
 ];
 
 const CREDIT: &str = "2026 by @vicnaum";
-const VERSION: &str = "v0.3";
+const VERSION: &str = "v0.3.0";
 const ART_WIDTH: u16 = 80;
 const DOS_HEIGHT: u16 = 25;
 
@@ -1182,12 +1182,19 @@ fn render_separator(area: Rect, buf: &mut Buffer) {
 
 fn render_header(area: Rect, buf: &mut Buffer, _phase: Phase) {
     let now = chrono_time();
-    let title = "STATELESS HISTORY NODE";
+    let title_white = "SHiNode";
+    let title_gray = " - Stateless History Node - v0.3.0";
     buf.set_string(
         area.x + 2,
         area.y,
-        title,
+        title_white,
         Style::default().fg(Color::White).bold(),
+    );
+    buf.set_string(
+        area.x + 2 + title_white.len() as u16,
+        area.y,
+        title_gray,
+        Style::default().fg(Color::DarkGray),
     );
     buf.set_string(
         area.x + area.width - now.len() as u16 - 2,
