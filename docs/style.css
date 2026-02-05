@@ -1,0 +1,183 @@
+:root {
+    --bg: #0a0a0a;
+    --fg: #e0e0e0;
+    --accent: #627eea;
+    --accent2: #cc785c;
+    --dim: #666;
+    --green: #4ade80;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.6;
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem;
+}
+
+header {
+    text-align: center;
+    padding: 3rem 0;
+    border-bottom: 1px solid #222;
+}
+
+.logo {
+    font-size: 0.5rem;
+    color: var(--accent);
+    white-space: pre;
+    line-height: 1.1;
+    margin-bottom: 1.5rem;
+}
+
+h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+}
+
+h1 span {
+    color: var(--dim);
+    font-weight: 400;
+}
+
+.tagline {
+    color: var(--dim);
+    font-size: 1rem;
+    max-width: 600px;
+    margin: 0 auto 1.5rem;
+}
+
+.badges {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+}
+
+.badges img {
+    height: 20px;
+}
+
+.demo {
+    margin: 2rem 0;
+    text-align: center;
+}
+
+.demo img {
+    max-width: 100%;
+    border: 1px solid #333;
+    border-radius: 4px;
+}
+
+section {
+    padding: 2rem 0;
+    border-bottom: 1px solid #222;
+}
+
+h2 {
+    color: var(--accent);
+    font-size: 1.2rem;
+    margin-bottom: 1rem;
+}
+
+ul {
+    list-style: none;
+}
+
+li {
+    padding: 0.5rem 0;
+    padding-left: 1.5rem;
+    position: relative;
+}
+
+li::before {
+    content: ">";
+    position: absolute;
+    left: 0;
+    color: var(--green);
+}
+
+li.no::before {
+    content: "x";
+    color: var(--accent2);
+}
+
+code {
+    background: #1a1a1a;
+    padding: 0.2rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.9rem;
+}
+
+pre {
+    background: #1a1a1a;
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    margin: 1rem 0;
+}
+
+.cta {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-top: 2rem;
+    flex-wrap: wrap;
+}
+
+.btn {
+    display: inline-block;
+    padding: 0.75rem 1.5rem;
+    text-decoration: none;
+    border-radius: 4px;
+    font-weight: 700;
+    transition: opacity 0.2s;
+}
+
+.btn:hover {
+    opacity: 0.8;
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: white;
+}
+
+.btn-secondary {
+    background: #222;
+    color: var(--fg);
+    border: 1px solid #444;
+}
+
+footer {
+    text-align: center;
+    padding: 2rem;
+    color: var(--dim);
+    font-size: 0.85rem;
+}
+
+footer a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+@media (max-width: 600px) {
+    .logo {
+        font-size: 0.35rem;
+    }
+    h1 {
+        font-size: 1.5rem;
+    }
+}
