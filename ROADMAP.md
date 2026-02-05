@@ -150,7 +150,8 @@ Ponder compatibility and additional endpoints:
 
 - `eth_getBlockByHash` (reorg traversal)
 - `eth_call` (requires state; proxy or RESS approach)
-- `eth_subscribe` (WS with polling fallback)
+- `eth_subscribe` (WebSocket live event streaming)
+- **Streaming-only mode** (`--no-storage`): disable disk writes entirely, stream live events over WebSocket as they arrive from P2P. Lightweight enough to run multiple instances on one machine for different networks. (idea: [@DefiDebauchery](https://x.com/DefiDebauchery))
 - `eth_getBlockReceipts` / `eth_getTransactionReceipt`
 - `debug_traceBlockByNumber` / `debug_traceBlockByHash`
 - `net_version`, `web3_clientVersion`
