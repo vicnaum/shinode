@@ -19,9 +19,8 @@
 ````
 
 A lightweight Ethereum history node that syncs headers, transactions, receipts, and logs directly from the P2P network and serves them via JSON-RPC.
-Think of it as an **alternative to running a full node** when all you need is event logs for indexing.
 
-**Use case:** Run indexers like [rindexer](https://github.com/joshstevens19/rindexer) against your own local node instead of paying for RPC services.
+Think of it as an **alternative to running a full node** when all you need is event logs for indexing.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.82+-orange.svg)](https://www.rust-lang.org/)
@@ -29,7 +28,9 @@ Think of it as an **alternative to running a full node** when all you need is ev
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)](ROADMAP.md)
 [![Built with AI](https://img.shields.io/badge/built%20with-Cursor%20%7C%20Claude%20%7C%20Codex-blueviolet.svg)](https://cursor.com/)
 
-> **100% AI-coded.** Every line of code, documentation, and infrastructure in this project was written by AI (Claude / Codex via Cursor and Claude Code). Human role: product direction, testing, and code review.
+> **100% AI-coded.** Every line of code, documentation, and infrastructure in this project was written by AI (Cursor, Claude, Codex).
+>
+> Don't use in production until this is fully tested and reviewed!
 
 ![SHiNode Demo](shinode_960.gif)
 
@@ -38,10 +39,10 @@ Think of it as an **alternative to running a full node** when all you need is ev
 Running a full Ethereum node just to index events is expensive — terabytes of state, constant maintenance through forks, and slow sync times. Paying for RPC providers costs even more. SHiNode gives you a **free, local, unlimited RPC** for event indexing without any of that.
 
 - **Fast sync** — over 1,000 blocks/sec. Full Mainnet history in ~6 hours on modern hardware with SSD, under a day even on older machines or HDDs
+- **Small disk footprint** — full Mainnet sync is under 800 GB with transactions, or ~250 GB for events only
 - **Runs on anything** — low CPU, low memory, works on HDDs. A Mac Mini, a Hetzner VPS, or that old PC in the closet
-- **Small footprint** — full Mainnet sync is under 800 GB with transactions, or ~250 GB for events only
 - **Partial sync** — start from any block. Only need Uniswap V3? Start from its deployment block (default start is block 10M — Uniswap V2 deployment)
-- **Indexer-compatible** — plug in [rindexer](https://github.com/joshstevens19/rindexer), Ponder, or any indexer that uses `eth_getLogs`
+- **Indexer-compatible** — plug in [rindexer](https://github.com/joshstevens19/rindexer), [Ponder](https://ponder.sh) (event-only mode), or any indexer that uses `eth_getLogs`
 - **Zero maintenance** — no EVM upgrades, no fork management, no pruning. Just run it
 - **Free local RPC** — no rate limits, no API keys, no monthly bills. Your data, on your machine
 
@@ -50,6 +51,7 @@ Running a full Ethereum node just to index events is expensive — terabytes of 
 - **Ethereum Mainnet only** — L2s don't expose receipts over P2P yet. Hoping that changes
 - **No verification yet** — data is fetched from P2P peers without proof validation. Planned: receipt hash verification, and optional CL node for full integrity
 - **History may thin out** — with EIP-4444 and The Purge, historical P2P data isn't guaranteed forever. Planned: [era1](https://github.com/ethereum/go-ethereum/pull/26621) archive and [Portal Network](https://www.ethportal.net/) support
+- **Ponder: event-only mode** — Ponder works for pure event indexing (no `readContract` calls). If your indexing functions use `context.client.readContract()`, you'll need a full node for `eth_call` (or Ress stateless execution or full-RPC forwarding - both of which are planned)
 - **No SHiNode-to-SHiNode sync yet** — planned: sync sealed shards between nodes via P2P, torrents, or HTTP archives
 
 ### What It Can Do

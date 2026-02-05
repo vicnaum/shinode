@@ -108,6 +108,7 @@ Focus: real-time operator visibility via fullscreen terminal dashboard.
 - [ ] Integration tests for sync loop + reorg handling
 - [ ] Codebase refactor: clean up dead/duplicated code, reorganize modules
 - [ ] Separate into library crate (`shinode-core`) and CLI/TUI binary
+- [ ] TUI keybind `d` for debug dump (complement to SIGUSR1 for headless)
 
 ---
 
