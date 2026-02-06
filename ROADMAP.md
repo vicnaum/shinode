@@ -112,6 +112,12 @@ Focus: real-time operator visibility via fullscreen terminal dashboard.
 
 ---
 
+## Future: Multi-Chain
+
+- **Polygon PoS** — Bor uses devp2p + serves receipts over P2P (eth/68, eth/69). Needs: pluggable chainspec/bootnodes, Polygon fork ID schedule, graceful handling of `StateSyncTxType` (0x7f) receipts. ([#4](https://github.com/vicnaum/shinode/issues/4))
+
+---
+
 ## Future: Performance & Storage
 
 - Bloom-based short-circuiting (skip blocks via `logsBloom`)
