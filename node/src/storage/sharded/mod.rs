@@ -432,6 +432,10 @@ impl SegmentWriter {
 pub struct Storage {
     data_dir: PathBuf,
     peer_cache_dir: PathBuf,
+    /// Exclusive lock on `{data_dir}/.lock` — prevents a second process from
+    /// opening the same data directory.  Held for the lifetime of this struct;
+    /// released automatically on drop.
+    _lock_file: fs::File,
     meta: Mutex<MetaState>,
     shards: Mutex<HashMap<u64, Arc<Mutex<ShardState>>>>,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
@@ -484,6 +488,13 @@ impl Storage {
         tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
 
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
+
+        let lock_path = config.data_dir.join(".lock");
+        let lock_file =
+            fs::File::create(&lock_path).wrap_err("failed to create lock file")?;
+        fs2::FileExt::try_lock_exclusive(&lock_file)
+            .wrap_err("data directory is already in use by another shinode process")?;
+
         let peer_cache_dir = config
             .peer_cache_dir
             .clone()
@@ -708,6 +719,7 @@ impl Storage {
         Ok(Self {
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
+            _lock_file: lock_file,
             meta: Mutex::new(meta),
             shards: Mutex::new(shards),
             peer_cache: Mutex::new(peer_cache),
@@ -723,6 +735,14 @@ impl Storage {
         if !config.data_dir.exists() {
             return Ok(RepairReport { shards: vec![] });
         }
+
+        // Acquire exclusive lock to prevent concurrent repair / sync
+        let lock_path = config.data_dir.join(".lock");
+        let lock_file =
+            fs::File::create(&lock_path).wrap_err("failed to create lock file")?;
+        fs2::FileExt::try_lock_exclusive(&lock_file)
+            .wrap_err("data directory is already in use by another shinode process")?;
+        let _lock_file = lock_file; // hold until end of function
 
         let shards_root = shards_dir(&config.data_dir);
         if !shards_root.exists() {
