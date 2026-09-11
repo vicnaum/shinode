@@ -221,9 +221,47 @@ counts all logs in a block, including earlier transactions and filtered-out logs
 `includeTransactions=true` still returns `-32602`; no extra OP RPC methods or
 safe/finalized head guarantees are added.
 
-These offline tests do not replace phase 8's live bounded ingestion, independent
-reference comparison, restart/compaction, and follow smoke tests.
+These offline tests complement the live smoke results recorded below.
 
 Phase 7 validation: 104 tests passed (5 intentionally ignored); workspace build,
 no-default-features build, and strict library/integration Clippy passed. Full
 binary/test Clippy adds no diagnostics relative to phase 6.
+
+## Live ingestion smoke (2026-09-11)
+
+Tested phase 7 commit `b2d8514` using the debug build, isolated temporary storage
+and peer caches, eight-block shards, and the default 64-block rollback window.
+The results and limitations below summarize the run. Raw smoke evidence and
+reference responses are temporary local test artifacts, excluded from Git.
+
+| Chain | Initial range (inclusive) | Transaction hashes compared | Complete logs compared |
+| --- | --- | ---: | ---: |
+| Base | 51,182,752–51,182,759 | 1,568 | 6,445 |
+| Ethereum | 25,956,120–25,956,127 | 2,249 | 5,729 |
+
+Both backfills compacted and sealed successfully. Stats, compact, rebuild-cache,
+and repair completed with the chain inferred from storage. After restart, the
+production RPC returned matching chain IDs, block hashes, header commitments,
+all transaction hashes, and every log field against independent public RPCs
+(`mainnet.base.org` for Base; `eth.drpc.org` for Ethereum). Base resumed without
+`--start-block`; Ethereum retained an explicit start to preserve its legacy CLI
+default. Base followed 51,182,965 → 51,182,969; Ethereum advanced 25,956,268 →
+25,956,270. Both final hashes matched their references and both processes exited
+cleanly on SIGINT. Ethereum remained 52 blocks behind a nearby reference head,
+so this establishes follow advancement, not current-tip freshness on Ethereum.
+
+A separate 90-second Base probe requested block 49,454,912 (roughly 40 days old).
+No connected peer advertised that history: the scheduler assigned no fetch,
+logged the need for a serving `--trusted-peer`, and stored no blocks. The harness
+then stopped it cleanly. A successful older backfill with a known serving peer
+remains untested; recent-range success does not imply archive coverage.
+
+Reopening both chains exposed a pre-existing sealed-shard cache decode warning.
+The node fell back to shard files and all data comparisons passed, but rebuilding
+the cache did not make its fast path usable. The cache embeds `ShardMeta`, whose
+optional compaction field is omitted during bincode serialization; that layout
+predates this port. This remains a follow-up fix. Formatting checks also remain
+non-clean. An initial Ethereum harness restart omitted `--start-block` and selected
+the legacy default; it was stopped and rerun with an explicit start in a fresh
+directory. PublicNode refused one reference log query as an archive request
+requiring a token, so the complete Ethereum comparison used dRPC.

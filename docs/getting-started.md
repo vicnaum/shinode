@@ -99,7 +99,8 @@ than serving continuously.
 The initial target is the probed P2P head minus the rollback window; live follow
 tracks the probed tip. Neither represents OP safe/finalized status or L1 finality.
 Read [protocol compatibility](base-protocol.md) before choosing a historical range;
-full live ingestion/restart/follow smoke tests remain part of release validation.
+see the recorded [live ingestion/restart/follow smoke results](base-protocol.md#live-ingestion-smoke-2026-09-11)
+and remaining release-validation limits.
 
 ### Headless / CI environments
 
