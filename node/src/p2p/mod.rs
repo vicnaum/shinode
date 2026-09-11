@@ -174,6 +174,15 @@ pub struct NetworkPeer<C: ChainTypes = EthereumChain> {
 }
 
 impl<C: ChainTypes> NetworkPeer<C> {
+    /// Intersect advertised history with the caller's head cap. A later header
+    /// probe may extend the session's initially advertised upper bound.
+    pub fn serving_range(&self, head_cap: u64) -> std::ops::RangeInclusive<u64> {
+        let upper = self.latest_block.map_or(head_cap, |latest| {
+            head_cap.min(latest.max(self.head_number))
+        });
+        self.earliest_block.unwrap_or(0)..=upper
+    }
+
     fn from_session(
         info: &SessionInfo,
         messages: PeerRequestSender<PeerRequest<C::Net>>,
@@ -403,7 +412,7 @@ impl<C: ChainTypes> PeerPool<C> {
 }
 
 #[cfg(test)]
-pub(crate) fn peer_pool_for_tests(peers: Vec<NetworkPeer>) -> PeerPool {
+pub(crate) fn peer_pool_for_tests<C: ChainTypes>(peers: Vec<NetworkPeer<C>>) -> PeerPool<C> {
     let pool = PeerPool::new();
     for peer in peers {
         pool.add_peer(peer);
@@ -667,23 +676,26 @@ pub async fn discover_head_p2p<C: ChainTypes>(
 
     let len = peers.len();
     let start_idx = HEAD_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) % len;
-    for (probed, offset) in (0..len).enumerate() {
-        if probed >= probe_peers {
-            break;
-        }
+    let mut probes = futures::stream::iter((0..probe_peers.min(len)).map(|offset| {
         let peer = &peers[(start_idx + offset) % len];
-        match request_headers_batch(peer, start, probe_limit).await {
+        async move {
+            (
+                peer.peer_id,
+                request_headers_batch(peer, start, probe_limit).await,
+            )
+        }
+    }))
+    .buffer_unordered(probe_peers.min(len));
+    while let Some((peer_id, result)) = probes.next().await {
+        match result {
             Ok(headers) => {
                 if let Some(last) = headers.last() {
                     best = best.max(last.number);
+                    pool.update_peer_head(peer_id, last.number);
                 }
             }
             Err(err) => {
-                tracing::debug!(
-                    peer_id = ?peer.peer_id,
-                    error = %err,
-                    "head probe failed"
-                );
+                debug!(?peer_id, error = %err, "head probe failed");
             }
         }
     }
@@ -766,6 +778,7 @@ pub async fn request_headers_chunked_with_stats<C: ChainTypes>(
         current = current.saturating_add(batch as u64);
         remaining = remaining.saturating_sub(batch);
     }
+    ensure_header_continuity(&headers)?;
     Ok(HeadersChunkedResponse { headers, requests })
 }
 
@@ -794,6 +807,7 @@ pub async fn request_headers_chunked_strict<C: ChainTypes>(
         current = current.saturating_add(batch as u64);
         remaining = remaining.saturating_sub(batch);
     }
+    ensure_header_continuity(&headers)?;
     Ok(headers)
 }
 
@@ -801,7 +815,26 @@ pub async fn request_headers_chunked_strict<C: ChainTypes>(
 pub struct PayloadFetchOutcome<C: ChainTypes = EthereumChain> {
     pub payloads: Vec<BlockPayload<C>>,
     pub missing_blocks: Vec<u64>,
+    /// Subset of missing blocks rejected for inconsistent payload commitments.
+    pub invalid_blocks: Vec<u64>,
     pub fetch_stats: FetchStageStats,
+}
+
+fn partition_headers(
+    headers: Vec<Header>,
+    range: std::ops::RangeInclusive<u64>,
+) -> (Vec<Header>, Vec<u64>) {
+    let mut by_number: HashMap<_, _> = headers.into_iter().map(|h| (h.number, h)).collect();
+    let mut ordered = Vec::new();
+    let mut missing = Vec::new();
+    for number in range {
+        if let Some(header) = by_number.remove(&number) {
+            ordered.push(header);
+        } else {
+            missing.push(number);
+        }
+    }
+    (ordered, missing)
 }
 
 pub async fn fetch_payloads_for_peer<C: ChainTypes>(
@@ -815,27 +848,14 @@ pub async fn fetch_payloads_for_peer<C: ChainTypes>(
     let headers_response = request_headers_chunked_with_stats(peer, start, count).await?;
     let headers_ms = headers_start.elapsed().as_millis() as u64;
     let headers_requests = headers_response.requests;
-    let headers = headers_response.headers;
-
-    let mut headers_by_number = HashMap::new();
-    for header in headers {
-        headers_by_number.insert(header.number, header);
-    }
-
-    let mut ordered_headers = Vec::new();
-    let mut missing_blocks = Vec::new();
-    for number in start..=end {
-        if let Some(header) = headers_by_number.remove(&number) {
-            ordered_headers.push(header);
-        } else {
-            missing_blocks.push(number);
-        }
-    }
+    let (ordered_headers, mut missing_blocks) =
+        partition_headers(headers_response.headers, start..=end);
 
     if ordered_headers.is_empty() {
         return Ok(PayloadFetchOutcome {
             payloads: Vec::new(),
             missing_blocks,
+            invalid_blocks: Vec::new(),
             fetch_stats: FetchStageStats {
                 headers_ms,
                 headers_requests,
@@ -868,6 +888,7 @@ pub async fn fetch_payloads_for_peer<C: ChainTypes>(
     let mut receipts = receipts.results;
 
     let mut payloads = Vec::with_capacity(ordered_headers.len());
+    let mut invalid_blocks = Vec::new();
     for (idx, header) in ordered_headers.into_iter().enumerate() {
         let number = header.number;
         let body = bodies.get_mut(idx).and_then(Option::take);
@@ -875,8 +896,12 @@ pub async fn fetch_payloads_for_peer<C: ChainTypes>(
 
         match (body, receipts) {
             (Some(body), Some(receipts)) => {
-                if body.transactions.len() != receipts.len() {
+                if let Err(reason) =
+                    crate::sync::validation::validate_payload::<C>(&header, &body, &receipts)
+                {
+                    debug!(peer_id = ?peer.peer_id, block = number, reason, "payload rejected; requeueing block");
                     missing_blocks.push(number);
+                    invalid_blocks.push(number);
                     continue;
                 }
                 payloads.push(BlockPayload {
@@ -894,6 +919,7 @@ pub async fn fetch_payloads_for_peer<C: ChainTypes>(
     Ok(PayloadFetchOutcome {
         payloads,
         missing_blocks,
+        invalid_blocks,
         fetch_stats: FetchStageStats {
             headers_ms,
             bodies_ms,
@@ -936,6 +962,7 @@ async fn request_headers_by_number<C: ChainTypes>(
             "header number does not match request"
         );
     }
+    ensure_header_continuity(&headers.0)?;
     Ok(headers.0)
 }
 
@@ -1180,6 +1207,17 @@ async fn request_receipts70<C: ChainTypes>(
     Ok(complete)
 }
 
+fn ensure_header_continuity(headers: &[Header]) -> Result<()> {
+    for pair in headers.windows(2) {
+        eyre::ensure!(
+            pair[0].number.checked_add(1) == Some(pair[1].number)
+                && pair[1].parent_hash == pair[0].hash_slow(),
+            "header chain is not contiguous"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,11 +1329,18 @@ mod tests {
                         let BlockHashOrNumber::Number(start) = request.start_block else {
                             continue;
                         };
-                        let headers: Vec<_> = (0..count)
-                            .map(|offset| Header {
-                                number: start + offset as u64,
-                                ..Default::default()
+                        let mut parent_hash = B256::ZERO;
+                        let headers: Vec<_> = (0..start + count as u64)
+                            .map(|number| {
+                                let header = Header {
+                                    number,
+                                    parent_hash,
+                                    ..Default::default()
+                                };
+                                parent_hash = header.hash_slow();
+                                header
                             })
+                            .skip(start as usize)
                             .collect();
                         let _ = response.send(Ok(BlockHeaders::from(headers)));
                     }
@@ -1335,9 +1380,14 @@ mod tests {
                             _ => 0,
                         };
                         let mut headers = Vec::new();
+                        let mut parent_hash = B256::ZERO;
                         for idx in 0..2u64 {
-                            let mut header = Header::default();
-                            header.number = start + idx;
+                            let header = Header {
+                                number: start + idx,
+                                parent_hash,
+                                ..Default::default()
+                            };
+                            parent_hash = header.hash_slow();
                             headers.push(header);
                         }
                         let _ = response.send(Ok(BlockHeaders::from(headers)));

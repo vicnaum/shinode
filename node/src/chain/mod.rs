@@ -7,7 +7,7 @@ mod op_stack;
 pub use base::BaseChain;
 pub use ethereum::EthereumChain;
 
-use alloy_consensus::{BlockBody, TxReceipt};
+use alloy_consensus::BlockBody;
 use alloy_primitives::B256;
 use clap::ValueEnum;
 use reth_chainspec::{EthChainSpec, Hardforks};
@@ -54,7 +54,7 @@ impl ChainKind {
 /// Compile-time wire types and validation behavior for one chain.
 pub trait ChainTypes: Send + Sync + Sized + 'static {
     type SignedTx: SignedTransaction;
-    type Receipt: TxReceipt<Log = alloy_primitives::Log> + Unpin + 'static;
+    type Receipt: reth_primitives_traits::FullReceipt + 'static;
     type Primitives: NodePrimitives<
         BlockHeader = Header,
         BlockBody = BlockBody<Self::SignedTx>,

@@ -1,8 +1,7 @@
 //! Peer-driven scheduler for historical sync.
 
 use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -533,7 +532,7 @@ impl BlockPeerBackoff {
 #[derive(Debug)]
 pub struct PeerWorkScheduler {
     config: SchedulerConfig,
-    pending: Mutex<BinaryHeap<Reverse<u64>>>,
+    pending: Mutex<BTreeSet<u64>>,
     queued: Mutex<HashSet<u64>>,
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Arc<PeerHealthTracker>,
@@ -562,15 +561,15 @@ mod tests {
         let scheduler = scheduler_with_blocks(config, 0, 9);
         let peer_id = PeerId::random();
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=4).await;
         assert_eq!(batch.blocks, vec![0, 1, 2]);
         assert_eq!(batch.mode, FetchMode::Normal);
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=4).await;
         assert_eq!(batch.blocks, vec![3, 4]);
         assert_eq!(batch.mode, FetchMode::Normal);
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 4).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=4).await;
         assert!(batch.blocks.is_empty());
     }
 
@@ -601,15 +600,15 @@ mod tests {
         let scheduler = scheduler_with_blocks(config, 1, 1);
         let peer_id = PeerId::random();
 
-        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=10).await;
         assert_eq!(batch.blocks, vec![1]);
 
         scheduler.requeue_failed(&[1]).await;
-        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=10).await;
         assert_eq!(batch.blocks, vec![1]);
 
         scheduler.requeue_failed(&[1]).await;
-        let batch = scheduler.next_batch_for_peer(peer_id, 10).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=10).await;
         assert_eq!(batch.blocks, vec![1]);
         assert_eq!(batch.mode, FetchMode::Escalation);
     }
@@ -642,7 +641,7 @@ mod tests {
         let peer_id = PeerId::random();
 
         // Move all blocks to in_flight
-        let batch = scheduler.next_batch_for_peer(peer_id, 200).await;
+        let batch = scheduler.next_batch_for_peer(peer_id, 0..=200).await;
         assert!(!batch.blocks.is_empty());
 
         let even: Vec<u64> = batch.blocks.iter().copied().filter(|b| b % 2 == 0).collect();
@@ -671,7 +670,7 @@ impl PeerWorkScheduler {
         peer_health: Arc<PeerHealthTracker>,
     ) -> Self {
         let queued: HashSet<u64> = blocks.iter().copied().collect();
-        let pending = blocks.into_iter().map(Reverse).collect::<BinaryHeap<_>>();
+        let pending = blocks.into_iter().collect::<BTreeSet<_>>();
         Self {
             config,
             pending: Mutex::new(pending),
@@ -696,9 +695,9 @@ impl PeerWorkScheduler {
     pub async fn next_batch_for_peer(
         &self,
         peer_id: PeerId,
-        peer_head: u64,
+        serving_range: std::ops::RangeInclusive<u64>,
     ) -> FetchBatch {
-        if self.is_peer_cooling_down(peer_id).await {
+        if serving_range.is_empty() || self.is_peer_cooling_down(peer_id).await {
             tracing::trace!(
                 peer_id = ?peer_id,
                 "scheduler: peer cooling down"
@@ -711,7 +710,7 @@ impl PeerWorkScheduler {
 
         // ESCALATION FIRST (priority queue)
         // Returns single block for more granular retry control
-        if let Some(block) = self.pop_escalation_for_peer(peer_id).await {
+        if let Some(block) = self.pop_escalation_for_peer(peer_id, &serving_range).await {
             return FetchBatch {
                 blocks: vec![block],
                 mode: FetchMode::Escalation,
@@ -720,7 +719,7 @@ impl PeerWorkScheduler {
 
         // Normal queue second
         let max_blocks = self.peer_health.batch_limit(peer_id).await;
-        let normal = self.pop_next_batch_for_head(peer_id, peer_head, max_blocks).await;
+        let normal = self.pop_next_batch_for_head(peer_id, serving_range, max_blocks).await;
         if !normal.is_empty() {
             return FetchBatch {
                 blocks: normal,
@@ -749,7 +748,7 @@ impl PeerWorkScheduler {
         let mut added = 0usize;
         for block in start..=end {
             if queued.insert(block) {
-                pending.push(Reverse(block));
+                pending.insert(block);
                 added += 1;
             }
         }
@@ -759,7 +758,7 @@ impl PeerWorkScheduler {
     async fn pop_next_batch_for_head(
         &self,
         peer_id: PeerId,
-        peer_head: u64,
+        serving_range: std::ops::RangeInclusive<u64>,
         max_blocks: usize,
     ) -> Vec<u64> {
         let mut pending = self.pending.lock().await;
@@ -774,20 +773,10 @@ impl PeerWorkScheduler {
         let mut last: Option<u64> = None;
 
         while batch.len() < limit {
-            let Some(Reverse(next)) = pending.peek().copied() else {
+            let Some(next) = pending.range(serving_range.clone()).next().copied() else {
                 break;
             };
 
-            // Sharded storage removes contiguous watermark backpressure.
-            if next > peer_head {
-                tracing::trace!(
-                    peer_id = ?peer_id,
-                    block = next,
-                    peer_head,
-                    "scheduler: pending block above head cap"
-                );
-                break;
-            }
             if let Some(prev) = last {
                 if next != prev.saturating_add(1) {
                     break;
@@ -805,7 +794,7 @@ impl PeerWorkScheduler {
                 break;
             }
 
-            pending.pop();
+            pending.remove(&next);
             queued.remove(&next);
             in_flight.insert(next);
             batch.push(next);
@@ -820,7 +809,11 @@ impl PeerWorkScheduler {
     /// Uses shard-aware prioritization: shards with fewer missing blocks (closer to
     /// complete) get priority to enable faster compaction. Within a shard, prefers
     /// blocks this peer hasn't tried recently (cooldown tracking).
-    async fn pop_escalation_for_peer(&self, peer_id: PeerId) -> Option<u64> {
+    async fn pop_escalation_for_peer(
+        &self,
+        peer_id: PeerId,
+        serving_range: &std::ops::RangeInclusive<u64>,
+    ) -> Option<u64> {
         let mut escalation = self.escalation.lock().await;
         let completed = self.completed.lock().await;
         let mut in_flight = self.in_flight.lock().await;
@@ -849,7 +842,7 @@ impl PeerWorkScheduler {
 
             for &block in shard_blocks {
                 // Skip completed blocks (will be cleaned up on success)
-                if completed.contains(&block) {
+                if !serving_range.contains(&block) || completed.contains(&block) {
                     continue;
                 }
 
@@ -958,7 +951,7 @@ impl PeerWorkScheduler {
                 // Normal retry
                 if !queued.contains(block) {
                     queued.insert(*block);
-                    pending.push(Reverse(*block));
+                    pending.insert(*block);
                 }
             } else {
                 // Promote to escalation (priority queue)
@@ -1041,6 +1034,16 @@ impl PeerWorkScheduler {
     pub async fn completed_count(&self) -> usize {
         let completed = self.completed.lock().await;
         completed.len()
+    }
+
+    /// Oldest queued block across normal work and escalation retries.
+    pub async fn oldest_waiting_block(&self) -> Option<u64> {
+        let first_pending = self.pending.lock().await.first().copied();
+        let escalation = self.escalation.lock().await;
+        first_pending
+            .into_iter()
+            .chain(escalation.shards.values().flat_map(|blocks| blocks.iter().copied()))
+            .min()
     }
 
     /// Number of pending blocks (normal queue + escalation).

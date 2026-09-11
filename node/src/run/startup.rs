@@ -1,5 +1,6 @@
 //! Startup initialization functions.
 
+use crate::chain::ChainTypes;
 use crate::cli::NodeConfig;
 use crate::logging::RunContext;
 use crate::p2p::{self, PeerPool};
@@ -238,16 +239,17 @@ pub async fn init_storage(
 
 /// Connect to the P2P network.
 #[expect(clippy::cognitive_complexity, reason = "P2P connection with status updates")]
-pub async fn connect_p2p(
+pub async fn connect_p2p<C: ChainTypes>(
     storage: Arc<Storage>,
     config: &NodeConfig,
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
-) -> Result<p2p::NetworkSession> {
-    ui::print_status_bar("Connecting to Ethereum P2P network...");
-    update_tui_startup(tui, "Connecting to Ethereum P2P network...", log_buffer.as_ref());
+) -> Result<p2p::NetworkSession<C>> {
+    let message = format!("Connecting to {} P2P network...", C::NAME);
+    ui::print_status_bar(&message);
+    update_tui_startup(tui, &message, log_buffer.as_ref());
     info!("starting p2p network");
-    let session = p2p::connect_peers::<crate::chain::EthereumChain>(
+    let session = p2p::connect_peers::<C>(
         Some(Arc::clone(&storage)),
         config.p2p_port,
         &config.trusted_peers,
@@ -262,8 +264,8 @@ pub async fn connect_p2p(
 }
 
 /// Wait for minimum number of peers.
-pub async fn wait_for_min_peers(
-    pool: &Arc<PeerPool>,
+pub async fn wait_for_min_peers<C: ChainTypes>(
+    pool: &Arc<PeerPool<C>>,
     min_peers: usize,
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
@@ -287,8 +289,8 @@ pub async fn wait_for_min_peers(
 }
 
 /// Wait for peer head to be at or above start block.
-pub async fn wait_for_peer_head(
-    pool: &Arc<PeerPool>,
+pub async fn wait_for_peer_head<C: ChainTypes>(
+    pool: &Arc<PeerPool<C>>,
     start_block: u64,
     end_block: Option<u64>,
     rollback_window: u64,
@@ -364,14 +366,14 @@ pub struct LogWriters {
 /// If `log_writers` is provided, the TUI will flush the log writers before
 /// exiting to prevent log truncation.
 #[expect(clippy::too_many_arguments, reason = "setup function needs many config params")]
-pub fn setup_ui(
+pub fn setup_ui<C: ChainTypes>(
     config: &NodeConfig,
     run_context: Option<&RunContext>,
     start_block: u64,
     end_block: u64,
     progress_stats: Option<&Arc<SyncProgressStats>>,
     peer_health: &Arc<PeerHealthTracker>,
-    pool: &Arc<PeerPool>,
+    pool: &Arc<PeerPool<C>>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     early_tui: Option<EarlyTui>,

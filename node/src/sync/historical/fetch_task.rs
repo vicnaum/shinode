@@ -1,5 +1,6 @@
 //! Fetch task execution for the ingest pipeline.
 
+use crate::chain::{ChainTypes, EthereumChain};
 use crate::p2p::NetworkPeer;
 use crate::sync::{BlockPayload, SyncProgressStats};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,11 +17,11 @@ use super::types::FetchMode;
 use super::PeerHealthTracker;
 
 /// Shared context for fetch tasks (references to pipeline state).
-pub struct FetchTaskContext {
+pub struct FetchTaskContext<C: ChainTypes = EthereumChain> {
     pub scheduler: Arc<PeerWorkScheduler>,
     pub peer_health: Arc<PeerHealthTracker>,
-    pub fetched_tx: mpsc::Sender<BlockPayload>,
-    pub ready_tx: mpsc::UnboundedSender<NetworkPeer>,
+    pub fetched_tx: mpsc::Sender<BlockPayload<C>>,
+    pub ready_tx: mpsc::UnboundedSender<NetworkPeer<C>>,
     pub stats: Option<Arc<SyncProgressStats>>,
     pub bench: Option<Arc<IngestBenchStats>>,
     pub events: Option<Arc<BenchEventLogger>>,
@@ -29,8 +30,8 @@ pub struct FetchTaskContext {
 }
 
 /// Parameters for a single fetch task invocation.
-pub struct FetchTaskParams {
-    pub peer: NetworkPeer,
+pub struct FetchTaskParams<C: ChainTypes = EthereumChain> {
+    pub peer: NetworkPeer<C>,
     pub blocks: Vec<u64>,
     pub mode: FetchMode,
     pub batch_limit: u64,
@@ -53,7 +54,7 @@ impl Drop for ActiveFetchTaskGuard {
 }
 
 /// Execute a single fetch task for a batch of blocks from a peer.
-pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
+pub async fn run_fetch_task<C: ChainTypes>(ctx: FetchTaskContext<C>, params: FetchTaskParams<C>) {
     let FetchTaskParams {
         peer,
         blocks,
@@ -96,8 +97,16 @@ pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let fetch_elapsed = fetch_started.elapsed();
     match result {
         Ok(outcome) => {
-            handle_fetch_success(&ctx, &peer, &blocks, outcome, fetch_elapsed, batch_limit, mode)
-                .await;
+            handle_fetch_success(
+                &ctx,
+                &peer,
+                &blocks,
+                outcome,
+                fetch_elapsed,
+                batch_limit,
+                mode,
+            )
+            .await;
         }
         Err(err) => {
             handle_fetch_error(&ctx, &peer, &blocks, err, fetch_elapsed, mode).await;
@@ -120,12 +129,16 @@ pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let _ = ctx.ready_tx.send(peer);
 }
 
-#[expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "handles success path with detailed event recording and error tracking")]
-async fn handle_fetch_success(
-    ctx: &FetchTaskContext,
-    peer: &NetworkPeer,
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "handles success path with detailed event recording and error tracking"
+)]
+async fn handle_fetch_success<C: ChainTypes>(
+    ctx: &FetchTaskContext<C>,
+    peer: &NetworkPeer<C>,
     blocks: &[u64],
-    outcome: FetchIngestOutcome,
+    outcome: FetchIngestOutcome<C>,
     fetch_elapsed: Duration,
     batch_limit: u64,
     mode: FetchMode,
@@ -133,6 +146,7 @@ async fn handle_fetch_success(
     let FetchIngestOutcome {
         payloads,
         missing_blocks,
+        invalid_blocks,
         fetch_stats,
     } = outcome;
 
@@ -232,24 +246,25 @@ async fn handle_fetch_success(
         ctx.peer_health
             .note_error(
                 peer.peer_id,
-                format!("missing {} blocks in batch", missing_blocks.len()),
+                format!(
+                    "unavailable: {} blocks; invalid payloads: {} ({:?})",
+                    missing_blocks.len() - invalid_blocks.len(),
+                    invalid_blocks.len(),
+                    ctx.db_mode
+                ),
             )
             .await;
 
-        let empty_response = completed.is_empty();
-        if ctx.db_mode == DbWriteMode::Follow {
-            // Near the tip, "missing" is often just propagation lag. Avoid banning
-            // peers for empty responses while keeping AIMD/quality feedback.
+        if invalid_blocks.is_empty() {
+            // Absence is not malformed data. Back off per block and try serving peers.
             ctx.scheduler.record_peer_partial(peer.peer_id).await;
-        } else if empty_response {
-            ctx.scheduler.record_peer_failure(peer.peer_id).await;
         } else {
-            ctx.scheduler.record_peer_partial(peer.peer_id).await;
+            ctx.scheduler.record_peer_failure(peer.peer_id).await;
         }
 
         if let Some(bench) = ctx.bench.as_ref() {
             bench.record_fetch_failure(missing_blocks.len() as u64, fetch_elapsed);
-            if empty_response && ctx.db_mode != DbWriteMode::Follow {
+            if !invalid_blocks.is_empty() {
                 bench.record_peer_failure();
             }
         }
@@ -276,9 +291,9 @@ async fn handle_fetch_success(
     }
 }
 
-async fn handle_fetch_error(
-    ctx: &FetchTaskContext,
-    peer: &NetworkPeer,
+async fn handle_fetch_error<C: ChainTypes>(
+    ctx: &FetchTaskContext<C>,
+    peer: &NetworkPeer<C>,
     blocks: &[u64],
     err: eyre::Error,
     fetch_elapsed: Duration,
@@ -314,7 +329,7 @@ async fn handle_fetch_error(
     );
 }
 
-async fn requeue_blocks(ctx: &FetchTaskContext, blocks: &[u64], mode: FetchMode) {
+async fn requeue_blocks<C: ChainTypes>(ctx: &FetchTaskContext<C>, blocks: &[u64], mode: FetchMode) {
     match mode {
         FetchMode::Normal => {
             // Blocks that exceed max attempts are promoted to escalation
@@ -326,5 +341,113 @@ async fn requeue_blocks(ctx: &FetchTaskContext, blocks: &[u64], mode: FetchMode)
                 ctx.scheduler.requeue_escalation_block(*block).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::scheduler::{PeerHealthConfig, SchedulerConfig};
+    use super::*;
+    use crate::chain::{BaseChain, ChainTypes, EthereumChain};
+    use eyre::{ensure, Result};
+
+    async fn rejected_payload_does_not_advance<C: ChainTypes>() -> Result<()> {
+        let config = SchedulerConfig::default();
+        let health = Arc::new(PeerHealthTracker::new(
+            PeerHealthConfig::from_scheduler_config(&config),
+        ));
+        let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
+            config,
+            vec![42],
+            Arc::clone(&health),
+        ));
+        let (tx, mut rx) = mpsc::channel(1);
+        let (ready_tx, _) = mpsc::unbounded_channel();
+        let peer_id = reth_network_api::PeerId::random();
+        let (messages, _) = mpsc::channel(1);
+        let peer = NetworkPeer::<C> {
+            peer_id,
+            eth_version: reth_eth_wire::EthVersion::Eth69,
+            messages: reth_network_api::PeerRequestSender::new(peer_id, messages),
+            head_number: 42,
+            earliest_block: Some(0),
+            latest_block: Some(42),
+        };
+        let stats = Arc::new(SyncProgressStats::default());
+        let ctx = FetchTaskContext {
+            scheduler: Arc::clone(&scheduler),
+            peer_health: Arc::clone(&health),
+            fetched_tx: tx,
+            ready_tx,
+            stats: Some(Arc::clone(&stats)),
+            bench: None,
+            events: None,
+            active_fetch_tasks: Arc::new(AtomicU64::new(0)),
+            db_mode: DbWriteMode::Follow,
+        };
+        scheduler.next_batch_for_peer(peer_id, 0..=42).await;
+        handle_fetch_success(
+            &ctx,
+            &peer,
+            &[42],
+            FetchIngestOutcome {
+                payloads: Vec::new(),
+                missing_blocks: vec![42],
+                invalid_blocks: vec![42],
+                fetch_stats: crate::p2p::FetchStageStats::default(),
+            },
+            Duration::ZERO,
+            1,
+            FetchMode::Normal,
+        )
+        .await;
+        ensure!(
+            rx.try_recv().is_err(),
+            "invalid payload reached processor queue"
+        );
+        ensure!(
+            scheduler.completed_count().await == 0 && scheduler.pending_count().await == 1,
+            "invalid payload advanced coverage or lost retry"
+        );
+        ensure!(
+            stats.snapshot().processed == 0 && stats.snapshot().head_block == 0,
+            "invalid payload advanced progress"
+        );
+        let snapshot = health.snapshot().await;
+        ensure!(
+            snapshot[0].failures == 1 && snapshot[0].partials == 0,
+            "malformed data was classified as unavailable"
+        );
+        handle_fetch_success(
+            &ctx,
+            &peer,
+            &[42],
+            FetchIngestOutcome {
+                payloads: Vec::new(),
+                missing_blocks: vec![42],
+                invalid_blocks: Vec::new(),
+                fetch_stats: crate::p2p::FetchStageStats::default(),
+            },
+            Duration::ZERO,
+            1,
+            FetchMode::Normal,
+        )
+        .await;
+        let snapshot = health.snapshot().await;
+        ensure!(
+            snapshot[0].failures == 1 && snapshot[0].partials == 1,
+            "unavailable history was classified as malformed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn base_rejected_payload_stays_missing() -> Result<()> {
+        rejected_payload_does_not_advance::<BaseChain>().await
+    }
+
+    #[tokio::test]
+    async fn ethereum_rejected_payload_stays_missing() -> Result<()> {
+        rejected_payload_does_not_advance::<EthereumChain>().await
     }
 }

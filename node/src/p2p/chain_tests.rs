@@ -139,14 +139,20 @@ async fn base_fetch_returns_typed_deposit_payload() -> Result<()> {
         ..Default::default()
     };
     let expected = body.clone();
+    let mut payload = BlockPayload::<BaseChain> {
+        header: Header {
+            number: 42,
+            ..Default::default()
+        },
+        body: body.clone(),
+        receipts: vec![deposit_receipt()],
+    };
+    crate::sync::validation::tests::commit_payload(&mut payload);
     let server = tokio::spawn(async move {
         for _ in 0..3 {
             match rx.recv().await {
                 Some(PeerRequest::GetBlockHeaders { response, .. }) => {
-                    let _ = response.send(Ok(BlockHeaders(vec![Header {
-                        number: 42,
-                        ..Default::default()
-                    }])));
+                    let _ = response.send(Ok(BlockHeaders(vec![payload.header.clone()])));
                 }
                 Some(PeerRequest::GetBlockBodies { response, .. }) => {
                     let _ = response.send(Ok(BlockBodies(vec![body.clone()])));
@@ -248,6 +254,32 @@ async fn head_probes_reject_wrong_headers() -> Result<()> {
     ensure!(
         pool.get_peer_head(peer.peer_id) == Some(0),
         "unverified head advanced"
+    );
+    server.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn header_requests_reject_broken_parent_links() -> Result<()> {
+    let (peer, mut rx) = mock_peer::<BaseChain>(EthVersion::Eth69);
+    let server = tokio::spawn(async move {
+        if let Some(PeerRequest::GetBlockHeaders { response, .. }) = rx.recv().await {
+            let _ = response.send(Ok(BlockHeaders(vec![
+                Header {
+                    number: 42,
+                    ..Default::default()
+                },
+                Header {
+                    number: 43,
+                    parent_hash: B256::ZERO,
+                    ..Default::default()
+                },
+            ])));
+        }
+    });
+    ensure!(
+        request_headers_batch(&peer, 42, 2).await.is_err(),
+        "disconnected headers accepted"
     );
     server.await?;
     Ok(())
@@ -358,4 +390,131 @@ async fn live_ethereum_connection() -> Result<()> {
     // Ethereum's pre-eth/69 status can advertise an old head. This regression
     // probe verifies a served payload and reports its age, without tip discovery.
     live_connection::<EthereumChain>(false).await
+}
+
+async fn omitted_middle_payload_is_not_associated_with_wrong_header<C: ChainTypes + Clone>(
+    first: BlockPayload<C>,
+) -> Result<()> {
+    let mut second = first.clone();
+    second.header.number += 1;
+    second.header.parent_hash = first.header.hash_slow();
+    let mut third = second.clone();
+    third.header.number += 1;
+    third.header.parent_hash = second.header.hash_slow();
+    third.body.transactions.clear();
+    third.receipts.clear();
+    crate::sync::validation::tests::commit_payload(&mut third);
+    let start = first.header.number;
+    let (peer, mut rx) = mock_peer::<C>(EthVersion::Eth69);
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            match rx.recv().await {
+                Some(PeerRequest::GetBlockHeaders { response, .. }) => {
+                    let _ = response.send(Ok(BlockHeaders(vec![
+                        first.header.clone(),
+                        second.header.clone(),
+                        third.header.clone(),
+                    ])));
+                }
+                Some(PeerRequest::GetBlockBodies { response, .. }) => {
+                    let _ = response.send(Ok(BlockBodies(vec![
+                        first.body.clone(),
+                        third.body.clone(),
+                    ])));
+                }
+                Some(PeerRequest::GetReceipts69 { response, .. }) => {
+                    let _ = response.send(Ok(Receipts69(vec![
+                        first.receipts.clone(),
+                        third.receipts.clone(),
+                    ])));
+                }
+                _ => return Err(eyre!("unexpected request")),
+            }
+        }
+        Ok(())
+    });
+    let fetched = fetch_payloads_for_peer(&peer, start..=start + 2).await?;
+    ensure!(
+        fetched.payloads.len() == 1 && fetched.payloads[0].header.number == start,
+        "misassociated payload was accepted"
+    );
+    ensure!(
+        fetched.missing_blocks == vec![start + 1, start + 2],
+        "missing blocks must be retried"
+    );
+    ensure!(
+        fetched.invalid_blocks == vec![start + 1],
+        "commitment rejection must be distinguished from absent data"
+    );
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn base_partial_response_validates_before_accepting_payload() -> Result<()> {
+    omitted_middle_payload_is_not_associated_with_wrong_header(
+        crate::sync::validation::tests::base_payload(crate::sync::validation::tests::CANYON),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn ethereum_partial_response_validates_before_accepting_payload() -> Result<()> {
+    omitted_middle_payload_is_not_associated_with_wrong_header(
+        crate::sync::validation::tests::ethereum_payload(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn legacy_peer_bloom_is_recomputed_from_logs() -> Result<()> {
+    let payload =
+        crate::sync::validation::tests::base_payload(crate::sync::validation::tests::CANYON);
+    let expected = payload.receipts.clone();
+    let number = payload.header.number;
+    let (peer, mut rx) = mock_peer::<BaseChain>(EthVersion::Eth68);
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            match rx.recv().await {
+                Some(PeerRequest::GetBlockHeaders { response, .. }) => {
+                    let _ = response.send(Ok(BlockHeaders(vec![payload.header.clone()])));
+                }
+                Some(PeerRequest::GetBlockBodies { response, .. }) => {
+                    let _ = response.send(Ok(BlockBodies(vec![payload.body.clone()])));
+                }
+                Some(PeerRequest::GetReceipts { response, .. }) => {
+                    let receipts = payload
+                        .receipts
+                        .iter()
+                        .cloned()
+                        .map(|r| {
+                            r.into_with_bloom_unchecked(alloy_primitives::Bloom::repeat_byte(0xff))
+                        })
+                        .collect();
+                    let _ = response.send(Ok(Receipts(vec![receipts])));
+                }
+                _ => return Err(eyre!("unexpected request")),
+            }
+        }
+        Ok(())
+    });
+    let fetched = fetch_payloads_for_peer(&peer, number..=number).await?;
+    ensure!(
+        fetched.payloads.len() == 1 && fetched.payloads[0].receipts == expected,
+        "peer-provided bloom affected receipt validation"
+    );
+    server.await??;
+    Ok(())
+}
+
+#[test]
+fn serving_range_uses_history_and_verified_head() {
+    let (mut peer, _) = mock_peer::<BaseChain>(EthVersion::Eth69);
+    peer.earliest_block = Some(100);
+    peer.latest_block = Some(200);
+    assert_eq!(peer.serving_range(300), 100..=200);
+    peer.head_number = 250;
+    assert_eq!(peer.serving_range(300), 100..=250);
+    assert_eq!(peer.serving_range(150), 100..=150);
+    assert!(peer.serving_range(99).is_empty());
 }

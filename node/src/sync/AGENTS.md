@@ -10,6 +10,7 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 - [x] `historical/` - High-performance pipeline for backfilling blocks from P2P peers. Implements fast-sync and follow-mode with AIMD scheduling, parallel fetch/process/write, escalation retries, reorg detection, and bench event logging. See `historical/AGENTS.md`.
 
 ### Files
+- `validation.rs` / `validation/tests.rs` - Chain-specific body/receipt commitment checks, recomputed log blooms, and Ethereum/Base malformed payload and fork-boundary fixtures.
 - `mod.rs` - Core sync types and progress tracking (~570 lines). Defines the sync state machine, atomic progress counters, and coverage tracker for TUI visualization.
   - **Key items**: `BlockPayload`, `SyncStatus` (LookingForPeers, Fetching, Finalizing, UpToDate, Following), `FinalizePhase` (Compacting, Sealing), `SyncProgressStats`, `SyncProgressSnapshot`, `CoverageTracker`, `ProgressReporter` trait, `format_eta_seconds`
   - **Key items** (re-exports): `run_follow_loop`, `PeerHealthTracker`, `BenchEvent`, `BenchEventLogger`, `IngestBenchStats`, `IngestBenchSummary`, `SummaryInput`
@@ -48,4 +49,4 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 - `peak_speed` and `update_peak_speed_max()` for peak throughput tracking
 - `SyncStatus::Following` (value 4) added to status enum
 
-`BlockPayload<C = EthereumChain>` carries chain-specific transactions and receipts for typed P2P fetching. The sync runtime still defaults to Ethereum until the next port phase.
+`BlockPayload<C = EthereumChain>` carries chain-specific transactions and receipts for typed P2P fetching. Fetch, follow, reorg, and runtime contexts carry the same chain parameter. Storage conversion uses `historical::IngestChain`, currently implemented only for Ethereum; Base ingestion remains gated until its storage adapter lands.

@@ -48,7 +48,7 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
 ### `trackers.rs`
 - **Role**: Background tasks for follow mode (~141 lines).
 - **Key items**: `HeadTrackerHandles`, `TailFeederHandles`, `spawn_head_tracker`, `spawn_tail_feeder`, `build_tail_config`
-- **Interactions**: Head tracker polls `PeerPool` every 1s for best head, persists to storage and updates stats. Tail feeder watches head advances, emits new block ranges past rollback window (500ms poll).
+- **Interactions**: Head tracker probes headers above the observed head on a 1s interval, persists confirmed advances to storage, and updates stats. Probes run concurrently and can be cancelled during shutdown. Tail feeder watches head advances, emits new block ranges past rollback window (500ms poll).
 
 ## Key APIs (no snippets)
 
@@ -84,3 +84,9 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
   13. Shutdown: SIGINT handler with graceful (first) and force exit code 130 (second).
 
 ## Notes
+
+Startup, sync/follow contexts, trackers, and cleanup carry `C: ChainTypes`.
+`run_sync<C: IngestChain>` also requires a storage conversion adapter; only
+Ethereum has that adapter until OP storage integration. Base startup stays gated
+in `main.rs`. Backfill tail feeding retains the rollback-depth delay; live follow
+tracks the probed tip. These are P2P observations, not OP safe/finalized heads.

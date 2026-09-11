@@ -1,22 +1,28 @@
 //! Fetch logic for historical sync.
 
+use crate::chain::{ChainTypes, EthereumChain};
 use crate::p2p::{fetch_payloads_for_peer, NetworkPeer, PayloadFetchOutcome};
 use crate::sync::BlockPayload;
 use eyre::{eyre, Result};
 
 #[derive(Debug)]
-pub struct FetchIngestOutcome {
-    pub payloads: Vec<BlockPayload>,
+pub struct FetchIngestOutcome<C: ChainTypes = EthereumChain> {
+    pub payloads: Vec<BlockPayload<C>>,
     pub missing_blocks: Vec<u64>,
+    pub invalid_blocks: Vec<u64>,
     pub fetch_stats: crate::p2p::FetchStageStats,
 }
 
 /// Fetch full block payloads for ingest mode.
-pub async fn fetch_ingest_batch(peer: &NetworkPeer, blocks: &[u64]) -> Result<FetchIngestOutcome> {
+pub async fn fetch_ingest_batch<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
+    blocks: &[u64],
+) -> Result<FetchIngestOutcome<C>> {
     if blocks.is_empty() {
         return Ok(FetchIngestOutcome {
             payloads: Vec::new(),
             missing_blocks: Vec::new(),
+            invalid_blocks: Vec::new(),
             fetch_stats: crate::p2p::FetchStageStats::default(),
         });
     }
@@ -26,11 +32,13 @@ pub async fn fetch_ingest_batch(peer: &NetworkPeer, blocks: &[u64]) -> Result<Fe
     let PayloadFetchOutcome {
         payloads,
         missing_blocks,
+        invalid_blocks,
         fetch_stats,
     } = fetch_payloads_for_peer(peer, start..=end).await?;
     Ok(FetchIngestOutcome {
         payloads,
         missing_blocks,
+        invalid_blocks,
         fetch_stats,
     })
 }

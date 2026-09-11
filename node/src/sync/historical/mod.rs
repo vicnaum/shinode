@@ -10,9 +10,11 @@ mod scheduler;
 mod stats;
 mod types;
 
+use crate::chain::ChainTypes;
 use crate::cli::NodeConfig;
 use crate::p2p::PeerPool;
 use crate::sync::{BlockPayload, ProgressReporter, SyncProgressStats, SyncStatus};
+use alloy_consensus::TxReceipt;
 use alloy_rlp::Encodable;
 use eyre::{eyre, Result};
 use reth_network_api::PeerId;
@@ -26,7 +28,7 @@ use tokio::time::{sleep, Duration};
 use crate::storage::Storage;
 use db_writer::{run_db_writer, DbWriteConfig, DbWriteMode, DbWriterMessage, DbWriterParams};
 pub use follow::run_follow_loop;
-use process::process_ingest;
+pub use process::IngestChain;
 pub use scheduler::PeerHealthTracker;
 use scheduler::{PeerHealthConfig, PeerWorkScheduler, SchedulerConfig};
 use stats::FetchByteTotals;
@@ -39,8 +41,8 @@ use fetch_task::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 
 static PEER_FEEDER_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-async fn pick_best_ready_peer_index(
-    peers: &[crate::p2p::NetworkPeer],
+async fn pick_best_ready_peer_index<C: ChainTypes>(
+    peers: &[crate::p2p::NetworkPeer<C>],
     peer_health: &PeerHealthTracker,
 ) -> usize {
     let mut best_idx = 0usize;
@@ -85,9 +87,9 @@ pub struct TailIngestConfig {
     pub head_offset: u64,
 }
 
-fn spawn_peer_feeder(
-    pool: Arc<PeerPool>,
-    ready_tx: mpsc::UnboundedSender<crate::p2p::NetworkPeer>,
+fn spawn_peer_feeder<C: ChainTypes>(
+    pool: Arc<PeerPool<C>>,
+    ready_tx: mpsc::UnboundedSender<crate::p2p::NetworkPeer<C>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -141,8 +143,8 @@ struct ProcessorContext {
 
 /// Run a single processor worker that receives payloads and sends bundles to DB.
 #[expect(clippy::cognitive_complexity, reason = "processor handles success/error with optional stats")]
-async fn run_processor_worker(
-    rx: Arc<Mutex<mpsc::Receiver<BlockPayload>>>,
+async fn run_processor_worker<C: IngestChain>(
+    rx: Arc<Mutex<mpsc::Receiver<BlockPayload<C>>>>,
     tx: mpsc::Sender<DbWriterMessage>,
     ctx: ProcessorContext,
 ) {
@@ -162,7 +164,7 @@ async fn run_processor_worker(
         let process_started = Instant::now();
         let bench_ref = ctx.bench.as_ref().map(Arc::as_ref);
         let span = tracing::trace_span!("process_block", block = payload.header.number);
-        let result = span.in_scope(|| process_ingest(payload, bench_ref));
+        let result = span.in_scope(|| C::process_ingest(payload, bench_ref));
         match result {
             Ok((bundle, log_count)) => {
                 if let Some(events) = ctx.events.as_ref() {
@@ -202,8 +204,8 @@ async fn run_processor_worker(
 }
 
 /// Run peer events tracker that logs connect/disconnect/ban events.
-async fn run_peer_events_tracker(
-    pool: Arc<PeerPool>,
+async fn run_peer_events_tracker<C: ChainTypes>(
+    pool: Arc<PeerPool<C>>,
     peer_health: Arc<PeerHealthTracker>,
     events: Arc<BenchEventLogger>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -309,9 +311,9 @@ pub struct IngestPipelineTrackers {
     clippy::cognitive_complexity,
     reason = "pipeline orchestrates fetching, processing, and DB writes with complex state machine"
 )]
-pub async fn run_ingest_pipeline(
+pub async fn run_ingest_pipeline<C: IngestChain>(
     storage: Arc<Storage>,
-    pool: Arc<PeerPool>,
+    pool: Arc<PeerPool<C>>,
     pipeline_config: IngestPipelineConfig<'_>,
     missing: MissingBlocks,
     trackers: IngestPipelineTrackers,
@@ -555,7 +557,7 @@ pub async fn run_ingest_pipeline(
         .fast_sync_max_buffered_blocks
         .max(1)
         .min(usize::MAX as u64) as usize;
-    let (fetched_blocks_tx, fetched_blocks_rx) = mpsc::channel::<BlockPayload>(buffer_cap);
+    let (fetched_blocks_tx, fetched_blocks_rx) = mpsc::channel::<BlockPayload<C>>(buffer_cap);
     let (processed_blocks_tx, processed_blocks_rx) = mpsc::channel(buffer_cap);
     let db_flush_tx = processed_blocks_tx.clone();
 
@@ -620,7 +622,7 @@ pub async fn run_ingest_pipeline(
         config.fast_sync_max_inflight.max(1) as usize,
     ));
     let mut fetch_tasks: JoinSet<()> = JoinSet::new();
-    let mut ready_peers: Vec<crate::p2p::NetworkPeer> = Vec::new();
+    let mut ready_peers: Vec<crate::p2p::NetworkPeer<C>> = Vec::new();
     let mut ready_set: HashSet<PeerId> = HashSet::new();
     let mut last_progress_check = Instant::now();
     let mut last_progress_completed = 0u64;
@@ -678,6 +680,13 @@ pub async fn run_ingest_pipeline(
                     ready_peers = ready_peers.len(),
                     "stall detected: no progress in 30s"
                 );
+                if let Some(block) = scheduler.oldest_waiting_block().await {
+                    let peers = pool.snapshot();
+                    if !peers.iter().any(|peer| peer.serving_range(u64::MAX).contains(&block)) {
+                        tracing::warn!(block, chain = C::NAME,
+                            "no connected peer advertises history for pending block; waiting for a serving peer (configure --trusted-peer for older history)");
+                    }
+                }
                 let health_snapshot = peer_health.snapshot().await;
                 let tracked = health_snapshot.len();
                 let cooling = health_snapshot.iter().filter(|p| p.is_cooling_down).count();
@@ -880,7 +889,7 @@ pub async fn run_ingest_pipeline(
             Some(cap) => cap,
             None => {
                 if db_mode == DbWriteMode::Follow {
-                    // NOTE: `NetworkPeer.head_number` is probed once at connect time and can go
+                    // NOTE: `NetworkPeer<C>.head_number` is probed once at connect time and can go
                     // stale. In follow mode we cap scheduling at the global observed head.
                     tail_head_seen
                         .as_ref()
@@ -893,7 +902,7 @@ pub async fn run_ingest_pipeline(
             }
         };
         let batch = scheduler
-            .next_batch_for_peer(peer.peer_id, head_cap)
+            .next_batch_for_peer(peer.peer_id, peer.serving_range(head_cap))
             .await;
         if batch.blocks.is_empty() {
             tracing::trace!(
@@ -1068,14 +1077,14 @@ const fn range_len(range: &RangeInclusive<u64>) -> u64 {
     }
 }
 
-pub(super) fn fetch_payload_bytes(payload: &BlockPayload) -> FetchByteTotals {
+pub(super) fn fetch_payload_bytes<C: ChainTypes>(payload: &BlockPayload<C>) -> FetchByteTotals {
     let headers = payload.header.length() as u64;
     let bodies = payload.body.length() as u64;
     let receipts = payload.receipts.length() as u64;
     let logs = payload
         .receipts
         .iter()
-        .map(|receipt| receipt.logs.length() as u64)
+        .map(|receipt| alloy_rlp::list_length(receipt.logs()) as u64)
         .sum();
     FetchByteTotals {
         headers,
@@ -1084,3 +1093,6 @@ pub(super) fn fetch_payload_bytes(payload: &BlockPayload) -> FetchByteTotals {
         logs,
     }
 }
+
+#[cfg(test)]
+mod history_tests;

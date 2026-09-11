@@ -1,10 +1,10 @@
 //! Resource monitoring for CPU, memory, and disk I/O.
 
+use crate::chain::ChainTypes;
 use crate::p2p::{P2pStats, PeerPool};
 use crate::sync::historical::PeerHealthTracker;
 use crate::sync::SyncProgressStats;
 use parking_lot::Mutex;
-use reth_eth_wire::EthNetworkPrimitives;
 use reth_network::NetworkHandle;
 use reth_network::PeersInfo;
 use serde::Serialize;
@@ -329,10 +329,10 @@ fn read_proc_disk_sample() -> Option<DiskSample> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn spawn_resource_logger(
+pub fn spawn_resource_logger<C: ChainTypes>(
     stats: Option<Arc<SyncProgressStats>>,
     resources_logger: Option<Arc<ResourcesLogger>>,
-    network: Option<NetworkHandle<EthNetworkPrimitives>>,
+    network: Option<NetworkHandle<C::Net>>,
     p2p_stats: Option<Arc<P2pStats>>,
 ) {
     // Skip spawning if no logger is provided
@@ -479,10 +479,10 @@ pub fn spawn_resource_logger(
     clippy::too_many_lines,
     reason = "resource monitoring loop with OS-specific metric collection is clearer inline"
 )]
-pub fn spawn_resource_logger(
+pub fn spawn_resource_logger<C: ChainTypes>(
     stats: Option<Arc<SyncProgressStats>>,
     resources_logger: Option<Arc<ResourcesLogger>>,
-    network: Option<NetworkHandle<EthNetworkPrimitives>>,
+    network: Option<NetworkHandle<C::Net>>,
     p2p_stats: Option<Arc<P2pStats>>,
 ) {
     use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
@@ -610,9 +610,9 @@ pub fn spawn_resource_logger(
 // ============================================================================
 
 #[cfg(unix)]
-pub fn spawn_usr1_state_logger(
+pub fn spawn_usr1_state_logger<C: ChainTypes>(
     stats: Option<Arc<SyncProgressStats>>,
-    peer_pool: Option<Arc<PeerPool>>,
+    peer_pool: Option<Arc<PeerPool<C>>>,
     peer_health: Option<Arc<PeerHealthTracker>>,
 ) {
     use tokio::signal::unix::{signal, SignalKind};

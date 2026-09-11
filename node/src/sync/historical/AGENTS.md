@@ -13,6 +13,7 @@ benchmark stats/event logging.
 ### Files
 - `db_writer.rs` - Batched DB writer that buffers `BlockBundle`s, writes WAL/follow segments, and triggers compaction + sealing.
   - **Key items**: `DbWriteConfig`, `DbWriteMode`, `DbWriterMessage`, `DbWriterFinalizeStats`, `DbWriterParams`, `FlushContext`, `ShardRemainingTracker`, `run_db_writer()`, `flush_fast_sync_buffer()`, `finalize_fast_sync()`, `db_bytes_for_bundles()`
+- `history_tests.rs` - Normal and escalation scheduling tests for advertised peer history bounds.
 - `fetch.rs` - Ingest fetch wrappers around the P2P layer (consecutive batch enforcement, ingest payload fetch).
   - **Key items**: `fetch_ingest_batch()`, `FetchIngestOutcome`, `ensure_consecutive()`
 - `fetch_task.rs` - Fetch task execution for the ingest pipeline; encapsulates per-batch fetch logic with error handling.
@@ -50,7 +51,7 @@ benchmark stats/event logging.
 - **Key items**: `run_ingest_pipeline()`, `MissingBlocks`, `TailIngestConfig` (fields: `stop_when_caught_up`, `head_offset`), `IngestFinalizeStats`, `IngestPipelineOutcome`, `IngestPipelineConfig`, `IngestPipelineTrackers`, `run_processor_worker()`, `run_peer_events_tracker()`, `ProcessorContext`, `pick_best_ready_peer_index()`, `spawn_peer_feeder()`, `PEER_FEEDER_CURSOR`
 - **Interactions**:
   - Uses `fetch_task::{FetchTaskContext, FetchTaskParams, run_fetch_task()}` for per-batch P2P fetching.
-  - Uses `process::process_ingest()` to build `BlockBundle`s and sends them to `db_writer`.
+  - Uses `IngestChain::process_ingest()` to build `BlockBundle`s and sends them to `db_writer`.
   - Uses `scheduler::{PeerWorkScheduler, PeerHealthTracker}` to assign work and adapt per-peer batch limits.
   - Spawns scheduler gauge task to emit `BenchEvent::SchedulerGaugeSample` every 10 seconds.
   - When `TailIngestConfig` is provided, enqueues appended ranges via `PeerWorkScheduler::enqueue_range()` and updates progress totals; head offset controls safe-head vs head tracking.
@@ -133,3 +134,26 @@ benchmark stats/event logging.
 - Processing workers: `process_ingest()` builds `BlockBundle`s with tx hashes via zero-copy KeccakBuf and sends them to the DB writer channel.
 - DB writer: buffer + `write_block_bundles_wal()` (fast sync) or BTreeMap reorder buffer (follow), trigger per-shard compaction when complete (unless `defer_compaction`), compact dirty shards and seal completed shards in finalize.
 - Follow mode: periodically observe head, preflight reorgs, rollback to common ancestor when needed, and re-run ingest for missing blocks near the tip.
+
+## Typed fetching and validation
+
+Fetch, follow, reorg, and pipeline contexts carry `C: ChainTypes`; scheduling,
+progress, and DB orchestration remain chain neutral. `IngestChain` is the storage
+conversion boundary and currently has only an Ethereum implementation. Base
+payloads stay typed through validation; deposit processing/storage is a later phase.
+
+The P2P layer validates transaction/ommers/receipt roots, receipt count, withdrawals,
+and recomputed log blooms before emitting payloads. Invalid blocks remain missing
+and are retried without advancing completion/coverage. Invalid commitments count
+as peer failures; unavailable data counts as partial service.
+
+Normal work uses a `BTreeSet` to seek within a peer's advertised history range.
+Escalation retries honor both range bounds too. Unserved work remains queued for
+other peers, with a periodic diagnostic when no connected peer advertises the
+oldest pending block. Advertised ranges do not prove receipt availability.
+
+Head probes run concurrently within the configured peer/request bounds and are
+cancellable on tracker shutdown. Existing policy is preserved: backfill targets a
+depth-delayed P2P head, follow tracks the probed tip, and common-ancestor search is
+bounded by `rollback_window`. Neither view establishes OP safe/finalized status
+or L1 finality; payload commitments establish consistency with the supplied header.

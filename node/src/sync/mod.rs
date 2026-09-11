@@ -5,6 +5,7 @@ use alloy_consensus::BlockBody;
 use reth_primitives_traits::Header;
 
 pub mod historical;
+pub mod validation;
 
 /// Full payload for a block: header, body, receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]

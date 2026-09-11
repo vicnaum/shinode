@@ -1,8 +1,10 @@
 //! Live follow loop for continuous syncing.
 
+use crate::chain::{ChainTypes, EthereumChain};
 use crate::cli::NodeConfig;
 use crate::p2p::{discover_head_p2p, PeerPool};
 use crate::storage::Storage;
+use crate::sync::historical::IngestChain;
 use crate::sync::{ProgressReporter, SyncProgressStats, SyncStatus};
 use eyre::{eyre, Result};
 use std::sync::Arc;
@@ -65,9 +67,9 @@ fn spawn_synced_watcher(
 }
 
 /// Context for the head tracker task.
-struct HeadTrackerContext {
+struct HeadTrackerContext<C: ChainTypes = EthereumChain> {
     storage: Arc<Storage>,
-    pool: Arc<PeerPool>,
+    pool: Arc<PeerPool<C>>,
     stats: Option<Arc<SyncProgressStats>>,
     start_block: u64,
     end_block: Option<u64>,
@@ -76,8 +78,8 @@ struct HeadTrackerContext {
 
 /// Run the head tracker that discovers new chain head and broadcasts updates.
 #[expect(clippy::cognitive_complexity, reason = "head tracker with discovery loop and error handling")]
-async fn run_head_tracker(
-    ctx: HeadTrackerContext,
+async fn run_head_tracker<C: ChainTypes>(
+    ctx: HeadTrackerContext<C>,
     head_seen_tx: watch::Sender<u64>,
     mut stop_rx: watch::Receiver<bool>,
     initial_head: u64,
@@ -93,10 +95,13 @@ async fn run_head_tracker(
             .ok()
             .flatten()
             .unwrap_or(ctx.start_block)
-            .max(ctx.start_block);
-        let head = match discover_head_p2p(&ctx.pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT)
-            .await
-        {
+            .max(ctx.start_block)
+            .max(last_head);
+        let result = tokio::select! {
+            _ = stop_rx.changed() => break,
+            result = discover_head_p2p(&ctx.pool, baseline, HEAD_PROBE_PEERS, HEAD_PROBE_LIMIT) => result,
+        };
+        let head = match result {
             Ok(Some(head)) => head,
             Ok(None) => {
                 sleep(ctx.poll).await;
@@ -160,9 +165,9 @@ async fn run_tail_scheduler(
 }
 
 /// Context for the reorg detector task.
-struct ReorgDetectorContext {
+struct ReorgDetectorContext<C: ChainTypes = EthereumChain> {
     storage: Arc<Storage>,
-    pool: Arc<PeerPool>,
+    pool: Arc<PeerPool<C>>,
     rollback_window: u64,
     start_block: u64,
     poll: Duration,
@@ -170,8 +175,8 @@ struct ReorgDetectorContext {
 
 /// Run the reorg detector that watches for chain reorganizations.
 #[expect(clippy::cognitive_complexity, reason = "reorg detection with ancestor search and error handling")]
-async fn run_reorg_detector(
-    ctx: ReorgDetectorContext,
+async fn run_reorg_detector<C: ChainTypes>(
+    ctx: ReorgDetectorContext<C>,
     reorg_tx: mpsc::UnboundedSender<Result<u64>>,
     stop_tx: watch::Sender<bool>,
     mut stop_rx: watch::Receiver<bool>,
@@ -242,9 +247,9 @@ async fn run_reorg_detector(
 }
 
 #[expect(clippy::cognitive_complexity, reason = "debug dump logs multiple subsystems")]
-async fn dump_follow_debug(
+async fn dump_follow_debug<C: ChainTypes>(
     storage: &Storage,
-    pool: &PeerPool,
+    pool: &PeerPool<C>,
     stats: Option<&SyncProgressStats>,
     peer_health: &super::scheduler::PeerHealthTracker,
 ) {
@@ -296,9 +301,9 @@ async fn dump_follow_debug(
     clippy::cognitive_complexity,
     reason = "follow loop coordinates reorg detection, head tracking, and ingest pipeline"
 )]
-pub async fn run_follow_loop(
+pub async fn run_follow_loop<C: IngestChain>(
     storage: Arc<Storage>,
-    pool: Arc<PeerPool>,
+    pool: Arc<PeerPool<C>>,
     config: &NodeConfig,
     progress: Option<Arc<dyn ProgressReporter>>,
     stats: Option<Arc<SyncProgressStats>>,

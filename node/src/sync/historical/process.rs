@@ -15,6 +15,23 @@ use reth_primitives_traits::SealedHeader;
 use std::mem::MaybeUninit;
 use std::time::Instant;
 
+/// Storage adapter boundary. OP encoding is added in the next port phase.
+pub trait IngestChain: crate::chain::ChainTypes {
+    fn process_ingest(
+        payload: BlockPayload<Self>,
+        bench: Option<&IngestBenchStats>,
+    ) -> Result<(BlockBundle, u64)>;
+}
+
+impl IngestChain for crate::chain::EthereumChain {
+    fn process_ingest(
+        payload: BlockPayload<Self>,
+        bench: Option<&IngestBenchStats>,
+    ) -> Result<(BlockBundle, u64)> {
+        process_ingest(payload, bench)
+    }
+}
+
 const KECCAK_SCRATCH_LEN: usize = 4096;
 
 struct KeccakBuf {

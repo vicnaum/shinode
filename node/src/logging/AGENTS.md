@@ -116,3 +116,5 @@ Usage: `kill -USR1 <pid>`
 7. `TuiLogBuffer` captures formatted entries for dashboard log panel
 8. On shutdown, `generate_run_report()` produces summary JSON with peer health
 9. `finalize_log_files()` flushes all writers and renames temp files atomically
+
+Resource and SIGUSR1 loggers accept chain-typed network handles/peer pools; metric formats remain chain neutral.

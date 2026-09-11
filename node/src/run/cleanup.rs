@@ -3,6 +3,7 @@
 //! This module consolidates the duplicated cleanup paths from main.rs into a single
 //! `finalize_session` function.
 
+use crate::chain::{ChainTypes, EthereumChain};
 use crate::cli::NodeConfig;
 use crate::logging::{finalize_log_files, generate_run_report, ResourcesLogger, RunContext, TracingGuards};
 use crate::p2p;
@@ -14,13 +15,13 @@ use std::str::FromStr;
 use tracing::warn;
 
 /// All data needed for report generation and log finalization.
-pub struct FinalizeContext<'a> {
+pub struct FinalizeContext<'a, C: ChainTypes = EthereumChain> {
     pub run_context: Option<&'a RunContext>,
     pub config: &'a NodeConfig,
     pub range: &'a RangeInclusive<u64>,
     pub head_at_startup: u64,
     pub peer_health: &'a PeerHealthTracker,
-    pub network: &'a p2p::NetworkSession,
+    pub network: &'a p2p::NetworkSession<C>,
     pub storage: &'a Storage,
     pub bench: &'a IngestBenchStats,
     pub events: Option<&'a BenchEventLogger>,
@@ -32,7 +33,7 @@ pub struct FinalizeContext<'a> {
 ///
 /// This generates the run report (if enabled), finalizes log files, and flushes the peer cache.
 #[expect(clippy::cognitive_complexity, reason = "cleanup orchestrates report, logs, and cache")]
-pub async fn finalize_session(ctx: FinalizeContext<'_>, logs_total: u64) {
+pub async fn finalize_session<C: ChainTypes>(ctx: FinalizeContext<'_, C>, logs_total: u64) {
     // Build summary from bench stats (use cached disk stats, no directory traversal)
     let storage_stats = match ctx.storage.disk_usage_cached() {
         Ok(stats) => Some(stats),
@@ -118,8 +119,8 @@ async fn persist_peer_limits(storage: &Storage, peer_health: &PeerHealthTracker)
 
 /// Flush peer cache with batch limits.
 #[expect(clippy::cognitive_complexity, reason = "cache flush with health snapshot")]
-pub async fn flush_peer_cache_with_limits(
-    session: &p2p::NetworkSession,
+pub async fn flush_peer_cache_with_limits<C: ChainTypes>(
+    session: &p2p::NetworkSession<C>,
     storage: &Storage,
     peer_health: Option<&PeerHealthTracker>,
 ) {

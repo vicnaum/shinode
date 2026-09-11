@@ -77,3 +77,10 @@ separate from the header-probed head. Discovery metrics also run without storage
 eth/70 incomplete final receipt blocks are dropped and reported missing for retry.
 The storage cache is namespaced by chain ID and genesis; connecting with a cache
 for a different chain fails before network startup. Full Base ingestion remains gated.
+
+Fetch assembly validates body and receipt commitments via `sync::validation`
+before producing payloads. `invalid_blocks` is a subset of `missing_blocks`;
+omitted or inconsistent responses are retried. Header requests check sequential
+numbers and parent links, including chunk boundaries. `NetworkPeer::serving_range`
+combines advertised history with the caller's head cap and verified head updates.
+Head discovery probes peers concurrently under the existing request timeout.

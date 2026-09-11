@@ -15,3 +15,5 @@ never relabel Ethereum networking as Base.
 
 `cargo test --lib` runs fork/genesis/withdrawals tests. The `base_protocol`
 integration test consumes these definitions rather than a second chainspec.
+
+`ChainTypes::Receipt` requires `FullReceipt`, exposing encoding and receipt traits to the generic sync pipeline. Receipt-root helpers recompute blooms from logs.

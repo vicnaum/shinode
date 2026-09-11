@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     }
 
     // Run main sync
-    run::run_sync(config, argv).await
+    run::run_sync::<chain::EthereumChain>(config, argv).await
 }
 
 #[cfg(test)]

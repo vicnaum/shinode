@@ -3,6 +3,8 @@
 // SIGINT handler must terminate the process on second signal
 #![expect(clippy::exit, reason = "SIGINT handler must terminate process")]
 
+use crate::chain::{ChainTypes, EthereumChain};
+use crate::sync::historical::IngestChain;
 use crate::cli::{compute_target_range, HeadSource, NodeConfig};
 use crate::logging::{init_tracing, spawn_resource_logger, ResourcesLogger, TracingGuards};
 #[cfg(unix)]
@@ -49,7 +51,7 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
     clippy::cognitive_complexity,
     reason = "main sync orchestration has sequential setup phases that are clearer inline"
 )]
-pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
+pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Number of coverage buckets for TUI blocks map visualization
     const COVERAGE_BUCKETS: usize = 200;
 
@@ -142,7 +144,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
                 // Draw initial startup screen with config info
                 {
                     let mut guard = tui_arc.lock();
-                    guard.state.startup_status = "Connecting to Ethereum P2P network...".to_string();
+                    guard.state.startup_status = format!("Connecting to {} P2P network...", C::NAME);
                     // Set config values for display
                     guard.state.set_config(
                         &config.data_dir.display().to_string(),
@@ -189,7 +191,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     }
 
     // Connect to P2P network
-    let session = connect_p2p(
+    let session = connect_p2p::<C>(
         Arc::clone(&storage),
         &config,
         early_tui.as_ref(),
@@ -356,7 +358,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         Some(log_writers),
     )?;
 
-    spawn_resource_logger(
+    spawn_resource_logger::<C>(
         progress_stats.clone(),
         resources_logger.clone(),
         Some(session.handle.clone()),
@@ -561,9 +563,9 @@ fn log_follow_transition(
 }
 
 /// Configuration for follow mode execution.
-struct FollowModeConfig<'a> {
+struct FollowModeConfig<'a, C: ChainTypes = EthereumChain> {
     storage: &'a Arc<Storage>,
-    session: &'a p2p::NetworkSession,
+    session: &'a p2p::NetworkSession<C>,
     config: &'a NodeConfig,
     range: &'a RangeInclusive<u64>,
     head_at_startup: u64,
@@ -591,8 +593,8 @@ struct FollowModeState<'a> {
     clippy::cognitive_complexity,
     reason = "follow mode orchestration with select loop is clearer inline"
 )]
-async fn run_follow_mode(
-    cfg: FollowModeConfig<'_>,
+async fn run_follow_mode<C: IngestChain>(
+    cfg: FollowModeConfig<'_, C>,
     trackers: FollowModeTrackers<'_>,
     state: FollowModeState<'_>,
     outcome: &IngestPipelineOutcome,

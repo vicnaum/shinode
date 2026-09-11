@@ -133,5 +133,32 @@ chain identity rejection, and peer-cache isolation/TTL/AIMD behavior.
 The no-default-features build and targeted library/integration Clippy pass;
 full binary Clippy retains its 37 existing errors, with no added diagnostics.
 
-Typed sync/runtime and OP storage integration remain follow-up work. Base
-sync and maintenance commands remain gated before storage/network side effects.
+Typed sync/runtime integration is implemented; OP transaction processing and
+storage integration remain follow-up work. Base sync and maintenance commands
+remain gated before storage/network side effects.
+
+## Payload validation and sync integration
+
+The production fetch path now checks transaction and ommers roots, receipt count,
+fork-aware receipt roots and withdrawals, and aggregate log bloom. Receipt blooms
+are recomputed from logs. Malformed or misassociated partial responses remain
+missing work for retry and do not advance coverage. Offline tests cover Ethereum,
+Base deposit payloads, omitted middle responses, and Canyon/Isthmus boundaries.
+After Isthmus, the withdrawals header field is treated as a storage commitment,
+not compared with an Ethereum withdrawals-list root.
+
+Normal and escalation scheduling respect advertised history bounds. Work without
+a serving peer remains queued, with a diagnostic identifying the oldest unavailable
+block. Head probes run concurrently and trackers can cancel pending requests on
+shutdown. The existing policy remains: backfill uses a rollback-depth-delayed P2P
+head; follow tracks the probed tip; ancestor search stays within the rollback
+window. Neither head represents OP safe/finalized status, and commitment checks
+do not establish canonicality or L1 finality.
+
+Phase 4's live Base recheck could not start networking because the local DNS
+resolver reported `no nameservers found in config`. The earlier live evidence
+above predates these validation changes; the new path is covered by offline tests.
+
+Phase 4 automated validation passes 90 tests (5 intentionally ignored), the
+no-default-features build, and strict library/integration Clippy checks. Full
+binary/test Clippy adds no diagnostics relative to phase 3's existing lint debt.

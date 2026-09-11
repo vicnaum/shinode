@@ -150,3 +150,5 @@ Manages terminal I/O and rendering loop:
 4. Phase transitions: Startup -> Sync -> Compact -> Seal -> Follow (no backwards)
 5. TUI renders phase-specific layout with appropriate panels (speed chart during sync, compaction panel during compact, big numbers during follow)
 6. On quit: send shutdown signal, wait for completion or 3s timeout, flush logs, restore terminal
+
+Progress updater functions accept `PeerPool<C>` for either chain; display snapshots remain chain neutral.
