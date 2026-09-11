@@ -97,7 +97,7 @@ most 90 seconds of peer probing, and is ignored in normal test runs. It writes
 the report only when `SHINODE_BASE_PROBE_OUTPUT` is set; the report itself is not
 a continuously updated compatibility guarantee.
 
-Validation on this branch:
+Validation of the initial protocol compatibility change:
 
 - `cargo check --workspace`: passed.
 - `cargo check --workspace --no-default-features --locked --offline`: passed.
@@ -106,4 +106,32 @@ Validation on this branch:
 - Explicit live probe: 1 passed; evidence above.
 - `cargo clippy --test base_protocol --locked --offline -- -D warnings`: passed.
 
-Chain selection and production network/storage integration remain follow-up work.
+## Production P2P validation
+
+Chain selection and the typed production P2P connector are implemented. The
+opt-in diagnostics call `connect_peers<C>` and `fetch_payloads_for_peer<C>`;
+they do not use the standalone protocol probe's request helpers.
+
+On September 11, 2026, Base served block **51,176,369**
+(`0x303476819af5c640ab3e80b3e3e2b67bcfe6b67d66aed1392ef2fce56468c237`)
+over eth/69: 923 transactions/receipts and 1,833 logs. The production fetch
+path decoded the payload and the diagnostic verified its transaction root,
+receipt root, withdrawals, and head freshness (11 seconds old).
+
+Ethereum served block **25,955,130**
+(`0x108d68ff09269c7dc645393337fd004087ffe1dc2613cdad2530c75a654a6a4f`)
+over eth/69: 391 transactions/receipts and 734 logs. Roots and withdrawals
+passed; its block timestamp was 649 seconds behind the observation time.
+Cold Ethereum attempts timed out; seeding the diagnostic with public addresses
+from the existing legacy cache found a serving peer. This demonstrates payload
+serving, not current-tip discovery or archive coverage.
+
+See [connectivity diagnostic commands](configuration.md#peer-caches-and-connectivity-diagnostics).
+Normal validation now passes 73 tests (5 ignored), including Base deposit
+receipts across eth/68–70, incomplete eth/70 responses, head verification,
+chain identity rejection, and peer-cache isolation/TTL/AIMD behavior.
+The no-default-features build and targeted library/integration Clippy pass;
+full binary Clippy retains its 37 existing errors, with no added diagnostics.
+
+Typed sync/runtime and OP storage integration remain follow-up work. Base
+sync and maintenance commands remain gated before storage/network side effects.

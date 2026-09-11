@@ -256,11 +256,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
         let messages = PeerRequestSender::new(peer_id, tx);
-        let peer = NetworkPeer {
+        let peer: NetworkPeer = NetworkPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages,
             head_number: 12,
+            earliest_block: None,
+            latest_block: None,
         };
 
         tokio::spawn(async move {
@@ -303,11 +305,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
         let messages = PeerRequestSender::new(peer_id, tx);
-        let peer = NetworkPeer {
+        let peer: NetworkPeer = NetworkPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages,
             head_number: 12,
+            earliest_block: None,
+            latest_block: None,
         };
 
         tokio::spawn(async move {
@@ -350,11 +354,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
         let messages = PeerRequestSender::new(peer_id, tx);
-        let peer = NetworkPeer {
+        let peer: NetworkPeer = NetworkPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages,
             head_number: 12,
+            earliest_block: None,
+            latest_block: None,
         };
 
         tokio::spawn(async move {

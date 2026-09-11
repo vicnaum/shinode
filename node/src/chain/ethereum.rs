@@ -11,7 +11,7 @@ use reth_primitives_traits::Header;
 use std::sync::Arc;
 
 /// Ethereum mainnet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EthereumChain;
 
 impl ChainTypes for EthereumChain {

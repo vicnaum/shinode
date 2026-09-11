@@ -1,16 +1,17 @@
 //! Sync and ingest orchestration.
 
-use reth_ethereum_primitives::{BlockBody, Receipt};
+use crate::chain::{ChainTypes, EthereumChain};
+use alloy_consensus::BlockBody;
 use reth_primitives_traits::Header;
 
 pub mod historical;
 
 /// Full payload for a block: header, body, receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockPayload {
+pub struct BlockPayload<C: ChainTypes = EthereumChain> {
     pub header: Header,
-    pub body: BlockBody,
-    pub receipts: Vec<Receipt>,
+    pub body: BlockBody<C::SignedTx>,
+    pub receipts: Vec<C::Receipt>,
 }
 
 pub trait ProgressReporter: Send + Sync {

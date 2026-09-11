@@ -104,7 +104,7 @@ fn base_boot_nodes() -> Vec<NodeRecord> {
 }
 
 /// Base mainnet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaseChain;
 
 impl ChainTypes for BaseChain {

@@ -196,3 +196,13 @@ shards/<shard_start>/
 11. **Peer cache**: load/update/persist `peers.json` for the P2P static peer seeding path.
 
 ## Notes
+
+## Peer cache chain isolation
+
+`peer_cache_tests.rs` covers shared directories, legacy Ethereum cache fallback,
+chain/genesis mismatch rejection, TTL/cap filtering, and AIMD/address persistence.
+Caches live at `<peer-cache-dir>/peers/<chain-id>-<genesis>/peers.json`. Untagged
+legacy caches only seed Ethereum when no namespaced file exists. Network startup
+calls `validate_peer_cache_identity()` before using the cache.
+
+`disk_usage_at()` resolves the peer-cache namespace from database metadata and shares cache-loading migration precedence: prefer the namespaced file, with an Ethereum-only legacy fallback.

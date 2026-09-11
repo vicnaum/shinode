@@ -28,8 +28,8 @@ is rejected because the selected chain still defaults to Ethereum mainnet.
 
 Base configuration is implemented, but this development version stops Base
 sync and maintenance commands before opening storage or connecting to peers.
-The typed networking and storage integration will enable those commands in a
-later change. Ethereum commands continue to work, including the new P2P options:
+Typed P2P networking is available through the opt-in diagnostic below. Sync and
+storage integration will enable those commands in a later change. Ethereum commands continue to work, including the new P2P options:
 
 ```sh
 shinode --chain mainnet --p2p-port 30309 --data-dir data/ethereum
@@ -54,6 +54,34 @@ revisited. An explicit lower start extends that saved range; a higher start does
 not discard it. Legacy Ethereum metadata remains readable, but a legacy numeric
 label of 8453 is not sufficient to identify Base data. Maintenance commands do
 not require a start block or change a saved sync range.
+
+## Peer caches and connectivity diagnostics
+
+Peer caches use `<peer-cache-dir>/peers/<chain-id>-<genesis-hash>/peers.json`.
+A shared cache directory is safe across chains. Existing untagged `peers.json`
+files are loaded only for Ethereum when its namespaced cache is absent; the
+next cache flush writes the new path. TTL, size caps, and learned AIMD batch
+limits are preserved.
+
+The opt-in test diagnostics use the production connector and typed fetch helpers,
+open no database, and stop after at most 90 seconds per chain. They fetch a
+header, body, and receipts and check transaction/receipt roots and withdrawals.
+Base requires a head within five minutes; the Ethereum regression probe also
+accepts older advertised heads and reports the block timestamp and age.
+Run from the repository root with network access:
+
+```sh
+cargo test --bin shinode live_base_connection --locked -- --ignored --nocapture
+cargo test --bin shinode live_ethereum_connection --locked -- --ignored --nocapture
+```
+
+To seed either diagnostic with known serving peers, set
+`SHINODE_PROBE_TRUSTED_PEERS_FILE` to a text file containing one enode URL per
+line. The file is read only; chain identity is still checked for every session.
+
+Each successful probe prints JSON with the peer, block hash, serving range, and
+validation results. These tests use ephemeral ports and are skipped by normal
+`cargo test` runs. A recent-block success does not establish archive availability.
 
 ## Display Options
 
@@ -245,7 +273,7 @@ After running, `data_dir` contains:
 ```
 data_dir/
 ├── meta.json                          # Schema, chain id, checkpoints
-├── peers.json                         # Persisted peer cache
+├── peers/<chain-id>-<genesis>/peers.json # Chain-specific peer cache
 └── static/shards/<shard_start>/       # One per shard
     ├── shard.json                     # Shard metadata (stats, compaction phase)
     ├── present.bitset                 # Block presence tracking

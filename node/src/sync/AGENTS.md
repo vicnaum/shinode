@@ -25,7 +25,7 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 
 ## Relationships
 
-- **Depends on**: `p2p::NetworkPeer` (for `BlockPayload`), `reth_ethereum_primitives` (Header, BlockBody, Receipt)
+- **Depends on**: `p2p::NetworkPeer` (for `BlockPayload`), `chain::ChainTypes` (typed block body and receipts), `reth_primitives_traits::Header`
 - **Used by**: `run/sync_runner.rs` (sync orchestration), `ui/` (progress snapshots for display), `rpc/` (request counters), `logging/` (bench stats for reports)
 - **Key field**: `fetch_complete` signals when all fetch tasks are done (used by UI to transition from syncing to finalizing even if `processed < total_len` due to processing failures)
 - **Data/control flow**:
@@ -47,3 +47,5 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 - `CoverageTracker` and `coverage` field for blocks map visualization (bucket-based)
 - `peak_speed` and `update_peak_speed_max()` for peak throughput tracking
 - `SyncStatus::Following` (value 4) added to status enum
+
+`BlockPayload<C = EthereumChain>` carries chain-specific transactions and receipts for typed P2P fetching. The sync runtime still defaults to Ethereum until the next port phase.

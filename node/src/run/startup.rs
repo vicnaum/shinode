@@ -247,7 +247,7 @@ pub async fn connect_p2p(
     ui::print_status_bar("Connecting to Ethereum P2P network...");
     update_tui_startup(tui, "Connecting to Ethereum P2P network...", log_buffer.as_ref());
     info!("starting p2p network");
-    let session = p2p::connect_mainnet_peers(
+    let session = p2p::connect_peers::<crate::chain::EthereumChain>(
         Some(Arc::clone(&storage)),
         config.p2p_port,
         &config.trusted_peers,

@@ -511,10 +511,12 @@ impl Storage {
         tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
 
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
-        let peer_cache_dir = config
+        let peer_cache_root = config
             .peer_cache_dir
             .clone()
             .unwrap_or_else(|| config.data_dir.clone());
+        let peer_cache_dir =
+            namespaced_peer_cache_dir(&peer_cache_root, config.chain_id, config.genesis_hash);
         fs::create_dir_all(&peer_cache_dir).wrap_err("failed to create peer cache dir")?;
 
         let meta_path = meta_path(&config.data_dir);
@@ -741,7 +743,11 @@ impl Storage {
         }
         persist_meta(&meta_path, &meta)?;
 
-        let peer_cache = load_peer_cache(&peer_cache_dir)?;
+        let peer_cache = load_peer_cache(&peer_cache_read_dir(
+            &peer_cache_root,
+            config.chain_id,
+            config.genesis_hash,
+        )?)?;
         let segment_cache = LruCache::new(
             NonZeroUsize::new(SEGMENT_CACHE_SIZE)
                 .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero")),
@@ -838,7 +844,7 @@ impl Storage {
     /// Use this instead of `disk_usage()` when you don't need to audit disk vs cached values.
     pub fn disk_usage_cached(&self) -> Result<StorageDiskStats> {
         let meta_bytes = file_size(&meta_path(&self.data_dir)).unwrap_or(0);
-        let peers_bytes = file_size(&peer_path(&self.data_dir)).unwrap_or(0);
+        let peers_bytes = file_size(&peer_path(&self.peer_cache_dir)).unwrap_or(0);
 
         // Compute per-segment totals from in-memory shard metadata
         let shards = self.shards.lock();
@@ -902,7 +908,22 @@ impl Storage {
     pub fn disk_usage_at(data_dir: &Path) -> Result<StorageDiskStats> {
         let static_dir = static_dir(data_dir);
         let meta_bytes = file_size(&meta_path(data_dir))?;
-        let peers_bytes = file_size(&peer_path(data_dir))?;
+        let peers_bytes = if meta_path(data_dir).try_exists()? {
+            let meta = load_meta(&meta_path(data_dir))?;
+            // Pre-chain-selection metadata only identifies Ethereum by chain ID.
+            let genesis = meta.genesis_hash.or_else(|| {
+                (meta.chain_id == crate::chain::ChainKind::Mainnet.chain_id())
+                    .then(|| crate::chain::ChainKind::Mainnet.genesis_hash())
+            });
+            match genesis {
+                Some(genesis) => file_size(&peer_path(&peer_cache_read_dir(
+                    data_dir, meta.chain_id, genesis,
+                )?))?,
+                None => 0,
+            }
+        } else {
+            0
+        };
         let static_total_bytes = dir_size(&static_dir)?;
         let total_bytes = dir_size(data_dir)?;
         let segments = shard_segment_stats(data_dir)?;
@@ -2048,6 +2069,24 @@ impl Storage {
         Ok(out)
     }
 
+    /// Prevent a typed network session from seeding another chain's cache.
+    pub fn validate_peer_cache_identity(
+        &self,
+        chain_id: u64,
+        genesis: alloy_primitives::B256,
+    ) -> Result<()> {
+        let meta = self.meta.lock();
+        let stored_genesis = meta.genesis_hash.or_else(|| {
+            (meta.chain_id == crate::chain::ChainKind::Mainnet.chain_id())
+                .then(|| crate::chain::ChainKind::Mainnet.genesis_hash())
+        });
+        eyre::ensure!(
+            meta.chain_id == chain_id && stored_genesis == Some(genesis),
+            "peer cache chain identity does not match network"
+        );
+        Ok(())
+    }
+
     pub fn upsert_peer(&self, mut peer: StoredPeer) -> Result<()> {
         let mut cache = self.peer_cache.lock();
         if let Some(existing) = cache.get(&peer.peer_id) {
@@ -2418,6 +2457,31 @@ fn sorted_dir(shard_dir: &Path) -> PathBuf {
 
 fn peer_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PEER_FILE_NAME)
+}
+
+fn namespaced_peer_cache_dir(
+    root: &Path,
+    chain_id: u64,
+    genesis: alloy_primitives::B256,
+) -> PathBuf {
+    root.join("peers").join(format!("{chain_id}-{genesis:x}"))
+}
+
+/// Use the same migration precedence for cache loading and disk statistics.
+fn peer_cache_read_dir(
+    root: &Path,
+    chain_id: u64,
+    genesis: alloy_primitives::B256,
+) -> Result<PathBuf> {
+    let namespaced = namespaced_peer_cache_dir(root, chain_id, genesis);
+    // Untagged caches came from Ethereum-only releases. Never use them for Base.
+    let legacy_ethereum = chain_id == crate::chain::ChainKind::Mainnet.chain_id()
+        && genesis == crate::chain::ChainKind::Mainnet.genesis_hash();
+    if legacy_ethereum && !peer_path(&namespaced).try_exists()? {
+        Ok(root.to_path_buf())
+    } else {
+        Ok(namespaced)
+    }
 }
 
 fn sealed_cache_path(data_dir: &Path) -> PathBuf {
@@ -3092,3 +3156,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod peer_cache_tests;
