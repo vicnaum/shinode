@@ -10,7 +10,7 @@ Integration tests for the Stateless History Node, including Base protocol and re
 - `fixtures/` - Pinned Base mainnet protocol values and execution bootnodes.
 
 ### Files
-- `chain_cli.rs` - Binary-level help checks and proof that Base sync/maintenance fail before creating storage while runtime integration is pending.
+- `chain_cli.rs` - Binary-level help checks, Base sync gating, Base/legacy Ethereum maintenance, directory overrides, and mismatch rejection before cache/log creation.
 - `base_protocol.rs` - Offline Base Beryl fork-ID, transaction-type, and OP receipt bincode tests; ignored, bounded live P2P block/receipt verification. Run the live test explicitly and set `SHINODE_BASE_PROBE_OUTPUT` to retain JSON evidence. Does not enable production Base ingestion.
 - `test_strategy.rs` - Integration test stubs for v0.1 strategy (~20 lines). Two ignored/TODO tests.
   - **Key items**: `rpc_contract_probe` (ignored - planned RPC contract test), `reorg_rollback_integration` (ignored - planned reorg rollback test)

@@ -2,7 +2,7 @@
 
 use crate::chain::ChainKind;
 use alloy_primitives::B256;
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use eyre::{ensure, eyre, Result};
 use reth_network_peers::TrustedPeer;
 use serde::{Deserialize, Serialize};
@@ -275,8 +275,9 @@ pub struct NodeConfig {
 impl NodeConfig {
     /// Parse configuration from CLI args.
     pub fn from_args() -> Result<Self> {
-        let mut config = Self::parse();
-        config.normalize()?;
+        let matches = Self::command().get_matches();
+        let mut config = Self::from_arg_matches(&matches)?;
+        config.normalize_selection(matches.value_source("chain") == Some(clap::parser::ValueSource::CommandLine))?;
         Ok(config)
     }
 
@@ -287,23 +288,43 @@ impl NodeConfig {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let mut config = Self::try_parse_from(args)?;
-        config.normalize()?;
+        let matches = Self::command().try_get_matches_from(args)?;
+        let mut config = Self::from_arg_matches(&matches)?;
+        config.normalize_selection(matches.value_source("chain") == Some(clap::parser::ValueSource::CommandLine))?;
         Ok(config)
     }
 
     /// Normalize config by propagating convenience flags.
     ///
     /// If `--log` is set, enables all log outputs.
+    #[cfg(test)]
     pub fn normalize(&mut self) -> Result<()> {
+        self.normalize_selection(true)
+    }
+
+    fn normalize_selection(&mut self, explicit_chain: bool) -> Result<()> {
+        if let Some(command) = &self.command {
+            let override_dir = match command {
+                Command::Db(DbCommand::Stats(args)) => &args.data_dir,
+                Command::Db(DbCommand::Compact(args)) => &args.data_dir,
+                Command::Db(DbCommand::RebuildCache(args)) => &args.data_dir,
+            };
+            if let Some(dir) = override_dir { self.data_dir = dir.clone(); }
+        }
         self.chain_id = self.chain.chain_id();
         self.genesis_hash = self.chain.genesis_hash();
+        let sync = self.command.is_none() && !self.repair;
+        if !sync {
+            crate::storage::Storage::configure_maintenance(self, explicit_chain)?;
+        } else if let Some(size) = crate::storage::Storage::read_shard_size(&self.data_dir)? {
+            self.shard_size = size;
+        }
         if let Some(asserted) = self.chain_id_override {
             ensure!(asserted == self.chain_id,
                 "--chain-id {asserted} conflicts with --chain {} (chain ID {}); select the network with --chain",
                 self.chain.name(), self.chain_id);
         }
-        let sync = self.command.is_none() && !self.repair;
+        crate::storage::Storage::validate_existing(self)?;
         self.start_block = match self.start_block_override {
             Some(start) => start,
             None if self.chain == ChainKind::Mainnet => DEFAULT_START_BLOCK,
@@ -331,10 +352,10 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Fail before any storage/network side effects until typed Base ingestion lands.
+    /// Keep Base sync gated while allowing chain-aware storage maintenance.
     pub fn ensure_runtime_supported(&self) -> Result<()> {
-        ensure!(self.chain == ChainKind::Mainnet,
-            "Base configuration is available, but Base sync and storage integration is not enabled yet");
+        ensure!(self.chain == ChainKind::Mainnet || self.command.is_some() || self.repair,
+            "Base sync is not enabled yet; storage maintenance is available");
         Ok(())
     }
 }

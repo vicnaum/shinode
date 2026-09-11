@@ -81,6 +81,7 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
         }
         config.shard_size = stored_shard_size;
     }
+    Storage::validate_existing(&config)?;
 
     // Build run context for log artifacts
     let run_context = build_run_context(&config, argv);

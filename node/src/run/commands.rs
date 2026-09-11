@@ -20,6 +20,10 @@ pub fn handle_db_stats(args: &DbStatsArgs, config: &NodeConfig) -> Result<()> {
         .data_dir
         .clone()
         .unwrap_or_else(|| config.data_dir.clone());
+    let mut resolved = config.clone();
+    resolved.data_dir.clone_from(&data_dir);
+    Storage::configure_maintenance(&mut resolved, true)?;
+    Storage::validate_existing(&resolved)?;
     let stats = Storage::disk_usage_at(&data_dir)?;
     ui::print_db_stats(&data_dir, &stats, args.json)?;
     Ok(())
@@ -27,18 +31,15 @@ pub fn handle_db_stats(args: &DbStatsArgs, config: &NodeConfig) -> Result<()> {
 
 /// Handle the `db compact` subcommand.
 pub fn handle_db_compact(args: &DbCompactArgs, config: &NodeConfig) -> Result<()> {
-    // Initialize tracing if --log-json is specified
-    let _log_writer = init_compact_tracing(args);
-
     let mut config = config.clone();
     if let Some(dir) = &args.data_dir {
         config.data_dir = dir.clone();
     }
 
-    // Auto-detect shard size from existing storage
-    if let Some(stored_shard_size) = Storage::read_shard_size(&config.data_dir)? {
-        config.shard_size = stored_shard_size;
-    }
+    Storage::configure_maintenance(&mut config, true)?;
+    Storage::validate_existing(&config)?;
+
+    let _log_writer = init_compact_tracing(args);
 
     info!(data_dir = %config.data_dir.display(), shard_size = config.shard_size, "starting db compact");
 
@@ -173,8 +174,11 @@ fn init_compact_tracing(args: &DbCompactArgs) -> Option<Arc<JsonLogWriter>> {
 
 /// Handle the `--repair` flag.
 pub fn handle_repair(config: &NodeConfig) -> Result<()> {
+    let mut config = config.clone();
+    Storage::configure_maintenance(&mut config, true)?;
+    Storage::validate_existing(&config)?;
     println!("Checking storage integrity...\n");
-    let report = Storage::repair(config)?;
+    let report = Storage::repair(&config)?;
 
     if report.shards.is_empty() {
         println!("No shards found in {}", config.data_dir.display());
@@ -215,10 +219,8 @@ pub fn handle_db_rebuild_cache(args: &DbRebuildCacheArgs, config: &NodeConfig) -
         config.data_dir = dir.clone();
     }
 
-    // Auto-detect shard size from existing storage
-    if let Some(stored_shard_size) = Storage::read_shard_size(&config.data_dir)? {
-        config.shard_size = stored_shard_size;
-    }
+    Storage::configure_maintenance(&mut config, true)?;
+    Storage::validate_existing(&config)?;
 
     println!("Opening storage...");
     let storage = Storage::open_with_progress(&config, |current, total| {

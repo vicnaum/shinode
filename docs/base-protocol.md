@@ -3,7 +3,7 @@
 Verified on 2026-09-11. The initial port targets **Base mainnet through Beryl**.
 Shinode's existing Reth revision and OP Alloy 0.23.1 successfully decoded and
 verified a recent Base block over P2P. No Reth upgrade is needed for this target.
-Base selection and ingestion are not enabled in the production binary yet.
+Base selection and storage maintenance are available; Base sync remains gated.
 
 ## Pinned sources and protocol
 
@@ -134,8 +134,8 @@ The no-default-features build and targeted library/integration Clippy pass;
 full binary Clippy retains its 37 existing errors, with no added diagnostics.
 
 Typed sync/runtime and OP transaction processing/storage integration are implemented.
-Base sync and maintenance commands remain gated pending the remaining identity
-and maintenance integration.
+Base storage identity and maintenance integration are implemented. Base sync
+remains gated pending the next runtime/RPC integration phase.
 
 ## Payload validation and sync integration
 
@@ -186,3 +186,21 @@ byte compatibility, cross-codec write rejection, and reopen after rollback.
 Phase 5 validation: 95 tests passed (5 intentionally ignored); workspace build,
 no-default-features build, and strict library/integration Clippy passed. Full
 binary/test Clippy adds no diagnostics relative to phase 4.
+
+## Storage identity and maintenance
+
+Open, resume, stats, and repair share read-only checks for chain ID, genesis,
+codec, schema, and storage settings before recovery or directory creation.
+Maintenance infers the stored chain when `--chain` is omitted and validates any
+explicit chain or ID assertion. Command-level data-directory overrides are
+resolved first. Legacy Ethereum data retains its codec and identity compatibility;
+mislabeled legacy Base data, incompatible metadata, and orphaned static data
+without metadata are rejected without modifying stored files.
+
+Binary tests cover Base and legacy Ethereum stats, compaction, cache rebuilding,
+and repair, including custom shard sizes, directory overrides, and rejection
+before creating peer caches or logs. Base sync remains separately gated.
+
+Phase 6 validation: 100 tests passed (5 intentionally ignored); workspace build,
+no-default-features build, and strict library/integration Clippy passed. Full
+binary/test Clippy adds no diagnostics relative to phase 5.

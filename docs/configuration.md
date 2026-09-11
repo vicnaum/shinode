@@ -6,7 +6,7 @@ Full reference for CLI options and environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--chain <mainnet\|base>` | `mainnet` | Select chain identity; Base runtime is not enabled yet |
+| `--chain <mainnet\|base>` | `mainnet` | Select sync identity or assert maintenance identity; Base sync remains gated |
 | `--chain-id <u64>` | - | Optional assertion matching the selected chain (1 or 8453) |
 | `--p2p-port <u16>` | `30303` | TCP listener and UDP discovery port (1–65535) |
 | `--trusted-peer <enode>` | - | Repeatable serving-peer URL; accepts IP or DNS hosts |
@@ -23,17 +23,35 @@ Full reference for CLI options and environment variables.
 ## Chain selection and serving peers
 
 `--chain` determines the chain ID and genesis used by the resolved configuration.
-For example, `--chain mainnet --chain-id 1` is accepted; `--chain-id 8453` alone
-is rejected because the selected chain still defaults to Ethereum mainnet.
+For sync, `--chain mainnet --chain-id 1` is accepted; `--chain-id 8453` alone
+is rejected because sync defaults to Ethereum mainnet. Maintenance infers the
+chain from existing metadata when `--chain` is omitted; `--chain-id` then asserts
+that resolved identity.
 
-Base configuration is implemented, but this development version stops Base
-sync and maintenance commands before opening storage or connecting to peers.
-Typed P2P networking is available through the opt-in diagnostic below. Sync and
-storage integration will enable those commands in a later change. Ethereum commands continue to work, including the new P2P options:
+Base storage maintenance is available. This development version still stops Base
+sync before opening storage or connecting to peers. Typed P2P networking is
+available through the opt-in diagnostic below. Ethereum sync commands continue
+to work, including the new P2P options:
 
 ```sh
 shinode --chain mainnet --p2p-port 30309 --data-dir data/ethereum
 ```
+
+Maintenance uses the effective data directory, including a command-level override:
+
+```sh
+shinode db stats --data-dir data/base --json
+shinode db compact --data-dir data/base
+shinode db rebuild-cache --data-dir data/base
+shinode --data-dir data/base --repair
+```
+
+An explicit `--chain mainnet` against a Base directory fails before recovery,
+cache creation, or maintenance log creation. Chain ID, genesis, codec, and schema
+are checked together. Legacy Ethereum metadata without genesis/codec remains
+readable; legacy data merely labelled `8453` is rejected. Static data without
+`meta.json` requires restoring metadata before maintenance; it is not adopted as
+a new database. Stored shard size is retained automatically.
 
 Use a separate data directory for each chain. The intended Base invocation once
 runtime integration is enabled is:

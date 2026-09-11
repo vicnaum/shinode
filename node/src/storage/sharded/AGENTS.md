@@ -9,6 +9,8 @@ Sharded static-file storage backend (schema v2) for Ethereum history data. Divid
 - (none)
 
 ### Files
+- `identity.rs` - Shared read-only metadata/config validation, legacy Ethereum compatibility, and maintenance chain resolution.
+- `identity_tests.rs` - Populated chain-switch, recovery-sentinel, orphan-data, and legacy/mislabeled metadata tests.
 - `bitset.rs` - Persistent bitset used to track which block offsets exist in a shard.
   - **Key items**: `Bitset::load()`, `Bitset::flush()`, `Bitset::set()`, `Bitset::clear()`, `Bitset::count_ones()`
 - `hash.rs` - Computes a stable content hash for a sealed shard based on metadata + sorted segment files.
@@ -222,3 +224,10 @@ recovery from restoring removed blocks. It recounts retained transactions,
 receipts, and logs using the selected codec, recomputes the actual retained tip,
 and refreshes the sealed-shard cache. `storage/chain_tests.rs` covers rollback
 across sealed data and a pending WAL tail, followed by reopening and new writes.
+
+Identity is validated before directory creation, shard recovery, or compaction.
+`existing_meta()` validates stored chain/genesis/codec/schema and refuses orphaned
+static data; `validate_existing()` also checks resolved configuration and settings.
+`configure_maintenance()` infers the chain only when no explicit selection was
+supplied and adopts the stored shard size. Resume, disk stats, and repair use the
+same identity rules; missing legacy identity fields imply Ethereum only.

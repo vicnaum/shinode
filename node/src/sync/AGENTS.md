@@ -49,4 +49,4 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 - `peak_speed` and `update_peak_speed_max()` for peak throughput tracking
 - `SyncStatus::Following` (value 4) added to status enum
 
-`BlockPayload<C = EthereumChain>` carries chain-specific transactions and receipts for typed P2P fetching. Fetch, follow, reorg, and runtime contexts carry the same chain parameter. Storage conversion uses `historical::IngestChain`, implemented for Ethereum and Base. Base startup remains gated pending identity/maintenance integration.
+`BlockPayload<C = EthereumChain>` carries chain-specific transactions and receipts for typed P2P fetching. Fetch, follow, reorg, and runtime contexts carry the same chain parameter. Storage conversion uses `historical::IngestChain`, implemented for Ethereum and Base. Base sync remains gated pending runtime/RPC integration; storage maintenance is enabled.

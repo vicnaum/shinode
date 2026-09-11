@@ -221,7 +221,7 @@ fn base_resume_retains_lower_bound_and_rejects_foreign_metadata() -> Result<()> 
     );
     let metadata_path = dir.join("meta.json");
     let original = std::fs::read(&metadata_path)?;
-    for field in ["chain_id", "genesis_hash", "schema_version"] {
+    for field in ["chain_id", "genesis_hash", "schema_version", "storage_codec"] {
         let mut metadata: serde_json::Value = serde_json::from_slice(&original)?;
         metadata[field] = if field == "genesis_hash" {
             serde_json::Value::Null

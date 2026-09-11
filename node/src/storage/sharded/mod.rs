@@ -2,6 +2,7 @@
 
 mod bitset;
 mod hash;
+mod identity;
 mod nippy_raw;
 mod wal;
 
@@ -16,6 +17,7 @@ use alloy_consensus::TxReceipt;
 use bitset::Bitset;
 use eyre::{eyre, Result, WrapErr};
 use hash::compute_shard_hash;
+use identity::{existing_meta, stored_chain, validate_config_identity};
 use nippy_raw::{NippyJarConfig, SegmentRawSource, SegmentRawWriter};
 use reth_nippy_jar::{
     compression::{Compressors, Zstd},
@@ -471,31 +473,19 @@ impl Storage {
         chain_id: u64,
         genesis_hash: alloy_primitives::B256,
     ) -> Result<Option<u64>> {
-        let path = meta_path(data_dir);
-        if !path.try_exists()? {
+        let Some(meta) = existing_meta(data_dir)? else {
             return Ok(None);
-        }
-        let meta = load_meta(&path)?;
-        if meta.chain_id != chain_id || meta.genesis_hash != Some(genesis_hash) {
-            return Err(eyre!(
-                "storage identity does not match the selected chain; use a separate data directory"
-            ));
-        }
-        if meta.schema_version != SCHEMA_VERSION {
-            return Err(eyre!("unsupported storage schema for resume"));
-        }
+        };
+        let chain = stored_chain(&meta)?;
+        eyre::ensure!(chain.chain_id() == chain_id && chain.genesis_hash() == genesis_hash,
+            "storage identity does not match the selected chain; use a separate data directory");
         Ok(meta.sync_start_block)
     }
 
     /// Read the shard size from an existing storage directory.
     /// Returns `Ok(Some(shard_size))` if meta.json exists, `Ok(None)` if the storage is uninitialized.
     pub fn read_shard_size(data_dir: &Path) -> Result<Option<u64>> {
-        let path = meta_path(data_dir);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let meta = load_meta(&path)?;
-        Ok(Some(meta.shard_size))
+        Ok(existing_meta(data_dir)?.map(|meta| meta.shard_size))
     }
 
     /// Open storage without progress reporting (test convenience wrapper).
@@ -514,6 +504,22 @@ impl Storage {
         let open_start = std::time::Instant::now();
         tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
 
+        validate_config_identity(config)?;
+        let existing = existing_meta(&config.data_dir)?;
+        let meta_path = meta_path(&config.data_dir);
+        let mut meta = existing.unwrap_or_else(|| MetaState {
+            schema_version: SCHEMA_VERSION,
+            chain_id: config.chain_id,
+            genesis_hash: Some(config.genesis_hash),
+            sync_start_block: (config.command.is_none() && !config.repair)
+                .then_some(config.start_block),
+            storage_codec: Some(StorageCodec::for_chain(config.chain)),
+            storage_key: StorageConfigKey::from(config),
+            shard_size: config.shard_size,
+            max_present_block: None,
+            head_seen: None,
+        });
+        validate_meta(config, &meta)?;
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
         let peer_cache_root = config
             .peer_cache_dir
@@ -523,31 +529,6 @@ impl Storage {
             namespaced_peer_cache_dir(&peer_cache_root, config.chain_id, config.genesis_hash);
         fs::create_dir_all(&peer_cache_dir).wrap_err("failed to create peer cache dir")?;
 
-        let meta_path = meta_path(&config.data_dir);
-        let mut meta = if meta_path.exists() {
-            load_meta(&meta_path)?
-        } else {
-            MetaState {
-                schema_version: SCHEMA_VERSION,
-                chain_id: config.chain_id,
-                genesis_hash: Some(config.genesis_hash),
-                sync_start_block: (config.command.is_none() && !config.repair)
-                    .then_some(config.start_block),
-                storage_codec: Some(StorageCodec::for_chain(config.chain)),
-                storage_key: StorageConfigKey::from(config),
-                shard_size: config.shard_size,
-                max_present_block: None,
-                head_seen: None,
-            }
-        };
-        validate_meta(config, &meta)?;
-        if meta.schema_version != SCHEMA_VERSION {
-            return Err(eyre!(
-                "schema version mismatch: expected {}, got {} (delete data dir to rebuild)",
-                SCHEMA_VERSION,
-                meta.schema_version
-            ));
-        }
         if !meta_path.exists() {
             persist_meta(&meta_path, &meta)?;
         }
@@ -772,6 +753,7 @@ impl Storage {
     /// Scans all shards for interrupted compactions and orphan files,
     /// performs recovery, and returns a detailed report.
     pub fn repair(config: &NodeConfig) -> Result<RepairReport> {
+        Self::validate_existing(config)?;
         // Ensure directories exist
         if !config.data_dir.exists() {
             return Ok(RepairReport { shards: vec![] });
@@ -781,14 +763,6 @@ impl Storage {
         if !shards_root.exists() {
             return Ok(RepairReport { shards: vec![] });
         }
-
-        let meta_path = meta_path(&config.data_dir);
-        let _meta = if meta_path.exists() {
-            load_meta(&meta_path)?
-        } else {
-            // No meta file means empty storage
-            return Ok(RepairReport { shards: vec![] });
-        };
 
         let mut results = Vec::new();
 
@@ -912,10 +886,10 @@ impl Storage {
     }
 
     pub fn disk_usage_at(data_dir: &Path) -> Result<StorageDiskStats> {
+        let metadata = existing_meta(data_dir)?;
         let static_dir = static_dir(data_dir);
         let meta_bytes = file_size(&meta_path(data_dir))?;
-        let peers_bytes = if meta_path(data_dir).try_exists()? {
-            let meta = load_meta(&meta_path(data_dir))?;
+        let peers_bytes = if let Some(meta) = metadata {
             // Pre-chain-selection metadata only identifies Ethereum by chain ID.
             let genesis = meta.genesis_hash.or_else(|| {
                 (meta.chain_id == crate::chain::ChainKind::Mainnet.chain_id())
@@ -2644,26 +2618,9 @@ fn recount_sorted_stats(state: &mut ShardState, codec: StorageCodec) -> Result<(
 }
 
 fn validate_meta(config: &NodeConfig, meta: &MetaState) -> Result<()> {
-    let expected_codec = StorageCodec::for_chain(config.chain);
-    // Missing codec means legacy Ethereum bytes, never OP bytes.
-    let stored_codec = meta.storage_codec.unwrap_or(StorageCodec::EthereumV1);
-    eyre::ensure!(stored_codec == expected_codec, "storage codec mismatch: expected {expected_codec:?}, got {stored_codec:?}");
-    if meta
-        .genesis_hash
-        .is_some_and(|hash| hash != config.genesis_hash)
-    {
-        return Err(eyre!("storage genesis does not match the selected chain"));
-    }
-    if config.chain == crate::chain::ChainKind::Base && meta.genesis_hash.is_none() {
-        return Err(eyre!("legacy storage is Ethereum data, even if labelled with a Base chain ID; use a separate data directory"));
-    }
-    if meta.chain_id != config.chain_id {
-        return Err(eyre!(
-            "chain id mismatch: expected {}, got {}",
-            config.chain_id,
-            meta.chain_id
-        ));
-    }
+    validate_config_identity(config)?;
+    let chain = stored_chain(meta)?;
+    eyre::ensure!(chain == config.chain, "storage identity does not match the selected chain; use a separate data directory");
     if meta.storage_key != StorageConfigKey::from(config) {
         return Err(eyre!(
             "storage config mismatch: expected {:?}, got {:?}",
@@ -3206,3 +3163,6 @@ mod tests {
 
 #[cfg(test)]
 mod peer_cache_tests;
+
+#[cfg(test)]
+mod identity_tests;

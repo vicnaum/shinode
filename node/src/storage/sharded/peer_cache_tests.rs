@@ -73,15 +73,10 @@ fn shared_cache_isolates_chain_identity_and_preserves_legacy_ethereum() -> Resul
     let mut other = base;
     other.data_dir = root.join("different-genesis");
     other.genesis_hash = alloy_primitives::B256::repeat_byte(1);
-    let foreign = Storage::open(&other)?;
-    ensure!(
-        foreign.peer_cache_dir != base_store.peer_cache_dir,
-        "genesis namespaces collided"
-    );
-    ensure!(
-        foreign.peer_cache_snapshot().is_empty(),
-        "foreign genesis loaded Base peers"
-    );
+    let foreign_dir = namespaced_peer_cache_dir(&root, other.chain_id, other.genesis_hash);
+    ensure!(foreign_dir != base_store.peer_cache_dir, "genesis namespaces collided");
+    ensure!(Storage::open(&other).is_err(), "foreign genesis configuration accepted");
+    ensure!(!other.data_dir.exists() && !foreign_dir.exists(), "rejected identity created directories");
     fs::remove_dir_all(root)?;
     Ok(())
 }

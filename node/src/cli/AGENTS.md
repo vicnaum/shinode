@@ -87,7 +87,7 @@ RPC limits, fast-sync scheduling, storage sharding, logging, and operational mod
 1. Parse argv into `NodeConfig` via clap derive.
 2. Apply defaults for missing flags (RPC limits, fast-sync scheduling, log outputs).
 3. Call the fallible `NodeConfig::normalize()` to resolve chain identity/range and propagate flags like `--log`. Clap-derived parsing alone does not resolve runtime fields; production uses `from_args()` and tests can use `try_from_args()`.
-4. `main.rs` calls `ensure_runtime_supported()` before dispatch: Base sync and maintenance remain gated until typed network/storage integration is complete.
+4. `main.rs` calls `ensure_runtime_supported()` before dispatch: Base sync remains gated; validated maintenance is allowed.
 5. If subcommand present (`db stats` / `db compact`), dispatch to handler and return.
 6. If `--repair` flag, run `Storage::repair()` and return.
 7. Otherwise, pass full config to `run::run_sync()` for main operation.
@@ -111,3 +111,10 @@ Skips inline shard compaction during fast-sync. Shards are compacted only at the
 
 ### `db compact` Subcommand
 Standalone command to compact dirty shards and seal completed ones. Accepts `--data-dir` to override the data directory. Useful after running with `--defer-compaction` or for maintenance.
+
+Production parsing retains clap's value source for `--chain`: omission permits
+maintenance to infer identity from metadata, while an explicit default `mainnet`
+still asserts Ethereum. Command-level `--data-dir` overrides are resolved before
+any metadata lookup. `normalize_selection()` validates stored identity/settings
+without side effects and retains stored shard size. `--chain-id` asserts the
+resolved chain for both sync and maintenance; sync still defaults to Ethereum.
