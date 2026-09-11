@@ -9,9 +9,10 @@ use crate::cli::NodeConfig;
 use crate::storage::{
     decode_bincode, decode_bincode_compat_value, decode_u64, encode_bincode_compat_value,
     encode_bincode_value, encode_u64_value, BlockBundle, PeerCacheLoad, SegmentDiskStats,
-    StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredPeer, StoredReceipts,
-    StoredTxHashes, ZSTD_DICT_MAX_SIZE,
+    StorageCodec, StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredPeer,
+    StoredReceipts, StoredTransactions, StoredTxHashes, ZSTD_DICT_MAX_SIZE,
 };
+use alloy_consensus::TxReceipt;
 use bitset::Bitset;
 use eyre::{eyre, Result, WrapErr};
 use hash::compute_shard_hash;
@@ -176,6 +177,8 @@ struct MetaState {
     genesis_hash: Option<alloy_primitives::B256>,
     #[serde(default)]
     sync_start_block: Option<u64>,
+    #[serde(default)]
+    storage_codec: Option<StorageCodec>,
     storage_key: StorageConfigKey,
     shard_size: u64,
     max_present_block: Option<u64>,
@@ -437,6 +440,7 @@ pub struct Storage {
     data_dir: PathBuf,
     peer_cache_dir: PathBuf,
     meta: Mutex<MetaState>,
+    codec: StorageCodec,
     shards: Mutex<HashMap<u64, Arc<Mutex<ShardState>>>>,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
     /// LRU cache for read-only segment handles, keyed by shard_start.
@@ -529,6 +533,7 @@ impl Storage {
                 genesis_hash: Some(config.genesis_hash),
                 sync_start_block: (config.command.is_none() && !config.repair)
                     .then_some(config.start_block),
+                storage_codec: Some(StorageCodec::for_chain(config.chain)),
                 storage_key: StorageConfigKey::from(config),
                 shard_size: config.shard_size,
                 max_present_block: None,
@@ -756,6 +761,7 @@ impl Storage {
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
             meta: Mutex::new(meta),
+            codec: StorageCodec::for_chain(config.chain),
             shards: Mutex::new(shards),
             peer_cache: Mutex::new(peer_cache),
             segment_cache: Mutex::new(segment_cache),
@@ -1138,11 +1144,11 @@ impl Storage {
             // Remember log count per block while we still have decoded receipts
             block_log_counts.insert(
                 bundle.number,
-                bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>(),
+                bundle.receipts.iter().map(|r| r.logs().len() as u64).sum::<u64>(),
             );
-            let tx_meta_uncompressed = encode_bincode_value(&bundle.transactions)?;
+            let tx_meta_uncompressed = self.codec.encode_transactions(&bundle.transactions)?;
             let tx_meta_uncompressed_len = tx_meta_uncompressed.len() as u32;
-            let receipts_uncompressed = encode_bincode_compat_value(&bundle.receipts)?;
+            let receipts_uncompressed = self.codec.encode_receipts(&bundle.receipts)?;
             let receipts_uncompressed_len = receipts_uncompressed.len() as u32;
             let record = WalBundleRecord {
                 number: bundle.number,
@@ -1238,6 +1244,8 @@ impl Storage {
     }
 
     pub fn write_block_bundle_follow(&self, bundle: &BlockBundle) -> Result<()> {
+        let receipts = self.codec.encode_receipts(&bundle.receipts)?;
+        let transactions = self.codec.encode_transactions(&bundle.transactions)?;
         let shard_start = shard_start(bundle.number, self.shard_size());
         let shard = self.get_or_create_shard(shard_start)?;
         let mut state = shard.lock();
@@ -1261,11 +1269,8 @@ impl Storage {
             .append_rows(bundle.number, &[encode_bincode_value(&bundle.tx_hashes)?])?;
         segments
             .tx_meta
-            .append_rows(bundle.number, &[encode_bincode_value(&bundle.transactions)?])?;
-        segments.receipts.append_rows(
-            bundle.number,
-            &[encode_bincode_compat_value(&bundle.receipts)?],
-        )?;
+            .append_rows(bundle.number, &[transactions])?;
+        segments.receipts.append_rows(bundle.number, &[receipts])?;
         segments
             .sizes
             .append_rows(bundle.number, &[encode_u64_value(bundle.size.size)])?;
@@ -1273,8 +1278,8 @@ impl Storage {
         if state.bitset.set(offset) {
             state.meta.present_count = state.meta.present_count.saturating_add(1);
             state.meta.total_transactions += bundle.tx_hashes.hashes.len() as u64;
-            state.meta.total_receipts += bundle.receipts.receipts.len() as u64;
-            state.meta.total_logs += bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>();
+            state.meta.total_receipts += bundle.receipts.len() as u64;
+            state.meta.total_logs += bundle.receipts.iter().map(|r| r.logs().len() as u64).sum::<u64>();
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         }
         state.meta.sorted = true;
@@ -1687,7 +1692,7 @@ impl Storage {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "convenience wrapper for cases without progress tracking")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "convenience wrapper for cases without progress tracking"))]
     pub fn compact_all_dirty(&self) -> Result<()> {
         self.compact_all_dirty_with_progress(|_| {})
     }
@@ -1759,7 +1764,7 @@ impl Storage {
         Ok(out)
     }
 
-    #[expect(dead_code, reason = "convenience wrapper for progress-less sealing")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "convenience wrapper for progress-less sealing"))]
     pub fn seal_completed_shards(&self) -> Result<()> {
         self.seal_completed_shards_with_progress(|_| {})
     }
@@ -1901,7 +1906,13 @@ impl Storage {
             if ancestor_number >= shard_end {
                 continue;
             }
+            // Materialize pending records before pruning so WAL recovery cannot
+            // resurrect blocks above the rollback point.
             let shard = self.get_or_create_shard(shard_start)?;
+            let has_wal = wal_path(&shard.lock().dir).exists();
+            if has_wal {
+                self.compact_shard(shard_start)?;
+            }
             let mut state = shard.lock();
             let sorted_dir = sorted_dir(&state.dir);
             if sorted_dir.exists() {
@@ -1927,17 +1938,18 @@ impl Storage {
                 }
             }
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
-            if ancestor_number < shard_start {
-                state.meta.tail_block = None;
-            } else {
-                state.meta.tail_block = Some(ancestor_number);
-            }
+            state.meta.tail_block = (0..state.meta.shard_size as usize)
+                .rev()
+                .find(|offset| state.bitset.is_set(*offset))
+                .map(|offset| shard_start + offset as u64);
+            recount_sorted_stats(&mut state, self.codec)?;
             state.meta.sealed = false;
             state.meta.content_hash = None;
             persist_shard_meta(&state.dir, &state.meta)?;
             state.bitset.flush(&bitset_path(&state.dir))?;
         }
         self.recompute_max_present()?;
+        self.update_sealed_cache()?;
         Ok(())
     }
 
@@ -2026,7 +2038,16 @@ impl Storage {
 
     pub fn block_receipts(&self, number: u64) -> Result<Option<StoredReceipts>> {
         self.with_readers_for_present_block(number, |segments| {
-            segments.receipts.read_row_compat(number)
+            segments.receipts.read_row_raw(number)?
+                .map(|bytes| self.codec.decode_receipts(&bytes)).transpose()
+        })
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "transaction metadata read API for storage verification and future RPC"))]
+    pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
+        self.with_readers_for_present_block(number, |segments| {
+            segments.tx_meta.read_row_raw(number)?
+                .map(|bytes| self.codec.decode_transactions(&bytes)).transpose()
         })
     }
 
@@ -2338,7 +2359,6 @@ impl SegmentReader {
 }
 
 /// Container for read-only segment handles for a single shard.
-#[expect(dead_code, reason = "tx_meta included for completeness; reads not yet wired")]
 struct ShardSegmentReaders {
     headers: SegmentReader,
     tx_hashes: SegmentReader,
@@ -2598,7 +2618,36 @@ fn persist_shard_meta(shard_dir: &Path, meta: &ShardMeta) -> Result<()> {
     fs::write(shard_meta_path(shard_dir), bytes).wrap_err("failed to write shard.json")
 }
 
+fn recount_sorted_stats(state: &mut ShardState, codec: StorageCodec) -> Result<()> {
+    state.meta.total_transactions = 0;
+    state.meta.total_receipts = 0;
+    state.meta.total_logs = 0;
+    if state.meta.present_count == 0 {
+        return Ok(());
+    }
+    let dir = sorted_dir(&state.dir);
+    let receipts = SegmentReader::open(dir.join("receipts"), state.meta.shard_start)?;
+    let hashes = SegmentReader::open(dir.join("tx_hashes"), state.meta.shard_start)?;
+    for offset in 0..state.meta.shard_size as usize {
+        if !state.bitset.is_set(offset) {
+            continue;
+        }
+        let number = state.meta.shard_start + offset as u64;
+        let bytes = receipts.read_row_raw(number)?.ok_or_else(|| eyre!("missing receipts during rollback"))?;
+        let decoded = codec.decode_receipts(&bytes)?;
+        let txs: StoredTxHashes = hashes.read_row(number)?.ok_or_else(|| eyre!("missing transaction hashes during rollback"))?;
+        state.meta.total_transactions += txs.hashes.len() as u64;
+        state.meta.total_receipts += decoded.len() as u64;
+        state.meta.total_logs += decoded.iter().map(|r| r.logs().len() as u64).sum::<u64>();
+    }
+    Ok(())
+}
+
 fn validate_meta(config: &NodeConfig, meta: &MetaState) -> Result<()> {
+    let expected_codec = StorageCodec::for_chain(config.chain);
+    // Missing codec means legacy Ethereum bytes, never OP bytes.
+    let stored_codec = meta.storage_codec.unwrap_or(StorageCodec::EthereumV1);
+    eyre::ensure!(stored_codec == expected_codec, "storage codec mismatch: expected {expected_codec:?}, got {stored_codec:?}");
     if meta
         .genesis_hash
         .is_some_and(|hash| hash != config.genesis_hash)
@@ -3072,9 +3121,7 @@ mod tests {
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
             transactions: StoredTransactions { txs: Vec::new() },
             size: StoredBlockSize { size: 0 },
-            receipts: StoredReceipts {
-                receipts: Vec::<Receipt>::new(),
-            },
+            receipts: StoredReceipts::Ethereum(Vec::<Receipt>::new()),
         }
     }
 

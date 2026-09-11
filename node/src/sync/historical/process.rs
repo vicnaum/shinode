@@ -1,34 +1,131 @@
 //! Processing stage for historical sync.
 
+use crate::chain::{BaseChain, EthereumChain};
 use crate::storage::{
     BlockBundle, StoredBlockSize, StoredReceipts, StoredTransaction, StoredTransactions,
     StoredTxHashes,
 };
 use crate::sync::historical::stats::{IngestBenchStats, ProcessTiming};
 use crate::sync::BlockPayload;
-use alloy_consensus::{SignableTransaction, Transaction as _};
-use alloy_primitives::{Keccak256, TxKind, B256};
+use alloy_consensus::{Block, BlockBody};
+use alloy_consensus::{SignableTransaction, Transaction as _, TxReceipt};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_primitives::{Keccak256, B256};
 use bytes::buf::UninitSlice;
 use eyre::{eyre, Result};
-use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SealedHeader;
 use std::mem::MaybeUninit;
 use std::time::Instant;
 
-/// Storage adapter boundary. OP encoding is added in the next port phase.
+/// Converts chain-specific transactions and receipts into storage representations.
 pub trait IngestChain: crate::chain::ChainTypes {
-    fn process_ingest(
-        payload: BlockPayload<Self>,
-        bench: Option<&IngestBenchStats>,
-    ) -> Result<(BlockBundle, u64)>;
-}
+    fn tx_hashes(txs: &[Self::SignedTx]) -> Vec<B256>;
+    fn transactions(
+        txs: &[Self::SignedTx],
+        receipts: &[Self::Receipt],
+        hashes: &[B256],
+    ) -> Result<StoredTransactions>;
+    fn store_receipts(receipts: Vec<Self::Receipt>) -> StoredReceipts;
 
-impl IngestChain for crate::chain::EthereumChain {
     fn process_ingest(
         payload: BlockPayload<Self>,
         bench: Option<&IngestBenchStats>,
     ) -> Result<(BlockBundle, u64)> {
         process_ingest(payload, bench)
+    }
+}
+
+impl IngestChain for EthereumChain {
+    fn tx_hashes(txs: &[Self::SignedTx]) -> Vec<B256> {
+        let mut buf = KeccakBuf::new();
+        txs.iter().map(|tx| tx_hash_fast(&mut buf, tx)).collect()
+    }
+
+    fn transactions(
+        txs: &[Self::SignedTx],
+        _receipts: &[Self::Receipt],
+        hashes: &[B256],
+    ) -> Result<StoredTransactions> {
+        let mut buf = KeccakBuf::new();
+        Ok(StoredTransactions {
+            txs: txs
+                .iter()
+                .zip(hashes)
+                .map(|(tx, hash)| StoredTransaction {
+                    hash: *hash,
+                    from: None,
+                    to: tx.to(),
+                    value: tx.value(),
+                    nonce: Some(tx.nonce()),
+                    signature: Some(*tx.signature()),
+                    signing_hash: Some(signing_hash_fast(&mut buf, tx)),
+                })
+                .collect(),
+        })
+    }
+
+    fn store_receipts(receipts: Vec<Self::Receipt>) -> StoredReceipts {
+        StoredReceipts::Ethereum(receipts)
+    }
+}
+
+impl IngestChain for BaseChain {
+    fn tx_hashes(txs: &[Self::SignedTx]) -> Vec<B256> {
+        // Hash the canonical typed envelope, including the 0x7e deposit prefix.
+        txs.iter()
+            .map(|tx| alloy_primitives::keccak256(tx.encoded_2718()))
+            .collect()
+    }
+
+    fn transactions(
+        txs: &[Self::SignedTx],
+        receipts: &[Self::Receipt],
+        hashes: &[B256],
+    ) -> Result<StoredTransactions> {
+        use op_alloy_consensus::OpTxEnvelope;
+        use reth_optimism_primitives::OpReceipt;
+        let mut stored = Vec::with_capacity(txs.len());
+        for ((tx, receipt), hash) in txs.iter().zip(receipts).zip(hashes) {
+            eyre::ensure!(
+                u8::from(tx.tx_type()) == u8::from(receipt.tx_type()),
+                "transaction/receipt type mismatch"
+            );
+            let (from, nonce, signing_hash) = match tx {
+                OpTxEnvelope::Deposit(deposit) => {
+                    let OpReceipt::Deposit(receipt) = receipt else {
+                        return Err(eyre!("deposit transaction requires a deposit receipt"));
+                    };
+                    (Some(deposit.from), receipt.deposit_nonce, None)
+                }
+                OpTxEnvelope::Legacy(tx) => {
+                    (None, Some(tx.tx().nonce()), Some(tx.signature_hash()))
+                }
+                OpTxEnvelope::Eip2930(tx) => {
+                    (None, Some(tx.tx().nonce()), Some(tx.signature_hash()))
+                }
+                OpTxEnvelope::Eip1559(tx) => {
+                    (None, Some(tx.tx().nonce()), Some(tx.signature_hash()))
+                }
+                OpTxEnvelope::Eip7702(tx) => {
+                    (None, Some(tx.tx().nonce()), Some(tx.signature_hash()))
+                }
+            };
+            stored.push(StoredTransaction {
+                hash: *hash,
+                from,
+                to: tx.to(),
+                value: tx.value(),
+                nonce,
+                signature: tx.signature().copied(),
+                signing_hash,
+            });
+        }
+        Ok(StoredTransactions { txs: stored })
+    }
+
+    fn store_receipts(receipts: Vec<Self::Receipt>) -> StoredReceipts {
+        StoredReceipts::Op(receipts)
     }
 }
 
@@ -101,8 +198,8 @@ fn signing_hash_fast(buf: &mut KeccakBuf, tx: &TransactionSigned) -> B256 {
 }
 
 /// Process a full payload into a storage bundle (ingest mode).
-pub fn process_ingest(
-    payload: BlockPayload,
+pub fn process_ingest<C: IngestChain>(
+    payload: BlockPayload<C>,
     bench: Option<&IngestBenchStats>,
 ) -> Result<(BlockBundle, u64)> {
     let BlockPayload {
@@ -118,12 +215,7 @@ pub fn process_ingest(
     let header_hash_us = header_hash_start.elapsed().as_micros() as u64;
 
     let tx_hashes_start = Instant::now();
-    let mut tx_hasher = KeccakBuf::new();
-    let tx_hashes = body
-        .transactions
-        .iter()
-        .map(|tx| tx_hash_fast(&mut tx_hasher, tx))
-        .collect::<Vec<_>>();
+    let tx_hashes = C::tx_hashes(&body.transactions);
     let tx_hashes_us = tx_hashes_start.elapsed().as_micros() as u64;
     if tx_hashes.len() != receipts.len() {
         return Err(eyre!(
@@ -135,26 +227,7 @@ pub fn process_ingest(
     }
 
     let txs_start = Instant::now();
-    let mut signing_hasher = KeccakBuf::new();
-    let mut stored_transactions = Vec::with_capacity(body.transactions.len());
-    for (tx, tx_hash) in body.transactions.iter().zip(tx_hashes.iter()) {
-        let value = tx.value();
-        let signature = *tx.signature();
-        let signing_hash = signing_hash_fast(&mut signing_hasher, tx);
-        let to = match tx.kind() {
-            TxKind::Call(address) => Some(address),
-            TxKind::Create => None,
-        };
-        stored_transactions.push(StoredTransaction {
-            hash: *tx_hash,
-            from: None,
-            to,
-            value,
-            nonce: tx.nonce(),
-            signature: Some(signature),
-            signing_hash: Some(signing_hash),
-        });
-    }
+    let stored_transactions = C::transactions(&body.transactions, &receipts, &tx_hashes)?;
     let transactions_us = txs_start.elapsed().as_micros() as u64;
 
     let withdrawals_us = 0;
@@ -168,7 +241,7 @@ pub fn process_ingest(
     let logs_start = Instant::now();
     let mut log_count = 0u64;
     for receipt in &receipts {
-        log_count = log_count.saturating_add(receipt.logs.len() as u64);
+        log_count = log_count.saturating_add(receipt.logs().len() as u64);
     }
     let logs_build_us = logs_start.elapsed().as_micros() as u64;
 
@@ -176,11 +249,9 @@ pub fn process_ingest(
         number: header.number,
         header: stored_header,
         tx_hashes: StoredTxHashes { hashes: tx_hashes },
-        transactions: StoredTransactions {
-            txs: stored_transactions,
-        },
+        transactions: stored_transactions,
         size: StoredBlockSize { size: block_size },
-        receipts: StoredReceipts { receipts },
+        receipts: C::store_receipts(receipts),
     };
 
     if let Some(bench) = bench {
@@ -199,7 +270,10 @@ pub fn process_ingest(
     Ok((bundle, log_count))
 }
 
-fn block_rlp_size(header: &reth_primitives_traits::Header, body: &BlockBody) -> u64 {
+fn block_rlp_size<T: Clone + alloy_rlp::Encodable>(
+    header: &reth_primitives_traits::Header,
+    body: &BlockBody<T>,
+) -> u64 {
     let block = Block {
         header: header.clone(),
         body: body.clone(),

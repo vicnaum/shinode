@@ -72,3 +72,5 @@ Designed for read-only access with configurable rate limiting; no state executio
 9. Graceful shutdown via `handle.stop()`.
 
 ## Notes
+
+Log derivation uses the common `TxReceipt` accessors on `StoredReceiptRef`, supporting both stored receipt variants while retaining the existing RPC contract.

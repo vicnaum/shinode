@@ -206,3 +206,19 @@ legacy caches only seed Ethereum when no namespaced file exists. Network startup
 calls `validate_peer_cache_identity()` before using the cache.
 
 `disk_usage_at()` resolves the peer-cache namespace from database metadata and shares cache-loading migration precedence: prefer the namespaced file, with an Ethereum-only legacy fallback.
+
+## Chain-selected payload codecs
+
+Global metadata records `storage_codec` (`ethereum_v1` or `op_v1`). Missing codec
+metadata retains legacy Ethereum decoding; Base requires explicit `op_v1`.
+Unknown or mismatched codecs fail before shard recovery. WAL and follow writes
+encode transactions/receipts with the selected codec; follow validates these
+encodings before appending any segments. Compaction copies encoded bytes, so
+legacy Ethereum data is not rewritten into an enum format. Receipt reads and
+`block_transactions()` decode through the same codec, including sealed segments.
+
+Rollback compacts pending WAL records before pruning affected shards, preventing
+recovery from restoring removed blocks. It recounts retained transactions,
+receipts, and logs using the selected codec, recomputes the actual retained tip,
+and refreshes the sealed-shard cache. `storage/chain_tests.rs` covers rollback
+across sealed data and a pending WAL tail, followed by reopening and new writes.

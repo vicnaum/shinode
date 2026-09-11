@@ -497,10 +497,13 @@ fn db_bytes_for_bundles(bundles: &[BlockBundle]) -> Result<DbWriteByteTotals> {
         totals.tx_hashes = totals
             .tx_hashes
             .saturating_add(encoded_len(&bundle.tx_hashes)?);
+        totals.transactions = totals.transactions.saturating_add(
+            bundle.receipts.codec().encode_transactions(&bundle.transactions)?.len() as u64,
+        );
         totals.sizes = totals.sizes.saturating_add(8);
         totals.receipts = totals
             .receipts
-            .saturating_add(encoded_len_compat(&bundle.receipts)?);
+            .saturating_add(bundle.receipts.codec().encode_receipts(&bundle.receipts)?.len() as u64);
     }
     Ok(totals)
 }
@@ -525,9 +528,7 @@ mod tests {
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
             transactions: StoredTransactions { txs: Vec::new() },
             size: StoredBlockSize { size: 0 },
-            receipts: StoredReceipts {
-                receipts: Vec::<Receipt>::new(),
-            },
+            receipts: StoredReceipts::Ethereum(Vec::<Receipt>::new()),
         }
     }
 

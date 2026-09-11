@@ -133,9 +133,9 @@ chain identity rejection, and peer-cache isolation/TTL/AIMD behavior.
 The no-default-features build and targeted library/integration Clippy pass;
 full binary Clippy retains its 37 existing errors, with no added diagnostics.
 
-Typed sync/runtime integration is implemented; OP transaction processing and
-storage integration remain follow-up work. Base sync and maintenance commands
-remain gated before storage/network side effects.
+Typed sync/runtime and OP transaction processing/storage integration are implemented.
+Base sync and maintenance commands remain gated pending the remaining identity
+and maintenance integration.
 
 ## Payload validation and sync integration
 
@@ -162,3 +162,27 @@ above predates these validation changes; the new path is covered by offline test
 Phase 4 automated validation passes 90 tests (5 intentionally ignored), the
 no-default-features build, and strict library/integration Clippy checks. Full
 binary/test Clippy adds no diagnostics relative to phase 3's existing lint debt.
+
+## Deposit processing and storage
+
+Base processing hashes canonical EIP-2718 envelopes, including type `0x7e`
+deposits. Deposit metadata preserves the explicit sender, recipient/value, and
+receipt nonce when present. Missing deposit nonces remain absent; deposits have
+no signature or signing hash. Ordinary OP transactions retain their signature,
+signing hash, and transaction nonce.
+
+Database metadata selects `ethereum_v1` or `op_v1` for transactions and receipts.
+Ethereum retains the original bincode field layout and receipt bytes, including
+reading databases without the new codec field. Base requires explicit `op_v1`;
+unknown or incompatible codecs are rejected. The receipt enum exists only in
+memory: OP receipts retain transaction type, deposit nonce, and receipt version
+through WAL, compaction, sealing, follow writes, reopening, and rollback.
+
+Rollback also clears pending WAL coverage by compacting before pruning, recounts
+retained data using its codec, and refreshes the sealed cache. Tests cover mixed
+OP transaction types and all deposit nonce/version combinations, legacy Ethereum
+byte compatibility, cross-codec write rejection, and reopen after rollback.
+
+Phase 5 validation: 95 tests passed (5 intentionally ignored); workspace build,
+no-default-features build, and strict library/integration Clippy passed. Full
+binary/test Clippy adds no diagnostics relative to phase 4.

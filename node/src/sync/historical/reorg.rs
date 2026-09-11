@@ -212,15 +212,17 @@ mod tests {
     }
 
     fn write_bundle(storage: &Storage, header: Header) {
+        write_bundle_with_receipts(storage, header, crate::storage::StoredReceipts::Ethereum(Vec::new()));
+    }
+
+    fn write_bundle_with_receipts(storage: &Storage, header: Header, receipts: crate::storage::StoredReceipts) {
         let bundle = crate::storage::BlockBundle {
             number: header.number,
             header,
             tx_hashes: crate::storage::StoredTxHashes { hashes: Vec::new() },
             transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             size: crate::storage::StoredBlockSize { size: 0 },
-            receipts: crate::storage::StoredReceipts {
-                receipts: Vec::new(),
-            },
+            receipts,
         };
         storage
             .write_block_bundle_follow(&bundle)
@@ -392,7 +394,9 @@ mod tests {
         let eight = header_with_number(8, b(0));
         let nine = header_with_number(9, eight.hash_slow());
         let ten = header_with_number(10, nine.hash_slow());
-        for header in [&eight, &nine, &ten] { write_bundle(&storage, header.clone()); }
+        for header in [&eight, &nine, &ten] {
+            write_bundle_with_receipts(&storage, header.clone(), crate::storage::StoredReceipts::Op(Vec::new()));
+        }
         let mut fork_ten = ten;
         fork_ten.extra_data = alloy_primitives::Bytes::from_static(&[1]);
         let peer_id = PeerId::random();

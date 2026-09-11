@@ -14,6 +14,8 @@ Note: Withdrawals and logs are not stored -- logs are derived on-demand from rec
 - [x] `sharded/` - Sharded static-file backend (schema v2) with WAL-based writes, per-shard bitset tracking, atomic three-phase compaction, LRU-cached reads, and crash recovery. See `sharded/AGENTS.md`.
 
 ### Files
+- `codec.rs` - Metadata-selected `EthereumV1` / `OpV1` receipt and transaction codecs; preserves legacy Ethereum bincode bytes.
+- `chain_tests.rs` - Deposit processing, codec compatibility, WAL/compaction/sealing/follow/rollback round trips, and codec rejection tests.
 - `mod.rs` - Storage types and bincode serialization helpers (~170 lines). Defines all data containers and re-exports `Storage`/`StorageAggregateStats` from `sharded`.
   - **Key items**: `StoredTxHashes`, `StoredTransaction`, `StoredTransactions`, `StoredBlockSize`, `StoredReceipts`, `BlockBundle`, `SegmentDiskStats`, `StorageDiskStats`, `StoredPeer`, `PeerCacheLoad`, `StorageConfigKey`, `ZSTD_DICT_MAX_SIZE`
   - **Key items** (encoding): `encode_bincode_value`, `decode_bincode`, `encode_bincode_compat_value`, `decode_bincode_compat_value`, `encode_u64_value`, `decode_u64`
@@ -34,3 +36,11 @@ Note: Withdrawals and logs are not stored -- logs are derived on-demand from rec
   3. Sync pipeline writes `BlockBundle`s via `Storage::write_block_bundles_wal()`
   4. RPC reads blocks via `Storage::block_header()`/`block_receipts()` and derives logs from receipts
   5. Peer cache managed via `Storage::upsert_peer()`/`load_peers()`/`flush_peer_cache()`
+
+`StoredReceipts` is an Ethereum/OP enum only in memory. `StoredReceiptRef`
+implements common `TxReceipt` accessors without dropping deposit fields or types.
+`StorageCodec` encodes the chain's bincode-compatible receipt vector directly;
+no enum tag is prepended to legacy Ethereum bytes. `StoredTransaction::nonce`
+is optional in memory: deposits use the receipt nonce, or `None` if unavailable.
+Ethereum's codec retains its original u64 nonce layout; `OpV1` stores the optional
+nonce. Deposits carry explicit `from` and no signature/signing hash.

@@ -86,7 +86,7 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
 ## Notes
 
 Startup, sync/follow contexts, trackers, and cleanup carry `C: ChainTypes`.
-`run_sync<C: IngestChain>` also requires a storage conversion adapter; only
-Ethereum has that adapter until OP storage integration. Base startup stays gated
+`run_sync<C: IngestChain>` uses the Ethereum or Base storage conversion adapter.
+Base startup stays gated pending identity/maintenance integration
 in `main.rs`. Backfill tail feeding retains the rollback-depth delay; live follow
 tracks the probed tip. These are P2P observations, not OP safe/finalized heads.

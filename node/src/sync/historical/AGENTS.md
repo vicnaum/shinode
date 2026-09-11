@@ -139,8 +139,10 @@ benchmark stats/event logging.
 
 Fetch, follow, reorg, and pipeline contexts carry `C: ChainTypes`; scheduling,
 progress, and DB orchestration remain chain neutral. `IngestChain` is the storage
-conversion boundary and currently has only an Ethereum implementation. Base
-payloads stay typed through validation; deposit processing/storage is a later phase.
+conversion boundary with Ethereum and Base implementations. Ethereum retains its
+Keccak hashing optimization; Base hashes canonical EIP-2718 envelopes, including
+0x7e deposits. Deposits store explicit senders and receipt nonces without fabricated
+signatures. OP receipt types and deposit fields survive the storage codec.
 
 The P2P layer validates transaction/ommers/receipt roots, receipt count, withdrawals,
 and recomputed log blooms before emitting payloads. Invalid blocks remain missing

@@ -9,6 +9,7 @@ use crate::{
     storage::Storage,
     sync::SyncProgressStats,
 };
+use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, Bytes, B256};
 use eyre::{Result, WrapErr};
 use jsonrpsee::{
@@ -346,10 +347,10 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     let Some(tx_hashes) = tx_hashes_by_number.get(&block_number) else {
                         continue;
                     };
-                    if stored.receipts.len() != tx_hashes.hashes.len() {
+                    if stored.len() != tx_hashes.hashes.len() {
                         warn!(
                             block_number,
-                            receipts = stored.receipts.len(),
+                            receipts = stored.len(),
                             tx_hashes = tx_hashes.hashes.len(),
                             "receipt/tx hash count mismatch while deriving logs"
                         );
@@ -357,12 +358,11 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     }
                     let block_hash = SealedHeader::seal_slow(header.clone()).hash();
                     for (tx_index, (receipt, tx_hash)) in stored
-                        .receipts
                         .iter()
                         .zip(tx_hashes.hashes.iter())
                         .enumerate()
                     {
-                        for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
+                        for (log_index, log) in receipt.logs().iter().cloned().enumerate() {
                             let alloy_primitives::Log { address, data } = log;
                             let (topics, data) = data.split();
                             let derived_log = DerivedLog {
@@ -681,7 +681,7 @@ mod tests {
             tx_hashes: crate::storage::StoredTxHashes { hashes: tx_hashes },
             transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             size: crate::storage::StoredBlockSize { size },
-            receipts: crate::storage::StoredReceipts { receipts },
+            receipts: crate::storage::StoredReceipts::Ethereum(receipts),
         }
     }
 
