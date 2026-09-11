@@ -172,6 +172,10 @@ pub struct StorageAggregateStats {
 struct MetaState {
     schema_version: u64,
     chain_id: u64,
+    #[serde(default)]
+    genesis_hash: Option<alloy_primitives::B256>,
+    #[serde(default)]
+    sync_start_block: Option<u64>,
     storage_key: StorageConfigKey,
     shard_size: u64,
     max_present_block: Option<u64>,
@@ -456,6 +460,29 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
+    /// Read a previously requested range without opening/recovering storage.
+    /// Legacy numeric chain IDs are insufficient to identify Base data.
+    pub fn read_resume_start(
+        data_dir: &Path,
+        chain_id: u64,
+        genesis_hash: alloy_primitives::B256,
+    ) -> Result<Option<u64>> {
+        let path = meta_path(data_dir);
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let meta = load_meta(&path)?;
+        if meta.chain_id != chain_id || meta.genesis_hash != Some(genesis_hash) {
+            return Err(eyre!(
+                "storage identity does not match the selected chain; use a separate data directory"
+            ));
+        }
+        if meta.schema_version != SCHEMA_VERSION {
+            return Err(eyre!("unsupported storage schema for resume"));
+        }
+        Ok(meta.sync_start_block)
+    }
+
     /// Read the shard size from an existing storage directory.
     /// Returns `Ok(Some(shard_size))` if meta.json exists, `Ok(None)` if the storage is uninitialized.
     pub fn read_shard_size(data_dir: &Path) -> Result<Option<u64>> {
@@ -497,6 +524,9 @@ impl Storage {
             MetaState {
                 schema_version: SCHEMA_VERSION,
                 chain_id: config.chain_id,
+                genesis_hash: Some(config.genesis_hash),
+                sync_start_block: (config.command.is_none() && !config.repair)
+                    .then_some(config.start_block),
                 storage_key: StorageConfigKey::from(config),
                 shard_size: config.shard_size,
                 max_present_block: None,
@@ -513,6 +543,17 @@ impl Storage {
         }
         if !meta_path.exists() {
             persist_meta(&meta_path, &meta)?;
+        }
+        // Keep the earliest explicitly requested lower bound so resume also
+        // revisits holes from out-of-order historical ingestion.
+        if config.command.is_none() && !config.repair {
+            let start = meta
+                .sync_start_block
+                .map_or(config.start_block, |old| old.min(config.start_block));
+            if meta.sync_start_block != Some(start) {
+                meta.sync_start_block = Some(start);
+                persist_meta(&meta_path, &meta)?;
+            }
         }
 
         let static_dir = static_dir(&config.data_dir);
@@ -2494,6 +2535,15 @@ fn persist_shard_meta(shard_dir: &Path, meta: &ShardMeta) -> Result<()> {
 }
 
 fn validate_meta(config: &NodeConfig, meta: &MetaState) -> Result<()> {
+    if meta
+        .genesis_hash
+        .is_some_and(|hash| hash != config.genesis_hash)
+    {
+        return Err(eyre!("storage genesis does not match the selected chain"));
+    }
+    if config.chain == crate::chain::ChainKind::Base && meta.genesis_hash.is_none() {
+        return Err(eyre!("legacy storage is Ethereum data, even if labelled with a Base chain ID; use a separate data directory"));
+    }
     if meta.chain_id != config.chain_id {
         return Err(eyre!(
             "chain id mismatch: expected {}, got {}",
@@ -2894,7 +2944,13 @@ mod tests {
 
     fn base_config(data_dir: PathBuf) -> NodeConfig {
         NodeConfig {
+            chain: crate::chain::ChainKind::Mainnet,
+            chain_id_override: None,
             chain_id: 1,
+            genesis_hash: crate::chain::ChainKind::Mainnet.genesis_hash(),
+            p2p_port: crate::cli::DEFAULT_P2P_PORT,
+            trusted_peers: Vec::new(),
+            start_block_override: Some(0),
             data_dir,
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),

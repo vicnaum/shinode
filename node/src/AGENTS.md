@@ -7,6 +7,7 @@ Main source tree for the Stateless History Node. Contains all application code o
 ## Contents (one hop)
 
 ### Subdirectories
+- [x] `chain/` - Shared Ethereum/Base identities, typed protocol bundles, Base discovery settings, and fork-aware receipt/withdrawals helpers. Exported through `lib.rs`; production Base startup remains gated during integration.
 - [x] `bin/` - Demo/testing binaries for TUI development (ui_mock, color_test, char_test). Standalone executables with no parent crate imports.
 - [x] `cli/` - CLI argument parsing and central `NodeConfig` struct (40+ parameters). Single source of truth for all runtime configuration. Includes range helpers (`compute_target_range()`).
 - [x] `logging/` - Observability subsystem: async JSON logging with dedup, TUI log capture (`TuiLogBuffer`, `TuiLogLayer`), run reports, platform-specific resource monitoring (Linux proc + macOS sysinfo), SIGUSR1 handler for on-demand state dumps.
@@ -18,6 +19,7 @@ Main source tree for the Stateless History Node. Contains all application code o
 - [x] `ui/` - Dual-mode terminal interface: ratatui fullscreen TUI dashboard (default, 10 FPS) with phase-aware layouts, speed chart, coverage map, and panels; or indicatif progress bars (`--no-tui`).
 
 ### Files
+- `lib.rs` - Exports shared chain definitions to the binary and protocol tests.
 - `main.rs` - Application entry point. Parses `NodeConfig`, routes to subcommands (`db stats`, `db compact`, `repair`) or `run::run_sync()`. Configures jemalloc allocator (feature-gated). Implements `ProgressReporter` for indicatif `ProgressBar`.
   - **Key items**: `main()`, `ProgressReporter for ProgressBar`, jemalloc feature gate
 - `metrics.rs` - Lightweight utility functions for metrics calculations.

@@ -189,7 +189,13 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     }
 
     // Connect to P2P network
-    let session = connect_p2p(Arc::clone(&storage), early_tui.as_ref(), log_buffer).await?;
+    let session = connect_p2p(
+        Arc::clone(&storage),
+        &config,
+        early_tui.as_ref(),
+        log_buffer,
+    )
+    .await?;
 
     // Wait for minimum peers
     let min_peers = config.min_peers as usize;

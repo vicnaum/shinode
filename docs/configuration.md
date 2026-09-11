@@ -6,16 +6,54 @@ Full reference for CLI options and environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--chain-id <u64>` | `1` | Chain ID for RPC (Ethereum mainnet only) |
+| `--chain <mainnet\|base>` | `mainnet` | Select chain identity; Base runtime is not enabled yet |
+| `--chain-id <u64>` | - | Optional assertion matching the selected chain (1 or 8453) |
+| `--p2p-port <u16>` | `30303` | TCP listener and UDP discovery port (1–65535) |
+| `--trusted-peer <enode>` | - | Repeatable serving-peer URL; accepts IP or DNS hosts |
 | `--data-dir <path>` | `data` | Base data directory for storage |
 | `--peer-cache-dir <path>` | (data dir) | Directory for persisted peer cache; defaults to data directory if unset |
-| `--start-block <u64>` | `10000000` | First block to backfill (pre-Uniswap V2) |
+| `--start-block <u64>` | mainnet: `10000000` | Required for a new Base database; omitted on Base resume to reuse its saved lower bound |
 | `--end-block <u64>` | - | Optional final block to stop at |
 | `--shard-size <u64>` | `10000` | Blocks per storage shard |
 | `--rollback-window <u64>` | `64` | Max rollback depth for reorgs |
 | `--retention-mode <mode>` | `full` | Retention policy (`full` only) |
 | `--head-source <source>` | `p2p` | Head source (`p2p` only) |
 | `--reorg-strategy <strategy>` | `delete` | Rollback strategy (`delete` only) |
+
+## Chain selection and serving peers
+
+`--chain` determines the chain ID and genesis used by the resolved configuration.
+For example, `--chain mainnet --chain-id 1` is accepted; `--chain-id 8453` alone
+is rejected because the selected chain still defaults to Ethereum mainnet.
+
+Base configuration is implemented, but this development version stops Base
+sync and maintenance commands before opening storage or connecting to peers.
+The typed networking and storage integration will enable those commands in a
+later change. Ethereum commands continue to work, including the new P2P options:
+
+```sh
+shinode --chain mainnet --p2p-port 30309 --data-dir data/ethereum
+```
+
+Use a separate data directory for each chain. The intended Base invocation once
+runtime integration is enabled is:
+
+```sh
+shinode --chain base --data-dir data/base --start-block <recent-block-number>
+```
+
+Select a recent block for a recent-history backfill. For older ranges, add
+`--trusted-peer enode://<public-key>@<archive-host>:<port>` for a node that actually
+serves that history; the flag may be repeated. Discovery or a successful
+connection does not guarantee historical receipt availability.
+
+New storage metadata records genesis and the requested start block. Base resume
+without `--start-block` requires matching chain/genesis metadata and reuses the
+earliest requested lower bound, so gaps from interrupted parallel backfill are
+revisited. An explicit lower start extends that saved range; a higher start does
+not discard it. Legacy Ethereum metadata remains readable, but a legacy numeric
+label of 8453 is not sufficient to identify Base data. Maintenance commands do
+not require a start block or change a saved sync range.
 
 ## Display Options
 

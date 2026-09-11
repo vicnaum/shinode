@@ -198,15 +198,23 @@ pub struct NetworkSession {
 }
 
 /// Start the devp2p network and wait for compatible peers.
-pub async fn connect_mainnet_peers(storage: Option<Arc<Storage>>) -> Result<NetworkSession> {
+pub async fn connect_mainnet_peers(
+    storage: Option<Arc<Storage>>,
+    port: u16,
+    trusted_peers: &[reth_network_peers::TrustedPeer],
+) -> Result<NetworkSession> {
     let secret_key = rng_secret_key();
     let peers_config = PeersConfig::default()
         .with_max_outbound(MAX_OUTBOUND)
         .with_max_inbound(MAX_INBOUND)
         .with_max_concurrent_dials(MAX_CONCURRENT_DIALS)
-        .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS));
+        .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS))
+        .with_trusted_nodes(trusted_peers.to_vec());
+    let listen = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
         .mainnet_boot_nodes()
+        .listener_addr(listen)
+        .discovery_addr(listen)
         .peer_config(peers_config)
         .disable_tx_gossip(true)
         .block_import(Box::new(ProofOfStakeBlockImport::default()))

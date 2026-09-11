@@ -7,7 +7,7 @@ use alloy_primitives::{Address, Bytes, Log, B256};
 use eyre::{ensure, eyre, Result};
 use futures::StreamExt;
 use op_alloy_consensus::{OpDepositReceipt, OpPooledTransaction, OpReceipt, OpTxType};
-use reth_chainspec::{EthChainSpec, EthereumHardfork, ForkCondition, Hardfork};
+use reth_chainspec::EthChainSpec;
 use reth_eth_wire::EthVersion;
 use reth_eth_wire_types::{
     BasicNetworkPrimitives, BlockHashOrNumber, GetBlockBodies, GetBlockHeaders, GetReceipts,
@@ -18,10 +18,11 @@ use reth_network_api::{
     NetworkEvent, NetworkEventListenerProvider, PeerRequest, PeerRequestSender,
 };
 use reth_network_peers::NodeRecord;
-use reth_optimism_chainspec::{OpChainSpec, BASE_MAINNET};
+use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_primitives::OpPrimitives;
 use reth_primitives_traits::{serde_bincode_compat::SerdeBincodeCompat, SealedHeader};
 use serde::Deserialize;
+use shinode::chain::{BaseChain, ChainKind, ChainTypes};
 use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::oneshot, time::timeout};
 
@@ -33,7 +34,6 @@ struct ProtocolFixture {
     source_revision: String,
     chain_id: u64,
     genesis_hash: B256,
-    azul_timestamp: u64,
     beryl_timestamp: u64,
     fork_hash: [u8; 4],
     discovery_protocol: String,
@@ -46,41 +46,19 @@ fn fixture() -> Result<ProtocolFixture> {
     ))?)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum BaseFork {
-    Azul,
-    Beryl,
-}
-
-impl Hardfork for BaseFork {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Azul => "Azul",
-            Self::Beryl => "Beryl",
-        }
-    }
-}
-
-fn base_spec(f: &ProtocolFixture) -> Arc<OpChainSpec> {
-    let mut spec = (**BASE_MAINNET).clone();
-    spec.inner.hardforks.insert(
-        EthereumHardfork::Osaka,
-        ForkCondition::Timestamp(f.azul_timestamp),
-    );
-    spec.inner
-        .hardforks
-        .insert(BaseFork::Azul, ForkCondition::Timestamp(f.azul_timestamp));
-    spec.inner
-        .hardforks
-        .insert(BaseFork::Beryl, ForkCondition::Timestamp(f.beryl_timestamp));
-    Arc::new(spec)
-}
-
 #[test]
 fn pinned_spec_matches_base_beryl() -> Result<()> {
     let f = fixture()?;
-    let spec = base_spec(&f);
+    let spec = BaseChain::chain_spec();
     ensure!(spec.chain().id() == f.chain_id, "chain ID mismatch");
+    ensure!(
+        ChainKind::Base.chain_id() == f.chain_id,
+        "selection ID mismatch"
+    );
+    ensure!(
+        ChainKind::Base.genesis_hash() == f.genesis_hash,
+        "selection genesis mismatch"
+    );
     ensure!(spec.genesis_hash() == f.genesis_hash, "genesis mismatch");
     ensure!(
         spec.latest_fork_id().hash.0 == f.fork_hash,
@@ -273,34 +251,16 @@ async fn probe_block(
 #[ignore = "live Base P2P probe; set SHINODE_BASE_PROBE_OUTPUT to save evidence"]
 async fn live_base_protocol_probe() -> Result<()> {
     let f = fixture()?;
-    let spec = base_spec(&f);
+    let spec = BaseChain::chain_spec();
     let listen: SocketAddr = "0.0.0.0:0".parse()?;
-    let mut discovery = discv5::ConfigBuilder::new(discv5::ListenConfig::from_ip(listen.ip(), 0));
-    discovery.protocol_identity(discv5::ProtocolIdentity {
-        protocol_id: f.discovery_protocol.as_bytes().try_into()?,
-        ..Default::default()
-    });
-    let bootnodes = f
-        .bootnodes
-        .iter()
-        .map(|s| s.parse())
-        .collect::<Result<Vec<NodeRecord>, _>>()?;
-    let config = NetworkConfigBuilder::<BaseNet>::new(reth_network::config::rng_secret_key())
+    let builder = NetworkConfigBuilder::<BaseNet>::new(reth_network::config::rng_secret_key())
         .listener_addr(listen)
         .discovery_addr(listen)
-        .boot_nodes(bootnodes.clone())
-        .disable_discv4_discovery()
-        .discovery_v5(
-            reth_discv5::Config::builder(listen)
-                .discv5_config(discovery.build())
-                .add_unsigned_boot_nodes(bootnodes),
-        )
         .disable_tx_gossip(true)
-        .block_import(Box::new(ProofOfStakeBlockImport::default()))
-        .build(reth_storage_api::noop::NoopProvider::<
-            OpChainSpec,
-            OpPrimitives,
-        >::new(Arc::clone(&spec)));
+        .block_import(Box::new(ProofOfStakeBlockImport::default()));
+    let config = BaseChain::configure_network(builder, listen).build(
+        reth_storage_api::noop::NoopProvider::<OpChainSpec, OpPrimitives>::new(Arc::clone(&spec)),
+    );
     let handle = config.start_network().await?;
     let mut events = handle.event_listener();
     let mut failures = BTreeSet::new();

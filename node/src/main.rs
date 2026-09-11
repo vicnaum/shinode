@@ -1,3 +1,4 @@
+use shinode::chain;
 mod cli;
 mod logging;
 mod metrics;
@@ -31,7 +32,8 @@ impl sync::ProgressReporter for ProgressBar {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = NodeConfig::from_args();
+    let config = NodeConfig::from_args()?;
+    config.ensure_runtime_supported()?;
     let argv: Vec<String> = env::args().collect();
 
     // Handle subcommands

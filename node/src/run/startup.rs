@@ -240,13 +240,19 @@ pub async fn init_storage(
 #[expect(clippy::cognitive_complexity, reason = "P2P connection with status updates")]
 pub async fn connect_p2p(
     storage: Arc<Storage>,
+    config: &NodeConfig,
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
 ) -> Result<p2p::NetworkSession> {
     ui::print_status_bar("Connecting to Ethereum P2P network...");
     update_tui_startup(tui, "Connecting to Ethereum P2P network...", log_buffer.as_ref());
     info!("starting p2p network");
-    let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
+    let session = p2p::connect_mainnet_peers(
+        Some(Arc::clone(&storage)),
+        config.p2p_port,
+        &config.trusted_peers,
+    )
+    .await?;
     let initial_peers = session.pool.len();
     info!(peers = initial_peers, "p2p peers connected");
     let status_msg = format!("P2P connected | {initial_peers} peers");

@@ -152,7 +152,13 @@ mod tests {
 
     fn base_config(dir: std::path::PathBuf) -> NodeConfig {
         NodeConfig {
+            chain: crate::chain::ChainKind::Mainnet,
+            chain_id_override: None,
             chain_id: 1,
+            genesis_hash: crate::chain::ChainKind::Mainnet.genesis_hash(),
+            p2p_port: crate::cli::DEFAULT_P2P_PORT,
+            trusted_peers: Vec::new(),
+            start_block_override: Some(0),
             data_dir: dir,
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("rpc bind"),
