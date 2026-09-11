@@ -163,6 +163,7 @@ pub struct TuiState {
 
     // Config parameters (set once at startup)
     /// Configured `--start-block` for this run (stable; not overwritten by snapshots).
+    pub config_chain: crate::chain::ChainKind,
     pub config_start_block: u64,
     pub config_data_dir: String,
     pub config_shard_size: u64,
@@ -263,8 +264,9 @@ impl TuiState {
             avg_speed_window: VecDeque::with_capacity(300), // 30 seconds at 100ms intervals
             last_tick_time: None,
             animation_frame: 0,
-            startup_status: "Connecting to Ethereum P2P network...".to_string(),
+            startup_status: "Connecting to P2P network...".to_string(),
             best_head_seen: 0,
+            config_chain: crate::chain::ChainKind::Mainnet,
             config_start_block: start_block,
             config_data_dir: String::new(),
             config_shard_size: 0,
@@ -333,7 +335,9 @@ impl TuiState {
     }
 
     /// Set configuration parameters for display.
-    pub fn set_config(&mut self, data_dir: &str, shard_size: u64, rpc_bind: &str, rollback_window: u64) {
+    pub fn set_config(&mut self, data_dir: &str, shard_size: u64, rpc_bind: &str, rollback_window: u64, chain: crate::chain::ChainKind) {
+        self.config_chain = chain;
+        self.startup_status = format!("Connecting to {} P2P network...", chain.display_name());
         self.config_data_dir = data_dir.to_string();
         self.config_shard_size = shard_size;
         self.config_rpc_bind = rpc_bind.to_string();
@@ -2295,10 +2299,10 @@ fn render_synced_status(area: Rect, buf: &mut Buffer, data: &TuiState) {
     buf.set_string(x + 3, y, " ", Style::default());
 
     // Main title
-    buf.set_string(x + 4, y, "Ethereum Mainnet", Style::default().fg(Color::White).bold());
+    buf.set_string(x + 4, y, data.config_chain.display_name(), Style::default().fg(Color::White).bold());
 
     // Right sparkles (different offset phases)
-    let rx = x + 4 + 16; // after "Ethereum Mainnet"
+    let rx = x + 5 + data.config_chain.display_name().len() as u16;
     buf.set_string(rx, y, " ", Style::default());
     buf.set_string(rx + 1, y, &format!("{}", s3), Style::default().fg(c3));
     buf.set_string(rx + 2, y, " ", Style::default());
@@ -2511,4 +2515,26 @@ fn format_number(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    #[test]
+    fn configured_chain_is_shown_at_startup_and_follow() {
+        for chain in [crate::chain::ChainKind::Mainnet, crate::chain::ChainKind::Base] {
+            let mut state = TuiState::new(42, 43);
+            state.set_config("data", 2, "127.0.0.1:8545", 64, chain);
+            assert!(state.startup_status.contains(chain.display_name()));
+            let area = Rect::new(0, 0, 100, 12);
+            let mut buffer = Buffer::empty(area);
+            render_synced_status(area, &mut buffer, &state);
+            let text: String = buffer.content.iter().map(ratatui::buffer::Cell::symbol).collect();
+            assert!(text.contains(chain.display_name()));
+            if chain == crate::chain::ChainKind::Base {
+                assert!(!text.contains("Ethereum Mainnet"));
+            }
+        }
+    }
 }

@@ -76,7 +76,7 @@ Session admission checks chain ID and genesis; advertised history bounds remain
 separate from the header-probed head. Discovery metrics also run without storage.
 eth/70 incomplete final receipt blocks are dropped and reported missing for retry.
 The storage cache is namespaced by chain ID and genesis; connecting with a cache
-for a different chain fails before network startup. Full Base ingestion remains gated.
+for a different chain fails before network startup. Both chain runtimes use this connector through startup dispatch.
 
 Fetch assembly validates body and receipt commitments via `sync::validation`
 before producing payloads. `invalid_blocks` is a subset of `missing_blocks`;

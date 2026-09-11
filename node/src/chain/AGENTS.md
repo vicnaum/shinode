@@ -9,8 +9,8 @@ Exported by `src/lib.rs` for both the binary and protocol integration tests.
 - `op_stack.rs`: timestamp-aware OP receipt roots and Canyon/Isthmus withdrawals handling.
 
 Adapted from Sieve 914d29f, MIT OR Apache-2.0. See `docs/base-protocol.md` for
-the pinned upstream revision and compatibility boundary. Base production startup
-is gated in `main.rs` until typed sync/storage is connected; configuration must
+the pinned upstream revision and compatibility boundary. The binary dispatches `ChainKind` once into the matching typed runtime.
+`ChainKind::display_name()` supplies user-facing chain names; configuration must
 never relabel Ethereum networking as Base.
 
 `cargo test --lib` runs fork/genesis/withdrawals tests. The `base_protocol`

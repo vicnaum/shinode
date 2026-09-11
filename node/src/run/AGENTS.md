@@ -87,8 +87,8 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
 
 Startup, sync/follow contexts, trackers, and cleanup carry `C: ChainTypes`.
 `run_sync<C: IngestChain>` uses the Ethereum or Base storage conversion adapter.
-Base sync stays gated pending runtime/RPC integration
-in `main.rs`. Backfill tail feeding retains the rollback-depth delay; live follow
+`main.rs` dispatches to the selected chain; runtime types must match the resolved
+chain ID/genesis before run artifacts or storage are created. Backfill tail feeding retains the rollback-depth delay; live follow
 tracks the probed tip. These are P2P observations, not OP safe/finalized heads.
 
 Maintenance handlers validate effective data-directory identity before tracing,

@@ -152,3 +152,6 @@ Manages terminal I/O and rendering loop:
 6. On quit: send shutdown signal, wait for completion or 3s timeout, flush logs, restore terminal
 
 Progress updater functions accept `PeerPool<C>` for either chain; display snapshots remain chain neutral.
+
+`TuiState::set_config()` receives the selected `ChainKind`; startup text and the
+follow title use its display name. Buffer tests cover both chain labels.

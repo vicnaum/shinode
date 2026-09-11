@@ -418,6 +418,7 @@ pub fn setup_ui<C: ChainTypes>(
                 config.shard_size,
                 &config.rpc_bind.to_string(),
                 config.rollback_window,
+                config.chain,
             );
             Arc::new(Mutex::new(tui))
         };

@@ -3,7 +3,8 @@
 Verified on 2026-09-11. The initial port targets **Base mainnet through Beryl**.
 Shinode's existing Reth revision and OP Alloy 0.23.1 successfully decoded and
 verified a recent Base block over P2P. No Reth upgrade is needed for this target.
-Base selection and storage maintenance are available; Base sync remains gated.
+Base sync, follow, storage maintenance, and the existing RPC subset are wired in
+this development branch. Full live ingestion smoke tests remain phase 8 work.
 
 ## Pinned sources and protocol
 
@@ -134,8 +135,7 @@ The no-default-features build and targeted library/integration Clippy pass;
 full binary Clippy retains its 37 existing errors, with no added diagnostics.
 
 Typed sync/runtime and OP transaction processing/storage integration are implemented.
-Base storage identity and maintenance integration are implemented. Base sync
-remains gated pending the next runtime/RPC integration phase.
+Base storage identity and maintenance integration are implemented. The runtime now dispatches Base into its typed pipeline and the existing RPC subset.
 
 ## Payload validation and sync integration
 
@@ -199,8 +199,31 @@ without metadata are rejected without modifying stored files.
 
 Binary tests cover Base and legacy Ethereum stats, compaction, cache rebuilding,
 and repair, including custom shard sizes, directory overrides, and rejection
-before creating peer caches or logs. Base sync remains separately gated.
+before creating peer caches or logs. Base sync is enabled through typed runtime dispatch.
 
 Phase 6 validation: 100 tests passed (5 intentionally ignored); workspace build,
 no-default-features build, and strict library/integration Clippy passed. Full
 binary/test Clippy adds no diagnostics relative to phase 5.
+
+## Runtime, RPC, and presentation
+
+The binary dispatches once to the Ethereum or Base runtime. It verifies that the
+runtime type agrees with the resolved chain ID/genesis before creating artifacts.
+Startup logs include chain name/ID/genesis, reports retain resolved configuration,
+and startup/follow TUI labels identify the selected chain.
+
+RPC tests process mixed Base deposit/user blocks, persist them through WAL,
+compaction/sealing, reopen storage, and exercise the production RPC module.
+They verify Base `eth_chainId` (`0x2105`), indexed head, block/transaction hashes,
+block size, the post-Isthmus withdrawals commitment, and complete filtered and
+unfiltered logs. Ethereum fixtures cover the same RPC contract. `logIndex` now
+counts all logs in a block, including earlier transactions and filtered-out logs.
+`includeTransactions=true` still returns `-32602`; no extra OP RPC methods or
+safe/finalized head guarantees are added.
+
+These offline tests do not replace phase 8's live bounded ingestion, independent
+reference comparison, restart/compaction, and follow smoke tests.
+
+Phase 7 validation: 104 tests passed (5 intentionally ignored); workspace build,
+no-default-features build, and strict library/integration Clippy passed. Full
+binary/test Clippy adds no diagnostics relative to phase 6.

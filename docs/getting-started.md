@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust toolchain (1.70+)
+- Recent stable Rust toolchain (tested with 1.93.1)
 - C compiler and linker (for native dependencies)
 - Git access for Reth dependencies
 
@@ -48,7 +48,7 @@ cd shinode
 cargo build
 
 # Production build (recommended)
-cargo build --release
+cargo build --release --locked
 ```
 
 ## First Run
@@ -67,6 +67,39 @@ The node will:
 5. Switch to follow mode once caught up
 
 Press `q` to quit gracefully. The node persists checkpoints and resumes on restart.
+
+### Base mainnet
+
+Build the current development checkout for Base support. Pick a recent Base block
+number, replace the placeholder below, and use a directory separate from Ethereum:
+
+```bash
+cargo run --release -- --chain base --data-dir data/base \
+  --start-block <recent-base-block> --p2p-port 30309 --rpc-bind 127.0.0.1:8546
+```
+
+On restart, use the same command without `--start-block` to reuse the saved lower
+bound. For an older backfill, add `--trusted-peer enode://<public-key>@<host>:<port>`
+for a node that serves that range; ordinary discovered peers may have pruned it.
+Plan around roughly 30 days of history when relying on public Base P2P peers:
+Base's [published pruned snapshots](https://github.com/base/base/blob/main/.env.mainnet)
+retain 1,339,200 blocks (about 31 days at two seconds per block). Operators can
+configure a different window, so this is not a guarantee for every peer. Older
+backfills need a peer retaining and serving the requested bodies and receipts.
+Shinode keeps the history it has already downloaded; upstream pruning does not
+delete it locally.
+Metadata prevents opening a populated directory as a different chain.
+
+After catching up, query `http://127.0.0.1:8546`: `eth_chainId` returns `0x2105`.
+Block queries return transaction hashes with `includeTransactions=false`; `true`
+is unsupported. Log queries include user and deposit transaction logs with their
+block-wide indices. A bounded run with `--end-block` exits after backfill rather
+than serving continuously.
+
+The initial target is the probed P2P head minus the rollback window; live follow
+tracks the probed tip. Neither represents OP safe/finalized status or L1 finality.
+Read [protocol compatibility](base-protocol.md) before choosing a historical range;
+full live ingestion/restart/follow smoke tests remain part of release validation.
 
 ### Headless / CI environments
 

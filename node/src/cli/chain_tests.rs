@@ -20,7 +20,6 @@ fn chain_selection_resolves_identity_and_defaults() -> Result<()> {
         mainnet.p2p_port == DEFAULT_P2P_PORT && mainnet.trusted_peers.is_empty(),
         "peer defaults changed"
     );
-    mainnet.ensure_runtime_supported()?;
     let base = NodeConfig::try_from_args(["shinode", "--chain", "base", "--start-block", "42"])?;
     ensure!(
         base.chain_id == 8453 && base.genesis_hash == ChainKind::Base.genesis_hash(),
@@ -29,10 +28,6 @@ fn chain_selection_resolves_identity_and_defaults() -> Result<()> {
     ensure!(
         base.start_block == 42 && base.chain_id_override.is_none(),
         "Base resolution failed"
-    );
-    ensure!(
-        base.ensure_runtime_supported().is_err(),
-        "Base must remain gated until typed ingestion is ready"
     );
     // Serialized reports contain the resolved values, not raw CLI assertions.
     let json = serde_json::to_value(&base)?;

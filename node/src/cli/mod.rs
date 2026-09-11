@@ -112,7 +112,7 @@ pub struct DbRebuildCacheArgs {
     reason = "CLI config needs many boolean flags"
 )]
 pub struct NodeConfig {
-    /// Network to index. Base runtime integration is still in progress.
+    /// Network to index; maintenance infers the stored chain when omitted.
     #[arg(long, value_enum, default_value = "mainnet")]
     pub chain: ChainKind,
     /// Optional assertion that must match the selected network's chain ID.
@@ -352,12 +352,7 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Keep Base sync gated while allowing chain-aware storage maintenance.
-    pub fn ensure_runtime_supported(&self) -> Result<()> {
-        ensure!(self.chain == ChainKind::Mainnet || self.command.is_some() || self.repair,
-            "Base sync is not enabled yet; storage maintenance is available");
-        Ok(())
-    }
+
 }
 
 #[cfg(test)]

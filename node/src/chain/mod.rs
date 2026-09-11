@@ -27,6 +27,14 @@ pub enum ChainKind {
 
 impl ChainKind {
     #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Mainnet => "Ethereum Mainnet",
+            Self::Base => "Base Mainnet",
+        }
+    }
+
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Mainnet => EthereumChain::NAME,

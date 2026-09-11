@@ -20,6 +20,7 @@ use crate::sync::historical::{
 };
 use crate::sync::{ProgressReporter, SyncProgressStats};
 use eyre::Result;
+use reth_chainspec::EthChainSpec;
 use std::env;
 use std::io::IsTerminal;
 use std::ops::RangeInclusive;
@@ -54,6 +55,11 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
 pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Number of coverage buckets for TUI blocks map visualization
     const COVERAGE_BUCKETS: usize = 200;
+    eyre::ensure!(
+        config.chain_id == C::chain_spec().chain().id()
+            && config.genesis_hash == C::chain_spec().genesis_hash(),
+        "runtime chain types do not match configuration"
+    );
 
     // Validate and normalize chunk sizes
     let chunk_max = config
@@ -125,7 +131,9 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
 
     // Main ingest path
     info!(
+        chain = config.chain.name(),
         chain_id = config.chain_id,
+        genesis = ?config.genesis_hash,
         data_dir = %config.data_dir.display(),
         "starting stateless history node"
     );
@@ -152,6 +160,7 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
                         config.shard_size,
                         &config.rpc_bind.to_string(),
                         config.rollback_window,
+                        config.chain,
                     );
                     let _ = guard.draw();
                 }
@@ -762,4 +771,19 @@ async fn run_follow_mode<C: IngestChain>(
 
     flush_peer_cache_with_limits(session, storage, Some(peer_health)).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mismatched_runtime_types_fail_before_creating_storage() -> Result<()> {
+        let root = crate::test_utils::temp_dir("runtime-chain-mismatch");
+        let config = crate::test_utils::base_config(root.clone());
+        let result = run_sync::<crate::chain::BaseChain>(config, Vec::new()).await;
+        eyre::ensure!(result.is_err(), "Base runtime accepted Ethereum configuration");
+        eyre::ensure!(!root.exists(), "runtime mismatch created storage");
+        Ok(())
+    }
 }

@@ -33,7 +33,6 @@ impl sync::ProgressReporter for ProgressBar {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = NodeConfig::from_args()?;
-    config.ensure_runtime_supported()?;
     let argv: Vec<String> = env::args().collect();
 
     // Handle subcommands
@@ -57,7 +56,10 @@ async fn main() -> Result<()> {
     }
 
     // Run main sync
-    run::run_sync::<chain::EthereumChain>(config, argv).await
+    match config.chain {
+        chain::ChainKind::Mainnet => run::run_sync::<chain::EthereumChain>(config, argv).await,
+        chain::ChainKind::Base => run::run_sync::<chain::BaseChain>(config, argv).await,
+    }
 }
 
 #[cfg(test)]

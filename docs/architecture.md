@@ -1,6 +1,6 @@
 # Architecture
 
-A minimal, stateless Ethereum history indexer that backfills headers, receipts, and logs from the EL P2P network and serves an indexer-friendly RPC subset. It does not execute transactions or maintain state (no EVM, no state trie).
+A minimal, stateless Ethereum/Base history indexer that backfills headers, receipts, and logs from the EL P2P network and serves an indexer-friendly RPC subset. It does not execute transactions or maintain state (no EVM, no state trie).
 
 ## Design Goals
 
@@ -61,7 +61,7 @@ node/src/
               └──────────── SyncProgressStats (atomics) ─────────────────────────────────┘
 ```
 
-1. **P2P** connects to Ethereum mainnet peers and fetches headers, bodies, and receipts (eth/68-70).
+1. **P2P** connects to the selected Ethereum or Base mainnet peers and fetches headers, bodies, and receipts (eth/68-70).
 2. **Sync** schedules work, manages batching and retries, and processes blocks. Tracks progress via atomic counters.
 3. **Storage** persists data in sharded static files with WAL for out-of-order ingestion.
 4. **RPC** serves queries from storage (logs derived on-demand from receipts, segment readers cached via LRU).
@@ -81,13 +81,24 @@ node/src/
 | `SyncProgressStats` | `sync/mod.rs` | Atomic progress counters |
 | `TuiController` | `ui/tui.rs` | Terminal I/O and rendering loop |
 
+`main.rs` dispatches once to `run_sync<EthereumChain>` or `run_sync<BaseChain>`.
+Typed peers/payloads remain chain-specific through fetching and validation.
+`IngestChain` converts them to common storage bundles; deposits preserve explicit
+senders and optional receipt nonces, without fabricated signatures. Ethereum
+keeps its hashing optimization; Base hashes canonical EIP-2718 envelopes.
+
+Metadata selects the Ethereum or OP payload codec. Legacy Ethereum bytes remain
+unchanged; OP receipt types and deposit nonce/version survive WAL, compaction,
+sealing, reads, and rollback. Open/resume/maintenance validate identity before
+mutating files. Peer caches are namespaced by chain ID and genesis.
+
 ## Data Model
 
 ### What We Ingest
 
 To serve `eth_getLogs` correctly (including `transactionHash`/`transactionIndex`/`logIndex`):
 
-- **Headers** (canonical chain): number/hash/parent/timestamp + `logsBloom`
+- **Headers** (observed P2P chain): number/hash/parent/timestamp + `logsBloom`
 - **Tx hashes per block** (from block bodies)
 - **Receipts** per block (from `GetReceipts*`), logs derived at query time
 
@@ -101,13 +112,14 @@ To serve `eth_getLogs` correctly (including `transactionHash`/`transactionIndex`
 
 - **Head source**: best-effort tracking from P2P peer views
 - **Reorg handling**: rollback within configured window (default: 64 blocks)
-- **Future**: integrate beacon API for `safe`/`finalized` head signals
+- **Commitments**: transaction/receipt roots, ommers, fork-aware withdrawals, and log blooms are checked against headers.
+- **Finality**: backfill uses a depth-delayed P2P view; follow uses the probed tip. Neither establishes canonicality, Ethereum consensus finality, or OP safe/finalized status.
 
 ## Storage Layout
 
 ```
 data_dir/
-├── meta.json                          # Schema version, chain id, checkpoints
+├── meta.json                          # Schema, chain ID/genesis, payload codec, checkpoints
 ├── sealed_shards.cache                # Fast-load cache for sealed shards
 └── static/shards/<shard_start>/       # One directory per shard
     ├── shard.json                     # Shard metadata (stats, compaction phase)
@@ -159,6 +171,9 @@ Minimal indexer-compatible subset:
 | `eth_getLogs` | Filtered logs by range, address, topic0 |
 
 Notes:
+- `includeTransactions=true` is rejected with `-32602`
+- `eth_chainId` is `0x1` for Ethereum or `0x2105` for Base
+- Log indices count all logs in a block before filtering
 - `totalDifficulty` mocked to `0x0`
 - `withdrawals` always `null` (not stored)
 - All other methods return `-32601`

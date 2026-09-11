@@ -7,7 +7,7 @@ Main source tree for the Stateless History Node. Contains all application code o
 ## Contents (one hop)
 
 ### Subdirectories
-- [x] `chain/` - Shared Ethereum/Base identities, typed protocol bundles, Base discovery settings, and fork-aware receipt/withdrawals helpers. Exported through `lib.rs`; production Base startup remains gated during integration.
+- [x] `chain/` - Shared Ethereum/Base identities, typed protocol bundles, Base discovery settings, and fork-aware receipt/withdrawals helpers. Exported through `lib.rs`; the binary dispatches Ethereum/Base into their typed runtime.
 - [x] `bin/` - Demo/testing binaries for TUI development (ui_mock, color_test, char_test). Standalone executables with no parent crate imports.
 - [x] `cli/` - CLI argument parsing and central `NodeConfig` struct (40+ parameters). Single source of truth for all runtime configuration. Includes range helpers (`compute_target_range()`).
 - [x] `logging/` - Observability subsystem: async JSON logging with dedup, TUI log capture (`TuiLogBuffer`, `TuiLogLayer`), run reports, platform-specific resource monitoring (Linux proc + macOS sysinfo), SIGUSR1 handler for on-demand state dumps.
@@ -34,7 +34,7 @@ Main source tree for the Stateless History Node. Contains all application code o
 - **Runtime**: `run::run_sync()`, `run::handle_db_stats()`, `run::handle_db_compact()`, `run::handle_repair()`
 - **Storage**: `storage::Storage` (sharded backend)
 - **Sync**: `sync::SyncProgressStats`, `sync::historical::run_ingest_pipeline()`, `sync::historical::run_follow_loop()`
-- **P2P**: `p2p::connect_mainnet_peers()`, `p2p::fetch_payloads_for_peer()`
+- **P2P**: `p2p::connect_peers<C>()`, `p2p::fetch_payloads_for_peer()`
 - **RPC**: `rpc::start()`
 - **Logging**: `logging::init_tracing()`
 - **UI**: `ui::TuiController`, `ui::UIController`

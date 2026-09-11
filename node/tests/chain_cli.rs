@@ -7,7 +7,7 @@ use std::{
 };
 
 #[test]
-fn base_runtime_guard_prevents_storage_creation() -> Result<()> {
+fn invalid_base_range_prevents_storage_creation() -> Result<()> {
     let dir = std::env::temp_dir().join(format!(
         "shinode-cli-guard-{}-{}",
         std::process::id(),
@@ -16,11 +16,11 @@ fn base_runtime_guard_prevents_storage_creation() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_shinode"))
         .args(["--chain", "base", "--data-dir"])
         .arg(&dir)
-        .args(["--start-block", "0"])
+        .args(["--start-block", "10", "--end-block", "9"])
         .output()?;
-    ensure!(!output.status.success(), "Base runtime incorrectly enabled");
+    ensure!(!output.status.success(), "invalid Base range accepted");
     ensure!(
-        String::from_utf8_lossy(&output.stderr).contains("not enabled yet"),
+        String::from_utf8_lossy(&output.stderr).contains("--end-block must be at least --start-block"),
         "unexpected error: {:?}",
         output
     );

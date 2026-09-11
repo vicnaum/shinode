@@ -6,7 +6,7 @@ Full reference for CLI options and environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--chain <mainnet\|base>` | `mainnet` | Select sync identity or assert maintenance identity; Base sync remains gated |
+| `--chain <mainnet\|base>` | `mainnet` | Select sync identity or assert maintenance identity |
 | `--chain-id <u64>` | - | Optional assertion matching the selected chain (1 or 8453) |
 | `--p2p-port <u16>` | `30303` | TCP listener and UDP discovery port (1–65535) |
 | `--trusted-peer <enode>` | - | Repeatable serving-peer URL; accepts IP or DNS hosts |
@@ -28,10 +28,10 @@ is rejected because sync defaults to Ethereum mainnet. Maintenance infers the
 chain from existing metadata when `--chain` is omitted; `--chain-id` then asserts
 that resolved identity.
 
-Base storage maintenance is available. This development version still stops Base
-sync before opening storage or connecting to peers. Typed P2P networking is
-available through the opt-in diagnostic below. Ethereum sync commands continue
-to work, including the new P2P options:
+Both Ethereum and Base dispatch into their typed P2P, sync, and storage pipelines.
+Ethereum remains the default. This development branch targets Base through Beryl;
+see [protocol compatibility](base-protocol.md) for verification and remaining live
+smoke tests. Ethereum commands retain their existing defaults:
 
 ```sh
 shinode --chain mainnet --p2p-port 30309 --data-dir data/ethereum
@@ -53,17 +53,23 @@ readable; legacy data merely labelled `8453` is rejected. Static data without
 `meta.json` requires restoring metadata before maintenance; it is not adopted as
 a new database. Stored shard size is retained automatically.
 
-Use a separate data directory for each chain. The intended Base invocation once
-runtime integration is enabled is:
+Use a separate data directory for each chain. To start Base sync:
 
 ```sh
-shinode --chain base --data-dir data/base --start-block <recent-block-number>
+shinode --chain base --data-dir data/base --start-block <recent-block-number> \
+  --p2p-port 30309 --rpc-bind 127.0.0.1:8546
 ```
 
 Select a recent block for a recent-history backfill. For older ranges, add
 `--trusted-peer enode://<public-key>@<archive-host>:<port>` for a node that actually
 serves that history; the flag may be repeated. Discovery or a successful
 connection does not guarantee historical receipt availability.
+
+For public Base P2P peers, plan around a roughly 30-day recent-history window.
+Base's [published pruned snapshots](https://github.com/base/base/blob/main/.env.mainnet)
+use 1,339,200 blocks (about 31 days); individual operators can change retention.
+Choose an older start only with a peer that serves the required bodies and
+receipts. This upstream limit does not prune history already stored by Shinode.
 
 New storage metadata records genesis and the requested start block. Base resume
 without `--start-block` requires matching chain/genesis metadata and reuses the
@@ -72,6 +78,19 @@ revisited. An explicit lower start extends that saved range; a higher start does
 not discard it. Legacy Ethereum metadata remains readable, but a legacy numeric
 label of 8453 is not sufficient to identify Base data. Maintenance commands do
 not require a start block or change a saved sync range.
+
+Backfill is capped at the observed P2P head minus `--rollback-window` (default
+64 blocks). Follow mode tracks the probed tip and rolls back only within that
+window. These views are not OP `safe` or `finalized`, and block tags with those
+names are unsupported. Root checks establish consistency with peer headers, not
+canonicality or L1 finality. A bounded `--end-block` run finalizes and exits;
+omit that flag to follow and serve RPC after the first synced edge.
+
+Base uses the same RPC subset: `eth_chainId` (`0x2105`), `eth_blockNumber`,
+`eth_getBlockByNumber` with `includeTransactions=false`, and `eth_getLogs`.
+`includeTransactions=true` returns `-32602`; no execution, receipt endpoint,
+or additional OP RPC methods are implied. Logs use block-wide indices, including
+when address/topic filters omit earlier logs.
 
 ## Peer caches and connectivity diagnostics
 

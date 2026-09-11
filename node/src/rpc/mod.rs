@@ -37,7 +37,7 @@ pub struct RpcConfig {
 impl From<&NodeConfig> for RpcConfig {
     fn from(config: &NodeConfig) -> Self {
         Self {
-            chain_id: config.chain_id,
+            chain_id: config.chain.chain_id(),
             max_request_body_bytes: config.rpc_max_request_body_bytes,
             max_response_body_bytes: config.rpc_max_response_body_bytes,
             max_connections: config.rpc_max_connections,
@@ -357,12 +357,15 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                         continue;
                     }
                     let block_hash = SealedHeader::seal_slow(header.clone()).hash();
+                    let mut block_log_index = 0_u64;
                     for (tx_index, (receipt, tx_hash)) in stored
                         .iter()
                         .zip(tx_hashes.hashes.iter())
                         .enumerate()
                     {
-                        for (log_index, log) in receipt.logs().iter().cloned().enumerate() {
+                        for log in receipt.logs().iter().cloned() {
+                            let log_index = block_log_index;
+                            block_log_index += 1;
                             let alloy_primitives::Log { address, data } = log;
                             let (topics, data) = data.split();
                             let derived_log = DerivedLog {
@@ -373,7 +376,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                                 block_hash,
                                 transaction_hash: *tx_hash,
                                 transaction_index: tx_index as u64,
-                                log_index: log_index as u64,
+                                log_index,
                                 removed: false,
                             };
                             if log_matches(
@@ -1122,3 +1125,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod chain_tests;

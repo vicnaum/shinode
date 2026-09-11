@@ -87,7 +87,7 @@ RPC limits, fast-sync scheduling, storage sharding, logging, and operational mod
 1. Parse argv into `NodeConfig` via clap derive.
 2. Apply defaults for missing flags (RPC limits, fast-sync scheduling, log outputs).
 3. Call the fallible `NodeConfig::normalize()` to resolve chain identity/range and propagate flags like `--log`. Clap-derived parsing alone does not resolve runtime fields; production uses `from_args()` and tests can use `try_from_args()`.
-4. `main.rs` calls `ensure_runtime_supported()` before dispatch: Base sync remains gated; validated maintenance is allowed.
+4. `main.rs` dispatches sync to the selected Ethereum/Base typed runtime after configuration/identity validation; maintenance uses the resolved storage identity.
 5. If subcommand present (`db stats` / `db compact`), dispatch to handler and return.
 6. If `--repair` flag, run `Storage::repair()` and return.
 7. Otherwise, pass full config to `run::run_sync()` for main operation.
