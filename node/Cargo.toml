@@ -27,6 +27,17 @@ reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc
 reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["secp256k1", "serde-bincode-compat"] }
+# Base protocol support. Keep every Reth crate on the same revision.
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["superchain-configs"] }
+reth-optimism-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["serde", "serde-bincode-compat"] }
+reth-optimism-forks = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-optimism-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+op-alloy-consensus = { version = "0.23", features = ["k256", "serde", "serde-bincode-compat"] }
+alloy-eips = "1.4.3"
+discv5 = "0.10.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
