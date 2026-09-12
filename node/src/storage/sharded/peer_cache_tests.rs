@@ -54,11 +54,13 @@ fn shared_cache_isolates_chain_identity_and_preserves_legacy_ethereum() -> Resul
         "Ethereum cache allowed Base network"
     );
     base_store.validate_peer_cache_identity(base.chain_id, base.genesis_hash)?;
+    drop(base_store);
     let reopened = Storage::open(&base)?;
     ensure!(
         reopened.peer_cache_snapshot()[0].peer_id == "base-only",
         "Base cache did not persist"
     );
+    drop(eth);
     let reopened_eth = Storage::open(&mainnet)?;
     ensure!(
         reopened_eth.peer_cache_snapshot()[0].peer_id == "legacy",
@@ -74,7 +76,7 @@ fn shared_cache_isolates_chain_identity_and_preserves_legacy_ethereum() -> Resul
     other.data_dir = root.join("different-genesis");
     other.genesis_hash = alloy_primitives::B256::repeat_byte(1);
     let foreign_dir = namespaced_peer_cache_dir(&root, other.chain_id, other.genesis_hash);
-    ensure!(foreign_dir != base_store.peer_cache_dir, "genesis namespaces collided");
+    ensure!(foreign_dir != reopened.peer_cache_dir, "genesis namespaces collided");
     ensure!(Storage::open(&other).is_err(), "foreign genesis configuration accepted");
     ensure!(!other.data_dir.exists() && !foreign_dir.exists(), "rejected identity created directories");
     fs::remove_dir_all(root)?;
@@ -102,7 +104,9 @@ fn namespaced_cache_preserves_ttl_cap_addresses_and_aimd() -> Result<()> {
         loaded.peers.len() == 1 && loaded.peers[0].peer_id == "newest",
         "wrong peer retained"
     );
-    let persisted = Storage::open(&config)?.peer_cache_snapshot();
+    drop(storage);
+    let storage = Storage::open(&config)?;
+    let persisted = storage.peer_cache_snapshot();
     ensure!(
         persisted[0].aimd_batch_limit == Some(64),
         "AIMD was lost on refresh/reopen"
@@ -114,6 +118,7 @@ fn namespaced_cache_preserves_ttl_cap_addresses_and_aimd() -> Result<()> {
     // A populated legacy file must not override an existing empty namespace.
     persist_peer_cache(&root, &[stored_peer("legacy", 999)?])?;
     storage.load_peers(1000, 1)?;
+    drop(storage);
     ensure!(
         Storage::open(&config)?.peer_cache_snapshot().is_empty(),
         "legacy peers resurrected after TTL expiry"

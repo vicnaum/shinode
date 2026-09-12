@@ -25,6 +25,7 @@ pub(super) fn arguments(root: &Path) -> SnapshotArgs {
         output_dir: Some(root.join("output")),
         dry_run: false,
         offline: true,
+        keep_scratch: true,
         max_download_bytes: 512 * 1024 * 1024,
         max_extracted_bytes: 1024 * 1024 * 1024,
         min_free_bytes: 0,
@@ -36,7 +37,7 @@ pub(super) fn arguments(root: &Path) -> SnapshotArgs {
     }
 }
 
-fn config(args: &SnapshotArgs) -> Result<NodeConfig> {
+pub(super) fn config(args: &SnapshotArgs) -> Result<NodeConfig> {
     let mut config = crate::test_utils::base_config(
         args.output_dir
             .clone()
@@ -50,10 +51,10 @@ fn config(args: &SnapshotArgs) -> Result<NodeConfig> {
     Ok(config)
 }
 
-struct Fixture {
-    root: PathBuf,
-    args: SnapshotArgs,
-    payloads: Vec<BlockPayload<BaseChain>>,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) args: SnapshotArgs,
+    pub(super) payloads: Vec<BlockPayload<BaseChain>>,
 }
 
 impl Drop for Fixture {
@@ -88,7 +89,7 @@ fn fixture_payloads(bad_last: bool) -> Vec<BlockPayload<BaseChain>> {
     payloads
 }
 
-fn fixture(bad_last: bool) -> Result<Fixture> {
+pub(super) fn fixture(bad_last: bool) -> Result<Fixture> {
     let root = crate::test_utils::temp_dir("snapshot");
     fs::create_dir_all(&root)?;
     let mut args = arguments(&root);

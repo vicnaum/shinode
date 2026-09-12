@@ -85,13 +85,7 @@ pub fn check_space(path: &Path, reserve: u64, amount: u64) -> Result<()> {
 }
 
 pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let temporary = path.with_extension("json.tmp");
-    let mut file = File::create(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    crate::storage::durable::atomic_write(path, &serde_json::to_vec_pretty(value)?)
 }
 
 fn reject_symlinks(root: &Path) -> Result<()> {
@@ -137,12 +131,26 @@ pub fn lock_staging(root: &Path, plan: &Plan, raw: &[u8]) -> Result<File> {
         );
     } else {
         for entry in fs::read_dir(root)? {
+            let name = entry?.file_name();
             ensure!(
-                entry?.file_name() == ".lock",
+                [
+                    ".lock",
+                    "manifest.json",
+                    "manifest.json.tmp",
+                    "job.json.tmp"
+                ]
+                .iter()
+                .any(|allowed| name == *allowed),
                 "refusing to adopt nonempty staging directory"
             );
         }
-        fs::write(root.join("manifest.json"), raw)?;
+        if root.join("manifest.json").exists() {
+            ensure!(
+                fs::read(root.join("manifest.json"))? == raw,
+                "staged manifest changed during initialization"
+            );
+        }
+        crate::storage::durable::atomic_write(&root.join("manifest.json"), raw)?;
         atomic_json(&marker, &identity)?;
     }
     for folder in ["archives", "partial", "chunks"] {
@@ -152,6 +160,7 @@ pub fn lock_staging(root: &Path, plan: &Plan, raw: &[u8]) -> Result<File> {
 }
 
 pub fn stage(root: &Path, plan: &Plan, args: &SnapshotArgs) -> Result<()> {
+    let mut ownership = super::scratch::Ownership::prepare(root, plan)?;
     progress(&format!(
         "Input: {} compressed / {} extracted bytes; limits: {} / {}, free reserve: {} bytes",
         plan.compressed_bytes,
@@ -169,7 +178,7 @@ pub fn stage(root: &Path, plan: &Plan, args: &SnapshotArgs) -> Result<()> {
     for chunk in &plan.chunks {
         let temp = root.join("partial").join(&chunk.name);
         if temp.exists() {
-            fs::remove_dir_all(temp)?;
+            clear_partial(&temp, chunk)?;
         }
         if !chunk_path(root, chunk).exists() {
             remaining = remaining
@@ -237,6 +246,7 @@ pub fn stage(root: &Path, plan: &Plan, args: &SnapshotArgs) -> Result<()> {
             .unwrap_or(0);
         return Err(failures.swap_remove(index));
     }
+    ownership.verified(root, plan)?;
     atomic_json(
         &root.join("download-report.json"),
         &serde_json::json!({
@@ -550,6 +560,29 @@ fn collect_files(root: &Path, path: &Path, files: &mut Vec<String>) -> Result<()
             );
         }
     }
+    Ok(())
+}
+
+fn clear_partial(directory: &Path, chunk: &Chunk) -> Result<()> {
+    let mut files = Vec::new();
+    collect_files(directory, directory, &mut files)?;
+    ensure!(
+        files
+            .iter()
+            .all(|path| chunk.files.iter().any(|file| file.path == *path)),
+        "unrelated files in partial extraction; move them before retrying"
+    );
+    // Only declared files may exist here. Preserve unknown directories as well.
+    for file in files {
+        let path = directory.join(file);
+        fs::remove_file(&path)?;
+    }
+    match fs::remove_dir(directory.join("static_files")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::remove_dir(directory)?;
     Ok(())
 }
 

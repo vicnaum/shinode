@@ -49,7 +49,7 @@ impl Bitset {
     }
 
     pub fn flush(&self, path: &Path) -> Result<()> {
-        fs::write(path, &self.bytes).wrap_err("failed to write present.bitset")
+        crate::storage::durable::atomic_write(path, &self.bytes).wrap_err("failed to write present.bitset")
     }
 
     pub fn is_set(&self, offset: usize) -> bool {

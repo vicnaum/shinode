@@ -44,6 +44,10 @@ pub fn append_records(path: &Path, records: &[WalRecord]) -> Result<()> {
         file.write_all(&crc.to_le_bytes())?;
     }
     file.flush()?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        crate::storage::durable::sync_directory(parent)?;
+    }
     Ok(())
 }
 

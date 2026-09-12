@@ -63,6 +63,8 @@ Cheap aggregation across all shards via `Storage::aggregate_stats()` (no disk I/
   - Uses `hash::compute_shard_hash()` when sealing complete shards.
   - Reports dirty shards (WAL bytes + sorted state) for `db_writer` finalization logging.
   - `compaction_copy_bytes()` measures existing sorted files and bitsets once per affected shard for snapshot working-space checks; incoming data is budgeted separately.
+  - `open_with_progress()` acquires a destination writer lease before mutation; `open_locked()` reuses an existing lease across importer reopen. `repair()` takes the same lock.
+  - Metadata and bitsets use atomic synced publication; WAL appends and replacement segments are synced before compaction swaps. `recount_stats_in_range()` reconciles counters after recovery before snapshot checkpoints.
   - `write_block_bundle_follow()` expects in-order appends; the follow DB writer enforces ordering via a reorder buffer.
   - Segment cache invalidation on compaction, rollback, and follow writes.
   - Exports `Storage` and `StorageAggregateStats` to parent module.

@@ -166,7 +166,7 @@ The measurements above describe the original phase-1/2 experiment, which importe
 only two selected eight-block shards. Python prototype scripts and raw manifests,
 archives, RPC responses and timing logs remain local, outside the intended PR.
 The production guide records the supported format, resource limits and remaining
-append/resume/P2P handoff work.
+later-fork and P2P handoff work.
 
 ## Validation
 

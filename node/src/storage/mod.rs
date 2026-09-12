@@ -11,6 +11,9 @@ use reth_primitives_traits::{serde_bincode_compat::SerdeBincodeCompat, Header};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 mod codec;
+pub mod durable;
+mod lock;
+pub use lock::DataDirLock;
 pub use codec::StorageCodec;
 
 pub const ZSTD_DICT_MAX_SIZE: usize = 5000;

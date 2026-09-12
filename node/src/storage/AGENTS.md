@@ -14,6 +14,8 @@ Note: Withdrawals and logs are not stored -- logs are derived on-demand from rec
 - [x] `sharded/` - Sharded static-file backend (schema v2) with WAL-based writes, per-shard bitset tracking, atomic three-phase compaction, LRU-cached reads, and crash recovery. See `sharded/AGENTS.md`.
 
 ### Files
+- `lock.rs` - OS advisory data-directory writer lease, shared by sync/import/maintenance; kept across importer reopen using `Arc<DataDirLock>`.
+- `durable.rs` - Atomic file publication, directory sync and recursive output durability barriers.
 - `codec.rs` - Metadata-selected `EthereumV1` / `OpV1` receipt and transaction codecs; preserves legacy Ethereum bincode bytes.
 - `chain_tests.rs` - Deposit processing, codec compatibility, WAL/compaction/sealing/follow/rollback round trips, and codec rejection tests.
 - `mod.rs` - Storage types and bincode serialization helpers (~170 lines). Defines all data containers and re-exports `Storage`/`StorageAggregateStats` from `sharded`.

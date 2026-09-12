@@ -19,7 +19,7 @@ pub struct SnapshotArgs {
     /// Private resumable input staging directory, separate from node storage.
     #[arg(long, required_unless_present = "dry_run")]
     pub staging_dir: Option<PathBuf>,
-    /// New node data directory. Existing directories are refused in this phase.
+    /// Node data directory; matching Base history is reused and gaps are filled.
     #[arg(long, required_unless_present = "dry_run")]
     pub output_dir: Option<PathBuf>,
     /// Inspect dependencies and resource requirements without writing or downloading.
@@ -28,6 +28,9 @@ pub struct SnapshotArgs {
     /// Use verified staged chunks only; make no archive requests.
     #[arg(long)]
     pub offline: bool,
+    /// Retain importer-created input files after verified durable completion.
+    #[arg(long)]
+    pub keep_scratch: bool,
     #[arg(long, default_value_t = 536_870_912)]
     pub max_download_bytes: u64,
     #[arg(long, default_value_t = 1_073_741_824)]

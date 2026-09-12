@@ -8,8 +8,9 @@ executable are not required at runtime.
 The initial production reader supports the verified Base V2 producer
 `2.5.2-dev (76a8261)` and **pre-Canyon bodies only**. Later-fork headers, unknown
 producer versions, pruned inputs and incompatible archive layouts are rejected.
-It requires a **new output directory**. Append/resume of node imports, automatic
-scratch reclamation and P2P handoff remain subsequent phases.
+Imports can resume into a matching Base database and fill gaps. Matching blocks
+are reused; conflicting hashes or stored fields stop the job before new blocks
+are added. Later forks and automatic P2P handoff remain unsupported.
 
 ## Inspect the input
 
@@ -63,14 +64,26 @@ reader's supported fork range; inspection is not a promise that it can be import
 
 Base is the command's default chain. An explicit conflicting chain or chain ID is
 rejected. Staging and output must be separate directories and cannot be nested.
-Any existing output directory is refused, including an empty one. Existing
-Ethereum/Base databases and conflicting overlaps are therefore preserved.
+The output may be new, empty, or a matching Base database. Unrelated nonempty
+directories and mismatched chain/genesis/codec/shard settings are refused. Use the
+same `--shard-size` and storage options when reopening an existing database.
 
 Add `--offline` to use verified staged chunks without archive requests. The same
 manifest and range must match staging's saved identity. After a download or
-preflight failure, repeat the command to resume staging. If writing to the output
-has already started and the process fails, use a new output directory: import
-checkpoints and recovery into an existing destination are not implemented yet.
+preflight or import failure, repeat the same command to resume. Durable checkpoints
+under `snapshot-imports/` bind the manifest, range, chain, and reader format.
+Recovered WAL/segment coverage is authoritative; a saved counter never skips a
+gap. The reader still scans from genesis when conversion must resume.
+
+Both staging and the output have exclusive advisory locks. Normal sync, import,
+compaction, cache rebuild, and repair share the output writer lock. Stop the node
+before importing into its database. Lock files remain in place after exit; the
+operating system releases the lease when the process closes or crashes.
+
+For another range or manifest, use a separate staging directory. The output can
+contain multiple import jobs, each with its own checkpoint. After successful
+completion, rerunning the same job verifies all stored fields against its saved
+digest and can finish interrupted cleanup without downloading inputs again.
 
 | Limit | Default | Option |
 | --- | --- | --- |
@@ -91,9 +104,17 @@ and compaction, budgeting the incoming batch plus a copy of each affected shard'
 existing sorted files and bitset; storage failures are surfaced rather than
 reported as successful imports.
 
-Archives and verified chunks are retained. Peak input space includes both the
-compressed and extracted selection. The output database and compaction working
-space are additional. This phase does not yet reclaim inputs after conversion.
+By default, successful import reclaims input files created by that job after
+durable output verification and reopen. Add `--keep-scratch` to retain them.
+Pre-existing archives/chunks, the supplied manifest, unrelated files, and files
+changed since verification are preserved. Cleanup records exact owned paths and
+fingerprints; it does not recursively delete the staging directory. Reports, job
+identity, ownership metadata, and lock files remain for retries.
+
+Peak input space still includes the full compressed and extracted selection.
+Cleanup happens after the whole requested range is verified, so this is not yet a
+rolling, constant-space importer. The output database and compaction working
+space are additional; explicit transfer/extraction limits continue to bound inputs.
 
 ## Validation and publication
 
@@ -117,15 +138,22 @@ after its complete verified extraction directory is renamed into place. An
 interrupted extraction is retried from its retained archive; only that job's
 unfinished extraction directory is cleared. Restarts rehash verified files.
 
-Before creating output storage, Shinode scans the entire required prefix, checks
+Before writing imported blocks, Shinode scans the entire required prefix, checks
 the Base genesis, header hashes and parent continuity, reconstructs transaction
 boundaries, checks transaction/receipt types, gas, roots, bloom and withdrawals,
 and verifies conversion through `BaseChain::process_ingest`. Transaction-number
-continuity and full row consumption are checked at archive boundaries. A second
-bounded pass writes only the requested blocks; it does not buffer the whole range.
+continuity and full row consumption are checked at archive boundaries. An overlap
+pass compares existing headers, transactions, receipts and block sizes before any
+new block is added. A bounded write pass imports only missing blocks; it does not
+buffer the whole range.
 
-The importer compacts and seals completed shards, reopens storage, checks coverage,
-and writes `snapshot-import.json` only after successful completion. Progress reports
+The importer compacts and seals completed shards, flushes durable output, reopens
+storage, and compares every requested stored block against the digest of validated
+source bundles. Only then does it publish a completed checkpoint and
+`snapshot-import.json` and allow cleanup. WAL data is synced before compaction;
+metadata/bitsets use atomic writes, and replacement segments are synced before
+the compaction swap. These barriers add write latency compared with the initial
+importer. Progress reports
 archive sizes and limits, transferred bytes, verification progress, imported block
 counts, average throughput and stored bytes on stderr. Existing
 storage/RPC formats are reused. Snapshot checksums and internally consistent blocks
@@ -170,3 +198,19 @@ repository. They are not part of the production workflow or the intended PR.
 Raw manifests, snapshots, databases and RPC reports remain local. The implementation
 and reusable Rust tests are intended for the PR; temporary plans and Python
 prototypes are excluded.
+
+## Resume and cleanup validation (2026-09-12)
+
+- Workspace suite: **131 passed, six ignored**. The final focused resume suite
+  passed **11 tests**, including one subsequently added initialization recovery
+  test. Coverage includes partial WAL, compaction phases, stale/torn checkpoints,
+  overlap conflicts, gaps, writer exclusion, and conservative scratch cleanup.
+- The production importer wrote **544 blocks**, reopened and verified them, then
+  repeated the same job successfully without using input chunks. All **16 sampled
+  RPC responses** matched the previously independently checked reference.
+- The supported build without default features passed. New code has no Clippy
+  diagnostics; pre-existing workspace lint failures remain.
+
+The interruption tests inject failures or construct interrupted filesystem states;
+they do not simulate hardware power loss. The sample remains pre-Canyon and does
+not establish arbitrary later-fork support or full-history throughput.

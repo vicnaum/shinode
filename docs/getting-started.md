@@ -88,8 +88,8 @@ not a public-network guarantee. Base's current
 describes the full preset as retaining only 10,064 blocks (about 5–6 hours).
 Older backfills need a peer retaining and serving the requested bodies and receipts.
 The [snapshot importer](base-snapshot-download.md) provides an alternative for
-verified pre-Canyon history from the pinned Base V2 snapshot. It currently requires
-a fresh output directory; later forks and automatic P2P handoff are not supported.
+verified pre-Canyon history from the pinned Base V2 snapshot. It supports resumable imports
+into matching Base storage; later forks and automatic P2P handoff are not supported.
 Shinode keeps the history it has already downloaded; upstream pruning does not
 delete it locally.
 Metadata prevents opening a populated directory as a different chain.

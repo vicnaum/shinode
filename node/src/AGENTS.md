@@ -7,7 +7,7 @@ Main source tree for the Stateless History Node. Contains all application code o
 ## Contents (one hop)
 
 ### Subdirectories
-- [x] `snapshot/` - Rust-only Base V2 snapshot inspection, selective resumable staging and validated pre-Canyon import into fresh storage. See `snapshot/AGENTS.md`.
+- [x] `snapshot/` - Rust-only Base V2 snapshot inspection, resumable staging/import, overlap verification and owned scratch cleanup for pre-Canyon history. See `snapshot/AGENTS.md`.
 - [x] `chain/` - Shared Ethereum/Base identities, typed protocol bundles, Base discovery settings, and fork-aware receipt/withdrawals helpers. Exported through `lib.rs`; the binary dispatches Ethereum/Base into their typed runtime.
 - [x] `bin/` - Demo/testing binaries for TUI development (ui_mock, color_test, char_test). Standalone executables with no parent crate imports.
 - [x] `cli/` - CLI argument parsing and central `NodeConfig` struct (40+ parameters). Single source of truth for all runtime configuration. Includes range helpers (`compute_target_range()`).

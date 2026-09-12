@@ -439,6 +439,7 @@ impl SegmentWriter {
 }
 
 pub struct Storage {
+    _writer_lock: Arc<crate::storage::DataDirLock>,
     data_dir: PathBuf,
     peer_cache_dir: PathBuf,
     meta: Mutex<MetaState>,
@@ -496,11 +497,22 @@ impl Storage {
 
     /// Open storage with a progress callback.
     /// The callback receives (current_shard, total_shards) during shard scanning.
-    #[expect(clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
     pub fn open_with_progress<F>(config: &NodeConfig, on_progress: F) -> Result<Self>
     where
         F: Fn(usize, usize),
     {
+        Self::validate_existing(config)?;
+        let lock = Arc::new(crate::storage::DataDirLock::acquire(&config.data_dir)?);
+        Self::open_locked(config, lock, on_progress)
+    }
+
+    /// Reopen under an existing writer lease without an unlocked interval.
+    #[expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
+    pub fn open_locked<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
+        lock.validate(&config.data_dir)?;
         let open_start = std::time::Instant::now();
         tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
 
@@ -548,6 +560,7 @@ impl Storage {
         fs::create_dir_all(&static_dir).wrap_err("failed to create static dir")?;
         let shards_root = shards_dir(&config.data_dir);
         fs::create_dir_all(&shards_root).wrap_err("failed to create shards dir")?;
+        crate::storage::durable::sync_directory(&static_dir)?;
 
         // Pre-scan to collect shard directories and get total count for progress
         let shard_entries: Vec<_> = fs::read_dir(&shards_root)?
@@ -739,6 +752,7 @@ impl Storage {
                 .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero")),
         );
         Ok(Self {
+            _writer_lock: lock,
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
             meta: Mutex::new(meta),
@@ -758,6 +772,8 @@ impl Storage {
         if !config.data_dir.exists() {
             return Ok(RepairReport { shards: vec![] });
         }
+        let _lock = crate::storage::DataDirLock::acquire(&config.data_dir)?;
+        Self::validate_existing(config)?;
 
         let shards_root = shards_dir(&config.data_dir);
         if !shards_root.exists() {
@@ -1121,6 +1137,22 @@ impl Storage {
             total = total.saturating_add(file_size(&bitset_path(&dir))?);
         }
         Ok(total)
+    }
+
+    /// Reconcile counters after recovery, including a crash before final compaction metadata.
+    pub fn recount_stats_in_range(&self, start: u64, end: u64) -> Result<()> {
+        let shards = self.shards.lock();
+        for shard in shards.values() {
+            let mut state = shard.lock();
+            let shard_end = state.meta.shard_start.saturating_add(state.meta.shard_size - 1);
+            if state.meta.shard_start > end || shard_end < start {
+                continue;
+            }
+            eyre::ensure!(state.meta.sorted, "compact recovered WAL before recounting statistics");
+            recount_sorted_stats(&mut state, self.codec)?;
+            persist_shard_meta(&state.dir, &state.meta)?;
+        }
+        Ok(())
     }
 
     pub fn write_block_bundles_wal(&self, bundles: &[BlockBundle]) -> Result<Vec<u64>> {
@@ -1542,6 +1574,7 @@ impl Storage {
 
         let t0 = std::time::Instant::now();
         writers.finish()?;
+        crate::storage::durable::sync_tree(&temp_dir)?;
         tracing::debug!(
             shard = shard_start,
             elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -2034,7 +2067,6 @@ impl Storage {
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "transaction metadata read API for storage verification and future RPC"))]
     pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
         self.with_readers_for_present_block(number, |segments| {
             segments.tx_meta.read_row_raw(number)?
@@ -2201,6 +2233,7 @@ impl Storage {
             disk_bytes_total: 0,
         };
         persist_shard_meta(&dir, &meta)?;
+        crate::storage::durable::sync_directory(&shards_dir(&self.data_dir))?;
         let state = ShardState {
             dir,
             meta,
@@ -2595,7 +2628,7 @@ fn load_meta(path: &Path) -> Result<MetaState> {
 
 fn persist_meta(path: &Path, meta: &MetaState) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(meta).wrap_err("failed to encode meta.json")?;
-    fs::write(path, bytes).wrap_err("failed to write meta.json")
+    crate::storage::durable::atomic_write(path, &bytes).wrap_err("failed to write meta.json")
 }
 
 fn load_shard_meta(shard_dir: &Path) -> Result<ShardMeta> {
@@ -2606,7 +2639,7 @@ fn load_shard_meta(shard_dir: &Path) -> Result<ShardMeta> {
 
 fn persist_shard_meta(shard_dir: &Path, meta: &ShardMeta) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(meta).wrap_err("failed to encode shard.json")?;
-    fs::write(shard_meta_path(shard_dir), bytes).wrap_err("failed to write shard.json")
+    crate::storage::durable::atomic_write(&shard_meta_path(shard_dir), &bytes).wrap_err("failed to write shard.json")
 }
 
 fn recount_sorted_stats(state: &mut ShardState, codec: StorageCodec) -> Result<()> {
