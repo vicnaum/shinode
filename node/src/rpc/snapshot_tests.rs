@@ -41,6 +41,8 @@ async fn import_snapshot_sample() -> Result<()> {
         "4984".to_owned(),
         "--end-block".to_owned(),
         "5527".to_owned(),
+        "--checkpoint-hash".to_owned(),
+        "0x2246525ba06cf8771e47607736d502e446cf5cffe00a2646ceb12de043d4205f".to_owned(),
         "--staging-dir".to_owned(),
         root.display().to_string(),
         "--output-dir".to_owned(),
@@ -52,6 +54,8 @@ async fn import_snapshot_sample() -> Result<()> {
     };
     snapshot::run(config.clone(), args).await?;
     let storage = Arc::new(Storage::open(&config)?);
+    storage.validate_snapshot_boundary()?;
+    ensure!(storage.last_indexed_block()? == Some(5527), "wrong anchored head");
     let rpc = module(RpcContext {
         config: RpcConfig::from(&config),
         storage: Arc::clone(&storage),

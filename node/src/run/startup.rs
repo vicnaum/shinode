@@ -209,10 +209,14 @@ pub async fn init_storage(
         }
     })?);
 
-    // Resume behavior: if the previous run exited before compaction finished, ensure we
-    // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
-    // across restarts. Skip when --defer-compaction is set (user can run `db compact`).
-    let dirty_shards = if config.defer_compaction {
+    // Anchored writes start after compacted coverage, while missing-block detection
+    // also counts WAL. Recover all anchored WAL first, including incomplete shards,
+    // regardless of deferred compaction, so the ordered writer cannot wait on a
+    // pending block that the scheduler considers already present.
+    let dirty_shards = if storage.snapshot_boundary().is_some() {
+        storage.dirty_shards()?.into_iter()
+            .map(|shard| shard.shard_start).collect()
+    } else if config.defer_compaction {
         vec![]
     } else {
         storage.dirty_complete_shards()?
@@ -222,7 +226,7 @@ pub async fn init_storage(
         let status_msg = format!("Compacting {shard_count} shards...");
         ui::print_status_bar(&status_msg);
         update_tui_startup(tui, &status_msg, log_buffer.as_ref());
-        info!(shard_count, "startup: compacting completed dirty shards");
+        info!(shard_count, "startup: compacting recovered dirty shards");
         let storage_clone = Arc::clone(&storage);
         tokio::task::spawn_blocking(move || -> Result<()> {
             for shard_start in dirty_shards {

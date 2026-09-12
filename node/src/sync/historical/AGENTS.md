@@ -11,6 +11,11 @@ benchmark stats/event logging.
 - (none)
 
 ### Files
+- `handoff.rs` - `preflight_snapshot_handoff()` probes actual successor payloads
+  against the stored parent, with bounded peer/time limits and explicit retention
+  gap or boundary-conflict errors. Called at startup, follow epochs and stalls.
+  `reconcile_snapshot_tip()` handles followed-tip reorgs before startup/follow
+  probes, within both the rollback window and the trusted boundary.
 - `db_writer.rs` - Batched DB writer that buffers `BlockBundle`s, writes WAL/follow segments, and triggers compaction + sealing.
   - **Key items**: `DbWriteConfig`, `DbWriteMode`, `DbWriterMessage`, `DbWriterFinalizeStats`, `DbWriterParams`, `FlushContext`, `ShardRemainingTracker`, `run_db_writer()`, `flush_fast_sync_buffer()`, `finalize_fast_sync()`, `db_bytes_for_bundles()`
 - `history_tests.rs` - Normal and escalation scheduling tests for advertised peer history bounds.
@@ -94,6 +99,17 @@ benchmark stats/event logging.
 - **Knobs / invariants**: Requires tx count to match receipts count; logs are counted from receipts and derived at query time.
 
 ### `db_writer.rs`
+- Snapshot-backed storage always uses ordered follow writes, starting after its
+  contiguous indexed head. Finalization rejects uncommitted newer blocks behind
+  a gap; scheduling caps lookahead by `fast_sync_max_buffered_blocks`.
+  Fetch policy remains tied to the requested sync phase, so ordered backfill
+  retains historical peer eligibility. `DbWriterMessage::Cancel` discards
+  uncommitted buffers on cancellation; `Finalize` still rejects anchored gaps.
+  The writer also receives the stop watch directly and checks it before applying
+  queued or buffered blocks, so cancellation takes effect during worker drain.
+  A write that has already started still propagates its storage errors.
+  The pipeline returns `Cancelled` rather than `RangeApplied`, allowing follow
+  to consume its queued reorg result and roll back before the next epoch.
 - **Role**: Applies `BlockBundle` writes to storage and manages compaction/sealing so reads work after ingest completes. Supports both fast-sync (WAL-based batched) and follow-mode (reorder buffer) writes.
 - **Key items**: `run_db_writer()`, `DbWriterParams`, `FlushContext`, `flush_fast_sync_buffer()`, `finalize_fast_sync()`, `DbWriteMode::{FastSync, Follow}`, `DbWriterMessage::{Block, Finalize}`, `DbWriterFinalizeStats`, `DbWriteConfig`, `ShardRemainingTracker`, `db_bytes_for_bundles()`
 - **Interactions**: Calls `Storage::write_block_bundles_wal()` (fast sync) or `Storage::write_block_bundle_follow()` (follow). Follow writes gated by `BTreeMap<u64, BlockBundle>` reorder buffer. Returns finalize timing stats. Spawns per-shard compaction tasks as shards complete (skipped when `defer_compaction` is set).

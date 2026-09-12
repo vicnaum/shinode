@@ -75,6 +75,10 @@ Designed for read-only access with configurable rate limiting; no state executio
 
 ## Notes
 
+`test_module()` exposes the production RPC module to snapshot handoff tests
+without binding a socket. The opt-in real snapshot proof records the independently
+checked block-5,527 boundary hash and verifies anchored continuity after reopen.
+
 Log derivation uses the common `TxReceipt` accessors on `StoredReceiptRef`, supporting both stored receipt variants while retaining the existing RPC contract.
 
 `RpcConfig` derives numeric identity from the resolved chain. `eth_getLogs` counts

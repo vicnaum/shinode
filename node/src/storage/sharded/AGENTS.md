@@ -9,6 +9,10 @@ Sharded static-file storage backend (schema v2) for Ethereum history data. Divid
 - (none)
 
 ### Files
+- `handoff.rs` - Durable snapshot boundary identity, contiguous indexed-head
+  calculation, parent-linked append checks and rollback fence. Sync restores the
+  recorded lower bound and rejects unarmed imports. Startup verifies the anchored
+  header chain; later shards cannot advance `last_indexed_block()` across gaps.
 - `identity.rs` - Shared read-only metadata/config validation, legacy Ethereum compatibility, and maintenance chain resolution.
 - `identity_tests.rs` - Populated chain-switch, recovery-sentinel, orphan-data, and legacy/mislabeled metadata tests.
 - `bitset.rs` - Persistent bitset used to track which block offsets exist in a shard.

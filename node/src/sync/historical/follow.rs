@@ -366,6 +366,9 @@ pub async fn run_follow_loop<C: IngestChain>(
             stats.set_head_seen(observed_head);
         }
 
+        if super::reconcile_snapshot_tip(&storage, &pool, config.rollback_window).await? {
+            continue;
+        }
         let start = last_indexed
             .map_or(config.start_block, |block| block.saturating_add(1))
             .max(config.start_block);
@@ -373,6 +376,7 @@ pub async fn run_follow_loop<C: IngestChain>(
         if let Some(end) = config.end_block {
             target_head = target_head.min(end);
         }
+        super::preflight_snapshot_handoff(&storage, &pool, target_head).await?;
 
         if start > target_head {
             if let Some(stats) = stats.as_ref() {
@@ -396,7 +400,7 @@ pub async fn run_follow_loop<C: IngestChain>(
             sleep(Duration::from_millis(FOLLOW_NEAR_TIP_BACKOFF_MS)).await;
         }
 
-        if let Some(last_indexed) = last_indexed {
+        if let Some(last_indexed) = last_indexed.filter(|_| storage.snapshot_boundary().is_none()) {
             match preflight_reorg(
                 storage.as_ref(),
                 pool.as_ref(),
@@ -546,6 +550,9 @@ pub async fn run_follow_loop<C: IngestChain>(
         }
 
         match outcome {
+            IngestPipelineOutcome::Cancelled { .. } => {
+                return Err(eyre!("follow cancelled without a reorg result"));
+            }
             IngestPipelineOutcome::UpToDate { head } => {
                 if let Some(s) = stats.as_ref() {
                     s.set_head_block(head);

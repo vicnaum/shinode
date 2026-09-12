@@ -10,7 +10,8 @@ The initial production reader supports the verified Base V2 producer
 producer versions, pruned inputs and incompatible archive layouts are rejected.
 Imports can resume into a matching Base database and fill gaps. Matching blocks
 are reused; conflicting hashes or stored fields stop the job before new blocks
-are added. Later forks and automatic P2P handoff remain unsupported.
+are added. An independently verified end-block hash enables guarded P2P
+continuation. Later-fork snapshot bodies remain unsupported.
 
 ## Inspect the input
 
@@ -116,6 +117,61 @@ Cleanup happens after the whole requested range is verified, so this is not yet 
 rolling, constant-space importer. The output database and compaction working
 space are additional; explicit transfer/extraction limits continue to bound inputs.
 
+## Continue through P2P
+
+Obtain the hash of the requested **end block** from a trusted checkpoint or an
+independent reference. Add `--checkpoint-hash <end-block-hash>` to the import
+command to record it in `snapshot-boundary.json`. Add `--follow` as well to start
+normal Base sync immediately after import and cleanup. `--follow` requires the
+hash and cannot be combined with `--dry-run`.
+
+A completed import can be armed by repeating its original command with
+`--checkpoint-hash`; verified output can be reused even after scratch cleanup.
+For the independently checked sample ending at block 5,527, the hash is
+`0x2246525ba06cf8771e47607736d502e446cf5cffe00a2646ceb12de043d4205f`.
+That ancient sample needs a peer serving subsequent historical bodies and
+receipts; it cannot bridge today's public retention window by itself.
+
+After recording the boundary, restart with the matching storage options:
+
+```sh
+nice -n 10 ./target/release/shinode \
+  --chain base --data-dir /path/to/new-base-history \
+  --p2p-port 30309 --rpc-bind 127.0.0.1:8546
+```
+
+Omit `--start-block` to reuse the recorded lower bound. If the import used a
+custom `--shard-size`, repeat that setting. Add `--trusted-peer
+enode://<public-key>@<host>:<port>` when a dedicated history peer is needed.
+An unarmed snapshot database is refused by normal sync until its boundary hash
+is supplied. A mismatched checkpoint is rejected before importing new blocks.
+
+Startup verifies the stored boundary and parent continuity through the indexed
+head. It first compacts all recovered WAL, including incomplete shards and runs
+using `--defer-compaction`, so pending blocks cannot prevent ordered continuation.
+It checks for a recoverable reorg of followed blocks before testing the
+successor, including on restart. Before fetching a continuation range, Shinode probes up to eight eligible
+peers for the actual successor header, body and receipts, with a ten-second
+timeout per peer. Advertised retention alone does not establish availability.
+Unavailable successors produce a history-gap error identifying the needed block
+and target; supply a newer supported, independently verified snapshot or a peer
+serving that history. Stalls during ingestion report the gap while waiting for
+a serving peer.
+
+Snapshot-backed writes advance in parent-linked order. Scheduling is bounded by
+`--fast-sync-max-buffered-blocks` beyond the contiguous indexed head, and
+`eth_blockNumber` never jumps across an unfilled gap. A conflicting successor
+stops continuation. During backfill, peers serving older blocks remain eligible
+even when another peer advertises a much newer head. Reorg cancellation discards
+queued and buffered blocks before applying further writes during worker drain,
+so rollback can proceed. Storage errors from writes already started still
+propagate; normal range completion
+still rejects buffered gaps. Reorgs retain the configured rollback-window limit and may
+not roll back below the trusted snapshot boundary. Use a separately verified
+snapshot to resolve a deeper conflict. The supplied hash is an operator trust
+input: neither archive checksums nor P2P root validation establishes canonicality,
+OP safe/finalized status or L1 finality.
+
 ## Validation and publication
 
 A private staging directory holds the exact manifest, fixed job identity, a
@@ -214,3 +270,32 @@ prototypes are excluded.
 The interruption tests inject failures or construct interrupted filesystem states;
 they do not simulate hardware power loss. The sample remains pre-Canyon and does
 not establish arbitrary later-fork support or full-history throughput.
+
+## Snapshot-to-P2P validation (2026-09-12)
+
+- Workspace suite: **145 passed, six ignored**, including twelve handoff/pipeline tests.
+  Typed mock peers exercise the production fetch/validation/ingest pipeline,
+  ordered continuation, nonempty logs spanning the boundary, restart and repair,
+  retention gaps, disconnected suffix validation, and shallow/deep reorg handling.
+- The production CLI verified the existing **544-block** real sample and pinned
+  its independently checked block-5,527 hash without needing input archives.
+  The opt-in RPC proof passed after reopening the anchored output; all **16
+  sampled block/log/deposit responses** matched the saved independent reference.
+- `cargo check --workspace --no-default-features --locked --offline` passed.
+  Clippy adds no diagnostics compared with phase 5; the same 220 pre-existing
+  binary/test lint errors remain.
+- A regression covers a single WAL batch filling blocks **4 and 7**
+  around an existing **5–6** suffix, including rejection of a wrong parent before
+  any batch writes and verification
+  of the completed chain after compaction and reopen.
+- Further pipeline regressions cover mixed historical/recent peers, recovery of
+  incomplete WAL shards with deferred compaction both enabled and disabled, and
+  cancellation with a queued reorg result versus strict normal completion.
+  Replacement-chain blocks arriving during cancelled worker drain are discarded;
+  the same parent mismatch still fails without cancellation. A separate writer
+  test confirms a storage I/O failure survives later cancellation.
+
+P2P continuation and reorg scenarios use controlled peers. This is not evidence
+of a live public-peer bridge from the ancient sample to today's Base head, nor
+of later-fork snapshot import support. Raw evidence and temporary plans remain
+local and are excluded from the intended PR.

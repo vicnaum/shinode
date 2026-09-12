@@ -165,8 +165,9 @@ range 4,984–5,527 and samples the original 16 reference blocks after reopening
 The measurements above describe the original phase-1/2 experiment, which imported
 only two selected eight-block shards. Python prototype scripts and raw manifests,
 archives, RPC responses and timing logs remain local, outside the intended PR.
-The production guide records the supported format, resource limits and remaining
-later-fork and P2P handoff work.
+The production guide records the supported format, resource limits and guarded
+P2P handoff using an independently verified end-block hash. Later-fork snapshot
+body support remains future work.
 
 ## Validation
 

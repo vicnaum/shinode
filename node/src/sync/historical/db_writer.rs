@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -28,6 +28,8 @@ pub struct DbWriterParams {
     pub progress_stats: Option<Arc<SyncProgressStats>>,
     pub remaining_per_shard: Option<ShardRemainingTracker>,
     pub follow_expected_start: Option<u64>,
+    /// Observe cancellation before applying blocks still arriving during worker drain.
+    pub cancel_rx: Option<watch::Receiver<bool>>,
 }
 
 /// Shared context for fast-sync flush operations (immutable parts).
@@ -161,6 +163,8 @@ impl DbWriteConfig {
 pub enum DbWriterMessage {
     Block(BlockBundle),
     Finalize,
+    /// Stop without claiming range completion; uncommitted follow buffers are discarded.
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +198,20 @@ pub async fn run_db_writer(
         progress_stats,
         remaining_per_shard,
         follow_expected_start,
+        cancel_rx,
     } = params;
+    // Anchored history advances in parent-linked order even during backfill.
+    let protected = storage.snapshot_boundary().is_some();
+    let mode = if protected {
+        DbWriteMode::Follow
+    } else {
+        mode
+    };
+    let follow_expected_start = if protected {
+        storage.last_indexed_block()?.and_then(|head| head.checked_add(1))
+    } else {
+        follow_expected_start
+    };
     let mut rx = rx;
     let mut interval = config.flush_interval.map(tokio::time::interval);
     // Compaction is a large, bursty workload (reads WAL + writes new segment files).
@@ -212,6 +229,8 @@ pub async fn run_db_writer(
     };
     let mut follow_buffer: std::collections::BTreeMap<u64, BlockBundle> =
         std::collections::BTreeMap::new();
+    let cancel_requested = || cancel_rx.as_ref().is_some_and(|rx| *rx.borrow());
+    let mut cancelled = false;
 
     tracing::debug!(
         mode = ?mode,
@@ -219,7 +238,13 @@ pub async fn run_db_writer(
         "db writer started"
     );
 
-    let write_follow_bundle = |bundle: BlockBundle| -> Result<()> {
+    let write_follow_bundle = |bundle: BlockBundle| -> Result<bool> {
+        // The stop signal is independent of the data queue. Check every write,
+        // including buffered blocks, before touching storage. Once a write starts,
+        // its errors must propagate even if cancellation arrives during the call.
+        if cancel_requested() {
+            return Ok(false);
+        }
         let bytes = if bench.is_some() || events.is_some() {
             Some(db_bytes_for_bundles(std::slice::from_ref(&bundle))?)
         } else {
@@ -261,7 +286,7 @@ pub async fn run_db_writer(
                 agg.disk_bytes_total,
             );
         }
-        Ok(())
+        Ok(true)
     };
 
     let flush_ctx = FlushContext {
@@ -278,6 +303,12 @@ pub async fn run_db_writer(
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(DbWriterMessage::Block(block)) => {
+                        cancelled |= cancel_requested();
+                        if cancelled {
+                            buffer.clear();
+                            follow_buffer.clear();
+                            continue;
+                        }
                         if mode == DbWriteMode::FastSync {
                             buffer.push(block);
                             if buffer.len() >= config.batch_blocks {
@@ -290,18 +321,38 @@ pub async fn run_db_writer(
                             }
                             follow_buffer.insert(number, block);
                             while let Some(bundle) = follow_buffer.remove(&follow_expected) {
-                                write_follow_bundle(bundle)?;
-                                follow_expected = follow_expected.saturating_add(1);
+                                if !write_follow_bundle(bundle)? {
+                                    cancelled = true;
+                                    follow_buffer.clear();
+                                    break;
+                                }
+                                follow_expected = if protected {
+                                    storage.last_indexed_block()?.unwrap_or(follow_expected).saturating_add(1)
+                                } else { follow_expected.saturating_add(1) };
                             }
                         }
                     }
-                    Some(DbWriterMessage::Finalize) | None => {
-                        if mode == DbWriteMode::FastSync {
+                    Some(DbWriterMessage::Finalize | DbWriterMessage::Cancel) | None => {
+                        cancelled |= matches!(maybe_msg, Some(DbWriterMessage::Cancel)) || cancel_requested();
+                        if cancelled {
+                            buffer.clear();
+                            follow_buffer.clear();
+                        } else if mode == DbWriteMode::FastSync {
                             flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                         } else {
                             while let Some(bundle) = follow_buffer.remove(&follow_expected) {
-                                write_follow_bundle(bundle)?;
-                                follow_expected = follow_expected.saturating_add(1);
+                                if !write_follow_bundle(bundle)? {
+                                    cancelled = true;
+                                    follow_buffer.clear();
+                                    break;
+                                }
+                                follow_expected = if protected {
+                                    storage.last_indexed_block()?.unwrap_or(follow_expected).saturating_add(1)
+                                } else { follow_expected.saturating_add(1) };
+                            }
+                            eyre::ensure!(cancelled || !protected || follow_buffer.is_empty(), "snapshot/P2P gap at block {follow_expected}; newer fetched blocks remain uncommitted");
+                            if cancelled {
+                                follow_buffer.clear();
                             }
                         }
                         break;
@@ -313,7 +364,11 @@ pub async fn run_db_writer(
                     interval.tick().await;
                 }
             }, if interval.is_some() => {
-                if mode == DbWriteMode::FastSync {
+                cancelled |= cancel_requested();
+                if cancelled {
+                    buffer.clear();
+                    follow_buffer.clear();
+                } else if mode == DbWriteMode::FastSync {
                     flush_fast_sync_buffer(&flush_ctx, &mut buffer, &mut compactions).await?;
                 }
             }
@@ -533,6 +588,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_failure_survives_later_cancellation() -> Result<()> {
+        let dir = temp_dir("db-writer-cancel-error");
+        let config = base_config(dir.clone());
+        let storage = Arc::new(Storage::open(&config)?);
+        // A regular file where a shard directory must be created forces an I/O error.
+        let shards = dir.join("static/shards");
+        std::fs::create_dir_all(&shards)?;
+        std::fs::write(shards.join("0"), b"block shard creation")?;
+        let (tx, rx) = mpsc::channel(8);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_db_writer(
+            Arc::clone(&storage), rx, DbWriterParams {
+                config: DbWriteConfig::new(1, None),
+                mode: DbWriteMode::Follow,
+                bench: None,
+                events: None,
+                progress_stats: None,
+                remaining_per_shard: None,
+                follow_expected_start: Some(0),
+                cancel_rx: Some(cancel_rx),
+            },
+        ));
+        tx.send(DbWriterMessage::Block(bundle_with_number(0))).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }).await?;
+        // The caller observes cancellation before consuming the writer's result.
+        cancel_tx.send_replace(true);
+        let error = handle.await?.err().ok_or_else(|| eyre::eyre!("storage failure was suppressed"))?;
+        let io_error = error.chain().any(<dyn std::error::Error>::is::<std::io::Error>);
+        eyre::ensure!(io_error, "expected storage I/O error: {error:?}");
+        drop(storage);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn db_writer_writes_out_of_order_blocks() {
         let dir = temp_dir("db-writer");
         let config = base_config(dir.clone());
@@ -550,6 +644,7 @@ mod tests {
                 progress_stats: None,
                 remaining_per_shard: None,
                 follow_expected_start: None,
+                cancel_rx: None,
             },
         ));
 

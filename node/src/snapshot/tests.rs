@@ -26,6 +26,8 @@ pub(super) fn arguments(root: &Path) -> SnapshotArgs {
         dry_run: false,
         offline: true,
         keep_scratch: true,
+        checkpoint_hash: None,
+        follow: false,
         max_download_bytes: 512 * 1024 * 1024,
         max_extracted_bytes: 1024 * 1024 * 1024,
         min_free_bytes: 0,

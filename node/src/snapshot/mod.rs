@@ -24,10 +24,29 @@ use std::{
 };
 
 pub async fn run(config: NodeConfig, args: SnapshotArgs) -> Result<()> {
-    tokio::task::spawn_blocking(move || execute(&config, &args)).await?
+    let import_config = config.clone();
+    let import_args = args.clone();
+    tokio::task::spawn_blocking(move || execute(&import_config, &import_args)).await??;
+    if args.follow {
+        let mut config = config;
+        config.data_dir = absolute(
+            args.output_dir
+                .as_deref()
+                .ok_or_else(|| eyre!("missing output"))?,
+        )?;
+        config.command = None;
+        config.end_block = None;
+        config.start_block_override = None;
+        crate::run::run_sync::<BaseChain>(config, std::env::args().collect()).await?;
+    }
+    Ok(())
 }
 
 fn execute(config: &NodeConfig, args: &SnapshotArgs) -> Result<()> {
+    ensure!(
+        !args.follow || (args.checkpoint_hash.is_some() && !args.dry_run),
+        "--follow requires --checkpoint-hash and an actual import"
+    );
     ensure!(
         args.chain == ChainKind::Base && config.chain == ChainKind::Base,
         "snapshot import currently supports Base mainnet only"
@@ -151,6 +170,14 @@ fn resume_complete(
         "completed import differs from durable storage; refusing cleanup"
     );
     crate::storage::durable::sync_tree(&config.data_dir)?;
+    if let Some(hash) = args.checkpoint_hash {
+        storage.pin_snapshot_boundary(
+            args.start_block,
+            args.end_block,
+            hash,
+            &plan.manifest_sha256,
+        )?;
+    }
     checkpoint.reconcile(&storage, plan)?;
     checkpoint.complete_digest = Some(actual);
     checkpoint.save(&config.data_dir, plan)?;
@@ -172,6 +199,14 @@ fn import_verified(
     let mut expected = Sha256::new();
     reader::scan(staging, plan, args.max_transactions_per_block, |payload| {
         let bundle = BaseChain::process_ingest(payload, None)?.0;
+        if bundle.number == args.end_block {
+            ensure!(
+                args.checkpoint_hash
+                    .is_none_or(|hash| hash == bundle.header.hash_slow()),
+                "trusted checkpoint hash does not match snapshot end block {}",
+                args.end_block
+            );
+        }
         if bundle.number >= args.start_block {
             journal::hash_bundle(&mut expected, &bundle)?;
         }
@@ -236,6 +271,14 @@ fn import_verified(
     checkpoint.reconcile(&storage, plan)?;
     checkpoint.complete_digest = Some(expected);
     checkpoint.save(output, plan)?;
+    if let Some(hash) = args.checkpoint_hash {
+        storage.pin_snapshot_boundary(
+            args.start_block,
+            args.end_block,
+            hash,
+            &plan.manifest_sha256,
+        )?;
+    }
     failpoint("after-complete-checkpoint")?;
     report(&storage, output, plan, started.elapsed().as_secs_f64())?;
     if !args.keep_scratch {
@@ -391,6 +434,10 @@ fn print_plan(plan: &manifest::Plan) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod handoff_tests;
+#[cfg(test)]
+mod pipeline_tests;
 #[cfg(test)]
 mod resume_tests;
 #[cfg(test)]

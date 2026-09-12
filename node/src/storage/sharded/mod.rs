@@ -1,6 +1,7 @@
 //! Sharded storage backend (schema v2).
 
 mod bitset;
+mod handoff;
 mod hash;
 mod identity;
 mod nippy_raw;
@@ -439,6 +440,7 @@ impl SegmentWriter {
 }
 
 pub struct Storage {
+    handoff: Mutex<Option<handoff::Boundary>>,
     _writer_lock: Arc<crate::storage::DataDirLock>,
     data_dir: PathBuf,
     peer_cache_dir: PathBuf,
@@ -513,6 +515,7 @@ impl Storage {
         F: Fn(usize, usize),
     {
         lock.validate(&config.data_dir)?;
+        let handoff = handoff::load(config)?;
         let open_start = std::time::Instant::now();
         tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
 
@@ -752,6 +755,7 @@ impl Storage {
                 .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero")),
         );
         Ok(Self {
+            handoff: Mutex::new(handoff),
             _writer_lock: lock,
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
@@ -939,8 +943,11 @@ impl Storage {
     }
 
     pub fn last_indexed_block(&self) -> Result<Option<u64>> {
-        let meta = self.meta.lock();
-        Ok(meta.max_present_block)
+        let maximum = self.meta.lock().max_present_block;
+        if let (Some(boundary), Some(maximum)) = (self.snapshot_boundary(), maximum) {
+            return self.contiguous_head(boundary.start, maximum);
+        }
+        Ok(maximum)
     }
 
     #[cfg(test)]
@@ -1156,6 +1163,7 @@ impl Storage {
     }
 
     pub fn write_block_bundles_wal(&self, bundles: &[BlockBundle]) -> Result<Vec<u64>> {
+        self.check_snapshot_write(bundles)?;
         if bundles.is_empty() {
             return Ok(Vec::new());
         }
@@ -1267,6 +1275,17 @@ impl Storage {
     }
 
     pub fn write_block_bundle_follow(&self, bundle: &BlockBundle) -> Result<()> {
+        self.check_snapshot_write(std::slice::from_ref(bundle))?;
+        if self.snapshot_boundary().is_some() {
+            if self.block_header(bundle.number)?.is_some() {
+                return Ok(());
+            }
+            let maximum = self.meta.lock().max_present_block;
+            if maximum.is_some_and(|head| head > bundle.number) {
+                self.write_block_bundles_wal(std::slice::from_ref(bundle))?;
+                return self.compact_shard(shard_start(bundle.number, self.shard_size()));
+            }
+        }
         let receipts = self.codec.encode_receipts(&bundle.receipts)?;
         let transactions = self.codec.encode_transactions(&bundle.transactions)?;
         let shard_start = shard_start(bundle.number, self.shard_size());
@@ -1920,6 +1939,13 @@ impl Storage {
     }
 
     pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
+        if let Some(boundary) = self.snapshot_boundary() {
+            eyre::ensure!(
+                ancestor_number >= boundary.number,
+                "reorg crosses trusted snapshot boundary {}; use a separately verified snapshot instead of rewriting imported history",
+                boundary.number
+            );
+        }
         let shard_size = self.shard_size();
         let shard_starts: Vec<u64> = {
             let shards = self.shards.lock();

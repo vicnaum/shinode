@@ -3,6 +3,10 @@ use clap::Args;
 use std::path::PathBuf;
 
 #[derive(Args, Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI switches for inspection, offline inputs, retention and follow"
+)]
 pub struct SnapshotArgs {
     /// Snapshot network (currently Base mainnet only).
     #[arg(long, value_enum, default_value = "base")]
@@ -31,6 +35,12 @@ pub struct SnapshotArgs {
     /// Retain importer-created input files after verified durable completion.
     #[arg(long)]
     pub keep_scratch: bool,
+    /// Independently verified hash of --end-block; pins the P2P handoff boundary.
+    #[arg(long)]
+    pub checkpoint_hash: Option<alloy_primitives::B256>,
+    /// Start P2P sync/follow after import and boundary verification.
+    #[arg(long, requires = "checkpoint_hash", conflicts_with = "dry_run")]
+    pub follow: bool,
     #[arg(long, default_value_t = 536_870_912)]
     pub max_download_bytes: u64,
     #[arg(long, default_value_t = 1_073_741_824)]

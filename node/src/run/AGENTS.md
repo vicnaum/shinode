@@ -1,5 +1,13 @@
 # run
 
+Snapshot-backed sync restores the boundary's lower bound before initialization,
+validates anchored continuity after storage recovery/compaction, reconciles any
+bounded reorg of followed blocks, then probes actual successor availability.
+Anchored startup compacts all recovered WAL, including incomplete shards and
+when `--defer-compaction` is set, before detecting missing blocks.
+Unarmed imported
+databases require repeating `snapshot-import` with `--checkpoint-hash`.
+
 ## Purpose
 
 Top-level orchestration layer for the node's runtime lifecycle. Coordinates initialization, P2P connection, sync execution, follow mode, RPC server startup, cleanup, and utility commands. Extracted from the original monolithic `main()` to provide clear separation of concerns between startup, sync execution, follow mode tracking, and cleanup/finalization. Manages the early TUI splash screen during startup and wires storage/DB stats into the dashboard.
@@ -26,7 +34,8 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
 - **Key items**: `build_run_context`, `init_storage`, `connect_p2p`, `wait_for_min_peers`, `wait_for_peer_head`, `setup_ui`, `update_tui_startup`, `update_tui_startup_head`, `update_tui_startup_peers`, `handle_startup_quit`, `EarlyTui`, `UiSetup`, `LogWriters`, `LogBufferRef`
 - **Interactions**: Called by `sync_runner.rs`. Creates `Storage`, `NetworkSession`, `TuiController`/`UIController`, `BenchEventLogger`. Shows startup splash with animated dots.
 - **Knobs / invariants**:
-  - Startup compacts dirty shards from previous incomplete runs
+  - Anchored startup compacts all dirty shards; ordinary startup compacts complete
+    dirty shards unless deferred compaction is enabled.
   - Wait for peer head blocks until head >= start_block (with rollback window)
   - `update_tui_startup*` functions return `true` if quit was requested; caller must invoke `handle_startup_quit` to restore terminal and exit
 

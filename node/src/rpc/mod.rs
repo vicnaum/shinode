@@ -72,6 +72,11 @@ pub struct RpcContext {
     stats: Option<Arc<SyncProgressStats>>,
 }
 
+#[cfg(test)]
+pub fn test_module(config: &NodeConfig, storage: Arc<Storage>) -> Result<RpcModule<RpcContext>> {
+    module(RpcContext { config: RpcConfig::from(config), storage, stats: None })
+}
+
 impl RpcContext {
     /// Create an internal error and increment the RPC error counter.
     fn internal_error(&self, err: impl std::fmt::Display) -> ErrorObjectOwned {

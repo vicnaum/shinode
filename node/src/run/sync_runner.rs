@@ -88,6 +88,7 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
         config.shard_size = stored_shard_size;
     }
     Storage::validate_existing(&config)?;
+    Storage::configure_snapshot_sync(&mut config)?;
 
     // Build run context for log artifacts
     let run_context = build_run_context(&config, argv);
@@ -193,6 +194,7 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
 
     // Initialize storage
     let storage = init_storage(&config, early_tui.as_ref(), log_buffer).await?;
+    storage.validate_snapshot_boundary()?;
 
     // Seed storage/DB stats into early TUI so panels show data during startup
     if let Some(tui) = early_tui.as_ref() {
@@ -237,6 +239,12 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
         head_at_startup,
         config.rollback_window,
     );
+    crate::sync::historical::reconcile_snapshot_tip(
+        &storage, &session.pool, config.rollback_window,
+    ).await?;
+    crate::sync::historical::preflight_snapshot_handoff(
+        &storage, &session.pool, *range.end(),
+    ).await?;
 
     // Calculate missing blocks
     let (missing_ranges, missing_total) = storage.missing_ranges_in_range(range.clone())?;
@@ -469,7 +477,8 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
 
     // Log finalize stats for follow mode transition
     let finalize_stats = match &outcome {
-        IngestPipelineOutcome::RangeApplied { finalize, .. } => Some(*finalize),
+        IngestPipelineOutcome::RangeApplied { finalize, .. }
+        | IngestPipelineOutcome::Cancelled { finalize, .. } => Some(*finalize),
         IngestPipelineOutcome::UpToDate { .. } => None,
     };
 
@@ -478,7 +487,9 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
     }
 
     // Handle follow mode or finalization
-    if follow_after && !shutdown_requested.load(Ordering::SeqCst) {
+    if follow_after && !shutdown_requested.load(Ordering::SeqCst)
+        && !matches!(outcome, IngestPipelineOutcome::Cancelled { .. })
+    {
         run_follow_mode(
             FollowModeConfig {
                 storage: &storage,
@@ -517,7 +528,8 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
 
     // Finalize
     let logs_total = match outcome {
-        IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
+        IngestPipelineOutcome::RangeApplied { logs, .. }
+        | IngestPipelineOutcome::Cancelled { logs, .. } => logs,
         IngestPipelineOutcome::UpToDate { .. } => 0,
     };
 
@@ -633,7 +645,8 @@ async fn run_follow_mode<C: IngestChain>(
 
     // Generate report at fast-sync completion
     let logs_total = match outcome {
-        IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+        IngestPipelineOutcome::RangeApplied { logs, .. }
+        | IngestPipelineOutcome::Cancelled { logs, .. } => *logs,
         IngestPipelineOutcome::UpToDate { .. } => 0,
     };
 
