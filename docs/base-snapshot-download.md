@@ -1,5 +1,8 @@
 # Import Base snapshot history with Shinode
 
+See [integration validation](base-integration-validation.md) for the larger
+50,000-block import/export/restore proof and measured resource requirements.
+
 The `snapshot-import` command downloads and verifies selected Base history, then
 writes it through Shinode's normal validation, ingestion, WAL, compaction and
 sealing pipeline. It uses the Rust binary alone: Python, curl and a separate zstd

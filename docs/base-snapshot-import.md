@@ -1,5 +1,9 @@
 # Base snapshot conversion: inspection and bounded proof
 
+For the final production workflow and larger measurements, see the
+[50,000-block Base integration validation](base-integration-validation.md).
+The measurements below describe the initial compatibility experiment.
+
 Verified on 2026-09-12. A small historical Base range can be converted from V2
 snapshot static files into Shinode without downloading execution state, MDBX, or
 RocksDB. This document records the initial bounded proof. Phase 4 now exposes a

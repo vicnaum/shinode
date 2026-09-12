@@ -1,5 +1,8 @@
 # Share and restore Base history
 
+The [50,000-block integration validation](base-integration-validation.md) records
+release-build import/restore costs and independent full-range log comparisons.
+
 `history-export` packages complete native Shinode shards. `history-restore`
 verifies and imports those packages using the Rust binary alone. Recipients need
 only the package, its trusted manifest SHA-256, and an independently verified
