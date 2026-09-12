@@ -5,6 +5,7 @@ mod handoff;
 mod hash;
 mod identity;
 mod nippy_raw;
+mod package;
 mod wal;
 
 use crate::cli::NodeConfig;
@@ -509,8 +510,23 @@ impl Storage {
     }
 
     /// Reopen under an existing writer lease without an unlocked interval.
-    #[expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
     pub fn open_locked<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
+        Self::open_locked_with_resume(config, lock, on_progress, true)
+    }
+
+    /// Recover storage for restore preflight without changing its saved sync lower bound.
+    pub fn open_locked_preserving_resume<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
+        Self::open_locked_with_resume(config, lock, on_progress, false)
+    }
+
+    #[expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
+    fn open_locked_with_resume<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F, update_resume_start: bool) -> Result<Self>
     where
         F: Fn(usize, usize),
     {
@@ -526,7 +542,7 @@ impl Storage {
             schema_version: SCHEMA_VERSION,
             chain_id: config.chain_id,
             genesis_hash: Some(config.genesis_hash),
-            sync_start_block: (config.command.is_none() && !config.repair)
+            sync_start_block: (update_resume_start && config.command.is_none() && !config.repair)
                 .then_some(config.start_block),
             storage_codec: Some(StorageCodec::for_chain(config.chain)),
             storage_key: StorageConfigKey::from(config),
@@ -549,7 +565,7 @@ impl Storage {
         }
         // Keep the earliest explicitly requested lower bound so resume also
         // revisits holes from out-of-order historical ingestion.
-        if config.command.is_none() && !config.repair {
+        if update_resume_start && config.command.is_none() && !config.repair {
             let start = meta
                 .sync_start_block
                 .map_or(config.start_block, |old| old.min(config.start_block));
@@ -1713,6 +1729,7 @@ impl Storage {
         if will_seal {
             let t0 = std::time::Instant::now();
             self.seal_shard_locked(&mut state)?;
+            persist_shard_meta(&state.dir, &state.meta)?;
             tracing::debug!(
                 shard = shard_start,
                 elapsed_ms = t0.elapsed().as_millis() as u64,

@@ -93,6 +93,8 @@ into matching Base storage. Supply an independently verified `--checkpoint-hash`
 for its end block to enable P2P continuation, and add `--follow` to start it after
 import. A peer must still serve the gap after that boundary. Later-fork snapshot
 bodies remain unsupported.
+Already imported history can be shared as [native history packages](base-history-packages.md).
+Recipients restore those shards without downloading the original execution snapshot.
 Shinode keeps the history it has already downloaded; upstream pruning does not
 delete it locally.
 Metadata prevents opening a populated directory as a different chain.

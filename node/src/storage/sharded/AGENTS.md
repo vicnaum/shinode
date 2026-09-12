@@ -9,6 +9,8 @@ Sharded static-file storage backend (schema v2) for Ethereum history data. Divid
 - (none)
 
 ### Files
+- `package.rs` - Verifies on-disk sealed metadata, complete bitsets and native
+  content hashes; exposes the exact 17 regular files allowed in history packages.
 - `handoff.rs` - Durable snapshot boundary identity, contiguous indexed-head
   calculation, parent-linked append checks and rollback fence. Sync restores the
   recorded lower bound and rejects unarmed imports. Startup verifies the anchored
@@ -68,8 +70,13 @@ Cheap aggregation across all shards via `Storage::aggregate_stats()` (no disk I/
   - Reports dirty shards (WAL bytes + sorted state) for `db_writer` finalization logging.
   - `compaction_copy_bytes()` measures existing sorted files and bitsets once per affected shard for snapshot working-space checks; incoming data is budgeted separately.
   - `open_with_progress()` acquires a destination writer lease before mutation; `open_locked()` reuses an existing lease across importer reopen. `repair()` takes the same lock.
+  - `open_locked_preserving_resume()` recovers storage without adopting an incoming
+    sync lower bound; package restore uses it until overlap and parent validation
+    have succeeded and imported blocks are durable.
   - Metadata and bitsets use atomic synced publication; WAL appends and replacement segments are synced before compaction swaps. `recount_stats_in_range()` reconciles counters after recovery before snapshot checkpoints.
   - `write_block_bundle_follow()` expects in-order appends; the follow DB writer enforces ordering via a reorder buffer.
+  - Compaction persists its final sealed metadata before returning; exports must
+    be able to verify the same seal after reopening without a cache.
   - Segment cache invalidation on compaction, rollback, and follow writes.
   - Exports `Storage` and `StorageAggregateStats` to parent module.
 - **Knobs / invariants**:

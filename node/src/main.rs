@@ -42,6 +42,12 @@ async fn main() -> Result<()> {
             cli::Command::SnapshotImport(args) => {
                 return snapshot::run(config.clone(), args.clone()).await;
             }
+            cli::Command::HistoryExport(args) => {
+                return snapshot::package::export(config.clone(), args.clone()).await;
+            }
+            cli::Command::HistoryRestore(args) => {
+                return snapshot::package::restore(config.clone(), args.clone()).await;
+            }
             cli::Command::Db(cli::DbCommand::Stats(args)) => {
                 return run::handle_db_stats(args, &config);
             }

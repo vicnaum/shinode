@@ -55,6 +55,10 @@ pub enum ReorgStrategy {
 pub enum Command {
     /// Import verified Base snapshot history into a fresh database.
     SnapshotImport(crate::snapshot::args::SnapshotArgs),
+    /// Export complete sealed Base history shards into a local package.
+    HistoryExport(crate::snapshot::package::args::ExportArgs),
+    /// Verify and restore a pinned local Base history package.
+    HistoryRestore(crate::snapshot::package::args::RestoreArgs),
     /// Database/static-file inspection commands.
     #[command(subcommand)]
     Db(DbCommand),
@@ -305,6 +309,19 @@ impl NodeConfig {
     }
 
     fn normalize_selection(&mut self, explicit_chain: bool) -> Result<()> {
+        if matches!(self.command, Some(Command::HistoryExport(_))) {
+            ensure!(!self.repair, "--repair conflicts with history-export");
+        }
+        if let Some(Command::HistoryRestore(args)) = &self.command {
+            ensure!(!self.repair, "--repair conflicts with history-restore");
+            ensure!(!explicit_chain || self.chain == ChainKind::Base, "history-restore requires Base");
+            self.chain = ChainKind::Base;
+            self.chain_id = self.chain.chain_id();
+            self.genesis_hash = self.chain.genesis_hash();
+            ensure!(self.chain_id_override.is_none_or(|id| id == self.chain_id), "conflicting package chain ID");
+            self.data_dir = args.output_dir.clone();
+            return Ok(());
+        }
         if let Some(Command::SnapshotImport(args)) = &self.command {
             ensure!(!self.repair, "--repair conflicts with snapshot-import");
             ensure!(!explicit_chain || self.chain == args.chain, "conflicting snapshot --chain selections");
@@ -323,7 +340,7 @@ impl NodeConfig {
                 Command::Db(DbCommand::Stats(args)) => args.data_dir.as_ref(),
                 Command::Db(DbCommand::Compact(args)) => args.data_dir.as_ref(),
                 Command::Db(DbCommand::RebuildCache(args)) => args.data_dir.as_ref(),
-                Command::SnapshotImport(_) => None,
+                Command::SnapshotImport(_) | Command::HistoryExport(_) | Command::HistoryRestore(_) => None,
             };
             if let Some(dir) = override_dir { self.data_dir = dir.clone(); }
         }

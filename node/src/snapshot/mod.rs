@@ -1,5 +1,6 @@
 //! Base history import without execution state or an external Python runtime.
 pub mod args;
+pub mod package;
 mod download;
 mod journal;
 mod manifest;

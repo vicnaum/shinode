@@ -13,6 +13,9 @@ are reused; conflicting hashes or stored fields stop the job before new blocks
 are added. An independently verified end-block hash enables guarded P2P
 continuation. Later-fork snapshot bodies remain unsupported.
 
+To share already imported history without the execution snapshot, use
+[native history export and restore](base-history-packages.md).
+
 ## Inspect the input
 
 Obtain and retain the [pinned manifest](https://mainnet-v2-snapshots.base.org/1789084806/manifest.json).

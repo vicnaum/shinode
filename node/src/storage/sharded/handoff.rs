@@ -17,7 +17,7 @@ pub struct Boundary {
     pub start: u64,
     pub number: u64,
     pub hash: B256,
-    manifest_sha256: String,
+    pub manifest_sha256: String,
 }
 
 pub(super) fn load(config: &NodeConfig) -> Result<Option<Boundary>> {
@@ -39,12 +39,24 @@ pub(super) fn load(config: &NodeConfig) -> Result<Option<Boundary>> {
 }
 
 impl Storage {
+    /// Check a restore's lower bound without opening storage or updating resume metadata.
+    pub fn validate_snapshot_restore_start(config: &NodeConfig, start: u64) -> Result<()> {
+        if let Some(boundary) = load(config)? {
+            ensure!(start >= boundary.start,
+                "restore starts before trusted history lower bound {}; use a fresh destination for earlier history",
+                boundary.start);
+        }
+        Ok(())
+    }
+
     pub fn configure_snapshot_sync(config: &mut NodeConfig) -> Result<()> {
         if let Some(boundary) = load(config)? {
             ensure!(config.start_block_override.is_none_or(|start| start == boundary.start),
                 "snapshot-backed sync starts at {}; omit --start-block to resume the recorded range", boundary.start);
             config.start_block = boundary.start;
         } else {
+            ensure!(!config.data_dir.join("history-package-init.json").exists(),
+                "incomplete history package restore; repeat history-restore before P2P sync");
             ensure!(!config.data_dir.join("snapshot-imports").exists(),
                 "snapshot P2P handoff requires an independently verified boundary hash; repeat snapshot-import with --checkpoint-hash <end-block-hash>");
         }
@@ -145,6 +157,8 @@ impl Storage {
 
     pub fn validate_snapshot_boundary(&self) -> Result<()> {
         let Some(boundary) = self.snapshot_boundary() else {
+            ensure!(!self.data_dir.join("history-package-init.json").exists(),
+                "incomplete history package restore; repeat history-restore before P2P sync");
             ensure!(!self.data_dir.join("snapshot-imports").exists(),
                 "snapshot P2P handoff requires an independently verified boundary hash; repeat snapshot-import with --checkpoint-hash <end-block-hash>");
             return Ok(());

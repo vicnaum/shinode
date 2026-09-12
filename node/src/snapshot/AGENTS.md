@@ -3,6 +3,10 @@
 Base snapshot import through the Rust binary. No Python or external downloader is
 required. Read `docs/base-snapshot-download.md` for the supported format and CLI.
 
+- `package/`: pinned local native history export/restore, bounded tar/zstd,
+  sealed coverage and overlap verification, recipient RPC/P2P acceptance tests.
+  See `package/AGENTS.md` and `docs/base-history-packages.md`.
+
 - `args.rs`: `SnapshotArgs`, resource limits, offline/dry-run and keep-scratch switches.
   `--checkpoint-hash` pins the independently verified end block; `--follow`
   enters the normal Base runtime after durable import and cleanup.
