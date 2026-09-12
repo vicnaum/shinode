@@ -1106,6 +1106,23 @@ impl Storage {
         Ok((ranges, missing))
     }
 
+    /// Existing bytes copied while compacting the shards touched by a batch.
+    /// The caller must additionally budget the incoming WAL and new segment data.
+    pub fn compaction_copy_bytes(&self, block_numbers: impl IntoIterator<Item = u64>) -> Result<u64> {
+        let shard_size = self.shard_size();
+        let starts: HashSet<u64> = block_numbers
+            .into_iter()
+            .map(|number| shard_start(number, shard_size))
+            .collect();
+        let mut total = 0u64;
+        for start in starts {
+            let dir = shard_dir(&self.data_dir, start);
+            total = total.saturating_add(dir_size(&sorted_dir(&dir))?);
+            total = total.saturating_add(file_size(&bitset_path(&dir))?);
+        }
+        Ok(total)
+    }
+
     pub fn write_block_bundles_wal(&self, bundles: &[BlockBundle]) -> Result<Vec<u64>> {
         if bundles.is_empty() {
             return Ok(Vec::new());

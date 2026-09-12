@@ -56,6 +56,12 @@ ratatui = "0.29"
 crossterm = "0.28"
 rand = "0.8"
 lru = "0.12"
+blake3 = "1.8"
+tar = "0.4"
+fs2 = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reth-codecs = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["op"] }
+reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 
 # ============================================
 # RUST-MAGIC-LINTER - Maximum Preset

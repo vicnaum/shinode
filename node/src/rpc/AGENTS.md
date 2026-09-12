@@ -11,6 +11,7 @@ Designed for read-only access with configurable rate limiting; no state executio
 - (none)
 
 ### Files
+- `snapshot_tests.rs` - Opt-in production Rust snapshot-import proof for 544 historical blocks, with 16 reference samples queried after reopen. Offline reader and downloader tests live in `snapshot/`. Reproduction and format limits are in `docs/base-snapshot-download.md`.
 - `chain_tests.rs` - Ethereum and mixed Base deposit/user fixtures through WAL, compaction, sealing, reopen, and the production RPC module; complete/filtered logs and block-query contracts.
 - `mod.rs` - RPC server bootstrap, method registrations, param parsing helpers, response formatting, and stats tracking (~1125 lines, ~476 lines tests).
   - **Key items**: `RpcConfig`, `RpcContext`, `start()`, `module()`, `eth_getBlockByNumber`, `eth_getLogs`, `parse_block_tag()`

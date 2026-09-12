@@ -5,6 +5,7 @@ mod metrics;
 mod p2p;
 mod rpc;
 mod run;
+mod snapshot;
 mod storage;
 mod sync;
 mod ui;
@@ -38,6 +39,9 @@ async fn main() -> Result<()> {
     // Handle subcommands
     if let Some(command) = &config.command {
         match command {
+            cli::Command::SnapshotImport(args) => {
+                return snapshot::run(config.clone(), args.clone()).await;
+            }
             cli::Command::Db(cli::DbCommand::Stats(args)) => {
                 return run::handle_db_stats(args, &config);
             }

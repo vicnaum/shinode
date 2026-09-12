@@ -80,6 +80,7 @@ RPC limits, fast-sync scheduling, storage sharding, logging, and operational mod
 - `--db-write-batch-blocks` (512), `--db-write-flush-interval-ms` (optional)
 
 ### Subcommands
+- `snapshot-import` - Base V2 manifest inspection (`--dry-run`) or bounded import into a new `--output-dir`; uses `--staging-dir`, pinned manifest SHA, explicit start/end and resource limits. Its arguments are in `snapshot/args.rs`. Snapshot normalization runs before sync/maintenance selection, defaults to Base, validates conflicting global chain/ID selections and makes no storage changes.
 - `db stats` - Print storage statistics (`DbStatsArgs`: `--data-dir`, `--json`)
 - `db compact` - Compact all dirty shards and seal completed ones (`DbCompactArgs`: `--data-dir`)
 

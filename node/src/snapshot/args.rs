@@ -1,0 +1,48 @@
+use crate::chain::ChainKind;
+use clap::Args;
+use std::path::PathBuf;
+
+#[derive(Args, Debug, Clone)]
+pub struct SnapshotArgs {
+    /// Snapshot network (currently Base mainnet only).
+    #[arg(long, value_enum, default_value = "base")]
+    pub chain: ChainKind,
+    /// Local V2 manifest; pin its SHA-256 independently.
+    #[arg(long)]
+    pub manifest: PathBuf,
+    #[arg(long)]
+    pub manifest_sha256: String,
+    #[arg(long)]
+    pub start_block: u64,
+    #[arg(long)]
+    pub end_block: u64,
+    /// Private resumable input staging directory, separate from node storage.
+    #[arg(long, required_unless_present = "dry_run")]
+    pub staging_dir: Option<PathBuf>,
+    /// New node data directory. Existing directories are refused in this phase.
+    #[arg(long, required_unless_present = "dry_run")]
+    pub output_dir: Option<PathBuf>,
+    /// Inspect dependencies and resource requirements without writing or downloading.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Use verified staged chunks only; make no archive requests.
+    #[arg(long)]
+    pub offline: bool,
+    #[arg(long, default_value_t = 536_870_912)]
+    pub max_download_bytes: u64,
+    #[arg(long, default_value_t = 1_073_741_824)]
+    pub max_extracted_bytes: u64,
+    #[arg(long, default_value_t = 5_368_709_120)]
+    pub min_free_bytes: u64,
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub concurrency: u8,
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=10))]
+    pub retries: u8,
+    /// Whole HTTP attempt timeout, including response reads.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout_seconds: u64,
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub batch_blocks: u16,
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_transactions_per_block: u32,
+}

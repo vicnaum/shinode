@@ -81,11 +81,15 @@ cargo run --release -- --chain base --data-dir data/base \
 On restart, use the same command without `--start-block` to reuse the saved lower
 bound. For an older backfill, add `--trusted-peer enode://<public-key>@<host>:<port>`
 for a node that serves that range; ordinary discovered peers may have pruned it.
-Plan around roughly 30 days of history when relying on public Base P2P peers:
-Base's [published pruned snapshots](https://github.com/base/base/blob/main/.env.mainnet)
-retain 1,339,200 blocks (about 31 days at two seconds per block). Operators can
-configure a different window, so this is not a guarantee for every peer. Older
-backfills need a peer retaining and serving the requested bodies and receipts.
+History availability depends on the peer's pruning configuration. The earlier
+roughly 30-day guidance described a specific 1,339,200-block pruning setting,
+not a public-network guarantee. Base's current
+[V2 snapshot documentation](https://docs.base.org/specifications/node-operators/snapshots)
+describes the full preset as retaining only 10,064 blocks (about 5–6 hours).
+Older backfills need a peer retaining and serving the requested bodies and receipts.
+The [snapshot importer](base-snapshot-download.md) provides an alternative for
+verified pre-Canyon history from the pinned Base V2 snapshot. It currently requires
+a fresh output directory; later forks and automatic P2P handoff are not supported.
 Shinode keeps the history it has already downloaded; upstream pruning does not
 delete it locally.
 Metadata prevents opening a populated directory as a different chain.

@@ -53,6 +53,8 @@ pub enum ReorgStrategy {
 /// Top-level CLI commands.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
+    /// Import verified Base snapshot history into a fresh database.
+    SnapshotImport(crate::snapshot::args::SnapshotArgs),
     /// Database/static-file inspection commands.
     #[command(subcommand)]
     Db(DbCommand),
@@ -303,11 +305,25 @@ impl NodeConfig {
     }
 
     fn normalize_selection(&mut self, explicit_chain: bool) -> Result<()> {
+        if let Some(Command::SnapshotImport(args)) = &self.command {
+            ensure!(!self.repair, "--repair conflicts with snapshot-import");
+            ensure!(!explicit_chain || self.chain == args.chain, "conflicting snapshot --chain selections");
+            self.chain = args.chain;
+            self.chain_id = self.chain.chain_id();
+            self.genesis_hash = self.chain.genesis_hash();
+            ensure!(self.chain_id_override.is_none_or(|id| id == self.chain_id), "--chain-id conflicts with snapshot chain");
+            if let Some(output) = &args.output_dir { self.data_dir = output.clone(); }
+            self.start_block = args.start_block;
+            self.start_block_override = Some(args.start_block);
+            self.end_block = Some(args.end_block);
+            return Ok(());
+        }
         if let Some(command) = &self.command {
             let override_dir = match command {
-                Command::Db(DbCommand::Stats(args)) => &args.data_dir,
-                Command::Db(DbCommand::Compact(args)) => &args.data_dir,
-                Command::Db(DbCommand::RebuildCache(args)) => &args.data_dir,
+                Command::Db(DbCommand::Stats(args)) => args.data_dir.as_ref(),
+                Command::Db(DbCommand::Compact(args)) => args.data_dir.as_ref(),
+                Command::Db(DbCommand::RebuildCache(args)) => args.data_dir.as_ref(),
+                Command::SnapshotImport(_) => None,
             };
             if let Some(dir) = override_dir { self.data_dir = dir.clone(); }
         }

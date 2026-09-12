@@ -62,6 +62,7 @@ Cheap aggregation across all shards via `Storage::aggregate_stats()` (no disk I/
   - Uses `nippy_raw::{SegmentRawSource, SegmentRawWriter}` to rebuild segment files via raw byte copy.
   - Uses `hash::compute_shard_hash()` when sealing complete shards.
   - Reports dirty shards (WAL bytes + sorted state) for `db_writer` finalization logging.
+  - `compaction_copy_bytes()` measures existing sorted files and bitsets once per affected shard for snapshot working-space checks; incoming data is budgeted separately.
   - `write_block_bundle_follow()` expects in-order appends; the follow DB writer enforces ordering via a reorder buffer.
   - Segment cache invalidation on compaction, rollback, and follow writes.
   - Exports `Storage` and `StorageAggregateStats` to parent module.

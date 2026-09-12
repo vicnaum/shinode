@@ -1,5 +1,8 @@
 //! JSON-RPC server.
 
+#[cfg(test)]
+mod snapshot_tests;
+
 use crate::{
     cli::{
         NodeConfig, DEFAULT_RPC_MAX_BATCH_REQUESTS, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
