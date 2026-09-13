@@ -10,6 +10,16 @@ Phase-aware layouts adapt to sync/compact/seal/follow stages.
 
 ## Files (detailed)
 
+### `archive.rs` / `archive_tests.rs`
+- Archive progress/cancellation adapter; `tui_archive.rs` maps progress into existing `TuiState` fields.
+- `Progress` shares bounded activity and active-worker state plus cancellation
+  across blocking import/package operations and scoped HTTP workers.
+- `run()` selects TUI for interactive stdin/stderr unless `--no-tui`, restores
+  terminal state on completion/error, and waits for the worker after q/Ctrl-C or
+  a display error. Storage errors take precedence over cancellation/display errors.
+- Tests cover concurrent counters, small terminal rendering, cancellation and
+  worker cleanup. Dry-run bypasses this controller; follow starts after it returns.
+
 ### `mod.rs` (~127 lines)
 - **Role**: Module root, status bar utilities, DB stats output, TUI mode global flag.
 - **Key items**: `TUI_MODE_ACTIVE` (global `AtomicBool`), `set_tui_mode()`, `is_tui_mode()`, `print_status_bar()`, `clear_status_bar()`, `print_db_stats()`, `human_bytes()`
@@ -70,7 +80,8 @@ polls stats every 100ms, calculates speed, draws the dashboard, and handles 'q' 
 ## TUI Dashboard (tui.rs)
 
 ### Phase Enum
-Ordered enum (0-5) preventing backwards transitions:
+Ordered enum (0-6) preventing backwards transitions:
+- **Archive** (Cyan, matching Sync) - Download, validate, import/export/restore
 - **Startup** (Yellow) - Initial connection, splash screen
 - **Sync** (Cyan) - Active block fetching
 - **Retry** (Red) - Escalation queue active
@@ -155,3 +166,12 @@ Progress updater functions accept `PeerPool<C>` for either chain; display snapsh
 
 `TuiState::set_config()` receives the selected `ChainKind`; startup text and the
 follow title use its display name. Buffer tests cover both chain labels.
+
+Archive jobs use `archive.rs` for shared progress/cancellation and the existing
+`TuiController`. `tui_archive.rs` maps phase counters and transfer information into
+that state; archive display calls the original `render_sync_ui` with its unchanged
+layout, progress bar, map, speed chart, NETWORK/QUEUE/STORAGE/DB panels and logs.
+Only Base archive workflows add ARCHIVE → HISTORY → FOLLOW to the phase strip.
+Ethereum retains STARTUP/SYNC and its existing appearance. No alternative compact
+renderer, resize gate, panel redesign or sound change belongs in this integration.
+The controller remains alive across handoff; terminal restoration is idempotent.

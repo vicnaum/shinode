@@ -14,6 +14,7 @@
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "UI output")]
 
 mod bars;
+pub mod archive;
 mod beep;
 mod progress;
 mod state;

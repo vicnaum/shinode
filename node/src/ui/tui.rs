@@ -10,10 +10,12 @@
     clippy::cast_lossless,
     clippy::or_fun_call,
     clippy::comparison_chain,
-    clippy::unused_self,
     reason = "TUI rendering code has many format/display operations"
 )]
 
+
+#[path = "tui_archive.rs"]
+mod archive;
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
@@ -60,7 +62,7 @@ const DOS_HEIGHT: u16 = 25;
 
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -80,19 +82,20 @@ use crate::sync::{FinalizePhase, SyncProgressSnapshot, SyncStatus};
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Phase {
-    Startup = 0,
-    Sync = 1,
-    Retry = 2,
-    Compact = 3,
-    Seal = 4,
-    Follow = 5,
+    Archive = 0,
+    Startup = 1,
+    Sync = 2,
+    Retry = 3,
+    Compact = 4,
+    Seal = 5,
+    Follow = 6,
 }
 
 impl Phase {
     pub const fn color(self) -> Color {
         match self {
             Self::Startup => Color::Yellow,
-            Self::Sync => Color::Cyan,
+            Self::Archive | Self::Sync => Color::Cyan,
             Self::Retry => Color::Red,
             Self::Compact => Color::Magenta,
             Self::Seal => Color::Green,
@@ -102,6 +105,7 @@ impl Phase {
 
     pub const fn status_text(self) -> &'static str {
         match self {
+            Self::Archive => "Archives",
             Self::Startup => "Starting",
             Self::Sync => "Fetching",
             Self::Retry => "Retrying",
@@ -118,6 +122,9 @@ impl Phase {
 
 /// State for the TUI dashboard, derived from `SyncProgressSnapshot`.
 pub struct TuiState {
+    pub archive: Option<super::archive::State>,
+    pub archive_workflow: bool,
+    archive_meter: Option<(Instant, Instant, u64, u64)>,
     // From SyncProgressSnapshot (available now)
     pub phase: Phase,
     pub progress: f64,
@@ -237,6 +244,9 @@ impl TuiState {
     /// Create a new TuiState with initial values.
     pub fn new(start_block: u64, end_block: u64) -> Self {
         Self {
+            archive: None,
+            archive_workflow: false,
+            archive_meter: None,
             phase: Phase::Startup,
             progress: 0.0,
             start_block,
@@ -436,7 +446,7 @@ impl TuiState {
         // - Compact: based on compactions_done vs compactions_total
         // - Seal: based on sealings_done vs sealings_total
         match self.phase {
-            Phase::Sync | Phase::Retry | Phase::Startup => {
+            Phase::Archive | Phase::Sync | Phase::Retry | Phase::Startup => {
                 if self.blocks_to_sync > 0 {
                     self.progress = (snapshot.processed as f64 / self.blocks_to_sync as f64).clamp(0.0, 1.0);
                 }
@@ -634,6 +644,9 @@ impl TuiState {
 
     /// Format ETA string.
     pub fn eta_string(&self) -> String {
+        if self.phase == Phase::Archive {
+            return self.archive_eta();
+        }
         if self.current_speed == 0 {
             return "--".into();
         }
@@ -654,23 +667,28 @@ pub struct TuiController {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     pub state: TuiState,
     pub should_quit: bool,
+    active: std::cell::Cell<bool>,
 }
 
 impl TuiController {
     /// Create a new TuiController and enter alternate screen mode.
     pub fn new(start_block: u64, end_block: u64) -> io::Result<Self> {
-        enable_raw_mode()?;
-        io::stdout().execute(EnterAlternateScreen)?;
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-
-        // Play IBM POST beep when TUI starts (splash screen)
-        super::beep::play_post_beep();
-
-        Ok(Self {
+        let controller = Self {
             terminal,
             state: TuiState::new(start_block, end_block),
             should_quit: false,
-        })
+            active: std::cell::Cell::new(true),
+        };
+        enable_raw_mode()?;
+        io::stdout().execute(EnterAlternateScreen)?;
+        super::set_tui_mode(true);
+        super::beep::play_post_beep();
+        Ok(controller)
+    }
+
+    pub fn begin_history(&mut self, start: u64) {
+        self.state.begin_history(start);
     }
 
     /// Poll for keyboard events (non-blocking).
@@ -678,7 +696,11 @@ impl TuiController {
     pub fn poll_quit(&mut self) -> io::Result<bool> {
         if event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+                if key.kind == KeyEventKind::Press
+                    && (key.code == KeyCode::Char('q')
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)))
+                {
                     self.should_quit = true;
                     return Ok(true);
                 }
@@ -697,16 +719,21 @@ impl TuiController {
 
     /// Restore terminal to normal state.
     pub fn restore(&self) -> io::Result<()> {
-        disable_raw_mode()?;
-        io::stdout().execute(LeaveAlternateScreen)?;
-        io::stdout().execute(Show)?; // Show cursor
-        Ok(())
+        if !self.active.replace(false) {
+            return Ok(());
+        }
+        let raw = disable_raw_mode();
+        let screen = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
+        let cursor = io::stdout().execute(Show).map(|_| ());
+        super::set_tui_mode(false);
+        raw.and(screen).and(cursor)
     }
 }
 
 impl Drop for TuiController {
     fn drop(&mut self) {
         let _ = self.restore();
+        super::set_tui_mode(false);
     }
 }
 
@@ -714,11 +741,11 @@ impl Drop for TuiController {
 // Rendering functions (adapted from ui_mock.rs)
 // ============================================================================
 
-fn render_ui(frame: &mut Frame, data: &TuiState) {
+pub(super) fn render_ui(frame: &mut Frame, data: &TuiState) {
     let area = frame.area();
     frame.render_widget(Clear, area);
 
-    if data.phase == Phase::Startup && data.peers_connected == 0 {
+    if data.phase == Phase::Startup && data.peers_connected == 0 && !data.archive_workflow {
         render_splash(frame, data);
     } else {
         let main_block = Block::default()
@@ -731,7 +758,7 @@ fn render_ui(frame: &mut Frame, data: &TuiState) {
 
         match data.phase {
             Phase::Startup => render_startup_ui(frame, inner, data),
-            Phase::Sync | Phase::Retry => render_sync_ui(frame, inner, data),
+            Phase::Archive | Phase::Sync | Phase::Retry => render_sync_ui(frame, inner, data),
             Phase::Compact | Phase::Seal => render_compact_ui(frame, inner, data),
             Phase::Follow => render_follow_ui(frame, inner, data),
         }
@@ -773,7 +800,7 @@ fn render_sync_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
         .split(inner);
 
     render_header(chunks[0], frame.buffer_mut(), data.phase);
-    render_phase_indicator(chunks[2], frame.buffer_mut(), data.phase);
+    render_phase_indicator(chunks[2], frame.buffer_mut(), data);
     render_separator(chunks[3], frame.buffer_mut());
     render_progress_section(chunks[4], frame.buffer_mut(), data);
     render_blocks_map(chunks[6], frame.buffer_mut(), data);
@@ -820,7 +847,7 @@ fn render_compact_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
         .split(inner);
 
     render_header(chunks[0], frame.buffer_mut(), data.phase);
-    render_phase_indicator(chunks[2], frame.buffer_mut(), data.phase);
+    render_phase_indicator(chunks[2], frame.buffer_mut(), data);
     render_separator(chunks[3], frame.buffer_mut());
     render_compact_progress_section(chunks[4], frame.buffer_mut(), data);
     render_shards_map(chunks[6], frame.buffer_mut(), data);
@@ -862,7 +889,7 @@ fn render_follow_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
         .split(inner);
 
     render_header(chunks[0], frame.buffer_mut(), data.phase);
-    render_phase_indicator(chunks[2], frame.buffer_mut(), data.phase);
+    render_phase_indicator(chunks[2], frame.buffer_mut(), data);
     render_separator(chunks[3], frame.buffer_mut());
     render_synced_status(chunks[4], frame.buffer_mut(), data);
     render_separator(chunks[5], frame.buffer_mut());
@@ -1030,7 +1057,7 @@ fn render_startup_ui(frame: &mut Frame, inner: Rect, data: &TuiState) {
         .split(inner);
 
     render_header(chunks[0], frame.buffer_mut(), data.phase);
-    render_phase_indicator(chunks[2], frame.buffer_mut(), data.phase);
+    render_phase_indicator(chunks[2], frame.buffer_mut(), data);
     render_separator(chunks[3], frame.buffer_mut());
     render_startup_status(chunks[4], frame.buffer_mut(), data);
     render_separator(chunks[5], frame.buffer_mut());
@@ -1208,15 +1235,16 @@ fn render_header(area: Rect, buf: &mut Buffer, _phase: Phase) {
     );
 }
 
-fn render_phase_indicator(area: Rect, buf: &mut Buffer, current_phase: Phase) {
-    let phases = [
-        ("STARTUP", Phase::Startup),
-        ("SYNC", Phase::Sync),
-        ("RETRY", Phase::Retry),
-        ("COMPACT", Phase::Compact),
-        ("SEAL", Phase::Seal),
-        ("FOLLOW", Phase::Follow),
-    ];
+fn render_phase_indicator(area: Rect, buf: &mut Buffer, data: &TuiState) {
+    let base_archive = data.archive_workflow && data.config_chain == crate::chain::ChainKind::Base;
+    let current_phase = if base_archive && data.phase == Phase::Startup { Phase::Sync } else { data.phase };
+    let phases = if base_archive { [
+        ("ARCHIVE", Phase::Archive), ("HISTORY", Phase::Sync), ("RETRY", Phase::Retry),
+        ("COMPACT", Phase::Compact), ("SEAL", Phase::Seal), ("FOLLOW", Phase::Follow),
+    ] } else { [
+        ("STARTUP", Phase::Startup), ("SYNC", Phase::Sync), ("RETRY", Phase::Retry),
+        ("COMPACT", Phase::Compact), ("SEAL", Phase::Seal), ("FOLLOW", Phase::Follow),
+    ] };
 
     let mut x = area.x + 2;
     let text = "Phase:  ";
@@ -1308,10 +1336,10 @@ fn render_progress_section(area: Rect, buf: &mut Buffer, data: &TuiState) {
         );
     }
 
-    let blocks_text = format!(
-        "synced {} of {} blocks",
-        format_number(data.synced_blocks()),
-        format_number(data.total_blocks())
+    let blocks_text = data.archive.as_ref().map_or_else(
+        || format!("synced {} of {} blocks", format_number(data.synced_blocks()), format_number(data.total_blocks())),
+        |job| if job.total == 0 { format!("{} — {}", job.phase, job.activity) }
+            else { format!("{} — {} / {} {}", job.phase, job.done, job.total, job.unit) },
     );
     let blocks_x = area.x + (area.width.saturating_sub(blocks_text.len() as u16)) / 2;
     buf.set_string(
@@ -1402,7 +1430,8 @@ fn render_blocks_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
     let label_width: u16 = 12;
     let right_margin: u16 = 6;
 
-    buf.set_string(area.x + 2, area.y, "Blocks", Style::default().fg(Color::Gray));
+    let label = data.archive.as_ref().map_or("Blocks", |job| job.unit);
+    buf.set_string(area.x + 2, area.y, label, Style::default().fg(Color::Gray));
     buf.set_string(area.x + 2, area.y + 1, "Map", Style::default().fg(Color::Gray));
 
     let start_label = format_number(data.start_block);
@@ -1564,8 +1593,13 @@ fn render_shards_map(area: Rect, buf: &mut Buffer, data: &TuiState) {
     reason = "chart rendering with gradient colors is verbose but straightforward"
 )]
 fn render_speed_chart(area: Rect, buf: &mut Buffer, data: &TuiState) {
+    let title = data.archive.as_ref().map_or_else(
+        || " Speed (blocks/s) ".to_owned(),
+        |job| if job.phase == "Downloading / extracting" { " Speed (KiB/s) ".to_owned() }
+            else { format!(" Speed ({}/s) ", job.unit) },
+    );
     let block = Block::default()
-        .title(" Speed (blocks/s) ")
+        .title(title)
         .title_style(Style::default().fg(Color::White))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));

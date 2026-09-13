@@ -46,13 +46,34 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".stateless-history-node"))
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn startup_quit_requested(tui: Option<&EarlyTui>) -> std::io::Result<bool> {
+    let Some(tui) = tui else { return Ok(false); };
+    let mut guard = tui.lock();
+    Ok(guard.should_quit || guard.poll_quit()?)
+}
+
 /// Run the main sync process.
+pub async fn run_sync<C: IngestChain>(config: NodeConfig, argv: Vec<String>) -> Result<()> {
+    run_sync_with_tui::<C>(config, argv, None).await
+}
+
 #[expect(
     clippy::too_many_lines,
     clippy::cognitive_complexity,
     reason = "main sync orchestration has sequential setup phases that are clearer inline"
 )]
-pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
+pub async fn run_sync_with_tui<C: IngestChain>(
+    mut config: NodeConfig,
+    argv: Vec<String>,
+    mut inherited_tui: Option<TuiController>,
+) -> Result<()> {
     // Number of coverage buckets for TUI blocks map visualization
     const COVERAGE_BUCKETS: usize = 200;
     eyre::ensure!(
@@ -148,7 +169,13 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
     // Create early TUI for startup phase display (before storage init)
     // Use a placeholder end_block of 0 - will be updated once we know the actual range
     let early_tui: Option<EarlyTui> = if use_tui {
-        match TuiController::new(config.start_block, 0) {
+        match inherited_tui.take().map_or_else(
+            || TuiController::new(config.start_block, 0),
+            |mut tui| {
+                tui.begin_history(config.start_block);
+                Ok(tui)
+            },
+        ) {
             Ok(tui) => {
                 let tui_arc = Arc::new(Mutex::new(tui));
                 // Draw initial startup screen with config info
@@ -179,14 +206,14 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
     // Spawn background redraw ticker so splash animations run while startup blocks
     let redraw_handle = early_tui.as_ref().map(|tui| {
         let tui = Arc::clone(tui);
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
                 let mut guard = tui.lock();
                 let _ = guard.draw();
             }
-        })
+        }))
     });
 
     // Get log buffer reference for startup TUI updates
@@ -195,6 +222,9 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
     // Initialize storage
     let storage = init_storage(&config, early_tui.as_ref(), log_buffer).await?;
     storage.validate_snapshot_boundary()?;
+    if startup_quit_requested(early_tui.as_ref())? {
+        return Ok(());
+    }
 
     // Seed storage/DB stats into early TUI so panels show data during startup
     if let Some(tui) = early_tui.as_ref() {
@@ -210,6 +240,11 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
         log_buffer,
     )
     .await?;
+
+    if startup_quit_requested(early_tui.as_ref())? {
+        session.handle.shutdown().await?;
+        return Ok(());
+    }
 
     // Wait for minimum peers
     let min_peers = config.min_peers as usize;
@@ -231,6 +266,11 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
         log_buffer,
     )
     .await;
+
+    if startup_quit_requested(early_tui.as_ref())? {
+        session.handle.shutdown().await?;
+        return Ok(());
+    }
 
     // Compute target range
     let range = compute_target_range(
@@ -352,9 +392,7 @@ pub async fn run_sync<C: IngestChain>(mut config: NodeConfig, argv: Vec<String>)
         log_writer: tracing_guards.log_writer.clone(),
     };
     // Stop background splash redraw ticker before main UI takes over
-    if let Some(handle) = redraw_handle {
-        handle.abort();
-    }
+    drop(redraw_handle);
 
     let UiSetup {
         ui_controller: _,

@@ -104,3 +104,8 @@ Maintenance handlers validate effective data-directory identity before tracing,
 logs, peer caches, or recovery. Stats, compact, rebuild-cache, and repair operate
 on either chain; CLI normalization infers stored identity when `--chain` is omitted.
 Sync validates existing metadata before creating run artifacts.
+
+`run_sync_with_tui` accepts the archive workflow's controller and resets its phase
+metrics without leaving the alternate screen. Startup redraw has an abort-on-drop
+guard so early errors release the terminal. Quit is checked after storage recovery,
+peer connection and head warmup, including their immediate-success paths.
