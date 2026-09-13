@@ -152,7 +152,7 @@ comparison reusable.
 | Concern | Evidence |
 | --- | --- |
 | Empty blocks and deposits | Real genesis, 25 sampled deposits, typed RPC/storage fixtures |
-| Fork rules | Generated Canyon/Isthmus boundary validation; snapshot reader rejects Canyon and later bodies |
+| Fork rules | Generated Canyon/Isthmus and later-timestamp Compact archive reconstruction; real-source scale evidence remains pre-Canyon |
 | Source archive boundaries | Generated multi-archive reconstruction and complete-row checks |
 | Corrupt, truncated or pruned input | Manifest, downloader, tar, reconstruction and package rejection tests |
 | Resource limits and interrupted writes | Disk/transfer limits, growing-shard compaction budgets, injected WAL/checkpoint failures and restart tests |
@@ -169,8 +169,77 @@ still has existing differences; this change does not reformat unrelated code.
 
 The compaction seal is now persisted before returning, allowing native export to
 verify it after reopen. The previously observed sealed-cache decode/fallback issue
-remains distinct and unresolved. Later-fork snapshot conversion, real cross-source-
-archive bulk imports, busy-range capacity, cross-platform runtime measurements,
+remains distinct and unresolved. Real-source later-fork conversion, real cross-source-archive bulk imports,
+busy-range capacity, cross-platform runtime measurements,
 and sustained historical P2P availability remain unverified. Public-peer retention
 is operator-dependent; the documented V2 full preset's 10,064-block window is not
 a universal retention promise. No hosting or upload service is introduced.
+
+## Initial archive dashboard evidence
+
+The archive TUI was exercised in a real pseudo-terminal on the same host and
+50,000-block range. A fresh archive download was cancelled after partial bytes
+arrived, then resumed through a complete import. Export and clean restore also
+completed. A second restore was cancelled after the first 1,000-block shard was
+written: it retained the unfinished-restore marker without publishing a trusted
+boundary, then completed on retry. Terminal settings and alternate-screen exit
+were checked on success, q, Ctrl-C, and an input error. `--no-tui` stayed in plain
+output even with a terminal, and dry-run retained clean JSON with empty stderr.
+
+Imported, clean-restored and resumed-restored output passed the independent reference comparison.
+The workspace suite passes **163 tests**, eight ignored, including archive UI
+rendering at small sizes, concurrent counters, cancellation/worker cleanup, and
+cancelled-download resume. These are behavior checks, not replacement throughput
+measurements for the table above. Raw terminal captures and helper scripts remain
+local under `/tmp/shinode-archive-tui-smoke` and are not runtime dependencies.
+The release build and no-default-features check pass; Clippy retains its exact
+220-error / 15-warning baseline. A completed-import TUI run also verified that
+existing output size is shown while transfer and extraction counters stay at zero.
+
+## Unified archive/history workflow
+
+The archive UI now extends the existing Shinode renderer and retains the same
+terminal controller into historical sync and follow. New jobs reconstruct from
+the containing archive rather than downloading a genesis prefix. Automatic mode
+probes actual typed peer bodies/receipts, checks the selected successor's parent
+against an independent RPC, and journals the boundary for stable resumes.
+
+Regression coverage includes pruned and headers-only peers, independent RPC
+agreement/disagreement, saved-boundary identity and budgets, non-genesis imports
+with missing earlier archives, wrong checkpoint rejection, later-fork Compact
+archives, and shared rendering across all phases. Production pipeline tests still
+cover archive → P2P ingestion, cross-boundary RPC, restart and reorg handling.
+The workspace suite passed 173 tests (eight ignored); an additional archive ETA
+regression passed with the five-test UI suite. Release and no-default-features
+builds pass. Clippy matches the existing 220 errors / 15 warnings.
+
+A real 50,000-block completed import ran in the shared TUI with exactly one
+alternate-screen entry/exit and restored terminal settings. Its history handoff
+kept that controller through startup. After tightening the startup quit path,
+pressing q at handoff exited with code 0, one alternate-screen entry/exit and
+restored terminal settings. One live attempt with this ancient range correctly
+reported a history gap because its connected peers could not serve the successor.
+Raw evidence remains local.
+A full recent-chain archive → public history → live follow run is not claimed.
+
+The separate archive/compact renderers and resize gate were removed after user
+review. Archive progress now uses the original `render_sync_ui` layout, map, chart,
+four panels and logs. Original colors and startup sound remain. Base archive
+workflows alone receive ARCHIVE/HISTORY labels; Ethereum keeps STARTUP/SYNC.
+Earlier compact-dashboard evidence describes the superseded implementation.
+
+Original-style verification passed eight UI tests and a real cached 50,000-block
+run at 120×30 (exit 0, one screen entry/exit, restored terminal). Fifteen original
+layout/panel renderer bodies were compared against the committed version and are
+unchanged except for passing state to the Base phase indicator. Release build
+passes; Clippy has no added or removed diagnostics against its existing baseline.
+
+User-provided terminal screenshots subsequently showed a 50,000-block archive
+import handing off to history and adding 1,381 blocks (51,381 stored total).
+A separate recent-range run starting at 51,227,600 reached FOLLOW at 51,228,026
+with 427 stored blocks and RPC active. These observations demonstrate the two
+transitions in separate runs, not a continuous archive-to-live bootstrap or
+guaranteed availability of ancient history from public peers.
+
+The final pre-push `cargo test --workspace --locked` run passed 175 tests with
+eight ignored on 2026-09-13. No live-network tests were enabled in that run.
