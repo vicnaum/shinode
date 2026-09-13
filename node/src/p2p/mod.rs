@@ -245,8 +245,8 @@ pub struct NetworkSession<C: ChainTypes = EthereumChain> {
     peer_cache: Option<PeerCacheHandle>,
 }
 
-/// Start the devp2p network and wait for compatible peers.
-pub async fn connect_peers<C: ChainTypes>(
+/// Start devp2p immediately; callers own peer warmup and session shutdown.
+pub async fn start_session<C: ChainTypes>(
     storage: Option<Arc<Storage>>,
     port: u16,
     trusted_peers: &[reth_network_peers::TrustedPeer],
@@ -298,9 +298,24 @@ pub async fn connect_peers<C: ChainTypes>(
         peer_cache.as_ref().map(|cache| Arc::clone(&cache.buffer)),
         Arc::clone(&p2p_stats),
     );
+    Ok(NetworkSession {
+        handle,
+        pool,
+        p2p_stats,
+        peer_cache,
+    })
+}
+
+/// Start the devp2p network and wait for compatible peers.
+pub async fn connect_peers<C: ChainTypes>(
+    storage: Option<Arc<Storage>>,
+    port: u16,
+    trusted_peers: &[reth_network_peers::TrustedPeer],
+) -> Result<NetworkSession<C>> {
+    let session = start_session::<C>(storage, port, trusted_peers).await?;
     let warmup_started = Instant::now();
     let _connected =
-        wait_for_peer_pool(Arc::clone(&pool), MIN_PEER_START, PEER_DISCOVERY_TIMEOUT).await?;
+        wait_for_peer_pool(Arc::clone(&session.pool), MIN_PEER_START, PEER_DISCOVERY_TIMEOUT).await?;
     if PEER_START_WARMUP_SECS > 0 {
         let min = Duration::from_secs(PEER_START_WARMUP_SECS);
         let elapsed = warmup_started.elapsed();
@@ -309,19 +324,14 @@ pub async fn connect_peers<C: ChainTypes>(
         }
     }
     info!(
-        reth_connected = handle.num_connected_peers(),
-        pool_peers = pool.len(),
-        discovered = p2p_stats.discovered_count.load(Ordering::Relaxed),
-        genesis_mismatches = p2p_stats.genesis_mismatch_count.load(Ordering::Relaxed),
+        reth_connected = session.handle.num_connected_peers(),
+        pool_peers = session.pool.len(),
+        discovered = session.p2p_stats.discovered_count.load(Ordering::Relaxed),
+        genesis_mismatches = session.p2p_stats.genesis_mismatch_count.load(Ordering::Relaxed),
         warmup_ms = warmup_started.elapsed().as_millis() as u64,
         "peer startup complete"
     );
-    Ok(NetworkSession {
-        handle,
-        pool,
-        p2p_stats,
-        peer_cache,
-    })
+    Ok(session)
 }
 
 impl<C: ChainTypes> NetworkSession<C> {

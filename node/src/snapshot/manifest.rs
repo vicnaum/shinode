@@ -65,11 +65,23 @@ pub fn read(args: &SnapshotArgs) -> Result<(Vec<u8>, Plan)> {
         "manifest exceeds 16 MiB"
     );
     let raw = fs::read(&args.manifest)?;
-    let plan = inspect(&raw, args)?;
+    // Existing staging jobs retain their original genesis-prefix selection.
+    let legacy = args
+        .staging_dir
+        .as_ref()
+        .and_then(|root| fs::read(root.join("job.json")).ok())
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .is_some_and(|job| job["format"] == 1);
+    let plan = inspect_from(&raw, args, if legacy { 0 } else { args.start_block })?;
     Ok((raw, plan))
 }
 
+#[cfg(test)]
 pub fn inspect(raw: &[u8], args: &SnapshotArgs) -> Result<Plan> {
+    inspect_from(raw, args, args.start_block)
+}
+
+fn inspect_from(raw: &[u8], args: &SnapshotArgs, start: u64) -> Result<Plan> {
     let digest = format!("{:x}", Sha256::digest(raw));
     ensure!(digest == args.manifest_sha256, "manifest SHA-256 mismatch");
     let manifest: Manifest = serde_json::from_slice(raw)?;
@@ -129,7 +141,9 @@ pub fn inspect(raw: &[u8], args: &SnapshotArgs) -> Result<Plan> {
             .all(|len| *len == count),
             "{name}: incomplete chunk metadata"
         );
-        for index in 0..=usize::try_from(args.end_block / component.blocks_per_file)? {
+        for index in usize::try_from(start / component.blocks_per_file)?
+            ..=usize::try_from(args.end_block / component.blocks_per_file)?
+        {
             chunks.push(select_chunk(&manifest.base_url, name, &component, index)?);
         }
     }
@@ -146,9 +160,13 @@ pub fn inspect(raw: &[u8], args: &SnapshotArgs) -> Result<Plan> {
         snapshot_height: manifest.block,
         producer: manifest.reth_version,
         requested_range: [args.start_block, args.end_block],
-        dependency_range: [0, args.end_block],
-        dependency_reason: "sequential transaction-boundary reconstruction from genesis",
-        supported_format: "verified producer; pre-Canyon bodies only; fresh output directory",
+        dependency_range: [
+            chunks.iter().map(|c| c.start).min().unwrap_or(0),
+            args.end_block,
+        ],
+        dependency_reason:
+            "sequential transaction-boundary reconstruction from the first selected archive",
+        supported_format: "pinned producer; fork-aware OP bodies; selected archive prefix",
         compressed_bytes: sum(false)?,
         extracted_bytes: sum(true)?,
         chunks,

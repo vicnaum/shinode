@@ -284,3 +284,44 @@ fn staging_identity_and_lock_are_enforced() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn cancelled_download_preserves_partial_and_resumes() -> Result<()> {
+    let temp = Temp::new()?;
+    let (url, worker) = server(vec![response(
+        "206 Partial Content",
+        "Content-Length: 5\r\nETag: \"v1\"\r\nContent-Range: bytes 5-9/10\r\n",
+        b"67890",
+    )])?;
+    let chunk = chunk(url, 10);
+    let args = crate::snapshot::tests::arguments(&temp.0);
+    let archive = temp.0.join("archives/headers-0-1.tar.zst");
+    fs::write(archive.with_extension("zst.part"), b"12345")?;
+    atomic_json(
+        &archive.with_extension("zst.json"),
+        &Partial {
+            url: chunk.url.clone(),
+            size: 10,
+            etag: Some("\"v1\"".into()),
+        },
+    )?;
+    let budget = Budget::new(&temp.0, &args);
+    budget.progress.cancel();
+    ensure!(
+        download(&temp.0, &chunk, &args, &budget, &Client::new()).is_err(),
+        "cancel ignored"
+    );
+    ensure!(
+        !archive.exists() && fs::read(archive.with_extension("zst.part"))? == b"12345",
+        "cancel changed partial"
+    );
+    let fresh = Budget::new(&temp.0, &args);
+    let result = download(&temp.0, &chunk, &args, &fresh, &Client::new())?;
+    ensure!(fs::read(result)? == b"1234567890", "resume changed archive");
+    let requests = worker.join().map_err(|_| eyre!("server panicked"))??;
+    ensure!(
+        requests.len() == 1 && requests[0].contains("range: bytes=5-"),
+        "cancel requested bytes or retry lost resume offset"
+    );
+    Ok(())
+}

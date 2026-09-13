@@ -18,8 +18,22 @@ pub struct SnapshotArgs {
     pub manifest_sha256: String,
     #[arg(long)]
     pub start_block: u64,
-    #[arg(long)]
+    #[arg(
+        long,
+        required = false,
+        required_unless_present = "auto_handoff",
+        default_value_if("auto_handoff", "true", "0")
+    )]
     pub end_block: u64,
+    /// Choose the archive end from actual peer history, then sync history and follow.
+    #[arg(long, requires = "checkpoint_rpc", conflicts_with_all = ["end_block", "checkpoint_hash", "offline", "dry_run"])]
+    pub auto_handoff: bool,
+    /// Independent RPC used to authenticate the automatically chosen archive boundary.
+    #[arg(long, requires = "auto_handoff")]
+    pub checkpoint_rpc: Option<String>,
+    /// Blocks of archive/P2P overlap to allow for a moving peer history window.
+    #[arg(long, default_value_t = 43_200)]
+    pub handoff_overlap_blocks: u64,
     /// Private resumable input staging directory, separate from node storage.
     #[arg(long, required_unless_present = "dry_run")]
     pub staging_dir: Option<PathBuf>,

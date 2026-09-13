@@ -84,3 +84,7 @@ omitted or inconsistent responses are retried. Header requests check sequential
 numbers and parent links, including chunk boundaries. `NetworkPeer::serving_range`
 combines advertised history with the caller's head cap and verified head updates.
 Head discovery probes peers concurrently under the existing request timeout.
+
+`start_session<C>` starts networking without waiting for a peer threshold; callers
+own warmup, cancellation and shutdown. Snapshot automatic boundary discovery uses
+it for bounded peer probes; `connect_peers<C>` retains the normal startup warmup.

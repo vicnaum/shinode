@@ -54,11 +54,14 @@ pub(super) fn reconstruct(
     max_transactions: u32,
     mut next: impl FnMut() -> Result<(OpTxEnvelope, OpReceipt)>,
 ) -> Result<BlockPayload<BaseChain>> {
-    ensure!(
-        header.withdrawals_root.is_none(),
-        "snapshot import supports pre-Canyon blocks only; later-fork bodies are not verified"
-    );
-    let mut body = BlockBody::<OpTxEnvelope>::default();
+    // OP bodies contain an empty withdrawals list from Canyon onward. Isthmus
+    // repurposes the header root; the shared chain validator handles that rule.
+    let mut body = BlockBody::<OpTxEnvelope> {
+        withdrawals: header
+            .withdrawals_root
+            .map(|_| alloy_eips::eip4895::Withdrawals::default()),
+        ..Default::default()
+    };
     ensure!(
         proofs::calculate_ommers_root(&body.ommers) == header.ommers_hash,
         "missing ommers"
@@ -99,6 +102,7 @@ struct Position {
     previous: Option<B256>,
     block: u64,
     transaction: u64,
+    transaction_known: bool,
 }
 
 pub fn scan(
@@ -107,7 +111,11 @@ pub fn scan(
     max_transactions: u32,
     mut consume: impl FnMut(BlockPayload<BaseChain>) -> Result<()>,
 ) -> Result<()> {
-    let mut position = Position::default();
+    let mut position = Position {
+        block: plan.dependency_range[0],
+        transaction_known: plan.dependency_range[0] == 0,
+        ..Position::default()
+    };
     for chunk in plan.chunks.iter().filter(|c| c.component == "headers") {
         scan_chunk(
             root,
@@ -168,6 +176,12 @@ fn scan_chunk(
             && receipts.user_header().block_end() == Some(end),
         "incomplete transaction/receipt block range"
     );
+    if !position.transaction_known {
+        if let Some(first) = transactions.user_header().tx_start() {
+            position.transaction = first;
+            position.transaction_known = true;
+        }
+    }
     ensure!(
         transactions.rows() == 0
             || transactions.user_header().tx_start() == Some(position.transaction),
@@ -188,7 +202,7 @@ fn scan_chunk(
         );
         if let Some(parent) = position.previous {
             ensure!(header.parent_hash == parent, "broken parent continuity");
-        } else {
+        } else if position.block == 0 {
             ensure!(
                 hash == ChainKind::Base.genesis_hash(),
                 "snapshot genesis mismatch"

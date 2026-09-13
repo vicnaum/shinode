@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     chain::ChainTypes,
     sync::{
-        validation::tests::{base_payload, commit_payload, CANYON},
+        validation::tests::{base_payload, commit_payload, CANYON, ISTHMUS},
         BlockPayload,
     },
 };
@@ -21,6 +21,9 @@ pub(super) fn arguments(root: &Path) -> SnapshotArgs {
         manifest_sha256: String::new(),
         start_block: 0,
         end_block: 3,
+        auto_handoff: false,
+        checkpoint_rpc: None,
+        handoff_overlap_blocks: 43_200,
         staging_dir: Some(root.join("staging")),
         output_dir: Some(root.join("output")),
         dry_run: false,
@@ -92,6 +95,10 @@ fn fixture_payloads(bad_last: bool) -> Vec<BlockPayload<BaseChain>> {
 }
 
 pub(super) fn fixture(bad_last: bool) -> Result<Fixture> {
+    fixture_with_payloads(fixture_payloads(bad_last))
+}
+
+fn fixture_with_payloads(payloads: Vec<BlockPayload<BaseChain>>) -> Result<Fixture> {
     let root = crate::test_utils::temp_dir("snapshot");
     fs::create_dir_all(&root)?;
     let mut args = arguments(&root);
@@ -99,7 +106,6 @@ pub(super) fn fixture(bad_last: bool) -> Result<Fixture> {
         .staging_dir
         .as_ref()
         .ok_or_else(|| eyre!("staging missing"))?;
-    let payloads = fixture_payloads(bad_last);
     let mut components = serde_json::Map::new();
     for (name, kind) in [
         ("headers", StaticFileSegment::Headers),
@@ -427,12 +433,31 @@ fn reconstruction_requires_transaction_root_and_complete_stream() -> Result<()> 
 }
 
 #[test]
-fn reconstruction_rejects_later_forks_gas_and_transaction_limits() -> Result<()> {
-    let payload = base_payload(CANYON);
-    let error = reader::reconstruct(payload.header, 10, || Err(eyre!("unexpected row read")))
-        .err()
-        .ok_or_else(|| eyre!("later fork accepted"))?;
-    ensure!(error.to_string().contains("pre-Canyon"), "wrong failure");
+fn reconstruction_supports_forks_and_rejects_gas_and_transaction_limits() -> Result<()> {
+    for timestamp in [
+        CANYON - 1,
+        CANYON,
+        ISTHMUS - 1,
+        ISTHMUS,
+        1_764_691_201,
+        1_779_840_001,
+    ] {
+        let mut payload = base_payload(timestamp);
+        payload.header.gas_used = payload.receipts[0].cumulative_gas_used();
+        let mut rows = payload
+            .body
+            .transactions
+            .clone()
+            .into_iter()
+            .zip(payload.receipts.clone());
+        let restored = reader::reconstruct(payload.header.clone(), 10, || {
+            rows.next().ok_or_else(|| eyre!("truncated"))
+        })?;
+        ensure!(
+            restored.body == payload.body && restored.receipts == payload.receipts,
+            "fork reconstruction changed body or deposit fields at {timestamp}"
+        );
+    }
     let mut payload = base_payload(CANYON - 1);
     payload.header.gas_used = 1;
     ensure!(
@@ -534,6 +559,126 @@ fn unsupported_producer_and_pruned_metadata_fail_inspection() -> Result<()> {
             manifest::inspect(&raw, &args).is_err(),
             "unsupported metadata accepted"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn later_archive_selection_requires_checkpoint_and_skips_genesis_files() -> Result<()> {
+    let fixture = fixture(false)?;
+    let mut args = fixture.args.clone();
+    args.start_block = 2;
+    let stage = args
+        .staging_dir
+        .as_ref()
+        .ok_or_else(|| eyre!("missing staging"))?;
+    download::atomic_json(
+        &stage.join("job.json"),
+        &json!({"format":2,"manifest_sha256":args.manifest_sha256,"requested_range":[2,3]}),
+    )?;
+    for component in manifest::COMPONENTS {
+        fs::remove_dir_all(stage.join("chunks").join(format!("{component}-0-1")))?;
+    }
+    let (_, plan) = manifest::read(&args)?;
+    ensure!(
+        plan.dependency_range == [2, 3] && plan.chunks.len() == 3,
+        "selected earlier archives"
+    );
+    ensure!(
+        execute(&config(&args)?, &args).is_err(),
+        "accepted unanchored non-genesis range"
+    );
+    args.checkpoint_hash = Some(alloy_primitives::B256::ZERO);
+    ensure!(
+        execute(&config(&args)?, &args).is_err(),
+        "accepted wrong checkpoint"
+    );
+    ensure!(
+        !args.output_dir.as_ref().is_some_and(|p| p.exists()),
+        "bad checkpoint changed output"
+    );
+    args.checkpoint_hash = Some(fixture.payloads[3].header.hash_slow());
+    execute(&config(&args)?, &args)?;
+    let storage = Storage::open(&config(&args)?)?;
+    ensure!(
+        storage.last_indexed_block()? == Some(3),
+        "later range did not import"
+    );
+    storage.validate_snapshot_boundary()?;
+    Ok(())
+}
+
+#[test]
+fn auto_handoff_cli_requires_rpc_and_implies_open_ended_workflow() -> Result<()> {
+    let args = [
+        "shinode",
+        "snapshot-import",
+        "--manifest",
+        "manifest.json",
+        "--manifest-sha256",
+        "abc",
+        "--start-block",
+        "100",
+        "--auto-handoff",
+        "--checkpoint-rpc",
+        "https://example.com",
+        "--staging-dir",
+        "stage",
+        "--output-dir",
+        "output",
+    ];
+    let config = NodeConfig::try_from_args(args)?;
+    let Some(crate::cli::Command::SnapshotImport(snapshot)) = config.command else {
+        return Err(eyre!("wrong command"));
+    };
+    ensure!(
+        snapshot.auto_handoff && snapshot.end_block == 0,
+        "auto end default failed"
+    );
+    for conflict in [
+        vec!["--end-block", "200"],
+        vec!["--offline"],
+        vec!["--dry-run"],
+    ] {
+        ensure!(
+            NodeConfig::try_from_args(args.into_iter().chain(conflict)).is_err(),
+            "auto handoff conflict accepted"
+        );
+    }
+    let missing_rpc = args
+        .into_iter()
+        .filter(|arg| !["--checkpoint-rpc", "https://example.com"].contains(arg));
+    ensure!(
+        NodeConfig::try_from_args(missing_rpc).is_err(),
+        "missing RPC accepted"
+    );
+    Ok(())
+}
+
+#[test]
+fn later_fork_compact_archives_import_with_deposit_fields_and_empty_withdrawals() -> Result<()> {
+    for timestamp in [CANYON, ISTHMUS, 1_764_691_201, 1_779_840_001] {
+        let mut payloads = fixture_payloads(false);
+        for index in 1..4 {
+            let mut payload = base_payload(timestamp);
+            payload.header.number = index as u64;
+            payload.header.parent_hash = payloads[index - 1].header.hash_slow();
+            payload.header.gas_used = payload.receipts[0].cumulative_gas_used();
+            payloads[index] = payload;
+        }
+        let fixture = fixture_with_payloads(payloads)?;
+        let config = config(&fixture.args)?;
+        execute(&config, &fixture.args)?;
+        let storage = Storage::open(&config)?;
+        for payload in &fixture.payloads {
+            ensure!(
+                journal::compare(
+                    &storage,
+                    &BaseChain::process_ingest(payload.clone(), None)?.0
+                )?,
+                "fork archive changed stored data at {timestamp}"
+            );
+        }
     }
     Ok(())
 }

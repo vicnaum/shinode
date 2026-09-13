@@ -2,6 +2,7 @@ use super::{
     args::SnapshotArgs,
     manifest::{chunk_path, Chunk, Plan},
 };
+use crate::ui::archive::Progress;
 use eyre::{ensure, eyre, Result, WrapErr};
 use parking_lot::Mutex;
 use reqwest::{blocking::Client, header, StatusCode};
@@ -36,20 +37,23 @@ pub struct Budget<'a> {
     limit: u64,
     transferred: Mutex<u64>,
     cancelled: AtomicBool,
+    progress: Progress,
 }
 
 impl<'a> Budget<'a> {
-    const fn new(root: &'a Path, args: &SnapshotArgs) -> Self {
+    fn new(root: &'a Path, args: &SnapshotArgs) -> Self {
         Self {
             root,
             reserve: args.min_free_bytes,
             limit: args.max_download_bytes,
             transferred: Mutex::new(0),
             cancelled: AtomicBool::new(false),
+            progress: Progress::default(),
         }
     }
 
     fn check(&self, amount: u64) -> Result<()> {
+        self.progress.check()?;
         ensure!(!self.cancelled.load(Ordering::Relaxed), "staging cancelled");
         check_space(self.root, self.reserve, amount)
     }
@@ -68,6 +72,7 @@ impl<'a> Budget<'a> {
             *transferred = next;
         }
         target.write_all(bytes)?;
+        self.progress.bytes(bytes.len() as u64, network);
         Ok(())
     }
 }
@@ -114,8 +119,16 @@ pub fn lock_staging(root: &Path, plan: &Plan, raw: &[u8]) -> Result<File> {
         .write(true)
         .open(root.join(".lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock).wrap_err("snapshot staging is already in use")?;
+    let existing_format = fs::read(root.join("job.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Identity>(&raw).ok())
+        .map_or(2, |job| job.format);
+    ensure!(
+        [1, 2].contains(&existing_format),
+        "unsupported staging job version"
+    );
     let identity = Identity {
-        format: 1,
+        format: existing_format,
         manifest_sha256: plan.manifest_sha256.clone(),
         requested_range: plan.requested_range,
     };
@@ -135,6 +148,8 @@ pub fn lock_staging(root: &Path, plan: &Plan, raw: &[u8]) -> Result<File> {
             ensure!(
                 [
                     ".lock",
+                    ".bootstrap.lock",
+                    "bootstrap.json",
                     "manifest.json",
                     "manifest.json.tmp",
                     "job.json.tmp"
@@ -159,9 +174,20 @@ pub fn lock_staging(root: &Path, plan: &Plan, raw: &[u8]) -> Result<File> {
     Ok(lock)
 }
 
-pub fn stage(root: &Path, plan: &Plan, args: &SnapshotArgs) -> Result<()> {
+pub fn stage_progress(
+    root: &Path,
+    plan: &Plan,
+    args: &SnapshotArgs,
+    progress: &Progress,
+) -> Result<()> {
+    progress.phase(
+        "Downloading / extracting",
+        plan.chunks.len() as u64,
+        "archives",
+    );
+    progress.check()?;
     let mut ownership = super::scratch::Ownership::prepare(root, plan)?;
-    progress(&format!(
+    progress.message(&format!(
         "Input: {} compressed / {} extracted bytes; limits: {} / {}, free reserve: {} bytes",
         plan.compressed_bytes,
         plan.extracted_bytes,
@@ -169,38 +195,13 @@ pub fn stage(root: &Path, plan: &Plan, args: &SnapshotArgs) -> Result<()> {
         args.max_extracted_bytes,
         args.min_free_bytes
     ));
-    let budget = Budget::new(root, args);
+    let mut budget = Budget::new(root, args);
+    budget.progress = progress.clone();
     atomic_json(
         &root.join("download-report.json"),
         &serde_json::json!({"complete": false, "manifest_sha256": plan.manifest_sha256}),
     )?;
-    let mut remaining = 0u64;
-    for chunk in &plan.chunks {
-        let temp = root.join("partial").join(&chunk.name);
-        if temp.exists() {
-            clear_partial(&temp, chunk)?;
-        }
-        if !chunk_path(root, chunk).exists() {
-            remaining = remaining
-                .checked_add(chunk.extracted)
-                .ok_or_else(|| eyre!("disk size overflow"))?;
-            let archive = root
-                .join("archives")
-                .join(format!("{}.tar.zst", chunk.name));
-            if !archive.exists() {
-                let part = archive.with_extension("zst.part");
-                let present = if part.exists() {
-                    fs::metadata(part)?.len()
-                } else {
-                    0
-                };
-                remaining = remaining
-                    .checked_add(chunk.compressed.saturating_sub(present))
-                    .ok_or_else(|| eyre!("disk size overflow"))?;
-            }
-        }
-    }
-    budget.check(remaining.saturating_add(1024 * 1024))?;
+    prepare_remaining(root, plan, &budget)?;
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
@@ -259,6 +260,36 @@ pub fn stage(root: &Path, plan: &Plan, args: &SnapshotArgs) -> Result<()> {
     Ok(())
 }
 
+fn prepare_remaining(root: &Path, plan: &Plan, budget: &Budget<'_>) -> Result<()> {
+    let mut remaining = 0u64;
+    for chunk in &plan.chunks {
+        let temp = root.join("partial").join(&chunk.name);
+        if temp.exists() {
+            clear_partial(&temp, chunk)?;
+        }
+        if !chunk_path(root, chunk).exists() {
+            remaining = remaining
+                .checked_add(chunk.extracted)
+                .ok_or_else(|| eyre!("disk size overflow"))?;
+            let archive = root
+                .join("archives")
+                .join(format!("{}.tar.zst", chunk.name));
+            if !archive.exists() {
+                let part = archive.with_extension("zst.part");
+                let present = if part.exists() {
+                    fs::metadata(part)?.len()
+                } else {
+                    0
+                };
+                remaining = remaining
+                    .checked_add(chunk.compressed.saturating_sub(present))
+                    .ok_or_else(|| eyre!("disk size overflow"))?;
+            }
+        }
+    }
+    budget.check(remaining.saturating_add(1024 * 1024))
+}
+
 fn stage_chunk(
     root: &Path,
     chunk: &Chunk,
@@ -267,22 +298,30 @@ fn stage_chunk(
     client: &Client,
 ) -> Result<()> {
     budget.check(0)?;
+    budget
+        .progress
+        .worker(&chunk.name, "Checking cached files", 0, chunk.extracted);
     if chunk_path(root, chunk).exists() {
-        verify_files(&chunk_path(root, chunk), chunk)?;
+        verify_files_progress(&chunk_path(root, chunk), chunk, &budget.progress)?;
     } else {
         ensure!(
             !args.offline,
             "offline staging is missing verified chunk {}",
             chunk.name
         );
-        progress(&format!(
+        budget.progress.message(&format!(
             "Downloading {} ({} bytes)",
             chunk.name, chunk.compressed
         ));
         let archive = download(root, chunk, args, budget, client)?;
+        budget
+            .progress
+            .worker(&chunk.name, "Extracting / verifying", 0, chunk.extracted);
         extract(root, chunk, &archive, budget)?;
     }
-    progress(&format!(
+    budget.progress.worker_done(&chunk.name);
+    budget.progress.advance(1);
+    budget.progress.message(&format!(
         "Verified {}; transferred {} bytes this run",
         chunk.name,
         *budget.transferred.lock()
@@ -322,8 +361,13 @@ fn download(
                     "{}: download retries exhausted: {reason}",
                     chunk.name
                 );
-                progress(&format!("Retrying {}: {reason}", chunk.name));
-                std::thread::sleep(Duration::from_secs(1u64 << attempt.min(3)));
+                budget
+                    .progress
+                    .message(&format!("Retrying {}: {reason}", chunk.name));
+                for _ in 0..(10 * (1u64 << attempt.min(3))) {
+                    budget.check(0)?;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
@@ -487,6 +531,10 @@ fn copy_response(
 ) -> Result<Attempt> {
     let mut buffer = vec![0u8; BUFFER];
     loop {
+        budget.check(0)?;
+        budget
+            .progress
+            .worker(&chunk.name, "Downloading", offset, chunk.compressed);
         let read = match response.read(&mut buffer) {
             Ok(read) => read,
             Err(error) => return Ok(Attempt::Retry(error.to_string())),
@@ -508,7 +556,12 @@ fn copy_response(
     Ok(Attempt::Complete)
 }
 
+#[cfg(test)]
 pub fn verify_files(directory: &Path, chunk: &Chunk) -> Result<()> {
+    verify_files_progress(directory, chunk, &Progress::default())
+}
+
+fn verify_files_progress(directory: &Path, chunk: &Chunk, progress: &Progress) -> Result<()> {
     reject_symlinks(directory)?;
     let mut paths = Vec::new();
     collect_files(directory, directory, &mut paths)?;
@@ -519,6 +572,7 @@ pub fn verify_files(directory: &Path, chunk: &Chunk) -> Result<()> {
                 .all(|p| chunk.files.iter().any(|f| f.path == *p)),
         "unexpected or missing staged files"
     );
+    let mut verified = 0;
     for expected in &chunk.files {
         let path = directory.join(&expected.path);
         ensure!(
@@ -530,11 +584,19 @@ pub fn verify_files(directory: &Path, chunk: &Chunk) -> Result<()> {
         let mut hash = blake3::Hasher::new();
         let mut buffer = vec![0; BUFFER];
         loop {
+            progress.check()?;
             let read = source.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             hash.update(&buffer[..read]);
+            verified += read as u64;
+            progress.worker(
+                &chunk.name,
+                "Checking cached files",
+                verified,
+                chunk.extracted,
+            );
         }
         ensure!(
             hash.finalize().to_hex().as_str() == expected.blake3,
@@ -597,6 +659,7 @@ fn extract(root: &Path, chunk: &Chunk, archive: &Path, budget: &Budget<'_>) -> R
         .ok_or_else(|| eyre!("tar size overflow"))?;
     let mut tar = tar::Archive::new(decoder.take(limit + 1));
     let mut seen = std::collections::BTreeSet::new();
+    let mut extracted = 0;
     for entry in tar.entries()?.raw(true) {
         budget.check(0)?;
         let mut entry = entry?;
@@ -637,6 +700,13 @@ fn extract(root: &Path, chunk: &Chunk, archive: &Path, budget: &Budget<'_>) -> R
             }
             budget.write(&mut target, &buffer[..read], false)?;
             written += read as u64;
+            extracted += read as u64;
+            budget.progress.worker(
+                &chunk.name,
+                "Extracting / verifying",
+                extracted,
+                chunk.extracted,
+            );
             hash.update(&buffer[..read]);
         }
         ensure!(
@@ -655,11 +725,6 @@ fn extract(root: &Path, chunk: &Chunk, archive: &Path, budget: &Budget<'_>) -> R
     ensure!(seen.len() == chunk.files.len(), "archive is missing files");
     fs::rename(temporary, chunk_path(root, chunk))?;
     Ok(())
-}
-
-#[expect(clippy::print_stderr, reason = "snapshot CLI progress output")]
-pub fn progress(message: &str) {
-    eprintln!("{message}");
 }
 
 #[cfg(test)]

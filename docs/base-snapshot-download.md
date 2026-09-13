@@ -8,16 +8,79 @@ writes it through Shinode's normal validation, ingestion, WAL, compaction and
 sealing pipeline. It uses the Rust binary alone: Python, curl and a separate zstd
 executable are not required at runtime.
 
-The initial production reader supports the verified Base V2 producer
-`2.5.2-dev (76a8261)` and **pre-Canyon bodies only**. Later-fork headers, unknown
-producer versions, pruned inputs and incompatible archive layouts are rejected.
+The reader supports the pinned Base V2 producer `2.5.2-dev (76a8261)`.
+It reconstructs OP bodies with fork-aware receipt and withdrawals validation,
+including Canyon and Isthmus. Unknown producer versions, pruned inputs and
+incompatible archive layouts are rejected.
 Imports can resume into a matching Base database and fill gaps. Matching blocks
 are reused; conflicting hashes or stored fields stop the job before new blocks
 are added. An independently verified end-block hash enables guarded P2P
-continuation. Later-fork snapshot bodies remain unsupported.
+continuation. Real-source scale evidence remains the pre-Canyon sample; later-fork
+reconstruction is covered by generated Compact archive fixtures.
 
 To share already imported history without the execution snapshot, use
 [native history export and restore](base-history-packages.md).
+
+## Terminal dashboard
+
+In an interactive terminal, `snapshot-import` uses the existing Shinode fullscreen TUI by default.
+The archive phase uses the original sync layout, map, speed chart, four panels
+and logs. Transfer details appear in the existing log panel. It shows active archives with live transfer/extraction
+bytes, selected input sizes, validation and import progress, batch compaction and
+sealing, output bytes, elapsed time, and recent activity. Transfer counters include
+retries; verified archive counts advance only after checksum verification.
+Cached inputs are checked without counting them as newly transferred bytes.
+
+Put `--no-tui` before the subcommand to keep terminal progress messages:
+`shinode --no-tui snapshot-import ...`. Redirected stderr or noninteractive stdin
+also selects plain output. `--dry-run` remains JSON output and never opens the TUI.
+
+Press **q** or **Ctrl-C** to request a safe stop. The screen waits for workers to
+release their locks, then restores the terminal. In-flight network reads may wait
+for the configured HTTP timeout; compaction and other active storage operations
+finish before cancellation is observed. Repeat the same command to resume.
+Completion and errors also restore the terminal and leave recent messages visible.
+With `--auto-handoff` or `--follow`, successful import retains the same terminal
+controller through **ARCHIVE → HISTORY → FOLLOW**. Cancellation stops the
+workflow. The original TUI layout, styling and startup sound are preserved;
+only Base archive workflows add archive/history phase labels.
+
+## Automatic archive → history → follow
+
+Use `--auto-handoff` instead of `--end-block` and supply an independent
+`--checkpoint-rpc`. Shinode discovers Base peers, probes actual bodies and
+receipts to find available history, and selects an archive end with overlap.
+The RPC must agree with the parent hash of the peer's validated successor.
+`--handoff-overlap-blocks` defaults to 43,200 blocks (about a day on Base).
+The overlap is capped by snapshot coverage and peer availability.
+
+```sh
+nice -n 10 ./target/release/shinode --p2p-port 30309 --rpc-bind 127.0.0.1:8546 snapshot-import \
+  --manifest /path/to/manifest.json \
+  --manifest-sha256 <independently-pinned-sha256> \
+  --start-block <earliest-block-you-want> \
+  --auto-handoff --checkpoint-rpc https://mainnet.base.org \
+  --staging-dir /path/to/base-snapshot-stage \
+  --output-dir /path/to/base-history
+```
+
+The chosen end and trusted hash are saved in staging's `bootstrap.json` before
+archive downloads. Repeat the same command to resume that boundary. After durable
+import, Shinode automatically runs normal historical sync and then live follow,
+keeping one TUI session throughout. `--follow` is implied in automatic mode.
+
+There is no assumed 30-day peer window. A peer must actually serve the needed
+successor, and ordinary handoff preflight checks availability again after import.
+If the snapshot is too old, use a newer independently pinned manifest or a
+`--trusted-peer` serving the missing history. A long import can outlast the
+overlap; overlap cannot guarantee future peer availability.
+
+Automatic mode requires online access and conflicts with `--end-block`,
+`--checkpoint-hash`, `--offline` and `--dry-run`. For a fixed offline job, use
+explicit end/hash arguments. The usual byte and free-space limits still apply;
+if selection exceeds them, the error reports required input bytes before any
+archive transfer. Inspect a fixed range with `--dry-run` when sizing a job.
+The checkpoint RPC supplies the trust anchor; this does not establish L1 finality.
 
 ## Inspect the input
 
@@ -45,17 +108,19 @@ and RocksDB indices are excluded. The manifest and its SHA stay fixed throughout
 retries; the command never consults a moving `latest` pointer. Shared completed
 chunks and snapshot-specific tail URLs are both supported.
 
-The reader currently reconstructs transaction boundaries from genesis. A later
-requested range therefore includes the complete header/transaction/receipt prefix
-through its end block. Inspection makes that dependency visible. The downloader
+New jobs start at the archive containing `--start-block` and reconstruct from
+that archive boundary through the requested end. Earlier archives are excluded.
+Non-genesis archive selections require an independent end checkpoint. Existing
+version-1 staging jobs retain their original genesis-prefix selection on resume.
+Inspection makes the selected dependency range visible. The downloader
 can inspect different component chunk widths, but the conversion reader currently
 requires aligned block ranges across the three components.
 
 For the example, three archives total **85,140,341 compressed bytes** and
 **279,526,316 extracted bytes**. Through the pinned snapshot tip, the same three
 components total **1.88 TB compressed / 3.80 TB extracted** across 309 archives.
-That whole-history selection exceeds the defaults and also crosses the current
-reader's supported fork range; inspection is not a promise that it can be imported.
+That whole-history selection exceeds the defaults; it has not been validated at
+full scale.
 
 ## Download and import
 
@@ -80,7 +145,7 @@ manifest and range must match staging's saved identity. After a download or
 preflight or import failure, repeat the same command to resume. Durable checkpoints
 under `snapshot-imports/` bind the manifest, range, chain, and reader format.
 Recovered WAL/segment coverage is authoritative; a saved counter never skips a
-gap. The reader still scans from genesis when conversion must resume.
+gap. Conversion resume rescans the selected archive prefix.
 
 Both staging and the output have exclusive advisory locks. Normal sync, import,
 compaction, cache rebuild, and repair share the output writer lock. Stop the node
@@ -201,7 +266,7 @@ interrupted extraction is retried from its retained archive; only that job's
 unfinished extraction directory is cleared. Restarts rehash verified files.
 
 Before writing imported blocks, Shinode scans the entire required prefix, checks
-the Base genesis, header hashes and parent continuity, reconstructs transaction
+the Base genesis when included, header hashes and parent continuity, reconstructs transaction
 boundaries, checks transaction/receipt types, gas, roots, bloom and withdrawals,
 and verifies conversion through `BaseChain::process_ingest`. Transaction-number
 continuity and full row consumption are checked at archive boundaries. An overlap

@@ -11,17 +11,20 @@ required. Read `docs/base-snapshot-download.md` for the supported format and CLI
   `--checkpoint-hash` pins the independently verified end block; `--follow`
   enters the normal Base runtime after durable import and cleanup.
 - `manifest.rs`: SHA-pinned Base V2 manifest inspection, component selection with
-  the genesis prefix dependency, output paths/checksums and aligned reader layout.
+  the selected archive prefix dependency (legacy staging retains genesis), output paths/checksums and aligned reader layout.
 - `download.rs`: staging identity and exclusive lock, bounded HTTP workers,
   strong-ETag resume, retries, free-space/transfer limits, streamed tar/zstd
   extraction and verified chunk publication. `download/tests.rs` uses local HTTP
   servers and generated archives.
 - `reader.rs`: NippyJar/Compact reader, sequential transaction boundaries, parent
-  and transaction-number continuity, typed Base validation, pre-Canyon gate.
+  and transaction-number continuity, typed Base fork-aware receipt/withdrawals validation.
 - `mod.rs`: dry-run output and import orchestration. Validates the full required
   prefix, recovers WAL/compaction, checks all overlaps, then streams missing blocks
   through `BaseChain::process_ingest` and storage WAL/compaction/sealing. Keeps the
   destination writer lease across reopen and verifies the full output digest.
+  Uses `ui::archive::Progress` for live phases, bytes and safe cancellation;
+  the same TUI controller continues into P2P history/follow. Blocking reads/compaction may
+  finish before cancellation is observed. Dry-run keeps its JSON-only output.
 - `journal.rs`: versioned manifest/range/chain/reader-bound checkpoints, complete
   stored-bundle comparison, coverage reconciliation and durable completion digest.
 - `scratch.rs`: exact owned input paths and fingerprints, conservative cleanup
@@ -39,9 +42,14 @@ required. Read `docs/base-snapshot-download.md` for the supported format and CLI
   of buffered gaps or replacement-chain blocks during worker drain, with queued
   reorg rollback versus strict normal completion.
 
-Keep the Reth pin shared with the rest of the node. Do not infer later-fork or
-arbitrary body-index compatibility from the tested pre-Canyon reader. Conversion
+Keep the Reth pin shared with the rest of the node. Real-source scale evidence
+remains pre-Canyon; generated Compact fixtures cover later fork reconstruction. Conversion
 resume still rescans the required prefix; reclamation follows full job completion,
-not rolling archive consumption. P2P handoff requires the explicit trusted hash
+not rolling archive consumption. P2P handoff requires an independently trusted hash
 and a peer serving the successor; checksums do not establish finality. Do not make
 the Python prototypes or local raw evidence runtime/CI dependencies.
+
+- `bootstrap.rs` / `bootstrap/peers.rs`: `--auto-handoff` probes actual peer payload
+  availability, verifies the chosen boundary against `--checkpoint-rpc`, persists
+  the choice for stable retries, and implies normal history/follow. No fixed peer
+  retention assumption. Dedicated staging, resource limits and cancellation apply.

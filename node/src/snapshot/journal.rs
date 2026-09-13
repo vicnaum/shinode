@@ -30,6 +30,7 @@ impl Identity {
             range: plan.requested_range,
             chain_id: 8453,
             genesis: ChainKind::Base.genesis_hash(),
+            // Keep the persisted ID: added fork support does not change bundle encoding.
             reader: "base-v2-pre-canyon-1".into(),
         }
     }
@@ -141,13 +142,29 @@ pub fn hash_bundle(hash: &mut Sha256, bundle: &BlockBundle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn digest(storage: &Storage, plan: &Plan) -> Result<Option<String>> {
+    digest_progress(storage, plan, &crate::ui::archive::Progress::default())
+}
+
+pub fn digest_progress(
+    storage: &Storage,
+    plan: &Plan,
+    progress: &crate::ui::archive::Progress,
+) -> Result<Option<String>> {
+    progress.phase(
+        "Verifying stored history",
+        plan.requested_range[1] - plan.requested_range[0] + 1,
+        "blocks",
+    );
     let mut hash = Sha256::new();
     for number in plan.requested_range[0]..=plan.requested_range[1] {
+        progress.check()?;
         let Some(bundle) = stored_bundle(storage, number)? else {
             return Ok(None);
         };
         hash_bundle(&mut hash, &bundle)?;
+        progress.advance(1);
     }
     Ok(Some(format!("{:x}", hash.finalize())))
 }
