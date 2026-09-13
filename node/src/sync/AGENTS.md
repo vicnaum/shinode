@@ -10,6 +10,7 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 - [x] `historical/` - High-performance pipeline for backfilling blocks from P2P peers. Implements fast-sync and follow-mode with AIMD scheduling, parallel fetch/process/write, escalation retries, reorg detection, and bench event logging. See `historical/AGENTS.md`.
 
 ### Files
+- `validation.rs` / `validation/tests.rs` - Chain-specific body/receipt commitment checks, recomputed log blooms, and Ethereum/Base malformed payload and fork-boundary fixtures.
 - `mod.rs` - Core sync types and progress tracking (~570 lines). Defines the sync state machine, atomic progress counters, and coverage tracker for TUI visualization.
   - **Key items**: `BlockPayload`, `SyncStatus` (LookingForPeers, Fetching, Finalizing, UpToDate, Following), `FinalizePhase` (Compacting, Sealing), `SyncProgressStats`, `SyncProgressSnapshot`, `CoverageTracker`, `ProgressReporter` trait, `format_eta_seconds`
   - **Key items** (re-exports): `run_follow_loop`, `PeerHealthTracker`, `BenchEvent`, `BenchEventLogger`, `IngestBenchStats`, `IngestBenchSummary`, `SummaryInput`
@@ -25,7 +26,7 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 
 ## Relationships
 
-- **Depends on**: `p2p::NetworkPeer` (for `BlockPayload`), `reth_ethereum_primitives` (Header, BlockBody, Receipt)
+- **Depends on**: `p2p::NetworkPeer` (for `BlockPayload`), `chain::ChainTypes` (typed block body and receipts), `reth_primitives_traits::Header`
 - **Used by**: `run/sync_runner.rs` (sync orchestration), `ui/` (progress snapshots for display), `rpc/` (request counters), `logging/` (bench stats for reports)
 - **Key field**: `fetch_complete` signals when all fetch tasks are done (used by UI to transition from syncing to finalizing even if `processed < total_len` due to processing failures)
 - **Data/control flow**:
@@ -47,3 +48,5 @@ Sync state machine and progress tracking. Defines shared types (`BlockPayload`, 
 - `CoverageTracker` and `coverage` field for blocks map visualization (bucket-based)
 - `peak_speed` and `update_peak_speed_max()` for peak throughput tracking
 - `SyncStatus::Following` (value 4) added to status enum
+
+`BlockPayload<C = EthereumChain>` carries chain-specific transactions and receipts for typed P2P fetching. Fetch, follow, reorg, and runtime contexts carry the same chain parameter. Storage conversion uses `historical::IngestChain`, implemented for Ethereum and Base. Both chain runtimes and storage maintenance are enabled; full live validation is tracked separately.

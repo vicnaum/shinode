@@ -18,12 +18,12 @@
 ────\|/──|───\|/─────────────────────────────────────────────────────────────
 ````
 
-A lightweight Ethereum history node that syncs headers, transactions, receipts, and logs directly from the P2P network and serves them via JSON-RPC.
+A lightweight Ethereum and Base history node that syncs headers, transactions, receipts, and logs directly from the P2P network and serves them via JSON-RPC.
 
 Think of it as an **alternative to running a full node** when all you need is event logs for indexing.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust](https://img.shields.io/badge/rust-1.82+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.93+-orange.svg)](https://www.rust-lang.org/)
 [![Ethereum](https://img.shields.io/badge/network-ETH%20Mainnet-627eea.svg)](https://ethereum.org/)
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)](ROADMAP.md)
 [![Built with AI](https://img.shields.io/badge/built%20with-Cursor%20%7C%20Claude%20%7C%20Codex-blueviolet.svg)](https://cursor.com/)
@@ -43,20 +43,20 @@ Running a full Ethereum node just to index events is expensive — terabytes of 
 - **Runs on anything** — low CPU, low memory, works on HDDs. A Mac Mini, a Hetzner VPS, or that old PC in the closet
 - **Partial sync** — start from any block. Only need Uniswap V3? Start from its deployment block (default start is block 10M — Uniswap V2 deployment)
 - **Indexer-compatible** — plug in [rindexer](https://github.com/joshstevens19/rindexer), [Ponder](https://ponder.sh) (event-only mode), or any indexer that uses `eth_getLogs`
-- **Zero maintenance** — no EVM upgrades, no fork management, no pruning. Just run it
+- **No execution state** — no EVM or state trie to maintain; network protocol upgrades still require compatible client versions.
 - **Free local RPC** — no rate limits, no API keys, no monthly bills. Your data, on your machine
 
 ### Known Limitations
 
-- **Ethereum Mainnet only** — L2s don't expose receipts over P2P yet. Hoping that changes
-- **No verification yet** — data is fetched from P2P peers without proof validation. Planned: receipt hash verification, and optional CL node for full integrity
+- **Base protocol target** — this development branch supports Base mainnet through Beryl; see [protocol compatibility and validation](docs/base-protocol.md). Other L2s are not supported.
+- **P2P trust model** — transaction/receipt roots, ommers, withdrawals, and log blooms are checked against headers. This establishes payload consistency, not canonicality or L1 finality.
 - **History may thin out** — with EIP-4444 and The Purge, historical P2P data isn't guaranteed forever. Planned: [era1](https://github.com/ethereum/go-ethereum/pull/26621) archive and [Portal Network](https://www.ethportal.net/) support
 - **Ponder: event-only mode** — Ponder works for pure event indexing (no `readContract` calls). If your indexing functions use `context.client.readContract()`, you'll need a full node for `eth_call` (or Ress stateless execution or full-RPC forwarding - both of which are planned)
 - **No SHiNode-to-SHiNode sync yet** — planned: sync sealed shards between nodes via P2P, torrents, or HTTP archives
 
 ### What It Can Do
 
-- **Sync ETH Mainnet** — any block range from the Ethereum P2P network — no RPC provider needed, no beacon node required
+- **Sync Ethereum or Base mainnet** — fetch a requested range from serving P2P peers without an RPC provider or beacon node. Older history may require a trusted archive peer.
 - **Follow the chain head** — stay synced with new blocks and handle reorgs automatically
 - **Serve event logs** — `eth_getLogs` with filtering by block range, address, and topics
 - **Serve block data** — `eth_getBlockByNumber` with transaction hashes
@@ -137,6 +137,36 @@ cargo run --release -- --no-tui
 Stop with Ctrl+C. The node persists checkpoints and resumes on restart.
 
 For detailed setup, see [docs/getting-started.md](docs/getting-started.md).
+
+### Base mainnet (development branch)
+
+Build this checkout with `cargo build --release --locked`, then choose a recent
+Base start block and a separate data directory:
+
+```bash
+./target/release/shinode --chain base --data-dir data/base \
+  --start-block <recent-base-block> --p2p-port 30309 --rpc-bind 127.0.0.1:8546
+
+# Resume the same database and its saved lower bound
+./target/release/shinode --chain base --data-dir data/base \
+  --p2p-port 30309 --rpc-bind 127.0.0.1:8546
+```
+
+Replace `<recent-base-block>` with a decimal block number. Add repeatable
+`--trusted-peer enode://<public-key>@<host>:<port>` for a peer serving older history.
+An advertised history range does not guarantee receipt availability.
+`--chain-id` only asserts the selected chain; it does not select Base.
+
+RPC starts after catching up: Base returns `0x2105` from `eth_chainId`.
+`eth_getBlockByNumber` supports transaction hashes (`false`); `true` remains
+unsupported. Receipt and state-query endpoints are not added by the Base port.
+A run with `--end-block` exits after its bounded backfill; omit it to keep serving
+RPC and following. Backfill targets head minus the rollback window, while follow
+tracks the probed P2P tip. Neither is an OP safe/finalized head.
+
+See [Base configuration](docs/configuration.md#chain-selection-and-serving-peers)
+and [validation evidence](docs/base-protocol.md) for the supported protocol and
+remaining live smoke-test work.
 
 ## Documentation
 

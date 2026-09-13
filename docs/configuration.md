@@ -6,16 +6,119 @@ Full reference for CLI options and environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--chain-id <u64>` | `1` | Chain ID for RPC (Ethereum mainnet only) |
+| `--chain <mainnet\|base>` | `mainnet` | Select sync identity or assert maintenance identity |
+| `--chain-id <u64>` | - | Optional assertion matching the selected chain (1 or 8453) |
+| `--p2p-port <u16>` | `30303` | TCP listener and UDP discovery port (1–65535) |
+| `--trusted-peer <enode>` | - | Repeatable serving-peer URL; accepts IP or DNS hosts |
 | `--data-dir <path>` | `data` | Base data directory for storage |
 | `--peer-cache-dir <path>` | (data dir) | Directory for persisted peer cache; defaults to data directory if unset |
-| `--start-block <u64>` | `10000000` | First block to backfill (pre-Uniswap V2) |
+| `--start-block <u64>` | mainnet: `10000000` | Required for a new Base database; omitted on Base resume to reuse its saved lower bound |
 | `--end-block <u64>` | - | Optional final block to stop at |
 | `--shard-size <u64>` | `10000` | Blocks per storage shard |
 | `--rollback-window <u64>` | `64` | Max rollback depth for reorgs |
 | `--retention-mode <mode>` | `full` | Retention policy (`full` only) |
 | `--head-source <source>` | `p2p` | Head source (`p2p` only) |
 | `--reorg-strategy <strategy>` | `delete` | Rollback strategy (`delete` only) |
+
+## Chain selection and serving peers
+
+`--chain` determines the chain ID and genesis used by the resolved configuration.
+For sync, `--chain mainnet --chain-id 1` is accepted; `--chain-id 8453` alone
+is rejected because sync defaults to Ethereum mainnet. Maintenance infers the
+chain from existing metadata when `--chain` is omitted; `--chain-id` then asserts
+that resolved identity.
+
+Both Ethereum and Base dispatch into their typed P2P, sync, and storage pipelines.
+Ethereum remains the default. This development branch targets Base through Beryl;
+see [protocol compatibility](base-protocol.md) for verification and remaining live
+smoke tests. Ethereum commands retain their existing defaults:
+
+```sh
+shinode --chain mainnet --p2p-port 30309 --data-dir data/ethereum
+```
+
+Maintenance uses the effective data directory, including a command-level override:
+
+```sh
+shinode db stats --data-dir data/base --json
+shinode db compact --data-dir data/base
+shinode db rebuild-cache --data-dir data/base
+shinode --data-dir data/base --repair
+```
+
+An explicit `--chain mainnet` against a Base directory fails before recovery,
+cache creation, or maintenance log creation. Chain ID, genesis, codec, and schema
+are checked together. Legacy Ethereum metadata without genesis/codec remains
+readable; legacy data merely labelled `8453` is rejected. Static data without
+`meta.json` requires restoring metadata before maintenance; it is not adopted as
+a new database. Stored shard size is retained automatically.
+
+Use a separate data directory for each chain. To start Base sync:
+
+```sh
+shinode --chain base --data-dir data/base --start-block <recent-block-number> \
+  --p2p-port 30309 --rpc-bind 127.0.0.1:8546
+```
+
+Select a recent block for a recent-history backfill. For older ranges, add
+`--trusted-peer enode://<public-key>@<archive-host>:<port>` for a node that actually
+serves that history; the flag may be repeated. Discovery or a successful
+connection does not guarantee historical receipt availability.
+
+For public Base P2P peers, plan around a roughly 30-day recent-history window.
+Base's [published pruned snapshots](https://github.com/base/base/blob/main/.env.mainnet)
+use 1,339,200 blocks (about 31 days); individual operators can change retention.
+Choose an older start only with a peer that serves the required bodies and
+receipts. This upstream limit does not prune history already stored by Shinode.
+
+New storage metadata records genesis and the requested start block. Base resume
+without `--start-block` requires matching chain/genesis metadata and reuses the
+earliest requested lower bound, so gaps from interrupted parallel backfill are
+revisited. An explicit lower start extends that saved range; a higher start does
+not discard it. Legacy Ethereum metadata remains readable, but a legacy numeric
+label of 8453 is not sufficient to identify Base data. Maintenance commands do
+not require a start block or change a saved sync range.
+
+Backfill is capped at the observed P2P head minus `--rollback-window` (default
+64 blocks). Follow mode tracks the probed tip and rolls back only within that
+window. These views are not OP `safe` or `finalized`, and block tags with those
+names are unsupported. Root checks establish consistency with peer headers, not
+canonicality or L1 finality. A bounded `--end-block` run finalizes and exits;
+omit that flag to follow and serve RPC after the first synced edge.
+
+Base uses the same RPC subset: `eth_chainId` (`0x2105`), `eth_blockNumber`,
+`eth_getBlockByNumber` with `includeTransactions=false`, and `eth_getLogs`.
+`includeTransactions=true` returns `-32602`; no execution, receipt endpoint,
+or additional OP RPC methods are implied. Logs use block-wide indices, including
+when address/topic filters omit earlier logs.
+
+## Peer caches and connectivity diagnostics
+
+Peer caches use `<peer-cache-dir>/peers/<chain-id>-<genesis-hash>/peers.json`.
+A shared cache directory is safe across chains. Existing untagged `peers.json`
+files are loaded only for Ethereum when its namespaced cache is absent; the
+next cache flush writes the new path. TTL, size caps, and learned AIMD batch
+limits are preserved.
+
+The opt-in test diagnostics use the production connector and typed fetch helpers,
+open no database, and stop after at most 90 seconds per chain. They fetch a
+header, body, and receipts and check transaction/receipt roots and withdrawals.
+Base requires a head within five minutes; the Ethereum regression probe also
+accepts older advertised heads and reports the block timestamp and age.
+Run from the repository root with network access:
+
+```sh
+cargo test --bin shinode live_base_connection --locked -- --ignored --nocapture
+cargo test --bin shinode live_ethereum_connection --locked -- --ignored --nocapture
+```
+
+To seed either diagnostic with known serving peers, set
+`SHINODE_PROBE_TRUSTED_PEERS_FILE` to a text file containing one enode URL per
+line. The file is read only; chain identity is still checked for every session.
+
+Each successful probe prints JSON with the peer, block hash, serving range, and
+validation results. These tests use ephemeral ports and are skipped by normal
+`cargo test` runs. A recent-block success does not establish archive availability.
 
 ## Display Options
 
@@ -207,7 +310,7 @@ After running, `data_dir` contains:
 ```
 data_dir/
 ├── meta.json                          # Schema, chain id, checkpoints
-├── peers.json                         # Persisted peer cache
+├── peers/<chain-id>-<genesis>/peers.json # Chain-specific peer cache
 └── static/shards/<shard_start>/       # One per shard
     ├── shard.json                     # Shard metadata (stats, compaction phase)
     ├── present.bitset                 # Block presence tracking

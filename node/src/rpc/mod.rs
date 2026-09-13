@@ -1,5 +1,11 @@
 //! JSON-RPC server.
 
+#[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
+mod history_reference_tests;
+
 use crate::{
     cli::{
         NodeConfig, DEFAULT_RPC_MAX_BATCH_REQUESTS, DEFAULT_RPC_MAX_BLOCKS_PER_FILTER,
@@ -9,6 +15,7 @@ use crate::{
     storage::Storage,
     sync::SyncProgressStats,
 };
+use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, Bytes, B256};
 use eyre::{Result, WrapErr};
 use jsonrpsee::{
@@ -36,7 +43,7 @@ pub struct RpcConfig {
 impl From<&NodeConfig> for RpcConfig {
     fn from(config: &NodeConfig) -> Self {
         Self {
-            chain_id: config.chain_id,
+            chain_id: config.chain.chain_id(),
             max_request_body_bytes: config.rpc_max_request_body_bytes,
             max_response_body_bytes: config.rpc_max_response_body_bytes,
             max_connections: config.rpc_max_connections,
@@ -66,6 +73,11 @@ pub struct RpcContext {
     config: RpcConfig,
     storage: Arc<Storage>,
     stats: Option<Arc<SyncProgressStats>>,
+}
+
+#[cfg(test)]
+pub fn test_module(config: &NodeConfig, storage: Arc<Storage>) -> Result<RpcModule<RpcContext>> {
+    module(RpcContext { config: RpcConfig::from(config), storage, stats: None })
 }
 
 impl RpcContext {
@@ -346,23 +358,25 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                     let Some(tx_hashes) = tx_hashes_by_number.get(&block_number) else {
                         continue;
                     };
-                    if stored.receipts.len() != tx_hashes.hashes.len() {
+                    if stored.len() != tx_hashes.hashes.len() {
                         warn!(
                             block_number,
-                            receipts = stored.receipts.len(),
+                            receipts = stored.len(),
                             tx_hashes = tx_hashes.hashes.len(),
                             "receipt/tx hash count mismatch while deriving logs"
                         );
                         continue;
                     }
                     let block_hash = SealedHeader::seal_slow(header.clone()).hash();
+                    let mut block_log_index = 0_u64;
                     for (tx_index, (receipt, tx_hash)) in stored
-                        .receipts
                         .iter()
                         .zip(tx_hashes.hashes.iter())
                         .enumerate()
                     {
-                        for (log_index, log) in receipt.logs.iter().cloned().enumerate() {
+                        for log in receipt.logs().iter().cloned() {
+                            let log_index = block_log_index;
+                            block_log_index += 1;
                             let alloy_primitives::Log { address, data } = log;
                             let (topics, data) = data.split();
                             let derived_log = DerivedLog {
@@ -373,7 +387,7 @@ pub fn module(ctx: RpcContext) -> Result<RpcModule<RpcContext>> {
                                 block_hash,
                                 transaction_hash: *tx_hash,
                                 transaction_index: tx_index as u64,
-                                log_index: log_index as u64,
+                                log_index,
                                 removed: false,
                             };
                             if log_matches(
@@ -681,7 +695,7 @@ mod tests {
             tx_hashes: crate::storage::StoredTxHashes { hashes: tx_hashes },
             transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             size: crate::storage::StoredBlockSize { size },
-            receipts: crate::storage::StoredReceipts { receipts },
+            receipts: crate::storage::StoredReceipts::Ethereum(receipts),
         }
     }
 
@@ -1122,3 +1136,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod chain_tests;

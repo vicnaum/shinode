@@ -1,5 +1,13 @@
 # run
 
+Snapshot-backed sync restores the boundary's lower bound before initialization,
+validates anchored continuity after storage recovery/compaction, reconciles any
+bounded reorg of followed blocks, then probes actual successor availability.
+Anchored startup compacts all recovered WAL, including incomplete shards and
+when `--defer-compaction` is set, before detecting missing blocks.
+Unarmed imported
+databases require repeating `snapshot-import` with `--checkpoint-hash`.
+
 ## Purpose
 
 Top-level orchestration layer for the node's runtime lifecycle. Coordinates initialization, P2P connection, sync execution, follow mode, RPC server startup, cleanup, and utility commands. Extracted from the original monolithic `main()` to provide clear separation of concerns between startup, sync execution, follow mode tracking, and cleanup/finalization. Manages the early TUI splash screen during startup and wires storage/DB stats into the dashboard.
@@ -26,7 +34,8 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
 - **Key items**: `build_run_context`, `init_storage`, `connect_p2p`, `wait_for_min_peers`, `wait_for_peer_head`, `setup_ui`, `update_tui_startup`, `update_tui_startup_head`, `update_tui_startup_peers`, `handle_startup_quit`, `EarlyTui`, `UiSetup`, `LogWriters`, `LogBufferRef`
 - **Interactions**: Called by `sync_runner.rs`. Creates `Storage`, `NetworkSession`, `TuiController`/`UIController`, `BenchEventLogger`. Shows startup splash with animated dots.
 - **Knobs / invariants**:
-  - Startup compacts dirty shards from previous incomplete runs
+  - Anchored startup compacts all dirty shards; ordinary startup compacts complete
+    dirty shards unless deferred compaction is enabled.
   - Wait for peer head blocks until head >= start_block (with rollback window)
   - `update_tui_startup*` functions return `true` if quit was requested; caller must invoke `handle_startup_quit` to restore terminal and exit
 
@@ -48,7 +57,7 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
 ### `trackers.rs`
 - **Role**: Background tasks for follow mode (~141 lines).
 - **Key items**: `HeadTrackerHandles`, `TailFeederHandles`, `spawn_head_tracker`, `spawn_tail_feeder`, `build_tail_config`
-- **Interactions**: Head tracker polls `PeerPool` every 1s for best head, persists to storage and updates stats. Tail feeder watches head advances, emits new block ranges past rollback window (500ms poll).
+- **Interactions**: Head tracker probes headers above the observed head on a 1s interval, persists confirmed advances to storage, and updates stats. Probes run concurrently and can be cancelled during shutdown. Tail feeder watches head advances, emits new block ranges past rollback window (500ms poll).
 
 ## Key APIs (no snippets)
 
@@ -84,3 +93,19 @@ Top-level orchestration layer for the node's runtime lifecycle. Coordinates init
   13. Shutdown: SIGINT handler with graceful (first) and force exit code 130 (second).
 
 ## Notes
+
+Startup, sync/follow contexts, trackers, and cleanup carry `C: ChainTypes`.
+`run_sync<C: IngestChain>` uses the Ethereum or Base storage conversion adapter.
+`main.rs` dispatches to the selected chain; runtime types must match the resolved
+chain ID/genesis before run artifacts or storage are created. Backfill tail feeding retains the rollback-depth delay; live follow
+tracks the probed tip. These are P2P observations, not OP safe/finalized heads.
+
+Maintenance handlers validate effective data-directory identity before tracing,
+logs, peer caches, or recovery. Stats, compact, rebuild-cache, and repair operate
+on either chain; CLI normalization infers stored identity when `--chain` is omitted.
+Sync validates existing metadata before creating run artifacts.
+
+`run_sync_with_tui` accepts the archive workflow's controller and resets its phase
+metrics without leaving the alternate screen. Startup redraw has an abort-on-drop
+guard so early errors release the terminal. Quit is checked after storage recovery,
+peer connection and head warmup, including their immediate-success paths.

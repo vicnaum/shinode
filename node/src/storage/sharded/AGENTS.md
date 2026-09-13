@@ -9,6 +9,14 @@ Sharded static-file storage backend (schema v2) for Ethereum history data. Divid
 - (none)
 
 ### Files
+- `package.rs` - Verifies on-disk sealed metadata, complete bitsets and native
+  content hashes; exposes the exact 17 regular files allowed in history packages.
+- `handoff.rs` - Durable snapshot boundary identity, contiguous indexed-head
+  calculation, parent-linked append checks and rollback fence. Sync restores the
+  recorded lower bound and rejects unarmed imports. Startup verifies the anchored
+  header chain; later shards cannot advance `last_indexed_block()` across gaps.
+- `identity.rs` - Shared read-only metadata/config validation, legacy Ethereum compatibility, and maintenance chain resolution.
+- `identity_tests.rs` - Populated chain-switch, recovery-sentinel, orphan-data, and legacy/mislabeled metadata tests.
 - `bitset.rs` - Persistent bitset used to track which block offsets exist in a shard.
   - **Key items**: `Bitset::load()`, `Bitset::flush()`, `Bitset::set()`, `Bitset::clear()`, `Bitset::count_ones()`
 - `hash.rs` - Computes a stable content hash for a sealed shard based on metadata + sorted segment files.
@@ -60,7 +68,15 @@ Cheap aggregation across all shards via `Storage::aggregate_stats()` (no disk I/
   - Uses `nippy_raw::{SegmentRawSource, SegmentRawWriter}` to rebuild segment files via raw byte copy.
   - Uses `hash::compute_shard_hash()` when sealing complete shards.
   - Reports dirty shards (WAL bytes + sorted state) for `db_writer` finalization logging.
+  - `compaction_copy_bytes()` measures existing sorted files and bitsets once per affected shard for snapshot working-space checks; incoming data is budgeted separately.
+  - `open_with_progress()` acquires a destination writer lease before mutation; `open_locked()` reuses an existing lease across importer reopen. `repair()` takes the same lock.
+  - `open_locked_preserving_resume()` recovers storage without adopting an incoming
+    sync lower bound; package restore uses it until overlap and parent validation
+    have succeeded and imported blocks are durable.
+  - Metadata and bitsets use atomic synced publication; WAL appends and replacement segments are synced before compaction swaps. `recount_stats_in_range()` reconciles counters after recovery before snapshot checkpoints.
   - `write_block_bundle_follow()` expects in-order appends; the follow DB writer enforces ordering via a reorder buffer.
+  - Compaction persists its final sealed metadata before returning; exports must
+    be able to verify the same seal after reopening without a cache.
   - Segment cache invalidation on compaction, rollback, and follow writes.
   - Exports `Storage` and `StorageAggregateStats` to parent module.
 - **Knobs / invariants**:
@@ -196,3 +212,36 @@ shards/<shard_start>/
 11. **Peer cache**: load/update/persist `peers.json` for the P2P static peer seeding path.
 
 ## Notes
+
+## Peer cache chain isolation
+
+`peer_cache_tests.rs` covers shared directories, legacy Ethereum cache fallback,
+chain/genesis mismatch rejection, TTL/cap filtering, and AIMD/address persistence.
+Caches live at `<peer-cache-dir>/peers/<chain-id>-<genesis>/peers.json`. Untagged
+legacy caches only seed Ethereum when no namespaced file exists. Network startup
+calls `validate_peer_cache_identity()` before using the cache.
+
+`disk_usage_at()` resolves the peer-cache namespace from database metadata and shares cache-loading migration precedence: prefer the namespaced file, with an Ethereum-only legacy fallback.
+
+## Chain-selected payload codecs
+
+Global metadata records `storage_codec` (`ethereum_v1` or `op_v1`). Missing codec
+metadata retains legacy Ethereum decoding; Base requires explicit `op_v1`.
+Unknown or mismatched codecs fail before shard recovery. WAL and follow writes
+encode transactions/receipts with the selected codec; follow validates these
+encodings before appending any segments. Compaction copies encoded bytes, so
+legacy Ethereum data is not rewritten into an enum format. Receipt reads and
+`block_transactions()` decode through the same codec, including sealed segments.
+
+Rollback compacts pending WAL records before pruning affected shards, preventing
+recovery from restoring removed blocks. It recounts retained transactions,
+receipts, and logs using the selected codec, recomputes the actual retained tip,
+and refreshes the sealed-shard cache. `storage/chain_tests.rs` covers rollback
+across sealed data and a pending WAL tail, followed by reopening and new writes.
+
+Identity is validated before directory creation, shard recovery, or compaction.
+`existing_meta()` validates stored chain/genesis/codec/schema and refuses orphaned
+static data; `validate_existing()` also checks resolved configuration and settings.
+`configure_maintenance()` infers the chain only when no explicit selection was
+supplied and adopts the stored shard size. Resume, disk stats, and repair use the
+same identity rules; missing legacy identity fields imply Ethereum only.

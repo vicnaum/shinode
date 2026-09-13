@@ -69,6 +69,7 @@ pub struct RunDerived {
     pub range_start: u64,
     pub range_end: u64,
     pub head_at_startup: u64,
+    /// Historical head minus rollback depth, not a consensus safe/finalized head.
     pub safe_head: u64,
     pub rollback_window_applied: bool,
     pub worker_count: usize,

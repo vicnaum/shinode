@@ -1,0 +1,39 @@
+{
+  "block_hash": "0xb012f7eec1b586865500b42d70c4922d6e3468092e3ca0965758f0b4a8be51a1",
+  "block_number": 51174575,
+  "block_timestamp": 1789138497,
+  "eth_version": "Eth69",
+  "fork_id": {
+    "hash": [
+      234,
+      1,
+      89,
+      235
+    ],
+    "next": 0
+  },
+  "logs": 773,
+  "observed_at_unix": 1789138500,
+  "peer_id": "0xafc53b3118ad7fa23c7a0ae9220732485220841a77041bd995653b299912c0b5a9e4065891128773ef53a7b7bacee149e508692e9ddd4113a402ab591bf83870",
+  "receipt_root_verified": true,
+  "receipts": 395,
+  "source_revision": "d5eed12dea87bff8688fbf0e1b789aa3f93f78a2",
+  "transaction_root_verified": true,
+  "transaction_types": [
+    0,
+    1,
+    2,
+    4,
+    126
+  ],
+  "transactions": 395,
+  "observed_at_utc": "2026-09-11T14:55:00+00:00",
+  "reference_rpc": {
+    "endpoint": "https://mainnet.base.org",
+    "block_hash_matches": true,
+    "block_number_matches": true,
+    "transaction_count_matches": true,
+    "transactions_root": "0x65e68e33730935dfd36465871c738c69dc5ee2372c543314ea712ca5217cc8de",
+    "receipts_root": "0x92e0a74b1264e2303cfc689f626aad772e39b7744236b4fcb71260913d70ed40"
+  }
+}

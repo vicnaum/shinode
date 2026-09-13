@@ -3,6 +3,7 @@
 // Allow process::exit for TUI quit functionality - needed to force exit after user presses 'q'
 #![expect(clippy::exit, reason = "intentional exit on user quit request")]
 
+use crate::chain::ChainTypes;
 use crate::p2p::PeerPool;
 use crate::sync::historical::PeerHealthTracker;
 use crate::sync::{format_eta_seconds, SyncProgressSnapshot, SyncProgressStats, SyncStatus};
@@ -357,10 +358,10 @@ fn format_progress_message(snapshot: &SyncProgressSnapshot, speed: f64, eta: &st
 }
 
 /// Spawn the background task that updates progress bars.
-pub fn spawn_progress_updater(
+pub fn spawn_progress_updater<C: ChainTypes>(
     ui: Arc<Mutex<UIController>>,
     stats: Arc<SyncProgressStats>,
-    peer_pool: Arc<PeerPool>,
+    peer_pool: Arc<PeerPool<C>>,
     peer_health: Option<Arc<PeerHealthTracker>>,
 ) {
     tokio::spawn(async move {
@@ -410,10 +411,10 @@ pub fn spawn_progress_updater(
 /// If `log_writer` is provided, it will be flushed before exiting to prevent
 /// log truncation.
 #[expect(clippy::too_many_arguments, reason = "TUI updater needs all sync state")]
-pub fn spawn_tui_progress_updater(
+pub fn spawn_tui_progress_updater<C: ChainTypes>(
     tui: Arc<Mutex<TuiController>>,
     stats: Arc<SyncProgressStats>,
-    peer_pool: Arc<PeerPool>,
+    peer_pool: Arc<PeerPool<C>>,
     peer_health: Option<Arc<PeerHealthTracker>>,
     end_block: u64,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,

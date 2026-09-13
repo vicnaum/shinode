@@ -1,0 +1,550 @@
+//! Base history import without execution state or an external Python runtime.
+pub mod args;
+mod bootstrap;
+mod download;
+mod journal;
+mod manifest;
+pub mod package;
+mod reader;
+mod scratch;
+
+use crate::ui::archive::{self as archive_ui, Progress};
+use crate::{
+    chain::{BaseChain, ChainKind},
+    cli::NodeConfig,
+    storage::{DataDirLock, Storage},
+    sync::historical::IngestChain,
+};
+use alloy_consensus::TxReceipt;
+use args::SnapshotArgs;
+use eyre::{ensure, eyre, Result};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+pub async fn run(config: NodeConfig, args: SnapshotArgs) -> Result<()> {
+    let import_config = config.clone();
+    let import_args = args.clone();
+    let follow = args.follow || args.auto_handoff;
+    if args.dry_run {
+        return tokio::task::spawn_blocking(move || {
+            execute_progress(&import_config, &import_args, &Progress::default())
+        })
+        .await?;
+    }
+    let tui =
+        archive_ui::run_with_handoff(config.no_tui, "Snapshot import", follow, move |progress| {
+            let resolved = bootstrap::resolve(&import_config, &import_args, &progress)?;
+            execute_progress(&import_config, &resolved, &progress)
+        })
+        .await?;
+    if follow {
+        let mut config = config;
+        config.no_tui |= tui.is_none();
+        config.data_dir = absolute(
+            args.output_dir
+                .as_deref()
+                .ok_or_else(|| eyre!("missing output"))?,
+        )?;
+        config.command = None;
+        config.end_block = None;
+        config.start_block_override = None;
+        crate::run::run_sync_with_tui::<BaseChain>(config, std::env::args().collect(), tui).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn execute(config: &NodeConfig, args: &SnapshotArgs) -> Result<()> {
+    execute_progress(config, args, &Progress::default())
+}
+
+fn execute_progress(config: &NodeConfig, args: &SnapshotArgs, progress: &Progress) -> Result<()> {
+    progress.check()?;
+    ensure!(
+        !args.follow || (args.checkpoint_hash.is_some() && !args.dry_run),
+        "--follow requires --checkpoint-hash and an actual import"
+    );
+    ensure!(
+        args.chain == ChainKind::Base && config.chain == ChainKind::Base,
+        "snapshot import currently supports Base mainnet only"
+    );
+    let (raw, plan) = manifest::read(args)?;
+    if args.dry_run {
+        return print_plan(&plan);
+    }
+    ensure!(
+        plan.compressed_bytes <= args.max_download_bytes,
+        "selected archives exceed --max-download-bytes; inspect the selected archive sizes"
+    );
+    ensure!(
+        plan.extracted_bytes <= args.max_extracted_bytes,
+        "selected files exceed --max-extracted-bytes"
+    );
+    manifest::validate_layout(&plan)?;
+    ensure!(
+        plan.dependency_range[0] == 0 || args.checkpoint_hash.is_some(),
+        "non-genesis archive import requires an independent --checkpoint-hash"
+    );
+    progress.selected(plan.compressed_bytes, plan.extracted_bytes);
+    progress.detail(format!(
+        "Blocks {}–{} → {}",
+        args.start_block,
+        args.end_block,
+        args.output_dir
+            .as_ref()
+            .map_or_else(String::new, |p| p.display().to_string())
+    ));
+    ensure!(config.shard_size > 0, "--shard-size must be nonzero");
+    let staging = args
+        .staging_dir
+        .as_ref()
+        .ok_or_else(|| eyre!("missing --staging-dir"))?;
+    let output = args
+        .output_dir
+        .as_ref()
+        .ok_or_else(|| eyre!("missing --output-dir"))?;
+    let staging = absolute(staging)?;
+    let output = absolute(output)?;
+    let mut normalized_args = args.clone();
+    normalized_args.output_dir = Some(output.clone());
+    let args = &normalized_args;
+    ensure!(
+        !staging.starts_with(&output) && !output.starts_with(&staging),
+        "staging and output directories must be separate, not nested"
+    );
+    let mut config = config.clone();
+    config.data_dir.clone_from(&output);
+    config.peer_cache_dir = None;
+    config.command = None;
+    config.start_block = args.start_block;
+    config.start_block_override = Some(args.start_block);
+    config.end_block = Some(args.end_block);
+    validate_output(&config, &plan)?;
+    let _staging_lock = download::lock_staging(&staging, &plan, &raw)?;
+    let lease = if output.exists() {
+        Some(Arc::new(DataDirLock::acquire(&output)?))
+    } else {
+        None
+    };
+    if let Some(lease) = &lease {
+        if resume_complete(&config, args, &plan, lease, progress)? {
+            cleanup_scratch(args, &staging, &plan, progress)?;
+            return Ok(());
+        }
+    }
+    download::stage_progress(&staging, &plan, args, progress)?;
+    import_verified(&config, args, &plan, &staging, lease, progress)
+}
+
+fn validate_output(config: &NodeConfig, plan: &manifest::Plan) -> Result<()> {
+    Storage::validate_existing(config)?;
+    let output = &config.data_dir;
+    if !output.exists() || output.join("meta.json").exists() {
+        return Ok(());
+    }
+    let marker = output.join("snapshot-import-init.json");
+    if marker.exists() {
+        ensure!(
+            serde_json::from_slice::<journal::Identity>(&fs::read(marker)?)?
+                == journal::Identity::new(plan),
+            "unfinished destination belongs to another import"
+        );
+    } else {
+        for entry in fs::read_dir(output)? {
+            let name = entry?.file_name();
+            ensure!(
+                name == ".writer.lock" || name == "snapshot-import-init.json.tmp",
+                "refusing to adopt unrelated output directory"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn recover(
+    storage: &Storage,
+    output: &Path,
+    args: &SnapshotArgs,
+    progress: &Progress,
+) -> Result<()> {
+    progress.phase("Recovering storage", 0, "shards");
+    progress.check()?;
+    let dirty = storage.dirty_shards()?;
+    if dirty.is_empty() {
+        return storage.recount_stats_in_range(args.start_block, args.end_block);
+    }
+    let existing = storage.compaction_copy_bytes(dirty.iter().map(|shard| shard.shard_start))?;
+    let budget = dirty.iter().fold(existing, |total, shard| {
+        total
+            .saturating_add(shard.wal_bytes.saturating_mul(4))
+            .saturating_add(1024 * 1024)
+    });
+    download::check_space(output, args.min_free_bytes, budget)?;
+    storage.compact_all_dirty_with_progress(|_| {})?;
+    storage.recount_stats_in_range(args.start_block, args.end_block)?;
+    storage.seal_completed_shards_with_progress(|_| {})
+}
+
+fn resume_complete(
+    config: &NodeConfig,
+    args: &SnapshotArgs,
+    plan: &manifest::Plan,
+    lease: &Arc<DataDirLock>,
+    progress: &Progress,
+) -> Result<bool> {
+    let mut checkpoint = journal::Checkpoint::load(&config.data_dir, plan)?;
+    let Some(expected) = checkpoint.complete_digest.clone() else {
+        return Ok(false);
+    };
+    let storage = Storage::open_locked(config, Arc::clone(lease), |_, _| {})?;
+    recover(&storage, &config.data_dir, args, progress)?;
+    progress.output(storage.disk_usage_cached()?.total_bytes);
+    let Some(actual) = journal::digest_progress(&storage, plan, progress)? else {
+        return Ok(false);
+    };
+    ensure!(
+        actual == expected,
+        "completed import differs from durable storage; refusing cleanup"
+    );
+    crate::storage::durable::sync_tree(&config.data_dir)?;
+    if let Some(hash) = args.checkpoint_hash {
+        storage.pin_snapshot_boundary(
+            args.start_block,
+            args.end_block,
+            hash,
+            &plan.manifest_sha256,
+        )?;
+    }
+    checkpoint.reconcile(&storage, plan)?;
+    checkpoint.complete_digest = Some(actual);
+    checkpoint.save(&config.data_dir, plan)?;
+    report(&storage, &config.data_dir, plan, 0.0)?;
+    progress.message("Requested range is already complete and verified; no inputs needed");
+    Ok(true)
+}
+
+fn import_verified(
+    config: &NodeConfig,
+    args: &SnapshotArgs,
+    plan: &manifest::Plan,
+    staging: &Path,
+    lease: Option<Arc<DataDirLock>>,
+    progress: &Progress,
+) -> Result<()> {
+    let started = Instant::now();
+    let output = &config.data_dir;
+    let expected = validate_source(staging, plan, args, progress)?;
+    let parent = output
+        .parent()
+        .ok_or_else(|| eyre!("invalid output parent"))?;
+    fs::create_dir_all(parent)?;
+    download::check_space(parent, args.min_free_bytes, 1024 * 1024)?;
+    let lease = match lease {
+        Some(lease) => lease,
+        None => Arc::new(DataDirLock::acquire(output)?),
+    };
+    validate_output(config, plan)?;
+    download::atomic_json(
+        &output.join("snapshot-import-init.json"),
+        &journal::Identity::new(plan),
+    )?;
+    crate::storage::durable::sync_directory(parent)?;
+    let storage = Storage::open_locked(config, Arc::clone(&lease), |_, _| {})?;
+    recover(&storage, output, args, progress)?;
+    progress.output(storage.disk_usage_cached()?.total_bytes);
+    progress.phase(
+        "Checking overlaps",
+        args.end_block - plan.dependency_range[0] + 1,
+        "blocks",
+    );
+    // Check every overlap before adding any new block from this job.
+    reader::scan(staging, plan, args.max_transactions_per_block, |payload| {
+        progress.check()?;
+        progress.position(payload.header.number - plan.dependency_range[0] + 1);
+        if payload.header.number >= args.start_block {
+            journal::compare(&storage, &BaseChain::process_ingest(payload, None)?.0)?;
+        }
+        Ok(())
+    })?;
+    let mut checkpoint = journal::Checkpoint::load(output, plan)?;
+    checkpoint.reconcile(&storage, plan)?;
+    checkpoint.save(output, plan)?;
+    progress.phase("Importing", args.end_block - args.start_block + 1, "blocks");
+    progress.position(checkpoint.verified_blocks);
+    let mut batch = Vec::new();
+    reader::scan(staging, plan, args.max_transactions_per_block, |payload| {
+        progress.check()?;
+        if payload.header.number < args.start_block {
+            return Ok(());
+        }
+        let bundle = BaseChain::process_ingest(payload, None)?.0;
+        if !journal::compare(&storage, &bundle)? {
+            batch.push(bundle);
+        }
+        if batch.len() >= usize::from(args.batch_blocks) {
+            flush(
+                &storage,
+                args,
+                plan,
+                &mut batch,
+                &mut checkpoint,
+                started,
+                progress,
+            )?;
+        }
+        Ok(())
+    })?;
+    flush(
+        &storage,
+        args,
+        plan,
+        &mut batch,
+        &mut checkpoint,
+        started,
+        progress,
+    )?;
+    crate::storage::durable::sync_tree(output)?;
+    drop(storage);
+    let storage = Storage::open_locked(config, Arc::clone(&lease), |_, _| {})?;
+    ensure!(
+        journal::digest_progress(&storage, plan, progress)?.as_ref() == Some(&expected),
+        "imported data differs after reopen or range is incomplete"
+    );
+    checkpoint.reconcile(&storage, plan)?;
+    checkpoint.complete_digest = Some(expected);
+    checkpoint.save(output, plan)?;
+    if let Some(hash) = args.checkpoint_hash {
+        storage.pin_snapshot_boundary(
+            args.start_block,
+            args.end_block,
+            hash,
+            &plan.manifest_sha256,
+        )?;
+    }
+    failpoint("after-complete-checkpoint")?;
+    report(&storage, output, plan, started.elapsed().as_secs_f64())?;
+    cleanup_scratch(args, staging, plan, progress)?;
+    progress.message(&format!(
+        "Verified {} blocks in {}",
+        checkpoint.verified_blocks,
+        output.display()
+    ));
+    Ok(())
+}
+
+fn cleanup_scratch(
+    args: &SnapshotArgs,
+    staging: &Path,
+    plan: &manifest::Plan,
+    progress: &Progress,
+) -> Result<()> {
+    if !args.keep_scratch {
+        progress.phase("Cleaning owned scratch", 0, "files");
+        progress.check()?;
+        scratch::Ownership::cleanup(staging, plan)?;
+    }
+    Ok(())
+}
+
+fn validate_source(
+    staging: &Path,
+    plan: &manifest::Plan,
+    args: &SnapshotArgs,
+    progress: &Progress,
+) -> Result<String> {
+    progress.message("Validating selected archive history before writing output storage");
+    progress.phase(
+        "Validating archive prefix",
+        args.end_block - plan.dependency_range[0] + 1,
+        "blocks",
+    );
+    let mut expected = Sha256::new();
+    reader::scan(staging, plan, args.max_transactions_per_block, |payload| {
+        progress.check()?;
+        progress.position(payload.header.number - plan.dependency_range[0] + 1);
+        let bundle = BaseChain::process_ingest(payload, None)?.0;
+        if bundle.number == args.end_block {
+            ensure!(
+                args.checkpoint_hash
+                    .is_none_or(|hash| hash == bundle.header.hash_slow()),
+                "trusted checkpoint hash does not match snapshot end block {}",
+                args.end_block
+            );
+        }
+        if bundle.number >= args.start_block {
+            journal::hash_bundle(&mut expected, &bundle)?;
+        }
+        if bundle.number % 10_000 == 0 {
+            progress.message(&format!(
+                "Validated block {}/{}",
+                bundle.number, args.end_block
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(format!("{:x}", expected.finalize()))
+}
+
+fn report(storage: &Storage, output: &Path, plan: &manifest::Plan, elapsed: f64) -> Result<()> {
+    let [start, end] = plan.requested_range;
+    let report = serde_json::json!({"manifest_sha256": plan.manifest_sha256, "chain_id": 8453,
+        "genesis": ChainKind::Base.genesis_hash(), "range": [start, end],
+        "imported_blocks": end - start + 1, "storage_bytes": storage.disk_usage()?.total_bytes,
+        "elapsed_seconds": elapsed, "complete": true});
+    download::atomic_json(&output.join("snapshot-import.json"), &report)
+}
+
+fn flush(
+    storage: &Storage,
+    args: &SnapshotArgs,
+    plan: &manifest::Plan,
+    batch: &mut Vec<crate::storage::BlockBundle>,
+    checkpoint: &mut journal::Checkpoint,
+    started: Instant,
+    progress: &Progress,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let output = args
+        .output_dir
+        .as_ref()
+        .ok_or_else(|| eyre!("missing output"))?;
+    progress.check()?;
+    let estimate = working_space(storage, batch)?;
+    download::check_space(output, args.min_free_bytes, estimate)?;
+    progress.activity("Writing batch");
+    storage.write_block_bundles_wal(batch)?;
+    failpoint("after-wal")?;
+    progress.activity("Compacting batch");
+    storage.compact_all_dirty_with_progress(|_| {})?;
+    failpoint("after-compaction")?;
+    progress.activity("Sealing batch");
+    storage.seal_completed_shards_with_progress(|_| {})?;
+    for bundle in batch.iter() {
+        ensure!(
+            journal::compare(storage, bundle)?,
+            "missing compacted block"
+        );
+    }
+    checkpoint.reconcile(storage, plan)?;
+    failpoint("before-checkpoint")?;
+    checkpoint.save(output, plan)?;
+    failpoint("after-checkpoint")?;
+    batch.clear();
+    progress.activity("");
+    progress.position(checkpoint.verified_blocks);
+    progress.output(storage.disk_usage_cached()?.total_bytes);
+    progress.message(&format!(
+        "Verified {}/{} blocks ({:.1} blocks/s), {} storage bytes",
+        checkpoint.verified_blocks,
+        args.end_block - args.start_block + 1,
+        checkpoint.verified_blocks as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON),
+        storage.disk_usage_cached()?.total_bytes,
+    ));
+    Ok(())
+}
+
+#[cfg(not(test))]
+const fn failpoint(_point: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! { static INTERRUPT_AT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) }; }
+
+#[cfg(test)]
+fn failpoint(point: &str) -> Result<()> {
+    INTERRUPT_AT.with(|target| {
+        if target
+            .borrow()
+            .as_ref()
+            .is_some_and(|target| *target == point)
+        {
+            target.replace(None);
+            return Err(eyre!("interrupted at {point}"));
+        }
+        Ok(())
+    })
+}
+
+fn working_space(storage: &Storage, batch: &[crate::storage::BlockBundle]) -> Result<u64> {
+    let incoming = batch
+        .iter()
+        .map(|bundle| {
+            let receipt_bytes = bundle.receipts.iter().fold(0u64, |sum, receipt| {
+                receipt
+                    .logs()
+                    .iter()
+                    .fold(sum.saturating_add(1024), |sum, log| {
+                        sum.saturating_add(log.data.data.len() as u64)
+                            .saturating_add(log.topics().len() as u64 * 32)
+                    })
+            });
+            bundle
+                .size
+                .size
+                .saturating_add(receipt_bytes)
+                .saturating_mul(4)
+                .saturating_add(4096)
+        })
+        .fold(0u64, u64::saturating_add);
+    // sorted.tmp retains a full copy of the old segments until the atomic swap.
+    // Count each affected shard once, even when the batch contains multiple rows.
+    let existing = storage.compaction_copy_bytes(batch.iter().map(|bundle| bundle.number))?;
+    Ok(incoming.saturating_add(existing))
+}
+
+fn absolute(path: &Path) -> Result<PathBuf> {
+    let full = std::env::current_dir()?.join(path);
+    let mut resolved = PathBuf::new();
+    for component in full.components() {
+        match component {
+            Component::ParentDir => {
+                // Existing symlinks have already been resolved, so this traverses
+                // the target's parent. At a filesystem root, `..` stays at root.
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(value) => {
+                resolved.push(value);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        // A dangling symlink must fail rather than become a new
+                        // destination, and a file cannot be a directory component.
+                        resolved = fs::canonicalize(&resolved)?;
+                        ensure!(
+                            resolved.is_dir(),
+                            "snapshot path is not a directory: {}",
+                            resolved.display()
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            value => resolved.push(value),
+        }
+    }
+    Ok(resolved)
+}
+
+#[expect(clippy::print_stdout, reason = "read-only snapshot inspection JSON")]
+fn print_plan(plan: &manifest::Plan) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(plan)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod handoff_tests;
+#[cfg(test)]
+mod pipeline_tests;
+#[cfg(test)]
+mod resume_tests;
+#[cfg(test)]
+mod tests;

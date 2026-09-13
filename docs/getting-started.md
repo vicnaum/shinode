@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust toolchain (1.70+)
+- Recent stable Rust toolchain (tested with 1.93.1)
 - C compiler and linker (for native dependencies)
 - Git access for Reth dependencies
 
@@ -48,7 +48,7 @@ cd shinode
 cargo build
 
 # Production build (recommended)
-cargo build --release
+cargo build --release --locked
 ```
 
 ## First Run
@@ -67,6 +67,49 @@ The node will:
 5. Switch to follow mode once caught up
 
 Press `q` to quit gracefully. The node persists checkpoints and resumes on restart.
+
+### Base mainnet
+
+Build the current development checkout for Base support. Pick a recent Base block
+number, replace the placeholder below, and use a directory separate from Ethereum:
+
+```bash
+cargo run --release -- --chain base --data-dir data/base \
+  --start-block <recent-base-block> --p2p-port 30309 --rpc-bind 127.0.0.1:8546
+```
+
+On restart, use the same command without `--start-block` to reuse the saved lower
+bound. For an older backfill, add `--trusted-peer enode://<public-key>@<host>:<port>`
+for a node that serves that range; ordinary discovered peers may have pruned it.
+History availability depends on the peer's pruning configuration. The earlier
+roughly 30-day guidance described a specific 1,339,200-block pruning setting,
+not a public-network guarantee. Base's current
+[V2 snapshot documentation](https://docs.base.org/specifications/node-operators/snapshots)
+describes the full preset as retaining only 10,064 blocks (about 5–6 hours).
+Older backfills need a peer retaining and serving the requested bodies and receipts.
+The [snapshot importer](base-snapshot-download.md) provides an alternative for
+verified pre-Canyon history from the pinned Base V2 snapshot. It supports resumable imports
+into matching Base storage. Supply an independently verified `--checkpoint-hash`
+for its end block to enable P2P continuation, and add `--follow` to start it after
+import. A peer must still serve the gap after that boundary. Later-fork snapshot
+bodies remain unsupported.
+Already imported history can be shared as [native history packages](base-history-packages.md).
+Recipients restore those shards without downloading the original execution snapshot.
+Shinode keeps the history it has already downloaded; upstream pruning does not
+delete it locally.
+Metadata prevents opening a populated directory as a different chain.
+
+After catching up, query `http://127.0.0.1:8546`: `eth_chainId` returns `0x2105`.
+Block queries return transaction hashes with `includeTransactions=false`; `true`
+is unsupported. Log queries include user and deposit transaction logs with their
+block-wide indices. A bounded run with `--end-block` exits after backfill rather
+than serving continuously.
+
+The initial target is the probed P2P head minus the rollback window; live follow
+tracks the probed tip. Neither represents OP safe/finalized status or L1 finality.
+Read [protocol compatibility](base-protocol.md) before choosing a historical range;
+see the recorded [live ingestion/restart/follow smoke results](base-protocol.md#live-ingestion-smoke-2026-09-11)
+and remaining release-validation limits.
 
 ### Headless / CI environments
 

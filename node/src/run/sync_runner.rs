@@ -3,6 +3,8 @@
 // SIGINT handler must terminate the process on second signal
 #![expect(clippy::exit, reason = "SIGINT handler must terminate process")]
 
+use crate::chain::{ChainTypes, EthereumChain};
+use crate::sync::historical::IngestChain;
 use crate::cli::{compute_target_range, HeadSource, NodeConfig};
 use crate::logging::{init_tracing, spawn_resource_logger, ResourcesLogger, TracingGuards};
 #[cfg(unix)]
@@ -18,6 +20,7 @@ use crate::sync::historical::{
 };
 use crate::sync::{ProgressReporter, SyncProgressStats};
 use eyre::Result;
+use reth_chainspec::EthChainSpec;
 use std::env;
 use std::io::IsTerminal;
 use std::ops::RangeInclusive;
@@ -43,15 +46,41 @@ fn default_peer_cache_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".stateless-history-node"))
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn startup_quit_requested(tui: Option<&EarlyTui>) -> std::io::Result<bool> {
+    let Some(tui) = tui else { return Ok(false); };
+    let mut guard = tui.lock();
+    Ok(guard.should_quit || guard.poll_quit()?)
+}
+
 /// Run the main sync process.
+pub async fn run_sync<C: IngestChain>(config: NodeConfig, argv: Vec<String>) -> Result<()> {
+    run_sync_with_tui::<C>(config, argv, None).await
+}
+
 #[expect(
     clippy::too_many_lines,
     clippy::cognitive_complexity,
     reason = "main sync orchestration has sequential setup phases that are clearer inline"
 )]
-pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
+pub async fn run_sync_with_tui<C: IngestChain>(
+    mut config: NodeConfig,
+    argv: Vec<String>,
+    mut inherited_tui: Option<TuiController>,
+) -> Result<()> {
     // Number of coverage buckets for TUI blocks map visualization
     const COVERAGE_BUCKETS: usize = 200;
+    eyre::ensure!(
+        config.chain_id == C::chain_spec().chain().id()
+            && config.genesis_hash == C::chain_spec().genesis_hash(),
+        "runtime chain types do not match configuration"
+    );
 
     // Validate and normalize chunk sizes
     let chunk_max = config
@@ -79,6 +108,8 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         }
         config.shard_size = stored_shard_size;
     }
+    Storage::validate_existing(&config)?;
+    Storage::configure_snapshot_sync(&mut config)?;
 
     // Build run context for log artifacts
     let run_context = build_run_context(&config, argv);
@@ -122,7 +153,9 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
 
     // Main ingest path
     info!(
+        chain = config.chain.name(),
         chain_id = config.chain_id,
+        genesis = ?config.genesis_hash,
         data_dir = %config.data_dir.display(),
         "starting stateless history node"
     );
@@ -136,19 +169,26 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Create early TUI for startup phase display (before storage init)
     // Use a placeholder end_block of 0 - will be updated once we know the actual range
     let early_tui: Option<EarlyTui> = if use_tui {
-        match TuiController::new(config.start_block, 0) {
+        match inherited_tui.take().map_or_else(
+            || TuiController::new(config.start_block, 0),
+            |mut tui| {
+                tui.begin_history(config.start_block);
+                Ok(tui)
+            },
+        ) {
             Ok(tui) => {
                 let tui_arc = Arc::new(Mutex::new(tui));
                 // Draw initial startup screen with config info
                 {
                     let mut guard = tui_arc.lock();
-                    guard.state.startup_status = "Connecting to Ethereum P2P network...".to_string();
+                    guard.state.startup_status = format!("Connecting to {} P2P network...", C::NAME);
                     // Set config values for display
                     guard.state.set_config(
                         &config.data_dir.display().to_string(),
                         config.shard_size,
                         &config.rpc_bind.to_string(),
                         config.rollback_window,
+                        config.chain,
                     );
                     let _ = guard.draw();
                 }
@@ -166,14 +206,14 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     // Spawn background redraw ticker so splash animations run while startup blocks
     let redraw_handle = early_tui.as_ref().map(|tui| {
         let tui = Arc::clone(tui);
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
                 let mut guard = tui.lock();
                 let _ = guard.draw();
             }
-        })
+        }))
     });
 
     // Get log buffer reference for startup TUI updates
@@ -181,6 +221,10 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
 
     // Initialize storage
     let storage = init_storage(&config, early_tui.as_ref(), log_buffer).await?;
+    storage.validate_snapshot_boundary()?;
+    if startup_quit_requested(early_tui.as_ref())? {
+        return Ok(());
+    }
 
     // Seed storage/DB stats into early TUI so panels show data during startup
     if let Some(tui) = early_tui.as_ref() {
@@ -189,7 +233,18 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     }
 
     // Connect to P2P network
-    let session = connect_p2p(Arc::clone(&storage), early_tui.as_ref(), log_buffer).await?;
+    let session = connect_p2p::<C>(
+        Arc::clone(&storage),
+        &config,
+        early_tui.as_ref(),
+        log_buffer,
+    )
+    .await?;
+
+    if startup_quit_requested(early_tui.as_ref())? {
+        session.handle.shutdown().await?;
+        return Ok(());
+    }
 
     // Wait for minimum peers
     let min_peers = config.min_peers as usize;
@@ -212,6 +267,11 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     )
     .await;
 
+    if startup_quit_requested(early_tui.as_ref())? {
+        session.handle.shutdown().await?;
+        return Ok(());
+    }
+
     // Compute target range
     let range = compute_target_range(
         config.start_block,
@@ -219,6 +279,12 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         head_at_startup,
         config.rollback_window,
     );
+    crate::sync::historical::reconcile_snapshot_tip(
+        &storage, &session.pool, config.rollback_window,
+    ).await?;
+    crate::sync::historical::preflight_snapshot_handoff(
+        &storage, &session.pool, *range.end(),
+    ).await?;
 
     // Calculate missing blocks
     let (missing_ranges, missing_total) = storage.missing_ranges_in_range(range.clone())?;
@@ -326,9 +392,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         log_writer: tracing_guards.log_writer.clone(),
     };
     // Stop background splash redraw ticker before main UI takes over
-    if let Some(handle) = redraw_handle {
-        handle.abort();
-    }
+    drop(redraw_handle);
 
     let UiSetup {
         ui_controller: _,
@@ -350,7 +414,7 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
         Some(log_writers),
     )?;
 
-    spawn_resource_logger(
+    spawn_resource_logger::<C>(
         progress_stats.clone(),
         resources_logger.clone(),
         Some(session.handle.clone()),
@@ -451,7 +515,8 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
 
     // Log finalize stats for follow mode transition
     let finalize_stats = match &outcome {
-        IngestPipelineOutcome::RangeApplied { finalize, .. } => Some(*finalize),
+        IngestPipelineOutcome::RangeApplied { finalize, .. }
+        | IngestPipelineOutcome::Cancelled { finalize, .. } => Some(*finalize),
         IngestPipelineOutcome::UpToDate { .. } => None,
     };
 
@@ -460,7 +525,9 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
     }
 
     // Handle follow mode or finalization
-    if follow_after && !shutdown_requested.load(Ordering::SeqCst) {
+    if follow_after && !shutdown_requested.load(Ordering::SeqCst)
+        && !matches!(outcome, IngestPipelineOutcome::Cancelled { .. })
+    {
         run_follow_mode(
             FollowModeConfig {
                 storage: &storage,
@@ -499,7 +566,8 @@ pub async fn run_sync(mut config: NodeConfig, argv: Vec<String>) -> Result<()> {
 
     // Finalize
     let logs_total = match outcome {
-        IngestPipelineOutcome::RangeApplied { logs, .. } => logs,
+        IngestPipelineOutcome::RangeApplied { logs, .. }
+        | IngestPipelineOutcome::Cancelled { logs, .. } => logs,
         IngestPipelineOutcome::UpToDate { .. } => 0,
     };
 
@@ -555,9 +623,9 @@ fn log_follow_transition(
 }
 
 /// Configuration for follow mode execution.
-struct FollowModeConfig<'a> {
+struct FollowModeConfig<'a, C: ChainTypes = EthereumChain> {
     storage: &'a Arc<Storage>,
-    session: &'a p2p::NetworkSession,
+    session: &'a p2p::NetworkSession<C>,
     config: &'a NodeConfig,
     range: &'a RangeInclusive<u64>,
     head_at_startup: u64,
@@ -585,8 +653,8 @@ struct FollowModeState<'a> {
     clippy::cognitive_complexity,
     reason = "follow mode orchestration with select loop is clearer inline"
 )]
-async fn run_follow_mode(
-    cfg: FollowModeConfig<'_>,
+async fn run_follow_mode<C: IngestChain>(
+    cfg: FollowModeConfig<'_, C>,
     trackers: FollowModeTrackers<'_>,
     state: FollowModeState<'_>,
     outcome: &IngestPipelineOutcome,
@@ -615,7 +683,8 @@ async fn run_follow_mode(
 
     // Generate report at fast-sync completion
     let logs_total = match outcome {
-        IngestPipelineOutcome::RangeApplied { logs, .. } => *logs,
+        IngestPipelineOutcome::RangeApplied { logs, .. }
+        | IngestPipelineOutcome::Cancelled { logs, .. } => *logs,
         IngestPipelineOutcome::UpToDate { .. } => 0,
     };
 
@@ -753,4 +822,19 @@ async fn run_follow_mode(
 
     flush_peer_cache_with_limits(session, storage, Some(peer_health)).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mismatched_runtime_types_fail_before_creating_storage() -> Result<()> {
+        let root = crate::test_utils::temp_dir("runtime-chain-mismatch");
+        let config = crate::test_utils::base_config(root.clone());
+        let result = run_sync::<crate::chain::BaseChain>(config, Vec::new()).await;
+        eyre::ensure!(result.is_err(), "Base runtime accepted Ethereum configuration");
+        eyre::ensure!(!root.exists(), "runtime mismatch created storage");
+        Ok(())
+    }
 }

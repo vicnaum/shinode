@@ -1,9 +1,11 @@
+use shinode::chain;
 mod cli;
 mod logging;
 mod metrics;
 mod p2p;
 mod rpc;
 mod run;
+mod snapshot;
 mod storage;
 mod sync;
 mod ui;
@@ -31,12 +33,21 @@ impl sync::ProgressReporter for ProgressBar {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = NodeConfig::from_args();
+    let config = NodeConfig::from_args()?;
     let argv: Vec<String> = env::args().collect();
 
     // Handle subcommands
     if let Some(command) = &config.command {
         match command {
+            cli::Command::SnapshotImport(args) => {
+                return snapshot::run(config.clone(), args.clone()).await;
+            }
+            cli::Command::HistoryExport(args) => {
+                return snapshot::package::export(config.clone(), args.clone()).await;
+            }
+            cli::Command::HistoryRestore(args) => {
+                return snapshot::package::restore(config.clone(), args.clone()).await;
+            }
             cli::Command::Db(cli::DbCommand::Stats(args)) => {
                 return run::handle_db_stats(args, &config);
             }
@@ -55,7 +66,10 @@ async fn main() -> Result<()> {
     }
 
     // Run main sync
-    run::run_sync(config, argv).await
+    match config.chain {
+        chain::ChainKind::Mainnet => run::run_sync::<chain::EthereumChain>(config, argv).await,
+        chain::ChainKind::Base => run::run_sync::<chain::BaseChain>(config, argv).await,
+    }
 }
 
 #[cfg(test)]

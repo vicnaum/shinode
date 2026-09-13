@@ -1,5 +1,6 @@
 //! Head tracking and tail feeding for follow mode.
 
+use crate::chain::ChainTypes;
 use crate::p2p::PeerPool;
 use crate::storage::Storage;
 use crate::sync::historical::TailIngestConfig;
@@ -18,7 +19,10 @@ pub struct HeadTrackerHandles {
 }
 
 /// Handles returned from spawning the tail feeder.
-#[expect(dead_code, reason = "fields accessed via destructuring")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "fields accessed via destructuring")
+)]
 pub struct TailFeederHandles {
     pub handle: JoinHandle<()>,
     pub stop_tx: watch::Sender<bool>,
@@ -26,8 +30,8 @@ pub struct TailFeederHandles {
 }
 
 /// Spawn the head tracker task that monitors peer heads and updates storage/stats.
-pub fn spawn_head_tracker(
-    pool: Arc<PeerPool>,
+pub fn spawn_head_tracker<C: ChainTypes>(
+    pool: Arc<PeerPool<C>>,
     storage: Arc<Storage>,
     stats: Option<Arc<SyncProgressStats>>,
     initial_head: u64,
@@ -43,12 +47,18 @@ pub fn spawn_head_tracker(
             if *stop_rx_head.borrow() {
                 break;
             }
-            let snapshot = pool.snapshot();
-            let best_head = snapshot
-                .iter()
-                .map(|peer| peer.head_number)
-                .max()
-                .unwrap_or(last_head);
+            let result = tokio::select! {
+                _ = stop_rx_head.changed() => break,
+                result = crate::p2p::discover_head_p2p(&pool, last_head, 3, 1024) => result,
+            };
+            let best_head = match result {
+                Ok(Some(head)) => head,
+                Ok(None) => last_head,
+                Err(err) => {
+                    tracing::debug!(error = %err, "head tracker: header probe failed");
+                    last_head
+                }
+            };
             if best_head > last_head {
                 last_head = best_head;
                 let _ = head_seen_tx.send(best_head);
@@ -137,5 +147,100 @@ pub fn build_tail_config(
         stop_tx: tail_handles.stop_tx,
         stop_when_caught_up: true,
         head_offset: rollback_window,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::BaseChain;
+    use crate::p2p::{peer_pool_for_tests, NetworkPeer};
+    use eyre::{ensure, Result};
+    use reth_eth_wire_types::{BlockHashOrNumber, BlockHeaders};
+    use reth_network_api::{PeerId, PeerRequest, PeerRequestSender};
+    use reth_primitives_traits::Header;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn base_head_tracker_advances_by_headers_and_cancels_pending_probes() -> Result<()> {
+        let root = crate::test_utils::temp_dir("base-head-tracker");
+        let mut config = crate::test_utils::base_config(root.clone());
+        config.chain = crate::chain::ChainKind::Base;
+        config.chain_id = config.chain.chain_id();
+        config.genesis_hash = config.chain.genesis_hash();
+        let storage = Arc::new(Storage::open(&config)?);
+        let peer_id = PeerId::random();
+        let (tx, mut rx) = mpsc::channel(8);
+        let pool = Arc::new(peer_pool_for_tests(vec![NetworkPeer::<BaseChain> {
+            peer_id,
+            eth_version: reth_eth_wire::EthVersion::Eth69,
+            messages: PeerRequestSender::new(peer_id, tx),
+            head_number: 100,
+            earliest_block: Some(0),
+            latest_block: Some(100),
+        }]));
+        let mut tracker =
+            spawn_head_tracker(Arc::clone(&pool), Arc::clone(&storage), None, 100, 64);
+        let Some(PeerRequest::GetBlockHeaders { request, response }) =
+            timeout(Duration::from_secs(2), rx.recv()).await?
+        else {
+            return Err(eyre::eyre!("missing header probe"));
+        };
+        ensure!(
+            request.start_block == BlockHashOrNumber::Number(101),
+            "probe did not start above observed head"
+        );
+        let mut parent_hash = alloy_primitives::B256::ZERO;
+        let headers: Vec<_> = (101..=104)
+            .map(|number| {
+                let header = Header {
+                    number,
+                    parent_hash,
+                    ..Default::default()
+                };
+                parent_hash = header.hash_slow();
+                header
+            })
+            .collect();
+        let _ = response.send(Ok(BlockHeaders(headers)));
+        timeout(Duration::from_secs(2), tracker.head_seen_rx.changed()).await??;
+        ensure!(
+            *tracker.head_seen_rx.borrow() == 104 && pool.get_peer_head(peer_id) == Some(104),
+            "head did not follow header probes"
+        );
+        ensure!(
+            storage.head_seen()? == Some(104),
+            "observed head not persisted"
+        );
+        let Some(PeerRequest::GetBlockHeaders { request, response }) =
+            timeout(Duration::from_secs(2), rx.recv()).await?
+        else {
+            return Err(eyre::eyre!("missing second probe"));
+        };
+        ensure!(
+            request.start_block == BlockHashOrNumber::Number(105),
+            "tracker repeated the old baseline"
+        );
+        tracker.stop_tx.send(true)?;
+        timeout(Duration::from_millis(250), tracker.handle).await??;
+        drop(response);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tail_feeder_preserves_rollback_depth() -> Result<()> {
+        let (head_tx, head_rx) = watch::channel(100);
+        let mut feeder = spawn_tail_feeder(36, 64, &head_rx);
+        ensure!(
+            feeder.ranges_rx.try_recv().is_err(),
+            "tail started above delayed head"
+        );
+        head_tx.send(105)?;
+        let range = timeout(Duration::from_secs(1), feeder.ranges_rx.recv()).await?;
+        ensure!(range == Some(37..=41), "rollback depth was not preserved");
+        feeder.stop_tx.send(true)?;
+        timeout(Duration::from_millis(250), feeder.handle).await??;
+        Ok(())
     }
 }

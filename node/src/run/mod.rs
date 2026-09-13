@@ -16,7 +16,7 @@ mod sync_runner;
 mod trackers;
 
 pub use commands::{handle_db_compact, handle_db_rebuild_cache, handle_db_stats, handle_repair};
-pub use sync_runner::run_sync;
+pub use sync_runner::{run_sync, run_sync_with_tui};
 
 // Re-exports for potential external use (not currently used from main.rs)
 #[expect(unused_imports, reason = "re-exported API for external use")]

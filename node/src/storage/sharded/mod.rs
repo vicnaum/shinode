@@ -1,20 +1,25 @@
 //! Sharded storage backend (schema v2).
 
 mod bitset;
+mod handoff;
 mod hash;
+mod identity;
 mod nippy_raw;
+mod package;
 mod wal;
 
 use crate::cli::NodeConfig;
 use crate::storage::{
     decode_bincode, decode_bincode_compat_value, decode_u64, encode_bincode_compat_value,
     encode_bincode_value, encode_u64_value, BlockBundle, PeerCacheLoad, SegmentDiskStats,
-    StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredPeer, StoredReceipts,
-    StoredTxHashes, ZSTD_DICT_MAX_SIZE,
+    StorageCodec, StorageConfigKey, StorageDiskStats, StoredBlockSize, StoredPeer,
+    StoredReceipts, StoredTransactions, StoredTxHashes, ZSTD_DICT_MAX_SIZE,
 };
+use alloy_consensus::TxReceipt;
 use bitset::Bitset;
 use eyre::{eyre, Result, WrapErr};
 use hash::compute_shard_hash;
+use identity::{existing_meta, stored_chain, validate_config_identity};
 use nippy_raw::{NippyJarConfig, SegmentRawSource, SegmentRawWriter};
 use reth_nippy_jar::{
     compression::{Compressors, Zstd},
@@ -172,6 +177,12 @@ pub struct StorageAggregateStats {
 struct MetaState {
     schema_version: u64,
     chain_id: u64,
+    #[serde(default)]
+    genesis_hash: Option<alloy_primitives::B256>,
+    #[serde(default)]
+    sync_start_block: Option<u64>,
+    #[serde(default)]
+    storage_codec: Option<StorageCodec>,
     storage_key: StorageConfigKey,
     shard_size: u64,
     max_present_block: Option<u64>,
@@ -430,9 +441,12 @@ impl SegmentWriter {
 }
 
 pub struct Storage {
+    handoff: Mutex<Option<handoff::Boundary>>,
+    _writer_lock: Arc<crate::storage::DataDirLock>,
     data_dir: PathBuf,
     peer_cache_dir: PathBuf,
     meta: Mutex<MetaState>,
+    codec: StorageCodec,
     shards: Mutex<HashMap<u64, Arc<Mutex<ShardState>>>>,
     peer_cache: Mutex<HashMap<String, StoredPeer>>,
     /// LRU cache for read-only segment handles, keyed by shard_start.
@@ -456,15 +470,26 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
+    /// Read a previously requested range without opening/recovering storage.
+    /// Legacy numeric chain IDs are insufficient to identify Base data.
+    pub fn read_resume_start(
+        data_dir: &Path,
+        chain_id: u64,
+        genesis_hash: alloy_primitives::B256,
+    ) -> Result<Option<u64>> {
+        let Some(meta) = existing_meta(data_dir)? else {
+            return Ok(None);
+        };
+        let chain = stored_chain(&meta)?;
+        eyre::ensure!(chain.chain_id() == chain_id && chain.genesis_hash() == genesis_hash,
+            "storage identity does not match the selected chain; use a separate data directory");
+        Ok(meta.sync_start_block)
+    }
+
     /// Read the shard size from an existing storage directory.
     /// Returns `Ok(Some(shard_size))` if meta.json exists, `Ok(None)` if the storage is uninitialized.
     pub fn read_shard_size(data_dir: &Path) -> Result<Option<u64>> {
-        let path = meta_path(data_dir);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let meta = load_meta(&path)?;
-        Ok(Some(meta.shard_size))
+        Ok(existing_meta(data_dir)?.map(|meta| meta.shard_size))
     }
 
     /// Open storage without progress reporting (test convenience wrapper).
@@ -475,50 +500,86 @@ impl Storage {
 
     /// Open storage with a progress callback.
     /// The callback receives (current_shard, total_shards) during shard scanning.
-    #[expect(clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
     pub fn open_with_progress<F>(config: &NodeConfig, on_progress: F) -> Result<Self>
     where
         F: Fn(usize, usize),
     {
+        Self::validate_existing(config)?;
+        let lock = Arc::new(crate::storage::DataDirLock::acquire(&config.data_dir)?);
+        Self::open_locked(config, lock, on_progress)
+    }
+
+    /// Reopen under an existing writer lease without an unlocked interval.
+    pub fn open_locked<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
+        Self::open_locked_with_resume(config, lock, on_progress, true)
+    }
+
+    /// Recover storage for restore preflight without changing its saved sync lower bound.
+    pub fn open_locked_preserving_resume<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
+        Self::open_locked_with_resume(config, lock, on_progress, false)
+    }
+
+    #[expect(clippy::too_many_lines, clippy::cognitive_complexity, reason = "storage open with config validation and recovery")]
+    fn open_locked_with_resume<F>(config: &NodeConfig, lock: Arc<crate::storage::DataDirLock>, on_progress: F, update_resume_start: bool) -> Result<Self>
+    where
+        F: Fn(usize, usize),
+    {
+        lock.validate(&config.data_dir)?;
+        let handoff = handoff::load(config)?;
         let open_start = std::time::Instant::now();
         tracing::info!(data_dir = %config.data_dir.display(), "storage open: starting");
 
+        validate_config_identity(config)?;
+        let existing = existing_meta(&config.data_dir)?;
+        let meta_path = meta_path(&config.data_dir);
+        let mut meta = existing.unwrap_or_else(|| MetaState {
+            schema_version: SCHEMA_VERSION,
+            chain_id: config.chain_id,
+            genesis_hash: Some(config.genesis_hash),
+            sync_start_block: (update_resume_start && config.command.is_none() && !config.repair)
+                .then_some(config.start_block),
+            storage_codec: Some(StorageCodec::for_chain(config.chain)),
+            storage_key: StorageConfigKey::from(config),
+            shard_size: config.shard_size,
+            max_present_block: None,
+            head_seen: None,
+        });
+        validate_meta(config, &meta)?;
         fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
-        let peer_cache_dir = config
+        let peer_cache_root = config
             .peer_cache_dir
             .clone()
             .unwrap_or_else(|| config.data_dir.clone());
+        let peer_cache_dir =
+            namespaced_peer_cache_dir(&peer_cache_root, config.chain_id, config.genesis_hash);
         fs::create_dir_all(&peer_cache_dir).wrap_err("failed to create peer cache dir")?;
 
-        let meta_path = meta_path(&config.data_dir);
-        let mut meta = if meta_path.exists() {
-            load_meta(&meta_path)?
-        } else {
-            MetaState {
-                schema_version: SCHEMA_VERSION,
-                chain_id: config.chain_id,
-                storage_key: StorageConfigKey::from(config),
-                shard_size: config.shard_size,
-                max_present_block: None,
-                head_seen: None,
-            }
-        };
-        validate_meta(config, &meta)?;
-        if meta.schema_version != SCHEMA_VERSION {
-            return Err(eyre!(
-                "schema version mismatch: expected {}, got {} (delete data dir to rebuild)",
-                SCHEMA_VERSION,
-                meta.schema_version
-            ));
-        }
         if !meta_path.exists() {
             persist_meta(&meta_path, &meta)?;
+        }
+        // Keep the earliest explicitly requested lower bound so resume also
+        // revisits holes from out-of-order historical ingestion.
+        if update_resume_start && config.command.is_none() && !config.repair {
+            let start = meta
+                .sync_start_block
+                .map_or(config.start_block, |old| old.min(config.start_block));
+            if meta.sync_start_block != Some(start) {
+                meta.sync_start_block = Some(start);
+                persist_meta(&meta_path, &meta)?;
+            }
         }
 
         let static_dir = static_dir(&config.data_dir);
         fs::create_dir_all(&static_dir).wrap_err("failed to create static dir")?;
         let shards_root = shards_dir(&config.data_dir);
         fs::create_dir_all(&shards_root).wrap_err("failed to create shards dir")?;
+        crate::storage::durable::sync_directory(&static_dir)?;
 
         // Pre-scan to collect shard directories and get total count for progress
         let shard_entries: Vec<_> = fs::read_dir(&shards_root)?
@@ -700,15 +761,22 @@ impl Storage {
         }
         persist_meta(&meta_path, &meta)?;
 
-        let peer_cache = load_peer_cache(&peer_cache_dir)?;
+        let peer_cache = load_peer_cache(&peer_cache_read_dir(
+            &peer_cache_root,
+            config.chain_id,
+            config.genesis_hash,
+        )?)?;
         let segment_cache = LruCache::new(
             NonZeroUsize::new(SEGMENT_CACHE_SIZE)
                 .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero")),
         );
         Ok(Self {
+            handoff: Mutex::new(handoff),
+            _writer_lock: lock,
             data_dir: config.data_dir.clone(),
             peer_cache_dir,
             meta: Mutex::new(meta),
+            codec: StorageCodec::for_chain(config.chain),
             shards: Mutex::new(shards),
             peer_cache: Mutex::new(peer_cache),
             segment_cache: Mutex::new(segment_cache),
@@ -719,23 +787,18 @@ impl Storage {
     /// Scans all shards for interrupted compactions and orphan files,
     /// performs recovery, and returns a detailed report.
     pub fn repair(config: &NodeConfig) -> Result<RepairReport> {
+        Self::validate_existing(config)?;
         // Ensure directories exist
         if !config.data_dir.exists() {
             return Ok(RepairReport { shards: vec![] });
         }
+        let _lock = crate::storage::DataDirLock::acquire(&config.data_dir)?;
+        Self::validate_existing(config)?;
 
         let shards_root = shards_dir(&config.data_dir);
         if !shards_root.exists() {
             return Ok(RepairReport { shards: vec![] });
         }
-
-        let meta_path = meta_path(&config.data_dir);
-        let _meta = if meta_path.exists() {
-            load_meta(&meta_path)?
-        } else {
-            // No meta file means empty storage
-            return Ok(RepairReport { shards: vec![] });
-        };
 
         let mut results = Vec::new();
 
@@ -797,7 +860,7 @@ impl Storage {
     /// Use this instead of `disk_usage()` when you don't need to audit disk vs cached values.
     pub fn disk_usage_cached(&self) -> Result<StorageDiskStats> {
         let meta_bytes = file_size(&meta_path(&self.data_dir)).unwrap_or(0);
-        let peers_bytes = file_size(&peer_path(&self.data_dir)).unwrap_or(0);
+        let peers_bytes = file_size(&peer_path(&self.peer_cache_dir)).unwrap_or(0);
 
         // Compute per-segment totals from in-memory shard metadata
         let shards = self.shards.lock();
@@ -859,9 +922,24 @@ impl Storage {
     }
 
     pub fn disk_usage_at(data_dir: &Path) -> Result<StorageDiskStats> {
+        let metadata = existing_meta(data_dir)?;
         let static_dir = static_dir(data_dir);
         let meta_bytes = file_size(&meta_path(data_dir))?;
-        let peers_bytes = file_size(&peer_path(data_dir))?;
+        let peers_bytes = if let Some(meta) = metadata {
+            // Pre-chain-selection metadata only identifies Ethereum by chain ID.
+            let genesis = meta.genesis_hash.or_else(|| {
+                (meta.chain_id == crate::chain::ChainKind::Mainnet.chain_id())
+                    .then(|| crate::chain::ChainKind::Mainnet.genesis_hash())
+            });
+            match genesis {
+                Some(genesis) => file_size(&peer_path(&peer_cache_read_dir(
+                    data_dir, meta.chain_id, genesis,
+                )?))?,
+                None => 0,
+            }
+        } else {
+            0
+        };
         let static_total_bytes = dir_size(&static_dir)?;
         let total_bytes = dir_size(data_dir)?;
         let segments = shard_segment_stats(data_dir)?;
@@ -881,8 +959,11 @@ impl Storage {
     }
 
     pub fn last_indexed_block(&self) -> Result<Option<u64>> {
-        let meta = self.meta.lock();
-        Ok(meta.max_present_block)
+        let maximum = self.meta.lock().max_present_block;
+        if let (Some(boundary), Some(maximum)) = (self.snapshot_boundary(), maximum) {
+            return self.contiguous_head(boundary.start, maximum);
+        }
+        Ok(maximum)
     }
 
     #[cfg(test)]
@@ -1064,7 +1145,41 @@ impl Storage {
         Ok((ranges, missing))
     }
 
+    /// Existing bytes copied while compacting the shards touched by a batch.
+    /// The caller must additionally budget the incoming WAL and new segment data.
+    pub fn compaction_copy_bytes(&self, block_numbers: impl IntoIterator<Item = u64>) -> Result<u64> {
+        let shard_size = self.shard_size();
+        let starts: HashSet<u64> = block_numbers
+            .into_iter()
+            .map(|number| shard_start(number, shard_size))
+            .collect();
+        let mut total = 0u64;
+        for start in starts {
+            let dir = shard_dir(&self.data_dir, start);
+            total = total.saturating_add(dir_size(&sorted_dir(&dir))?);
+            total = total.saturating_add(file_size(&bitset_path(&dir))?);
+        }
+        Ok(total)
+    }
+
+    /// Reconcile counters after recovery, including a crash before final compaction metadata.
+    pub fn recount_stats_in_range(&self, start: u64, end: u64) -> Result<()> {
+        let shards = self.shards.lock();
+        for shard in shards.values() {
+            let mut state = shard.lock();
+            let shard_end = state.meta.shard_start.saturating_add(state.meta.shard_size - 1);
+            if state.meta.shard_start > end || shard_end < start {
+                continue;
+            }
+            eyre::ensure!(state.meta.sorted, "compact recovered WAL before recounting statistics");
+            recount_sorted_stats(&mut state, self.codec)?;
+            persist_shard_meta(&state.dir, &state.meta)?;
+        }
+        Ok(())
+    }
+
     pub fn write_block_bundles_wal(&self, bundles: &[BlockBundle]) -> Result<Vec<u64>> {
+        self.check_snapshot_write(bundles)?;
         if bundles.is_empty() {
             return Ok(Vec::new());
         }
@@ -1076,11 +1191,11 @@ impl Storage {
             // Remember log count per block while we still have decoded receipts
             block_log_counts.insert(
                 bundle.number,
-                bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>(),
+                bundle.receipts.iter().map(|r| r.logs().len() as u64).sum::<u64>(),
             );
-            let tx_meta_uncompressed = encode_bincode_value(&bundle.transactions)?;
+            let tx_meta_uncompressed = self.codec.encode_transactions(&bundle.transactions)?;
             let tx_meta_uncompressed_len = tx_meta_uncompressed.len() as u32;
-            let receipts_uncompressed = encode_bincode_compat_value(&bundle.receipts)?;
+            let receipts_uncompressed = self.codec.encode_receipts(&bundle.receipts)?;
             let receipts_uncompressed_len = receipts_uncompressed.len() as u32;
             let record = WalBundleRecord {
                 number: bundle.number,
@@ -1176,6 +1291,19 @@ impl Storage {
     }
 
     pub fn write_block_bundle_follow(&self, bundle: &BlockBundle) -> Result<()> {
+        self.check_snapshot_write(std::slice::from_ref(bundle))?;
+        if self.snapshot_boundary().is_some() {
+            if self.block_header(bundle.number)?.is_some() {
+                return Ok(());
+            }
+            let maximum = self.meta.lock().max_present_block;
+            if maximum.is_some_and(|head| head > bundle.number) {
+                self.write_block_bundles_wal(std::slice::from_ref(bundle))?;
+                return self.compact_shard(shard_start(bundle.number, self.shard_size()));
+            }
+        }
+        let receipts = self.codec.encode_receipts(&bundle.receipts)?;
+        let transactions = self.codec.encode_transactions(&bundle.transactions)?;
         let shard_start = shard_start(bundle.number, self.shard_size());
         let shard = self.get_or_create_shard(shard_start)?;
         let mut state = shard.lock();
@@ -1199,11 +1327,8 @@ impl Storage {
             .append_rows(bundle.number, &[encode_bincode_value(&bundle.tx_hashes)?])?;
         segments
             .tx_meta
-            .append_rows(bundle.number, &[encode_bincode_value(&bundle.transactions)?])?;
-        segments.receipts.append_rows(
-            bundle.number,
-            &[encode_bincode_compat_value(&bundle.receipts)?],
-        )?;
+            .append_rows(bundle.number, &[transactions])?;
+        segments.receipts.append_rows(bundle.number, &[receipts])?;
         segments
             .sizes
             .append_rows(bundle.number, &[encode_u64_value(bundle.size.size)])?;
@@ -1211,8 +1336,8 @@ impl Storage {
         if state.bitset.set(offset) {
             state.meta.present_count = state.meta.present_count.saturating_add(1);
             state.meta.total_transactions += bundle.tx_hashes.hashes.len() as u64;
-            state.meta.total_receipts += bundle.receipts.receipts.len() as u64;
-            state.meta.total_logs += bundle.receipts.receipts.iter().map(|r| r.logs.len() as u64).sum::<u64>();
+            state.meta.total_receipts += bundle.receipts.len() as u64;
+            state.meta.total_logs += bundle.receipts.iter().map(|r| r.logs().len() as u64).sum::<u64>();
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
         }
         state.meta.sorted = true;
@@ -1484,6 +1609,7 @@ impl Storage {
 
         let t0 = std::time::Instant::now();
         writers.finish()?;
+        crate::storage::durable::sync_tree(&temp_dir)?;
         tracing::debug!(
             shard = shard_start,
             elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -1603,6 +1729,7 @@ impl Storage {
         if will_seal {
             let t0 = std::time::Instant::now();
             self.seal_shard_locked(&mut state)?;
+            persist_shard_meta(&state.dir, &state.meta)?;
             tracing::debug!(
                 shard = shard_start,
                 elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -1625,7 +1752,7 @@ impl Storage {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "convenience wrapper for cases without progress tracking")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "convenience wrapper for cases without progress tracking"))]
     pub fn compact_all_dirty(&self) -> Result<()> {
         self.compact_all_dirty_with_progress(|_| {})
     }
@@ -1697,7 +1824,7 @@ impl Storage {
         Ok(out)
     }
 
-    #[expect(dead_code, reason = "convenience wrapper for progress-less sealing")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "convenience wrapper for progress-less sealing"))]
     pub fn seal_completed_shards(&self) -> Result<()> {
         self.seal_completed_shards_with_progress(|_| {})
     }
@@ -1829,6 +1956,13 @@ impl Storage {
     }
 
     pub fn rollback_to(&self, ancestor_number: u64) -> Result<()> {
+        if let Some(boundary) = self.snapshot_boundary() {
+            eyre::ensure!(
+                ancestor_number >= boundary.number,
+                "reorg crosses trusted snapshot boundary {}; use a separately verified snapshot instead of rewriting imported history",
+                boundary.number
+            );
+        }
         let shard_size = self.shard_size();
         let shard_starts: Vec<u64> = {
             let shards = self.shards.lock();
@@ -1839,7 +1973,13 @@ impl Storage {
             if ancestor_number >= shard_end {
                 continue;
             }
+            // Materialize pending records before pruning so WAL recovery cannot
+            // resurrect blocks above the rollback point.
             let shard = self.get_or_create_shard(shard_start)?;
+            let has_wal = wal_path(&shard.lock().dir).exists();
+            if has_wal {
+                self.compact_shard(shard_start)?;
+            }
             let mut state = shard.lock();
             let sorted_dir = sorted_dir(&state.dir);
             if sorted_dir.exists() {
@@ -1865,17 +2005,18 @@ impl Storage {
                 }
             }
             state.meta.complete = u64::from(state.meta.present_count) >= state.meta.shard_size;
-            if ancestor_number < shard_start {
-                state.meta.tail_block = None;
-            } else {
-                state.meta.tail_block = Some(ancestor_number);
-            }
+            state.meta.tail_block = (0..state.meta.shard_size as usize)
+                .rev()
+                .find(|offset| state.bitset.is_set(*offset))
+                .map(|offset| shard_start + offset as u64);
+            recount_sorted_stats(&mut state, self.codec)?;
             state.meta.sealed = false;
             state.meta.content_hash = None;
             persist_shard_meta(&state.dir, &state.meta)?;
             state.bitset.flush(&bitset_path(&state.dir))?;
         }
         self.recompute_max_present()?;
+        self.update_sealed_cache()?;
         Ok(())
     }
 
@@ -1964,7 +2105,15 @@ impl Storage {
 
     pub fn block_receipts(&self, number: u64) -> Result<Option<StoredReceipts>> {
         self.with_readers_for_present_block(number, |segments| {
-            segments.receipts.read_row_compat(number)
+            segments.receipts.read_row_raw(number)?
+                .map(|bytes| self.codec.decode_receipts(&bytes)).transpose()
+        })
+    }
+
+    pub fn block_transactions(&self, number: u64) -> Result<Option<StoredTransactions>> {
+        self.with_readers_for_present_block(number, |segments| {
+            segments.tx_meta.read_row_raw(number)?
+                .map(|bytes| self.codec.decode_transactions(&bytes)).transpose()
         })
     }
 
@@ -2005,6 +2154,24 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    /// Prevent a typed network session from seeding another chain's cache.
+    pub fn validate_peer_cache_identity(
+        &self,
+        chain_id: u64,
+        genesis: alloy_primitives::B256,
+    ) -> Result<()> {
+        let meta = self.meta.lock();
+        let stored_genesis = meta.genesis_hash.or_else(|| {
+            (meta.chain_id == crate::chain::ChainKind::Mainnet.chain_id())
+                .then(|| crate::chain::ChainKind::Mainnet.genesis_hash())
+        });
+        eyre::ensure!(
+            meta.chain_id == chain_id && stored_genesis == Some(genesis),
+            "peer cache chain identity does not match network"
+        );
+        Ok(())
     }
 
     pub fn upsert_peer(&self, mut peer: StoredPeer) -> Result<()> {
@@ -2109,6 +2276,7 @@ impl Storage {
             disk_bytes_total: 0,
         };
         persist_shard_meta(&dir, &meta)?;
+        crate::storage::durable::sync_directory(&shards_dir(&self.data_dir))?;
         let state = ShardState {
             dir,
             meta,
@@ -2258,7 +2426,6 @@ impl SegmentReader {
 }
 
 /// Container for read-only segment handles for a single shard.
-#[expect(dead_code, reason = "tx_meta included for completeness; reads not yet wired")]
 struct ShardSegmentReaders {
     headers: SegmentReader,
     tx_hashes: SegmentReader,
@@ -2379,6 +2546,31 @@ fn peer_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PEER_FILE_NAME)
 }
 
+fn namespaced_peer_cache_dir(
+    root: &Path,
+    chain_id: u64,
+    genesis: alloy_primitives::B256,
+) -> PathBuf {
+    root.join("peers").join(format!("{chain_id}-{genesis:x}"))
+}
+
+/// Use the same migration precedence for cache loading and disk statistics.
+fn peer_cache_read_dir(
+    root: &Path,
+    chain_id: u64,
+    genesis: alloy_primitives::B256,
+) -> Result<PathBuf> {
+    let namespaced = namespaced_peer_cache_dir(root, chain_id, genesis);
+    // Untagged caches came from Ethereum-only releases. Never use them for Base.
+    let legacy_ethereum = chain_id == crate::chain::ChainKind::Mainnet.chain_id()
+        && genesis == crate::chain::ChainKind::Mainnet.genesis_hash();
+    if legacy_ethereum && !peer_path(&namespaced).try_exists()? {
+        Ok(root.to_path_buf())
+    } else {
+        Ok(namespaced)
+    }
+}
+
 fn sealed_cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SEALED_CACHE_FILE_NAME)
 }
@@ -2479,7 +2671,7 @@ fn load_meta(path: &Path) -> Result<MetaState> {
 
 fn persist_meta(path: &Path, meta: &MetaState) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(meta).wrap_err("failed to encode meta.json")?;
-    fs::write(path, bytes).wrap_err("failed to write meta.json")
+    crate::storage::durable::atomic_write(path, &bytes).wrap_err("failed to write meta.json")
 }
 
 fn load_shard_meta(shard_dir: &Path) -> Result<ShardMeta> {
@@ -2490,17 +2682,38 @@ fn load_shard_meta(shard_dir: &Path) -> Result<ShardMeta> {
 
 fn persist_shard_meta(shard_dir: &Path, meta: &ShardMeta) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(meta).wrap_err("failed to encode shard.json")?;
-    fs::write(shard_meta_path(shard_dir), bytes).wrap_err("failed to write shard.json")
+    crate::storage::durable::atomic_write(&shard_meta_path(shard_dir), &bytes).wrap_err("failed to write shard.json")
+}
+
+fn recount_sorted_stats(state: &mut ShardState, codec: StorageCodec) -> Result<()> {
+    state.meta.total_transactions = 0;
+    state.meta.total_receipts = 0;
+    state.meta.total_logs = 0;
+    if state.meta.present_count == 0 {
+        return Ok(());
+    }
+    let dir = sorted_dir(&state.dir);
+    let receipts = SegmentReader::open(dir.join("receipts"), state.meta.shard_start)?;
+    let hashes = SegmentReader::open(dir.join("tx_hashes"), state.meta.shard_start)?;
+    for offset in 0..state.meta.shard_size as usize {
+        if !state.bitset.is_set(offset) {
+            continue;
+        }
+        let number = state.meta.shard_start + offset as u64;
+        let bytes = receipts.read_row_raw(number)?.ok_or_else(|| eyre!("missing receipts during rollback"))?;
+        let decoded = codec.decode_receipts(&bytes)?;
+        let txs: StoredTxHashes = hashes.read_row(number)?.ok_or_else(|| eyre!("missing transaction hashes during rollback"))?;
+        state.meta.total_transactions += txs.hashes.len() as u64;
+        state.meta.total_receipts += decoded.len() as u64;
+        state.meta.total_logs += decoded.iter().map(|r| r.logs().len() as u64).sum::<u64>();
+    }
+    Ok(())
 }
 
 fn validate_meta(config: &NodeConfig, meta: &MetaState) -> Result<()> {
-    if meta.chain_id != config.chain_id {
-        return Err(eyre!(
-            "chain id mismatch: expected {}, got {}",
-            config.chain_id,
-            meta.chain_id
-        ));
-    }
+    validate_config_identity(config)?;
+    let chain = stored_chain(meta)?;
+    eyre::ensure!(chain == config.chain, "storage identity does not match the selected chain; use a separate data directory");
     if meta.storage_key != StorageConfigKey::from(config) {
         return Err(eyre!(
             "storage config mismatch: expected {:?}, got {:?}",
@@ -2894,7 +3107,13 @@ mod tests {
 
     fn base_config(data_dir: PathBuf) -> NodeConfig {
         NodeConfig {
+            chain: crate::chain::ChainKind::Mainnet,
+            chain_id_override: None,
             chain_id: 1,
+            genesis_hash: crate::chain::ChainKind::Mainnet.genesis_hash(),
+            p2p_port: crate::cli::DEFAULT_P2P_PORT,
+            trusted_peers: Vec::new(),
+            start_block_override: Some(0),
             data_dir,
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("valid bind"),
@@ -2952,9 +3171,7 @@ mod tests {
             tx_hashes: StoredTxHashes { hashes: Vec::new() },
             transactions: StoredTransactions { txs: Vec::new() },
             size: StoredBlockSize { size: 0 },
-            receipts: StoredReceipts {
-                receipts: Vec::<Receipt>::new(),
-            },
+            receipts: StoredReceipts::Ethereum(Vec::<Receipt>::new()),
         }
     }
 
@@ -3036,3 +3253,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod peer_cache_tests;
+
+#[cfg(test)]
+mod identity_tests;

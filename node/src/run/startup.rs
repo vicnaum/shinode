@@ -1,5 +1,6 @@
 //! Startup initialization functions.
 
+use crate::chain::ChainTypes;
 use crate::cli::NodeConfig;
 use crate::logging::RunContext;
 use crate::p2p::{self, PeerPool};
@@ -208,10 +209,14 @@ pub async fn init_storage(
         }
     })?);
 
-    // Resume behavior: if the previous run exited before compaction finished, ensure we
-    // compact any completed shards up-front so we don't keep reprocessing WAL-heavy shards
-    // across restarts. Skip when --defer-compaction is set (user can run `db compact`).
-    let dirty_shards = if config.defer_compaction {
+    // Anchored writes start after compacted coverage, while missing-block detection
+    // also counts WAL. Recover all anchored WAL first, including incomplete shards,
+    // regardless of deferred compaction, so the ordered writer cannot wait on a
+    // pending block that the scheduler considers already present.
+    let dirty_shards = if storage.snapshot_boundary().is_some() {
+        storage.dirty_shards()?.into_iter()
+            .map(|shard| shard.shard_start).collect()
+    } else if config.defer_compaction {
         vec![]
     } else {
         storage.dirty_complete_shards()?
@@ -221,7 +226,7 @@ pub async fn init_storage(
         let status_msg = format!("Compacting {shard_count} shards...");
         ui::print_status_bar(&status_msg);
         update_tui_startup(tui, &status_msg, log_buffer.as_ref());
-        info!(shard_count, "startup: compacting completed dirty shards");
+        info!(shard_count, "startup: compacting recovered dirty shards");
         let storage_clone = Arc::clone(&storage);
         tokio::task::spawn_blocking(move || -> Result<()> {
             for shard_start in dirty_shards {
@@ -238,15 +243,22 @@ pub async fn init_storage(
 
 /// Connect to the P2P network.
 #[expect(clippy::cognitive_complexity, reason = "P2P connection with status updates")]
-pub async fn connect_p2p(
+pub async fn connect_p2p<C: ChainTypes>(
     storage: Arc<Storage>,
+    config: &NodeConfig,
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
-) -> Result<p2p::NetworkSession> {
-    ui::print_status_bar("Connecting to Ethereum P2P network...");
-    update_tui_startup(tui, "Connecting to Ethereum P2P network...", log_buffer.as_ref());
+) -> Result<p2p::NetworkSession<C>> {
+    let message = format!("Connecting to {} P2P network...", C::NAME);
+    ui::print_status_bar(&message);
+    update_tui_startup(tui, &message, log_buffer.as_ref());
     info!("starting p2p network");
-    let session = p2p::connect_mainnet_peers(Some(Arc::clone(&storage))).await?;
+    let session = p2p::connect_peers::<C>(
+        Some(Arc::clone(&storage)),
+        config.p2p_port,
+        &config.trusted_peers,
+    )
+    .await?;
     let initial_peers = session.pool.len();
     info!(peers = initial_peers, "p2p peers connected");
     let status_msg = format!("P2P connected | {initial_peers} peers");
@@ -256,8 +268,8 @@ pub async fn connect_p2p(
 }
 
 /// Wait for minimum number of peers.
-pub async fn wait_for_min_peers(
-    pool: &Arc<PeerPool>,
+pub async fn wait_for_min_peers<C: ChainTypes>(
+    pool: &Arc<PeerPool<C>>,
     min_peers: usize,
     tui: Option<&EarlyTui>,
     log_buffer: &LogBufferRef,
@@ -281,8 +293,8 @@ pub async fn wait_for_min_peers(
 }
 
 /// Wait for peer head to be at or above start block.
-pub async fn wait_for_peer_head(
-    pool: &Arc<PeerPool>,
+pub async fn wait_for_peer_head<C: ChainTypes>(
+    pool: &Arc<PeerPool<C>>,
     start_block: u64,
     end_block: Option<u64>,
     rollback_window: u64,
@@ -358,14 +370,14 @@ pub struct LogWriters {
 /// If `log_writers` is provided, the TUI will flush the log writers before
 /// exiting to prevent log truncation.
 #[expect(clippy::too_many_arguments, reason = "setup function needs many config params")]
-pub fn setup_ui(
+pub fn setup_ui<C: ChainTypes>(
     config: &NodeConfig,
     run_context: Option<&RunContext>,
     start_block: u64,
     end_block: u64,
     progress_stats: Option<&Arc<SyncProgressStats>>,
     peer_health: &Arc<PeerHealthTracker>,
-    pool: &Arc<PeerPool>,
+    pool: &Arc<PeerPool<C>>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     completion_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     early_tui: Option<EarlyTui>,
@@ -410,6 +422,7 @@ pub fn setup_ui(
                 config.shard_size,
                 &config.rpc_bind.to_string(),
                 config.rollback_window,
+                config.chain,
             );
             Arc::new(Mutex::new(tui))
         };

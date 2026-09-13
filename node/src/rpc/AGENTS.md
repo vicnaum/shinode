@@ -11,6 +11,11 @@ Designed for read-only access with configurable rate limiting; no state executio
 - (none)
 
 ### Files
+- `history_reference_tests.rs` - Opt-in independent block/receipt/full-range-log
+  comparison for an imported or restored database, using saved external reference
+  JSON. See `docs/base-integration-validation.md` for environment variables and schema.
+- `snapshot_tests.rs` - Opt-in production Rust snapshot-import proof for 544 historical blocks, with 16 reference samples queried after reopen. Offline reader and downloader tests live in `snapshot/`. Reproduction and format limits are in `docs/base-snapshot-download.md`.
+- `chain_tests.rs` - Ethereum and mixed Base deposit/user fixtures through WAL, compaction, sealing, reopen, and the production RPC module; complete/filtered logs and block-query contracts.
 - `mod.rs` - RPC server bootstrap, method registrations, param parsing helpers, response formatting, and stats tracking (~1125 lines, ~476 lines tests).
   - **Key items**: `RpcConfig`, `RpcContext`, `start()`, `module()`, `eth_getBlockByNumber`, `eth_getLogs`, `parse_block_tag()`
 
@@ -72,3 +77,15 @@ Designed for read-only access with configurable rate limiting; no state executio
 9. Graceful shutdown via `handle.stop()`.
 
 ## Notes
+
+`test_module()` exposes the production RPC module to snapshot handoff tests
+without binding a socket. The opt-in real snapshot proof records the independently
+checked block-5,527 boundary hash and verifies anchored continuity after reopen.
+
+Log derivation uses the common `TxReceipt` accessors on `StoredReceiptRef`, supporting both stored receipt variants while retaining the existing RPC contract.
+
+`RpcConfig` derives numeric identity from the resolved chain. `eth_getLogs` counts
+log indices across all receipts within each block before filtering; indices reset
+at block boundaries. Base returns `0x2105` from `eth_chainId`; Ethereum returns
+`0x1`. Both retain the same limited method surface: full transaction block queries
+(`includeTransactions=true`) and safe/finalized block tags remain unsupported.

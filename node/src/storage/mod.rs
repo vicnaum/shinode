@@ -1,14 +1,20 @@
 //! Storage types and helpers. The sharded backend lives in `sharded`.
 
 use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
+use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, Signature, B256, U256};
 use eyre::{Result, WrapErr};
 use reth_ethereum_primitives::Receipt;
-use reth_primitives_traits::{
-    serde_bincode_compat::{BincodeReprFor, SerdeBincodeCompat},
-    Header,
-};
+use reth_optimism_primitives::OpReceipt;
+
+use reth_primitives_traits::{serde_bincode_compat::SerdeBincodeCompat, Header};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+mod codec;
+pub mod durable;
+mod lock;
+pub use lock::DataDirLock;
+pub use codec::StorageCodec;
 
 pub const ZSTD_DICT_MAX_SIZE: usize = 5000;
 
@@ -24,7 +30,8 @@ pub struct StoredTransaction {
     pub from: Option<Address>,
     pub to: Option<Address>,
     pub value: U256,
-    pub nonce: u64,
+    /// Ordinary transaction nonce, or deposit receipt nonce when available.
+    pub nonce: Option<u64>,
     #[serde(default)]
     pub signature: Option<Signature>,
     #[serde(default)]
@@ -41,29 +48,74 @@ pub struct StoredBlockSize {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredReceipts {
-    pub receipts: Vec<Receipt>,
+/// Tagged in memory; disk encoding is selected by database metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredReceipts {
+    Ethereum(Vec<Receipt>),
+    Op(Vec<OpReceipt>),
 }
 
-type ReceiptBincodeRepr<'a> = BincodeReprFor<'a, Receipt>;
-
-impl SerdeBincodeCompat for StoredReceipts {
-    type BincodeRepr<'a> = Vec<ReceiptBincodeRepr<'a>>;
-
-    fn as_repr(&self) -> Self::BincodeRepr<'_> {
-        self.receipts
-            .iter()
-            .map(SerdeBincodeCompat::as_repr)
-            .collect()
+impl StoredReceipts {
+    pub const fn codec(&self) -> StorageCodec {
+        match self {
+            Self::Ethereum(_) => StorageCodec::EthereumV1,
+            Self::Op(_) => StorageCodec::OpV1,
+        }
     }
 
-    fn from_repr(repr: Self::BincodeRepr<'_>) -> Self {
-        let receipts = repr
-            .into_iter()
-            .map(<Receipt as SerdeBincodeCompat>::from_repr)
-            .collect();
-        Self { receipts }
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Ethereum(r) => r.len(),
+            Self::Op(r) => r.len(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = StoredReceiptRef<'_>> {
+        (0..self.len()).map(move |i| match self {
+            Self::Ethereum(r) => StoredReceiptRef::Ethereum(&r[i]),
+            Self::Op(r) => StoredReceiptRef::Op(&r[i]),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredReceiptRef<'a> {
+    Ethereum(&'a Receipt),
+    Op(&'a OpReceipt),
+}
+
+impl TxReceipt for StoredReceiptRef<'_> {
+    type Log = alloy_primitives::Log;
+
+    fn status_or_post_state(&self) -> alloy_consensus::Eip658Value {
+        match self {
+            Self::Ethereum(r) => r.status_or_post_state(),
+            Self::Op(r) => r.status_or_post_state(),
+        }
+    }
+    fn status(&self) -> bool {
+        match self {
+            Self::Ethereum(r) => r.status(),
+            Self::Op(r) => r.status(),
+        }
+    }
+    fn bloom(&self) -> alloy_primitives::Bloom {
+        match self {
+            Self::Ethereum(r) => r.bloom(),
+            Self::Op(r) => r.bloom(),
+        }
+    }
+    fn cumulative_gas_used(&self) -> u64 {
+        match self {
+            Self::Ethereum(r) => r.cumulative_gas_used(),
+            Self::Op(r) => r.cumulative_gas_used(),
+        }
+    }
+    fn logs(&self) -> &[Self::Log] {
+        match self {
+            Self::Ethereum(r) => r.logs(),
+            Self::Op(r) => r.logs(),
+        }
     }
 }
 
@@ -167,3 +219,6 @@ pub fn decode_u64(bytes: &[u8]) -> Result<u64> {
     buf.copy_from_slice(bytes);
     Ok(u64::from_le_bytes(buf))
 }
+
+#[cfg(test)]
+mod chain_tests;

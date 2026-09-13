@@ -116,3 +116,9 @@ Usage: `kill -USR1 <pid>`
 7. `TuiLogBuffer` captures formatted entries for dashboard log panel
 8. On shutdown, `generate_run_report()` produces summary JSON with peer health
 9. `finalize_log_files()` flushes all writers and renames temp files atomically
+
+Resource and SIGUSR1 loggers accept chain-typed network handles/peer pools; metric formats remain chain neutral.
+
+Startup logs identify chain name, ID, and genesis; run reports include the resolved
+chain in `config`. The retained `derived.safe_head` field is the historical
+rollback-depth target, not a consensus safe/finalized head.

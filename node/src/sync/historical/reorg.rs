@@ -1,5 +1,6 @@
 //! Reorg detection and common-ancestor search for follow mode.
 
+use crate::chain::{ChainTypes, EthereumChain};
 use crate::p2p::{request_headers_batch, request_headers_chunked_strict, NetworkPeer, PeerPool};
 use crate::storage::Storage;
 use alloy_primitives::B256;
@@ -8,19 +9,19 @@ use reth_primitives_traits::SealedHeader;
 use std::collections::HashMap;
 
 #[derive(Debug)]
-pub enum ReorgCheck {
+pub enum ReorgCheck<C: ChainTypes = EthereumChain> {
     NoReorg,
-    ReorgDetected { anchor: NetworkPeer },
+    ReorgDetected { anchor: NetworkPeer<C> },
     Inconclusive,
 }
 
-pub async fn preflight_reorg(
+pub async fn preflight_reorg<C: ChainTypes>(
     storage: &Storage,
-    pool: &PeerPool,
+    pool: &PeerPool<C>,
     last_indexed: u64,
     start_block: u64,
     probe_peers: usize,
-) -> Result<ReorgCheck> {
+) -> Result<ReorgCheck<C>> {
     let stored_header = storage
         .block_header(last_indexed)?
         .ok_or_else(|| eyre!("missing stored header for block {last_indexed}"))?;
@@ -31,7 +32,7 @@ pub async fn preflight_reorg(
         return Ok(ReorgCheck::Inconclusive);
     }
 
-    let mut mismatch_anchor: Option<NetworkPeer> = None;
+    let mut mismatch_anchor: Option<NetworkPeer<C>> = None;
     let probe_peers = probe_peers.max(1);
     for peer in peers.iter().take(probe_peers) {
 
@@ -59,9 +60,9 @@ pub async fn preflight_reorg(
     Ok(ReorgCheck::Inconclusive)
 }
 
-pub async fn find_common_ancestor(
+pub async fn find_common_ancestor<C: ChainTypes>(
     storage: &Storage,
-    anchor: &NetworkPeer,
+    anchor: &NetworkPeer<C>,
     low: u64,
     high: u64,
 ) -> Result<Option<u64>> {
@@ -106,8 +107,8 @@ fn find_common_ancestor_number(
     None
 }
 
-async fn fetch_single_header(
-    peer: &NetworkPeer,
+async fn fetch_single_header<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     number: u64,
 ) -> Result<Option<reth_primitives_traits::Header>> {
     let mut headers = request_headers_batch(peer, number, 1).await?;
@@ -116,7 +117,7 @@ async fn fetch_single_header(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_common_ancestor_number, preflight_reorg, ReorgCheck};
+    use super::{find_common_ancestor, find_common_ancestor_number, preflight_reorg, ReorgCheck};
     use crate::cli::{HeadSource, NodeConfig, ReorgStrategy, RetentionMode};
     use crate::p2p::{peer_pool_for_tests, NetworkPeer};
     use crate::storage::Storage;
@@ -152,7 +153,13 @@ mod tests {
 
     fn base_config(dir: std::path::PathBuf) -> NodeConfig {
         NodeConfig {
+            chain: crate::chain::ChainKind::Mainnet,
+            chain_id_override: None,
             chain_id: 1,
+            genesis_hash: crate::chain::ChainKind::Mainnet.genesis_hash(),
+            p2p_port: crate::cli::DEFAULT_P2P_PORT,
+            trusted_peers: Vec::new(),
+            start_block_override: Some(0),
             data_dir: dir,
             peer_cache_dir: None,
             rpc_bind: "127.0.0.1:0".parse().expect("rpc bind"),
@@ -205,15 +212,17 @@ mod tests {
     }
 
     fn write_bundle(storage: &Storage, header: Header) {
+        write_bundle_with_receipts(storage, header, crate::storage::StoredReceipts::Ethereum(Vec::new()));
+    }
+
+    fn write_bundle_with_receipts(storage: &Storage, header: Header, receipts: crate::storage::StoredReceipts) {
         let bundle = crate::storage::BlockBundle {
             number: header.number,
             header,
             tx_hashes: crate::storage::StoredTxHashes { hashes: Vec::new() },
             transactions: crate::storage::StoredTransactions { txs: Vec::new() },
             size: crate::storage::StoredBlockSize { size: 0 },
-            receipts: crate::storage::StoredReceipts {
-                receipts: Vec::new(),
-            },
+            receipts,
         };
         storage
             .write_block_bundle_follow(&bundle)
@@ -250,11 +259,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
         let messages = PeerRequestSender::new(peer_id, tx);
-        let peer = NetworkPeer {
+        let peer: NetworkPeer = NetworkPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages,
             head_number: 12,
+            earliest_block: None,
+            latest_block: None,
         };
 
         tokio::spawn(async move {
@@ -297,11 +308,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
         let messages = PeerRequestSender::new(peer_id, tx);
-        let peer = NetworkPeer {
+        let peer: NetworkPeer = NetworkPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages,
             head_number: 12,
+            earliest_block: None,
+            latest_block: None,
         };
 
         tokio::spawn(async move {
@@ -344,11 +357,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let peer_id = PeerId::random();
         let messages = PeerRequestSender::new(peer_id, tx);
-        let peer = NetworkPeer {
+        let peer: NetworkPeer = NetworkPeer {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages,
             head_number: 12,
+            earliest_block: None,
+            latest_block: None,
         };
 
         tokio::spawn(async move {
@@ -366,4 +381,47 @@ mod tests {
         assert!(matches!(result, ReorgCheck::Inconclusive));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[tokio::test]
+    async fn base_reorg_search_stays_inside_requested_window() -> eyre::Result<()> {
+        use crate::chain::{BaseChain, ChainKind};
+        use eyre::ensure;
+        let dir = temp_dir();
+        let mut config = base_config(dir.clone());
+        config.chain = ChainKind::Base;
+        config.chain_id = config.chain.chain_id();
+        config.genesis_hash = config.chain.genesis_hash();
+        let storage = Storage::open(&config)?;
+        let eight = header_with_number(8, b(0));
+        let nine = header_with_number(9, eight.hash_slow());
+        let ten = header_with_number(10, nine.hash_slow());
+        for header in [&eight, &nine, &ten] {
+            write_bundle_with_receipts(&storage, header.clone(), crate::storage::StoredReceipts::Op(Vec::new()));
+        }
+        let mut fork_ten = ten;
+        fork_ten.extra_data = alloy_primitives::Bytes::from_static(&[1]);
+        let peer_id = PeerId::random();
+        let (tx, mut rx) = mpsc::channel(8);
+        let peer = NetworkPeer::<BaseChain> {
+            peer_id, eth_version: EthVersion::Eth69,
+            messages: PeerRequestSender::new(peer_id, tx), head_number: 10,
+            earliest_block: Some(0), latest_block: Some(10),
+        };
+        let server = tokio::spawn(async move {
+            while let Some(PeerRequest::GetBlockHeaders { request, response }) = rx.recv().await {
+                let BlockHashOrNumber::Number(start) = request.start_block else { break; };
+                let headers = [&eight, &nine, &fork_ten].into_iter()
+                    .filter(|h| h.number >= start && h.number < start + request.limit)
+                    .cloned().collect();
+                let _ = response.send(Ok(BlockHeaders(headers)));
+            }
+        });
+        let pool = peer_pool_for_tests(vec![peer.clone()]);
+        ensure!(matches!(preflight_reorg(&storage, &pool, 10, 11, 1).await?, ReorgCheck::ReorgDetected { .. }), "Base fork was not detected");
+        ensure!(find_common_ancestor(&storage, &peer, 8, 10).await? == Some(9), "wrong common ancestor");
+        ensure!(find_common_ancestor(&storage, &peer, 10, 10).await?.is_none(), "search escaped rollback window");
+        server.abort();
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
 }
