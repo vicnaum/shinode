@@ -12,6 +12,20 @@ The first package format supports Base, storage schema 2, and the `op_v1` codec.
 It distributes already imported history; it does not extend the execution
 snapshot reader's supported producer versions or fork range.
 
+`history-export` and `history-restore` use the fullscreen archive dashboard in an
+interactive terminal. Export reports verified/packaged shards and compressed
+output size; restore shows archive extraction, native verification, overlap and
+parent checks, writing/compaction, sealing, and final verification. Use
+`shinode --no-tui history-export ...` or `shinode --no-tui history-restore ...`
+for plain terminal output; redirected stderr and noninteractive stdin use it
+automatically. The export manifest hash remains visible after the screen closes.
+
+Press **q** or **Ctrl-C** to stop at the next safe checkpoint. The command waits
+for active storage work and releases its locks before restoring the terminal.
+Repeat an interrupted restore to resume; an interrupted export restarts packaging
+into its still-unpublished output directory. A completed export still requires a
+new output directory for another run.
+
 ## Export
 
 Stop the writer using the source database. If older data has not been durably

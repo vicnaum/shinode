@@ -11,6 +11,9 @@ Local Base native-history distribution; no execution snapshot or Python dependen
 - `mod.rs`: exclusive source/export, private staging, native seal and bundle
   verification, overlap/combined-parent preflight, missing-block WAL merge,
   compaction-aware disk budget, reopen verification and trusted-boundary pinning.
+  Export/restore run through the archive TUI controller, reporting verification,
+  packaging/extraction, merge and publication phases. Shared cancellation checks
+  stop between blocks and file buffers; active storage work finishes before exit.
 - `tests.rs`: standalone restore, malformed manifests/archives, conflict/gap
   rejection, interrupted WAL recovery, CLI, adjacent/older packages, production
   typed-peer continuation and RPC/restart. The ignored native sample proof uses

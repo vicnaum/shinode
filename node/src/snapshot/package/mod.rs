@@ -8,6 +8,7 @@ use self::{
     format::{Manifest, Shard, Source},
 };
 use super::{absolute, download, journal};
+use crate::ui::archive::{self as archive_ui, Progress};
 use crate::{
     chain::ChainKind,
     cli::NodeConfig,
@@ -27,11 +28,17 @@ use std::{
 };
 
 pub async fn export(config: NodeConfig, args: ExportArgs) -> Result<()> {
-    tokio::task::spawn_blocking(move || export_local(&config, &args)).await?
+    archive_ui::run(config.no_tui, "History export", move |progress| {
+        export_progress(&config, &args, &progress)
+    })
+    .await
 }
 
 pub async fn restore(config: NodeConfig, args: RestoreArgs) -> Result<()> {
-    tokio::task::spawn_blocking(move || restore_local(config, &args)).await?
+    archive_ui::run(config.no_tui, "History restore", move |progress| {
+        restore_progress(config, &args, &progress)
+    })
+    .await
 }
 
 fn separate(first: &Path, second: &Path) -> Result<()> {
@@ -77,11 +84,22 @@ impl Drop for Scratch {
     }
 }
 
+#[cfg(test)]
 fn range_digest(storage: &Storage, start: u64, end: u64) -> Result<(String, B256, B256)> {
+    range_digest_progress(storage, start, end, &Progress::default())
+}
+
+fn range_digest_progress(
+    storage: &Storage,
+    start: u64,
+    end: u64,
+    progress: &Progress,
+) -> Result<(String, B256, B256)> {
     let mut digest = Sha256::new();
     let mut previous = None;
     let mut first_parent = B256::ZERO;
     for number in start..=end {
+        progress.check()?;
         let bundle = journal::stored_bundle(storage, number)?
             .ok_or_else(|| eyre!("package coverage gap at {number}"))?;
         ensure!(
@@ -107,7 +125,19 @@ fn range_digest(storage: &Storage, start: u64, end: u64) -> Result<(String, B256
     ))
 }
 
+#[cfg(test)]
 fn export_local(config: &NodeConfig, args: &ExportArgs) -> Result<()> {
+    export_progress(config, args, &Progress::default())
+}
+
+fn export_progress(config: &NodeConfig, args: &ExportArgs, progress: &Progress) -> Result<()> {
+    progress.check()?;
+    progress.detail(format!(
+        "Blocks {}–{} → {}",
+        args.start_block,
+        args.end_block,
+        args.output_dir.display()
+    ));
     ensure!(
         config.chain == ChainKind::Base,
         "history packages currently support Base only"
@@ -172,33 +202,51 @@ fn export_local(config: &NodeConfig, args: &ExportArgs) -> Result<()> {
         shards: Vec::new(),
     };
     let mut extracted = 0u64;
+    let mut compressed = 0u64;
+    progress.phase(
+        "Verifying / packaging",
+        (args.end_block - args.start_block + 1) / config.shard_size,
+        "shards",
+    );
     for start in (args.start_block..=args.end_block).step_by(usize::try_from(config.shard_size)?) {
-        manifest.shards.push(package_shard(
-            &storage,
-            args,
-            start,
-            &scratch.0,
-            &mut extracted,
-        )?);
+        progress.check()?;
+        let shard = package_shard(&storage, args, start, &scratch.0, &mut extracted, progress)?;
+        compressed += shard.archive_bytes;
+        progress.output(compressed);
+        progress.advance(1);
+        progress.message(&format!("Packaged {}..={}", shard.start, shard.end));
+        manifest.shards.push(shard);
     }
+    publish_export(&manifest, &scratch, &output, args.min_free_bytes, progress)
+}
+
+fn publish_export(
+    manifest: &Manifest,
+    scratch: &Scratch,
+    output: &Path,
+    reserve: u64,
+    progress: &Progress,
+) -> Result<()> {
+    progress.check()?;
+    progress.phase("Publishing package", 0, "files");
     manifest.validate()?;
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     ensure!(
         bytes.len() <= 8 * 1024 * 1024,
         "manifest exceeds supported size"
     );
-    download::check_space(&scratch.0, args.min_free_bytes, bytes.len() as u64)?;
+    download::check_space(&scratch.0, reserve, bytes.len() as u64)?;
     durable::atomic_write(&scratch.0.join("manifest.json"), &bytes)?;
     durable::sync_tree(&scratch.0)?;
     ensure!(!output.exists(), "export output appeared during packaging");
-    fs::rename(&scratch.0, &output)?;
+    fs::rename(&scratch.0, output)?;
     durable::sync_directory(
         output
             .parent()
             .ok_or_else(|| eyre!("missing output parent"))?,
     )?;
     let (compressed, extracted) = manifest.sizes()?;
-    download::progress(&format!("Exported {} shards: {extracted} native bytes -> {compressed} archive bytes; manifest SHA-256 {}", manifest.shards.len(), format::sha(&bytes)));
+    progress.message(&format!("Exported {} shards: {extracted} native bytes -> {compressed} archive bytes; manifest SHA-256 {}", manifest.shards.len(), format::sha(&bytes)));
     Ok(())
 }
 
@@ -208,10 +256,13 @@ fn package_shard(
     start: u64,
     directory: &Path,
     extracted: &mut u64,
+    progress: &Progress,
 ) -> Result<Shard> {
+    progress.activity(&format!("Verifying shard {start}"));
     let sealed = storage.verified_sealed_shard(start)?;
     let end = start + storage.shard_size() - 1;
-    let (bundle_sha256, first_parent, end_hash) = range_digest(storage, start, end)?;
+    let (bundle_sha256, first_parent, end_hash) =
+        range_digest_progress(storage, start, end, progress)?;
     let mut files = Vec::new();
     for (name, path) in &sealed.files {
         let bytes = fs::metadata(path)?.len();
@@ -225,12 +276,13 @@ fn package_shard(
         files.push(format::File {
             name: name.clone(),
             bytes,
-            sha256: format::file_sha(path)?,
+            sha256: format::file_sha_progress(path, progress)?,
         });
     }
     let archive = format!("shard-{start}.tar.zst");
     let path = directory.join(&archive);
-    archive::pack(&sealed.files, &path, args.min_free_bytes)?;
+    progress.activity(&format!("Compressing shard {start}"));
+    archive::pack(&sealed.files, &path, args.min_free_bytes, progress)?;
     Ok(Shard {
         start,
         end,
@@ -240,7 +292,7 @@ fn package_shard(
         bundle_sha256,
         archive,
         archive_bytes: fs::metadata(&path)?.len(),
-        archive_sha256: format::file_sha(&path)?,
+        archive_sha256: format::file_sha_progress(&path, progress)?,
         files,
     })
 }
@@ -309,8 +361,22 @@ fn validate_destination(config: &NodeConfig, manifest: &Manifest) -> Result<()> 
     Ok(())
 }
 
-fn restore_local(mut config: NodeConfig, args: &RestoreArgs) -> Result<()> {
+#[cfg(test)]
+fn restore_local(config: NodeConfig, args: &RestoreArgs) -> Result<()> {
+    restore_progress(config, args, &Progress::default())
+}
+
+fn restore_progress(mut config: NodeConfig, args: &RestoreArgs, progress: &Progress) -> Result<()> {
+    progress.check()?;
     let manifest = read_manifest(args)?;
+    let (compressed, extracted) = manifest.sizes()?;
+    progress.selected(compressed, extracted);
+    progress.detail(format!(
+        "Blocks {}–{} → {}",
+        manifest.start,
+        manifest.end,
+        args.output_dir.display()
+    ));
     ensure!(
         config.chain == ChainKind::Base,
         "restore requires Base identity"
@@ -344,7 +410,13 @@ fn restore_local(mut config: NodeConfig, args: &RestoreArgs) -> Result<()> {
     let mut staged_config = config.clone();
     staged_config.data_dir = scratch.0.join("database");
     drop(Storage::open_with_progress(&staged_config, |_, _| {})?);
+    progress.phase(
+        "Extracting / verifying archives",
+        manifest.shards.len() as u64,
+        "shards",
+    );
     for shard in &manifest.shards {
+        progress.check()?;
         archive::unpack(
             &root,
             shard,
@@ -352,16 +424,24 @@ fn restore_local(mut config: NodeConfig, args: &RestoreArgs) -> Result<()> {
                 .data_dir
                 .join(format!("static/shards/{}", shard.start)),
             args.min_free_bytes,
+            progress,
         )?;
+        progress.advance(1);
     }
     let staged = Storage::open_with_progress(&staged_config, |_, _| {})?;
+    progress.phase(
+        "Verifying native shards",
+        manifest.shards.len() as u64,
+        "shards",
+    );
     for shard in &manifest.shards {
+        progress.check()?;
         ensure!(
             staged.verified_sealed_shard(shard.start)?.hash == shard.sealed_hash,
             "shard seal mismatch"
         );
         ensure!(
-            range_digest(&staged, shard.start, shard.end)?
+            range_digest_progress(&staged, shard.start, shard.end, progress)?
                 == (
                     shard.bundle_sha256.clone(),
                     shard.first_parent,
@@ -369,6 +449,7 @@ fn restore_local(mut config: NodeConfig, args: &RestoreArgs) -> Result<()> {
                 ),
             "package data/coverage mismatch"
         );
+        progress.advance(1);
     }
     staged.pin_snapshot_boundary(
         manifest.start,
@@ -376,7 +457,7 @@ fn restore_local(mut config: NodeConfig, args: &RestoreArgs) -> Result<()> {
         manifest.end_hash,
         &args.manifest_sha256,
     )?;
-    merge(&config, args, &manifest, &staged)
+    merge(&config, args, &manifest, &staged, progress)
 }
 
 fn merge(
@@ -384,9 +465,12 @@ fn merge(
     args: &RestoreArgs,
     manifest: &Manifest,
     staged: &Storage,
+    progress: &Progress,
 ) -> Result<()> {
     // Validation above completes before the destination is created. Existing writers
     // are excluded across recovery, overlap checks, import, reopen and publication.
+    progress.check()?;
+    progress.phase("Recovering destination", 0, "shards");
     let lease = Arc::new(DataDirLock::acquire(&config.data_dir)?);
     validate_destination(config, manifest)?;
     if !config.data_dir.join("meta.json").exists() {
@@ -406,6 +490,7 @@ fn merge(
         }));
     download::check_space(&config.data_dir, args.min_free_bytes, budget)?;
     storage.compact_all_dirty_with_progress(|_| {})?;
+    progress.output(storage.disk_usage_cached()?.total_bytes);
     if storage.snapshot_boundary().is_some() {
         ensure!(
             manifest.start <= storage.last_indexed_block()?.unwrap_or(0).saturating_add(1),
@@ -413,14 +498,21 @@ fn merge(
         );
         storage.validate_snapshot_boundary()?;
     }
+    progress.phase(
+        "Checking overlaps",
+        manifest.end - manifest.start + 1,
+        "blocks",
+    );
     for number in manifest.start..=manifest.end {
+        progress.check()?;
+        progress.position(number - manifest.start);
         journal::compare(
             &storage,
             &journal::stored_bundle(staged, number)?
                 .ok_or_else(|| eyre!("missing staged block"))?,
         )?;
     }
-    verify_combined_chain(config, &storage, staged, manifest)?;
+    verify_combined_chain(config, &storage, staged, manifest, progress)?;
     // A crash before the first boundary is published must require restore to
     // finish, rather than exposing a partially imported database to normal sync.
     if storage.snapshot_boundary().is_none() {
@@ -429,26 +521,48 @@ fn merge(
             &serde_json::to_vec_pretty(manifest)?,
         )?;
     }
+    progress.phase("Restoring", manifest.end - manifest.start + 1, "blocks");
     let mut batch = Vec::new();
     for number in manifest.start..=manifest.end {
+        progress.check()?;
+        progress.position(number - manifest.start);
         let bundle =
             journal::stored_bundle(staged, number)?.ok_or_else(|| eyre!("missing staged block"))?;
         if !journal::compare(&storage, &bundle)? {
             batch.push(bundle);
         }
         if batch.len() >= usize::from(args.batch_blocks) {
-            flush(&storage, config, args, &mut batch)?;
+            flush(&storage, config, args, &mut batch, progress)?;
         }
     }
-    flush(&storage, config, args, &mut batch)?;
+    flush(&storage, config, args, &mut batch, progress)?;
     storage.recount_stats_in_range(manifest.start, manifest.end)?;
-    storage.seal_completed_shards_with_progress(|_| {})?;
+    progress.phase("Sealing restored shards", 0, "shards");
+    storage.seal_completed_shards_with_progress(|_| progress.advance(1))?;
     durable::sync_tree(&config.data_dir)?;
     drop(storage);
+    finish_restore(config, args, manifest, staged, lease, progress)
+}
+
+fn finish_restore(
+    config: &NodeConfig,
+    args: &RestoreArgs,
+    manifest: &Manifest,
+    staged: &Storage,
+    lease: Arc<DataDirLock>,
+    progress: &Progress,
+) -> Result<()> {
     // Only adopt the package's lower bound after overlap/parent preflight and
     // durable writes succeed. Keep the same writer lease across this reopen.
+    progress.phase(
+        "Verifying restored output",
+        manifest.end - manifest.start + 1,
+        "blocks",
+    );
     let storage = Storage::open_locked(config, lease, |_, _| {})?;
     for number in manifest.start..=manifest.end {
+        progress.check()?;
+        progress.position(number - manifest.start);
         ensure!(
             journal::compare(
                 &storage,
@@ -458,6 +572,8 @@ fn merge(
             "restored output differs"
         );
     }
+    progress.check()?;
+    progress.phase("Publishing trusted boundary", 0, "items");
     if storage
         .snapshot_boundary()
         .is_none_or(|boundary| manifest.end >= boundary.number)
@@ -476,7 +592,7 @@ fn merge(
             .join(format!("history-package-{}.json", args.manifest_sha256)),
         &serde_json::to_vec_pretty(manifest)?,
     )?;
-    download::progress(&format!(
+    progress.message(&format!(
         "Restored and verified {}..={} ({} shards)",
         manifest.start,
         manifest.end,
@@ -490,11 +606,19 @@ fn verify_combined_chain(
     storage: &Storage,
     staged: &Storage,
     manifest: &Manifest,
+    progress: &Progress,
 ) -> Result<()> {
     let start = Storage::read_resume_start(&config.data_dir, config.chain_id, config.genesis_hash)?
         .map_or(manifest.start, |saved| saved.min(manifest.start));
     let mut previous = None;
+    progress.phase(
+        "Checking parent continuity",
+        manifest.end - start + 1,
+        "blocks",
+    );
     for number in start..=manifest.end {
+        progress.check()?;
+        progress.position(number - start);
         let source = if number >= manifest.start {
             staged
         } else {
@@ -512,6 +636,7 @@ fn verify_combined_chain(
     // Joining an existing suffix must not make an incompatible branch reachable.
     let mut next = manifest.end.checked_add(1);
     while let Some(number) = next {
+        progress.check()?;
         let Some(header) = storage.block_header(number)? else {
             break;
         };
@@ -530,6 +655,7 @@ fn flush(
     config: &NodeConfig,
     args: &RestoreArgs,
     batch: &mut Vec<crate::storage::BlockBundle>,
+    progress: &Progress,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -539,8 +665,17 @@ fn flush(
         args.min_free_bytes,
         super::working_space(storage, batch)?,
     )?;
+    progress.check()?;
+    progress.activity("Writing batch");
     storage.write_block_bundles_wal(batch)?;
+    progress.activity("Compacting batch");
     storage.compact_all_dirty_with_progress(|_| {})?;
+    progress.activity("");
+    progress.output(storage.disk_usage_cached()?.total_bytes);
+    progress.message(&format!(
+        "Restored batch through block {}",
+        batch.last().map_or(0, |b| b.number)
+    ));
     batch.clear();
     Ok(())
 }

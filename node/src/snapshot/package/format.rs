@@ -61,7 +61,12 @@ pub fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(test)]
 pub fn file_sha(path: &Path) -> Result<String> {
+    file_sha_progress(path, &crate::ui::archive::Progress::default())
+}
+
+pub fn file_sha_progress(path: &Path, progress: &crate::ui::archive::Progress) -> Result<String> {
     ensure!(
         fs::symlink_metadata(path)?.file_type().is_file(),
         "not a regular file: {}",
@@ -71,6 +76,7 @@ pub fn file_sha(path: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = vec![0; 1024 * 1024];
     loop {
+        progress.check()?;
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
